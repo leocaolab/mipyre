@@ -2,7 +2,7 @@
 
 All notable changes to mipyre are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/): within 1.x, the public API does not break.
 
-## [1.0.0] — unreleased
+## [1.0.0] — 2026-10-21
 
 The first public release.
 
