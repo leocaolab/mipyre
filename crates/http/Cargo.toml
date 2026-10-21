@@ -1,0 +1,109 @@
+[package]
+name = "mipyre_http"
+description = "pyre's HTTP: what a request resolves to and the response it gets (plan/, no IO), and the IO HTTP does over a connection (io/): the bounded body read, request ids, write coalescing, static files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No pyo3 and no `#[global_allocator]`, here or in anything this crate depends on (`deny.toml`
+# bans pyo3 under this crate). Taking these files from a crate that had pyo3 and a global
+# allocator once put all of libpython and mimalloc into a process that linked only the network
+# floor (`ldd` showed libpython3.14, `nm -D` 303 `Py*`).
+#
+# plan/ needs only the first nine below. Nothing in this list keeps it off the rest: clippy.toml
+# and dev/archcheck.toml do (src/plan/mod.rs says how).
+#
+# tokio's features are this crate's own, not a consumer's: `cargo check -p mipyre_http` in the
+# merge gate builds it alone, so a feature it uses without naming fails there.
+[dependencies]
+http = "1"
+bytes = "1"
+matchit = "0.8"
+percent-encoding = "2"
+# HTTP-dates: `Last-Modified` and `If-Modified-Since` (plan/conditional.rs). Already under hyper.
+httpdate = "1"
+thiserror = "2"
+serde_json = "1"
+# zlib-rs, not the default miniz_oxide (b/606): from 4.8 KiB of JSON up, 1.4–1.7x fewer instructions
+# per body; its stream is reset per body (plan/compression.rs, GzipStream).
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+brotli = "7"
+# The connection HTTP is spoken over (stream/: the peer-gone judgement, the write timeout) and the log throttles.
+mipyre_transport = { path = "../transport" }
+mipyre_util = { path = "../util" }
+tokio = { version = "1", features = ["net", "time", "sync", "rt", "io-util", "macros"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+http-body-util = "0.1"
+parking_lot = "0.12"
+libc = "0.2"
+tracing = "0.1"
+dashmap = "6"
+# Static-file cache invalidation: a mount's cache follows the disk through it, so a cached
+# hit touches no file (src/io/static_files/cache.rs). inotify on Linux; kqueue on macOS rather than
+# the default FSEvents, which delivers late (and, measured on the dev Macs, not at all to
+# this process), where kqueue, like inotify, queues the event in the writing syscall. kqueue
+# holds a descriptor per watched file: a tree past the fd limit is served uncached.
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
+
+[dev-dependencies]
+# The microbenches' harness and counting allocator.
+mipyre_microbench = { path = "../microbench" }
+proptest = "1"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "test-util", "fs"] }
+tokio-stream = "0.1"
+# A real `hyper::Error` for the body feeder's tests: hyper serving a request over an in-memory pipe.
+hyper-util = { version = "0.1", features = ["tokio"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+# The bench's allocator only (`benches/coalesce_io.rs`): the server's, for production
+# allocation costs. A dev-dependency never reaches a process that links this crate.
+mimalloc = { version = "0.1", default-features = false }
+
+# The Loom models (`src/io/static_files/cache/loom_model.rs`), built only under `--cfg sync_model`, which swaps `src/sync.rs`'s names
+# for Loom's in this crate and in every package built with it, so Loom is a dependency under that cfg only:
+# `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_http --lib --release --target-dir target/loom loom`.
+[target.'cfg(sync_model)'.dependencies]
+loom = "0.7"
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "coalesce_io"
+harness = false
+
+# The per-call benches, one per module they measure (`mipyre_microbench::run`).
+[[bench]]
+name = "request_id"
+harness = false
+
+[[bench]]
+name = "body"
+harness = false
+
+[[bench]]
+name = "coalesce"
+harness = false
+
+[[bench]]
+name = "static_files"
+harness = false
+
+[[bench]]
+name = "per_key_throttle"
+harness = false
+
+[[bench]]
+name = "compression"
+harness = false
+
+[[bench]]
+name = "response"
+harness = false
+
+[[bench]]
+name = "error_body"
+harness = false
+
+[[bench]]
+name = "request"
+harness = false

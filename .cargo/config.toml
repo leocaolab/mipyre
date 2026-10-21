@@ -1,0 +1,6 @@
+# Every `cargo test` / `cargo nextest` run in this tree (the merge gate's and a local one) runs each proptest on the
+# same inputs: docs/property-testing.md §5, b/749. A run that sets PROPTEST_RNG_SEED itself keeps its own (the
+# nightly run: random seed, PROPTEST_CASES large). A failure's shrunk input is written to the crate's
+# proptest-regressions/ beside the source, which is committed and replayed first on every run.
+[env]
+PROPTEST_RNG_SEED = "2749"

@@ -1,0 +1,64 @@
+[package]
+name = "mipyre_transport"
+description = "pyre's connections, under any protocol: TCP listening and accepting (bound here or handed in by systemd), TLS over any byte stream, in-process connections, a byte stream's write timeout and peer-gone judgement, and the driver a server takes connections through"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No hyper, no HTTP and no pyo3: a connection is bytes, and what is spoken over it is the layer above's
+# (`deny.toml` bans pyo3 under every package it does not list). Inside, tcp/ uses no tls/ (dev/archcheck.toml
+# E-P12), so the TCP half can be handed out alone.
+#
+# tokio's features are this crate's own: `cargo check -p mipyre_transport` in the merge gate builds it alone.
+[dependencies]
+mipyre_util = { path = "../util" }
+tokio = { version = "1", features = ["net", "time", "sync", "rt", "io-util"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging", "tls12"] }
+pin-project-lite = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+# The listening socket under tokio's readiness (`tcp::os::AcceptingSocket`): its accept hands back
+# a connection no runtime has registered, so the thread that serves it registers it once.
+mio = { version = "1", features = ["net", "os-poll"] }
+libc = "0.2"
+thiserror = "2"
+tracing = "0.1"
+
+# The socket options it has a safe call for (`tcp/os.rs`); libc keeps the ones it has not.
+[target.'cfg(unix)'.dependencies]
+# `time` only because rustix 1.1.5's Linux `net` uses its `timespec` module without asking for it
+# (backend/linux_raw/net/sockopt.rs; lib.rs compiles the module for fs/event/process/thread/time).
+rustix = { version = "1.1.5", default-features = false, features = ["std", "net", "time"] }
+
+[dev-dependencies]
+# The microbenches' harness and counting allocator.
+mipyre_microbench = { path = "../microbench" }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "test-util"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+# A fresh self-signed certificate per TLS test: no key or expiry date checked in.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "passed_accept"
+harness = false
+
+# The per-call benches, one per module they measure (`mipyre_microbench::run`).
+[[bench]]
+name = "events"
+harness = false
+
+[[bench]]
+name = "listener"
+harness = false
+
+[[bench]]
+name = "write_stall"
+harness = false
+
+# What a new TLS connection costs and how often it resumes, by where resumption state lives.
+[[bench]]
+name = "tls_handshake"
+harness = false

@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: ruff
+        run: pipx run ruff==0.17.1 check
+      - name: clippy
+        run: PYO3_PYTHON="$(which python)" cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test-linux:
+    name: Test (Linux x86_64)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      MIPYRE_TEST_PG_DSN: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install "maturin>=1.9.4,<2.0"
+          maturin develop --release -E test
+      - name: cargo test
+        run: PYO3_PYTHON="$PWD/.venv/bin/python" cargo test --workspace --locked
+      - name: pytest
+        run: .venv/bin/python -m pytest tests --ignore=tests/e2e -n 4 --dist loadgroup -rfEs
+
+  test-macos:
+    name: Test (macOS arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install "maturin>=1.9.4,<2.0"
+          maturin develop --release -E test
+      - name: cargo test
+        run: PYO3_PYTHON="$PWD/.venv/bin/python" cargo test --workspace --locked
+      - name: pytest
+        run: .venv/bin/python -m pytest tests --ignore=tests/e2e -n 3 --dist loadgroup -rfEs
+
+  wheels:
+    name: Wheel (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test-linux, test-macos]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i python3.14
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheels]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mipyre
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

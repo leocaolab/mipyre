@@ -1,0 +1,87 @@
+{
+  "_about": "The template socket's frames, as bytes: commands written by crates/pyext/src/lane/template.rs (TemplateCommand::frame) and read by python/mipyre/_process_lane/template.py (split_frame, parse_start, ...); reports written by template.py (forked_frame, exited_frame, ...) and read by template.rs (decode_template_report). Checked on both sides: lane/tests.rs and tests/test_process_lane_start_failures.py.",
+  "max_frame_bytes": 65536,
+  "commands": [
+    {
+      "what": "the setup",
+      "kind": "setup",
+      "json": "{\"workers\": 2}",
+      "hex": "0f000000017b22776f726b657273223a20327d"
+    },
+    {
+      "what": "lane 3's fds",
+      "kind": "lane",
+      "lane": 3,
+      "hex": "050000000203000000"
+    },
+    {
+      "what": "start lane 0, attempt 0",
+      "kind": "start",
+      "lane": 0,
+      "attempt": 0,
+      "hex": "09000000030000000000000000"
+    },
+    {
+      "what": "start lane 7, attempt 4294967295",
+      "kind": "start",
+      "lane": 7,
+      "attempt": 4294967295,
+      "hex": "090000000307000000ffffffff"
+    }
+  ],
+  "reports": [
+    {
+      "what": "lane 0 attempt 1 started worker 4242",
+      "kind": "forked",
+      "lane": 0,
+      "attempt": 1,
+      "pid": 4242,
+      "hex": "0d00000004000000000100000092100000"
+    },
+    {
+      "what": "lane 7 attempt 4294967295 started worker 2147483647",
+      "kind": "forked",
+      "lane": 7,
+      "attempt": 4294967295,
+      "pid": 2147483647,
+      "hex": "0d0000000407000000ffffffffffffff7f"
+    },
+    {
+      "what": "lane 3 attempt 9 failed with errno 11",
+      "kind": "forked",
+      "lane": 3,
+      "attempt": 9,
+      "errno": 11,
+      "hex": "0d000000040300000009000000f5ffffff"
+    },
+    {
+      "what": "worker 4321 of lane 1 reaped, killed by SIGKILL",
+      "kind": "exited",
+      "lane": 1,
+      "pid": 4321,
+      "status": 9,
+      "hex": "0d0000000501000000e110000009000000"
+    },
+    {
+      "what": "worker 2147483647 of lane 7 reaped, exited 3",
+      "kind": "exited",
+      "lane": 7,
+      "pid": 2147483647,
+      "status": 768,
+      "hex": "0d0000000507000000ffffff7f00030000"
+    },
+    {
+      "what": "the app failed to import, with a traceback that is not ASCII",
+      "kind": "import_failed",
+      "traceback": "Traceback: ünïcode",
+      "hex": "150000000654726163656261636b3a20c3bc6ec3af636f6465"
+    },
+    {
+      "what": "lane 2's frame came with 1 fd",
+      "kind": "lane_fds_missing",
+      "lane": 2,
+      "got": 1,
+      "hex": "09000000070200000001000000"
+    }
+  ]
+}

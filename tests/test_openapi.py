@@ -1,0 +1,276 @@
+"""The OpenAPI 3.1 document `app.enable_openapi()` serves (b/748): what it says about each route,
+that it is valid against the official OpenAPI 3.1 schema, and that Schemathesis can test a served
+app from it."""
+
+from __future__ import annotations
+
+import pydantic
+import pytest
+import schemathesis
+from hypothesis import settings
+from schemathesis.checks import negative_data_rejection
+from openapi_spec_validator import validate
+
+from mipyre import Mipyre, Response
+from mipyre.app import FastRouteInfo, NoOpenApiDocument, RouteDeclaration
+from mipyre.openapi import document
+from mipyre.testing import TestClient, Transport
+from tests.apps.openapi_items import app as items_app
+
+
+class Point(pydantic.BaseModel):
+    x: int
+    y: int
+
+
+def _doc(*routes: RouteDeclaration, fast: tuple[FastRouteInfo, ...] = ()) -> dict:
+    doc = document("T", "1", list(routes), list(fast))
+    validate(doc)
+    return doc
+
+
+def _success_content(handler) -> dict | None:
+    return _doc(RouteDeclaration("GET", "/r", handler, None))["paths"]["/r"]["get"]["responses"]["200"].get("content")
+
+
+def _returns_str(req) -> str:
+    raise NotImplementedError
+def _returns_bytes(req) -> bytes:
+    raise NotImplementedError
+def _returns_dict(req) -> dict[str, list[int]]:
+    raise NotImplementedError
+def _returns_list(req) -> list:
+    raise NotImplementedError
+def _returns_set_list(req) -> list[set[int]]:
+    raise NotImplementedError
+def _returns_none(req) -> None: ...
+def _returns_point(req) -> Point:
+    raise NotImplementedError
+def _unannotated(req): ...
+def _unresolvable(req): ...
+
+
+# A forward reference that never resolves, as a name imported only under TYPE_CHECKING is.
+_unresolvable.__annotations__ = {"return": "NotImportedHere"}
+
+
+class _View:
+    def __call__(self, req) -> str:
+        raise NotImplementedError
+
+
+@pytest.mark.parametrize(
+    ("handler", "content"),
+    [
+        (_View(), {"text/plain; charset=utf-8": {"schema": {"type": "string"}}}),
+        (_returns_str, {"text/plain; charset=utf-8": {"schema": {"type": "string"}}}),
+        (_returns_bytes, {"application/octet-stream": {}}),
+        (
+            _returns_dict,
+            {"application/json": {"schema": {
+                "type": "object", "additionalProperties": {"type": "array", "items": {"type": "integer"}},
+            }}},
+        ),
+        (_returns_list, {"application/json": {"schema": {"type": "array"}}}),
+        # JSON, but the items have no JSON Schema form: the shape is left undescribed.
+        (_returns_set_list, {"application/json": {}}),
+        # The engine answers None with an empty body and a pydantic model with its str(): no
+        # media type follows from either annotation, nor from none at all.
+        (_returns_none, None),
+        (_returns_point, None),
+        (_unannotated, None),
+        (_unresolvable, None),
+    ],
+)
+def test_the_success_body_is_described_only_as_far_as_the_return_annotation_says(handler, content):
+    assert _success_content(handler) == content
+
+
+def test_a_model_route_takes_the_model_as_its_required_json_body_and_documents_the_422():
+    def create(p: Point) -> dict:
+        raise NotImplementedError
+
+    op = _doc(RouteDeclaration("POST", "/points", create, Point))["paths"]["/points"]["post"]
+
+    assert op["requestBody"] == {
+        "required": True,
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Point"}}},
+    }
+    assert set(op["responses"]) == {"200", "422"}
+
+
+def test_a_model_used_by_two_routes_is_one_component():
+    def make(p: Point) -> dict:
+        raise NotImplementedError
+
+    doc = _doc(RouteDeclaration("POST", "/a", make, Point), RouteDeclaration("PUT", "/b", make, Point))
+
+    assert list(doc["components"]["schemas"]) == ["Point"]
+
+
+class Search(pydantic.BaseModel):
+    q: str = pydantic.Field(description="what to look for")
+    page: int = 1
+    tag: list[str] = []
+    since: int | None = pydantic.Field(None, alias="from")
+
+
+def test_a_query_model_s_fields_are_the_query_parameters_and_its_own_schema_is_not_a_component():
+    def search(req, s: Search) -> dict:
+        raise NotImplementedError
+
+    doc = _doc(RouteDeclaration("GET", "/items/{shelf}", search, None, Search))
+    op = doc["paths"]["/items/{shelf}"]["get"]
+
+    assert op["parameters"] == [
+        {"name": "shelf", "in": "path", "required": True, "schema": {"type": "string"}},
+        {"name": "q", "in": "query", "required": True,
+         "schema": {"type": "string", "title": "Q", "description": "what to look for"}},
+        {"name": "page", "in": "query", "required": False,
+         "schema": {"type": "integer", "title": "Page", "default": 1}},
+        # One parameter whose key repeats: OpenAPI's default for a query array (form, explode).
+        {"name": "tag", "in": "query", "required": False,
+         "schema": {"type": "array", "items": {"type": "string"}, "title": "Tag", "default": []}},
+        # By the key the query string carries: the alias.
+        {"name": "from", "in": "query", "required": False,
+         "schema": {"anyOf": [{"type": "integer"}, {"type": "null"}], "title": "From", "default": None}},
+    ]
+    assert "requestBody" not in op
+    assert op["responses"]["422"]["description"].startswith("The query does not validate")
+    assert "components" not in doc
+
+
+def test_a_query_model_that_is_also_a_body_stays_a_component():
+    def search(req, s: Search) -> dict:
+        raise NotImplementedError
+
+    doc = _doc(RouteDeclaration("GET", "/s", search, None, Search), RouteDeclaration("POST", "/s", search, Search))
+
+    assert list(doc["components"]["schemas"]) == ["Search"]
+
+
+def test_a_route_with_a_body_and_a_query_documents_both_and_one_422():
+    def tag(p: Point, s: Search) -> dict:
+        raise NotImplementedError
+
+    op = _doc(RouteDeclaration("POST", "/t", tag, Point, Search))["paths"]["/t"]["post"]
+
+    assert [p["name"] for p in op["parameters"]] == ["q", "page", "tag", "from"]
+    assert op["requestBody"]["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/Point"}
+    assert op["responses"]["422"]["description"].startswith("The body or the query does not validate")
+
+
+def test_without_a_model_route_there_are_no_components():
+    assert "components" not in _doc(RouteDeclaration("GET", "/r", _returns_str, None))
+
+
+def test_path_params_are_required_strings_and_a_catch_all_is_a_plain_template():
+    def get(req, a, rest): ...
+
+    paths = _doc(RouteDeclaration("GET", "/x/{a}/{*rest}", get, None))["paths"]
+
+    assert list(paths) == ["/x/{a}/{rest}"]
+    assert paths["/x/{a}/{rest}"]["get"]["parameters"] == [
+        {"name": "a", "in": "path", "required": True, "schema": {"type": "string"}},
+        {"name": "rest", "in": "path", "required": True, "schema": {"type": "string"}},
+    ]
+
+
+def test_the_handler_docstring_is_the_operation_description():
+    def get(req):
+        """Return the thing."""
+
+    assert _doc(RouteDeclaration("GET", "/r", get, None))["paths"]["/r"]["get"]["description"] == "Return the thing."
+
+
+def test_methods_share_a_path_item_and_a_method_openapi_has_no_key_for_is_left_out():
+    paths = _doc(
+        RouteDeclaration("GET", "/r", _returns_str, None),
+        RouteDeclaration("DELETE", "/r", _returns_str, None),
+        RouteDeclaration("PURGE", "/r", _returns_str, None),
+    )["paths"]
+
+    assert set(paths["/r"]) == {"get", "delete"}
+
+
+def test_a_fast_route_is_documented_with_its_status_and_content_type_and_wins_its_path():
+    fast = FastRouteInfo(method="GET", path="/r", status_code=299, content_type="text/csv", body_bytes=3)
+
+    op = _doc(RouteDeclaration("GET", "/r", _returns_str, None), fast=(fast,))["paths"]["/r"]["get"]
+
+    assert op == {"responses": {"299": {"description": "Status 299", "content": {"text/csv": {}}}}}
+
+
+def test_without_enable_openapi_there_is_no_document():
+    app = Mipyre(runtime="main")
+    app.get("/r", _returns_str)
+
+    with TestClient(app) as c:
+        assert c.get("/openapi.json").status_code == 404
+
+
+def test_a_before_request_hook_guards_the_document_like_any_route():
+    app = Mipyre(runtime="main")
+    app.enable_openapi(title="T", version="1")
+
+    @app.before_request
+    def guard(req):
+        return Response(body="sign in first", status_code=401) if req.path == "/openapi.json" else None
+
+    with TestClient(app) as c:
+        assert c.get("/openapi.json").status_code == 401
+
+
+def test_enable_openapi_refuses_a_path_with_a_parameter():
+    with pytest.raises(ValueError, match="path parameter"):
+        Mipyre(runtime="main").enable_openapi(title="T", version="1", path="/docs/{name}")
+
+
+def test_enable_openapi_twice_alike_is_one_and_differently_is_refused():
+    app = Mipyre(runtime="main")
+    app.enable_openapi(title="T", version="1")
+    app.enable_openapi(title="T", version="1")
+
+    with pytest.raises(ValueError, match="already enabled"):
+        app.enable_openapi(title="T", version="2")
+
+
+def test_the_served_document_is_valid_openapi_3_1_and_lists_every_route_but_its_own():
+    with TestClient(items_app) as c:
+        r = c.get("/openapi.json")
+
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/json"
+    doc = r.json()
+    validate(doc)
+    assert doc["info"] == {"title": "Items", "version": "1.0.0"}
+    # `/mcp` speaks JSON-RPC, which MCP's `tools/list` describes.
+    assert set(doc["paths"]) == {"/items", "/items/{item_id}", "/items/{item_id}/tags", "/search", "/files/{rest}",
+                                 "/raw", "/plain", "/ping"}
+
+
+def test_app_openapi_is_the_served_document_and_needs_enable_openapi():
+    with TestClient(items_app) as c:
+        assert c.get("/openapi.json").json() == items_app.openapi()
+
+    with pytest.raises(NoOpenApiDocument):
+        Mipyre(runtime="main").openapi()
+
+
+_items = schemathesis.openapi.from_dict(items_app.openapi())
+
+
+@pytest.fixture(scope="module")
+def items_url():
+    with TestClient(items_app, transport=Transport.TCP) as c:
+        yield f"http://127.0.0.1:{c.port}"
+
+
+@_items.parametrize()
+# Fixed: the merge gate runs the same cases every time (docs/property-testing.md §5).
+@settings(derandomize=True, database=None, deadline=None)
+def test_schemathesis_finds_the_served_operation_answering_as_documented(case, items_url):
+    # Left out: pydantic's default (lax) mode takes `false` and `"7"` for an int, which its own JSON
+    # Schema excludes, so this check reports the `model=` route accepting them. Strict mode does not
+    # help: it refuses `7.0`, which JSON Schema's "integer" includes.
+    case.call_and_validate(base_url=items_url, excluded_checks=[negative_data_rejection])

@@ -1,0 +1,46 @@
+[package]
+name = "mipyre_subinterp"
+description = "OWN_GIL sub-interpreters: created on the thread that serves them, entered per unit of work, kept and ended there, GC between units of work"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# What a unit of work *is* stays with whoever uses this (an HTTP request, a task, ...).
+# No global allocator here and no `extension-module`: the final artifact decides how libpython
+# is linked. `pyo3` resolves to the PyO3 fork through the consumer's workspace `[patch]`; this
+# crate uses fork-only APIs (`Python::attach_current`, `InterpreterHandle::try_attach`, see
+# `interp.rs` and the README).
+[features]
+# Start-phase timestamps (`trace`), printed to stderr when `MIPYRE_B183_TRACE` is set. Off in
+# every other build; the consumer's `startup_trace` feature turns it on.
+startup_trace = []
+
+[dependencies]
+# For `CacheLine`, the one definition of a value alone on its cache line (a hardware fact).
+mipyre_cpu = { path = "../cpu" }
+pyo3 = "0.29"
+parking_lot = "0.12"
+thiserror = "2"
+tracing = "0.1"
+
+# The Loom model of a slot's state word (`src/interp/loom_model.rs`), built only under `--cfg sync_model`, which swaps
+# `src/sync.rs`'s names for Loom's in every package built with it, so Loom is a dependency under that cfg only:
+# `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_subinterp --lib --release --target-dir target/loom`.
+[target.'cfg(sync_model)'.dependencies]
+loom = "0.7"
+
+[dev-dependencies]
+# The microbenches' harness and counting allocator.
+mipyre_microbench = { path = "../microbench" }
+
+[lints]
+workspace = true
+
+# The per-call benches, one per module they measure (`mipyre_microbench::run`).
+[[bench]]
+name = "interp"
+harness = false
+
+[[bench]]
+name = "gc"
+harness = false

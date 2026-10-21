@@ -1,0 +1,33 @@
+# plan/ decides; it does not do. clippy reads one of these per package, so it binds the whole package: a module that
+# must name one of these (the atomics' names in sync.rs, the system calls in os.rs) lifts it with `#![expect(...)]`,
+# which turns red once it stops needing it.
+disallowed-methods = [
+  { path = "std::fs::read", reason = "plan/ does no IO" },
+  { path = "std::fs::write", reason = "plan/ does no IO" },
+  { path = "std::fs::File::open", reason = "plan/ does no IO" },
+  { path = "std::fs::File::create", reason = "plan/ does no IO" },
+  { path = "std::env::var", reason = "plan/ reads no environment" },
+  { path = "std::env::var_os", reason = "plan/ reads no environment" },
+  { path = "std::process::Command::new", reason = "plan/ starts no process" },
+  { path = "std::process::exit", reason = "plan/ returns what it decided; it never ends the process" },
+  { path = "std::thread::spawn", reason = "plan/ starts no thread" },
+  { path = "std::thread::sleep", reason = "plan/ does not wait" },
+  { path = "std::time::Instant::now", reason = "plan/ reads no clock: the caller hands the time in" },
+  { path = "std::time::SystemTime::now", reason = "plan/ reads no clock" },
+]
+disallowed-types = [
+  { path = "std::time::Instant", reason = "plan/ reads no clock: the caller hands the time in" },
+  { path = "std::time::SystemTime", reason = "plan/ reads no clock" },
+  { path = "std::fs::File", reason = "plan/ does no IO" },
+  { path = "std::sync::atomic::AtomicU32", reason = "plan/ takes the values the counters held, never the counters" },
+  { path = "std::sync::atomic::AtomicU64", reason = "plan/ takes the values the counters held, never the counters" },
+]
+disallowed-macros = [
+  { path = "std::println", reason = "plan/ prints nothing: it returns what it decided" },
+  { path = "std::eprintln", reason = "plan/ prints nothing" },
+  { path = "std::dbg", reason = "plan/ prints nothing" },
+]
+# Tests may unwrap, expect and panic: a failed expectation is how a test fails.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

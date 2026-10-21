@@ -1,0 +1,5 @@
+# Workspace-wide clippy settings (a crate with its own clippy.toml, like mipyre_http, repeats them there).
+# Tests may unwrap and expect: a failed expectation is how a test fails. Shipping code may not
+# (workspace lint `unwrap_used`, b/74): it propagates, or registers why the value cannot be absent.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

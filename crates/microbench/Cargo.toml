@@ -1,0 +1,14 @@
+[package]
+name = "mipyre_microbench"
+description = "What every Rust microbench of the workspace runs on: the counting allocator, the case runner (BENCH_N, --list, cases by name), the timed loop, and Must for a set-up that fails"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Only std, and only ever a dev-dependency: a bench's harness must not reach a process that links a
+# package (dev/archcheck.toml P2 gives every category one edge to it, and nothing else).
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+target/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.dylib
+*.egg-info/
+dist/
+.venv/
+*.lock
+# Cargo.lock is tracked: it pins PyO3 to the leocaolab/pyo3 fork commit, and an untracked
+# lock let fresh builds pick up upstream PyO3 0.29.1, which crashes sub-interpreter mode.
+!/Cargo.lock
+# uv.lock is tracked: dev/venv.sh installs exactly what it names, so the gate and a fresh venv test the same versions.
+!/uv.lock
+.arc/*
+!.arc/archcheck.toml
+!.arc/arch_waivers.txt
+arc.log.jsonl
+python/mipyre/engine.cpython-314-darwin.so.dSYM/

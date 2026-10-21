@@ -1,0 +1,36 @@
+# Standalone (not a member of pyre's workspace): a test asset, built only by tests/test_isolate.py. Its own
+# workspace root, so cargo does not look for the root workspace above it.
+#
+# The [patch.crates-io] below is a COPY of the root Cargo.toml's: a standalone crate cannot inherit the root's
+# patch. tests/test_isolate.py::test_fixture_pyo3_pins_match_root keeps it (and this crate's Cargo.lock pyo3 sources)
+# identical to the root; a mismatch fails that test. Remove the copy when the fixture moves into the workspace:
+# arc b/2622 (archcheck supports the 测试夹具包 category).
+[workspace]
+
+[package]
+name = "pyo3_mp"
+description = "Test fixture for tests/test_isolate.py: a PyO3 multi-phase extension, built in two variants by the feature below. Not part of the wheel."
+version = "2.10.0"
+edition = "2021"
+
+[lib]
+name = "pyo3_mp"
+crate-type = ["cdylib"]
+
+[features]
+# The one difference between the two fixtures. Off: the module does not declare per-interpreter GIL support, so a
+# sub-interpreter worker must clone it. On: it declares Py_mod_multiple_interpreters = per-interpreter GIL, so the
+# worker loads it shared. Off is the only variant that can be built here: PyO3's own #[pymodule] always declares
+# the slot (the fork's ModuleDef::new -> with_per_interpreter_gil), so the off build writes PyInit by hand.
+declare_per_interpreter = []
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"] }
+
+
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+pyo3-ffi = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+pyo3-macros = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+pyo3-macros-backend = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+pyo3-build-config = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }

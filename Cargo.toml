@@ -1,0 +1,50 @@
+# pyre is a workspace and nothing else (b/51 E0b): one package per domain in `crates/<domain>`
+# (`crates/README.md`); the engine is `mipyre_pyext` in `crates/pyext` (maturin finds it through pyproject.toml's
+# `manifest-path`). A root that is a package is a layout arc archcheck cannot judge (arc b/2596).
+#
+# Every directory under `crates/` is a package, so one glob names them all. `[profile]` and the `[patch]` at
+# the bottom must stay in this file: cargo reads both only from the workspace root and ignores them in a
+# member, with a warning.
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+# Suppressions are written down (b/53 E1-2, design §5.1): a lint is silenced only by
+# `#[expect(lint, reason = "...")]` — which turns red once the lint stops firing, so a stale one cannot stay —
+# and a test is ignored only with a reason. The merge gate's clippy step (-D warnings) is what enforces these.
+# The two verification builds name their cfg: `sync_model` (the Loom models: each package's sync primitives are
+# swapped for Loom's model of them, `RUSTFLAGS="--cfg sync_model"`) and
+# `kani` (the Kani proofs, set by `cargo kani`). The Loom cfg is ours, not the plain `loom` the crates.io ecosystem
+# reads: under `--cfg loom` tokio swaps its own internals for Loom's and stops building (`tokio::net` is gone, the
+# runtime builder has no `on_thread_park`), so every package that uses tokio could not be built for a model at all.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sync_model)", "cfg(kani)"] }
+
+[workspace.lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+ignore_without_reason = "deny"
+let_underscore_must_use = "deny"
+unused_result_ok = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+
+[workspace.package]
+version = "1.0.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[profile.release]
+lto = "fat"            # Cross-crate inlining: LLVM optimizes across hyper/tokio/pyo3 boundaries
+codegen-units = 1      # Single codegen unit: max optimization at cost of compile time
+opt-level = 3          # Aggressive optimization
+strip = true           # Strip symbols: smaller binary, better icache
+
+# PyO3 with per-interpreter state for own-GIL sub-interpreters (leocaolab/pyo3).
+# Released as tags; the version stays 0.29.2 so `pyo3 = "0.29"` keeps matching.
+[patch.crates-io]
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+pyo3-ffi = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+pyo3-macros = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+pyo3-macros-backend = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+pyo3-build-config = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }

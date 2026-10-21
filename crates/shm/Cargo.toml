@@ -1,0 +1,15 @@
+[package]
+name = "mipyre_shm"
+description = "A shared-memory channel between two processes: the ring's counters and their checks, the slot header, the start report and the spin window, as decisions that touch no memory (plan/)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Only what dev/archcheck.toml E-P15 allows (rustix, libc, thiserror, bytes, mipyre_cpu, and loom under
+# `cfg(sync_model)`): no pyo3, no tokio, no `#[global_allocator]`. plan/ needs only thiserror; the rest come with the
+# code that uses them.
+[dependencies]
+thiserror = "2"
+
+[lints]
+workspace = true

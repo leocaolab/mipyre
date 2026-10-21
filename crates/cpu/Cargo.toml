@@ -1,0 +1,24 @@
+[package]
+name = "mipyre_cpu"
+description = "CPU topology and thread pinning: which CPUs this process may use, which are one physical core, keeping a thread on one"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No pyo3 and no tokio: knowing the CPUs needs neither. Adding either here puts it into every
+# consumer that only wanted a core count.
+[dependencies]
+core_affinity = "0.8"
+libc = "0.2"
+
+[dev-dependencies]
+# The microbenches' harness and counting allocator.
+mipyre_microbench = { path = "../microbench" }
+proptest = "1"
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "host_cpus"
+harness = false

@@ -1,0 +1,69 @@
+# plan/ decides; it does not do. Every call that reads or writes the world is named here, one path at
+# a time (clippy takes no `std::fs::*`), and the merge gate's clippy runs with -D warnings. Measured on
+# clippy 0.1.97: each std entry below fires on a probe that uses it.
+#
+# clippy reads one of these per package, so it binds io/ too: src/io/mod.rs, and each bench and
+# integration test, lift it with `#![expect(...)]`, which turns red if they stop needing it.
+disallowed-methods = [
+  { path = "std::fs::read", reason = "plan/ does no IO: io/ reads, plan decides" },
+  { path = "std::fs::read_to_string", reason = "plan/ does no IO" },
+  { path = "std::fs::write", reason = "plan/ does no IO" },
+  { path = "std::fs::File::open", reason = "plan/ does no IO" },
+  { path = "std::fs::File::create", reason = "plan/ does no IO" },
+  { path = "std::env::var", reason = "plan/ reads no environment: the engine reads its configuration once, at its boundary" },
+  { path = "std::env::var_os", reason = "plan/ reads no environment" },
+  { path = "std::env::vars", reason = "plan/ reads no environment" },
+  { path = "std::process::Command::new", reason = "plan/ starts no process" },
+  { path = "std::process::exit", reason = "plan/ returns its errors; it never ends the process" },
+  { path = "std::io::stdin", reason = "plan/ does no IO" },
+  { path = "std::io::stdout", reason = "plan/ does no IO" },
+  { path = "std::io::stderr", reason = "plan/ does no IO" },
+  { path = "std::thread::spawn", reason = "plan/ starts no thread" },
+  { path = "std::thread::sleep", reason = "plan/ does not wait" },
+  { path = "std::thread::Builder::spawn", reason = "plan/ starts no thread" },
+  { path = "std::time::Instant::now", reason = "plan/ reads no clock: a duration is handed in" },
+  { path = "std::time::SystemTime::now", reason = "plan/ reads no clock" },
+  { path = "std::net::TcpStream::connect", reason = "plan/ does no network IO" },
+  { path = "std::net::TcpListener::bind", reason = "plan/ does no network IO" },
+  { path = "std::net::UdpSocket::bind", reason = "plan/ does no network IO" },
+  { path = "tokio::spawn", reason = "plan/ starts no task" },
+  { path = "tokio::task::spawn_blocking", reason = "plan/ starts no task" },
+  { path = "tokio::time::sleep", reason = "plan/ does not wait" },
+  { path = "tokio::fs::read", reason = "plan/ does no IO" },
+]
+disallowed-types = [
+  { path = "std::time::Instant", reason = "plan/ reads no clock: a duration is handed in" },
+  { path = "std::time::SystemTime", reason = "plan/ reads no clock" },
+  { path = "std::fs::File", reason = "plan/ does no IO" },
+  { path = "std::process::Command", reason = "plan/ starts no process" },
+  { path = "std::net::TcpStream", reason = "plan/ does no network IO" },
+  # What io/ runs on: plan/ names none of it. hyper's re-exports of `http` types are not listed —
+  # they are the same types plan/ uses from `http`.
+  { path = "tokio::net::TcpStream", reason = "plan/ does no network IO" },
+  { path = "tokio::net::TcpListener", reason = "plan/ does no network IO" },
+  { path = "tokio::net::UdpSocket", reason = "plan/ does no network IO" },
+  { path = "tokio::fs::File", reason = "plan/ does no IO" },
+  { path = "tokio::runtime::Runtime", reason = "plan/ runs nothing: it decides" },
+  { path = "tokio::runtime::Handle", reason = "plan/ runs nothing: it decides" },
+  { path = "tokio::task::JoinHandle", reason = "plan/ starts no task" },
+  { path = "tokio::time::Instant", reason = "plan/ reads no clock: a duration is handed in" },
+  { path = "tokio::time::Sleep", reason = "plan/ does not wait" },
+  { path = "hyper::body::Incoming", reason = "plan/ reads no body off a connection" },
+  { path = "hyper::server::conn::http1::Builder", reason = "plan/ drives no connection" },
+  { path = "hyper::server::conn::http2::Builder", reason = "plan/ drives no connection" },
+  { path = "socket2::Socket", reason = "plan/ does no network IO" },
+  { path = "socket2::SockAddr", reason = "plan/ does no network IO" },
+]
+# `thread_local!` is not here: clippy reports it at the crate root, out of reach of io/'s expect, and
+# io/request_id.rs needs it. dev/archcheck.toml (E-P1c) refuses it in plan/'s text instead.
+disallowed-macros = [
+  { path = "std::println", reason = "plan/ prints nothing: it returns what it decided" },
+  { path = "std::print", reason = "plan/ prints nothing" },
+  { path = "std::eprintln", reason = "plan/ prints nothing" },
+  { path = "std::eprint", reason = "plan/ prints nothing" },
+  { path = "std::dbg", reason = "plan/ prints nothing" },
+]
+# Tests may unwrap, expect and panic: a failed expectation is how a test fails.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

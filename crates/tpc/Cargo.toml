@@ -1,0 +1,44 @@
+[package]
+name = "mipyre_tpc"
+description = "Thread-per-core skeleton: one pinned thread per core, a current-thread runtime and LocalSet on each, the caller's future on it, and a per-thread stop signal; and OS threads joined, or given up on, at a deadline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No pyo3: what runs on the threads is the caller's (`deny.toml` bans pyo3 under this crate).
+# Depends on `mipyre_cpu` for pinning — the one edge between the shared crates
+# (`dev/archcheck.toml`).
+[dependencies]
+mipyre_cpu = { path = "../cpu" }
+# The log throttle (`LogThrottle`) for a connection task's panic line, and the clock it runs on.
+mipyre_util = { path = "../util" }
+tokio = { version = "1", features = ["rt", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+thiserror = "2"
+# `catch_unwind` on a connection task, so its panic is counted and its text logged where it is caught.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tracing = "0.1"
+
+# The paused clock (`start_paused`) for the drain's timeout tests.
+[dev-dependencies]
+# The microbenches' harness and counting allocator.
+mipyre_microbench = { path = "../microbench" }
+tokio = { version = "1", features = ["rt", "time", "test-util"] }
+
+# The Loom models (`src/threads/loom_model.rs`), built only under `--cfg sync_model`, which swaps `src/sync.rs`'s names
+# for Loom's in this crate and in every package built with it, so Loom is a dependency under that cfg only:
+# `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_tpc --lib --release --target-dir target/loom loom`.
+[target.'cfg(sync_model)'.dependencies]
+loom = "0.7"
+
+[lints]
+workspace = true
+
+# Microbenches, run by hand: `cargo bench -p mipyre_tpc --bench <name>` (not part of `cargo test`).
+[[bench]]
+name = "stop_poll"
+harness = false
+
+[[bench]]
+name = "local_tasks"
+harness = false
