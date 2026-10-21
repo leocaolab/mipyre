@@ -27,7 +27,12 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: ruff
-        run: pipx run ruff==0.17.1 check
+        run: |
+          python -m venv .venv-lint
+          . .venv-lint/bin/activate
+          python -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+          pip install ruff==0.17.1
+          ruff check
       - name: clippy
         run: PYO3_PYTHON="$(which python)" cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -57,6 +62,7 @@ jobs:
         run: |
           python -m venv .venv
           . .venv/bin/activate
+          python -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
           pip install "maturin>=1.9.4,<2.0"
           maturin develop --release -E test
       - name: cargo test
@@ -80,6 +86,7 @@ jobs:
         run: |
           python -m venv .venv
           . .venv/bin/activate
+          python -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
           pip install "maturin>=1.9.4,<2.0"
           maturin develop --release -E test
       - name: cargo test
