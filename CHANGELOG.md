@@ -2,7 +2,7 @@
 
 All notable changes to mipyre are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/): within 1.x, the public API does not break.
 
-## [2.0.0] — unreleased
+## [2.0.0] — 2026-10-22
 
 A large rework: settings are declared once and checked at startup, the features an app turns on are objects of their own, the engine answers more by itself, and `runtime="process"` routes run on a shared-memory channel of their own (the `mipyre_shm` crate). It breaks the 1.0 API in the places listed under Breaking. An old spelling fails where it is written, not silently; most of the errors name the new spelling.
 
