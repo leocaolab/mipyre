@@ -807,7 +807,18 @@ mod tests {
     }
 
     /// Returns the messages of the events `f` emits on this thread.
+    ///
+    /// A callsite caches its interest the first time any thread reaches it. While this capture is
+    /// the only subscriber alive, tracing-core asks only the reaching thread's default, so a
+    /// parallel test reaching `log_startup` first, with no subscriber of its own, caches `never`
+    /// and this capture loses the event (b/998). A global default that wants every event keeps a
+    /// second subscriber alive, so the interest is asked of every live subscriber, this one too.
     fn events_of<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        static EVERY_THREAD: std::sync::Once = std::sync::Once::new();
+        EVERY_THREAD.call_once(|| {
+            tracing::subscriber::set_global_default(tracing_subscriber::registry())
+                .expect("no other test in this binary sets the global subscriber");
+        });
         #[derive(Clone, Default)]
         struct Messages(Arc<std::sync::Mutex<Vec<String>>>);
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Messages {
