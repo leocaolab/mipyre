@@ -5,15 +5,36 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use tokio_util::sync::CancellationToken;
 
-use super::{App, RegistrationSealed};
-use crate::boot::{EnvConfig, InterpreterMode, ServerRun, ServerSizes, Topology};
-use mipyre_transport::driver::TransportDriver;
+use super::{App, LateRegistrationError, RunSettings};
+use crate::boot::{InterpreterMode, ServerRun, Topology};
 use crate::runtime::{record_worker_app, AppRoute, ScriptRegistrations};
 use crate::serve::Site;
-use mipyre_http::plan::route::{
-    ExpectedRoute, HandlerKind, HandlerPlace, RouteRegistration, RuntimeChoice,
-};
+use mipyre_http::plan::route::{ExpectedRoute, HandlerKind, HandlerPlace, RouteRegistration, RuntimeChoice};
 use mipyre_http::plan::site::SiteRules;
+use mipyre_transport::driver::TransportDriver;
+
+/// Returns whether calling `handler` gives an awaitable, which sends its route to the async
+/// workers: it is a coroutine function (`async def`, or marked one with
+/// `inspect.markcoroutinefunction`), or a class-based view whose `__call__` is. This is the
+/// only place that decides it; `_bind.py` asks it, through `mipyre.engine._is_async_handler`, for
+/// the wrapper it puts around a handler.
+///
+/// # Errors
+///
+/// Whatever `inspect.iscoroutinefunction` or reading `__call__` raises. A failing check fails
+/// the registration, because guessing sync would send an async handler to the sync pool.
+pub(crate) fn is_async_handler(handler: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = handler.py();
+    let inspect = py.import("inspect")?;
+    let is_coroutine_function =
+        |f: &Bound<'_, PyAny>| -> PyResult<bool> { inspect.call_method1("iscoroutinefunction", (f,))?.extract() };
+    Ok(is_coroutine_function(handler)?
+        || match handler.getattr(pyo3::intern!(py, "__call__")) {
+            Ok(call) => is_coroutine_function(&call)?,
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => false,
+            Err(e) => return Err(e),
+        })
+}
 
 impl App {
     /// Records, in a worker, the first app the script registers on as the one the worker
@@ -50,7 +71,7 @@ impl App {
         handler: Py<PyAny>,
         runtime: RuntimeChoice,
         stream: bool,
-    ) -> PyResult<()> {
+    ) -> PyResult<bool> {
         Self::serve_in_worker(slf)?;
         slf.borrow_mut()
             .add_route(slf.py(), method, path, handler, runtime, stream)
@@ -64,39 +85,49 @@ impl App {
     pub(super) fn server_run<D: TransportDriver, A>(
         &self,
         py: Python<'_>,
-        sizing: ServerSizes,
-        mode: Option<&Bound<'_, PyAny>>,
+        settings: RunSettings,
         stop: &CancellationToken,
         open: impl FnOnce(std::num::NonZeroUsize) -> PyResult<(D, A)>,
     ) -> PyResult<(ServerRun<D>, A)> {
-        let env = EnvConfig::from_env()?;
-        let mode = mode
-            .map(crate::pyapi::config::mode_from_arg)
-            .transpose()?
-            .unwrap_or(InterpreterMode::Gil);
-        let crate::boot::ServerCpus { cpus, pin_order } = crate::boot::host_cpus();
-        let topology = Topology::resolve(mode, &env, sizing, cpus)?;
+        let RunSettings {
+            recipe,
+            names,
+            proxies,
+            command_line,
+            tcp,
+        } = settings;
+        let server_cpus = crate::boot::host_cpus();
 
         // A raw-engine script never calls `_seal_registrations`, so the table is sealed here
         // for workers to compare against.
         self.seal_if_unsealed();
-        let site: Arc<Site> = Arc::new(
-            self.snapshot(py, crate::telemetry::start_run(env.tuning.metrics)),
-        );
-        // No sub-interpreters are built when no route runs on one; the TPC server already
-        // builds none itself.
-        let topology = match topology {
-            Topology::Pool { .. } if !site.rules.routes.uses_workers() => {
-                topology.without_workers()
-            }
-            other => other,
+        let mut site = self.snapshot(py, self.start_counters(recipe.tuning.metrics, &server_cpus))?;
+        let crate::boot::ServerCpus { cpus, pin_order, .. } = server_cpus;
+        site.rules.settings.names = names;
+        site.rules.settings.proxies = proxies;
+        // In the background, before the first request: a mount whose files cannot be watched says
+        // so now, and serves uncached as before (q/55 B').
+        for mount in site.rules.routes.static_mounts() {
+            mount.start_watching();
+        }
+        site.pg = self.seal_pg(py)?;
+        let site: Arc<Site> = Arc::new(site);
+        let topology = Topology::resolve(InterpreterMode::of(&site.rules.routes), &recipe, cpus)?;
+        let counts = mipyre_http::plan::route::PlaceCounts::of(&site.rules.routes);
+        let layout = crate::boot::ServerLayout {
+            topology,
+            worker_routes: site.rules.routes.uses_workers(),
+            main_routes: site.rules.routes.uses_main(),
+            async_worker_routes: counts.worker_async > 0,
+            process_routes: site.rules.routes.uses_lane(),
+            tcp,
         };
-        for note in topology
-            .unused_sizes(sizing)
-            .into_iter()
-            .chain(topology.unused_settings(&env))
-        {
-            println!("  Note: {note}");
+        if let Some(unused) = crate::boot::ConfigError::of(layout.unused(&recipe.values)) {
+            return Err(unused.into());
+        }
+        let isolate_dir = recipe.isolate_dir(crate::boot::user_cache_dir().as_deref());
+        if self.source.isolation {
+            isolated_start(py, isolate_dir.as_deref(), &layout)?;
         }
         if site.rules.routes.uses_lane() && site.process.is_none() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -112,14 +143,47 @@ impl App {
             site,
             stop: stop.clone(),
             topology,
-            tuning: env.tuning,
+            tuning: recipe.tuning,
             cpus,
             pin_order,
             app: self.source.clone(),
+            isolate_dir,
+            command_line,
             store: self.store.clone(),
             abandoned: self.abandoned.clone(),
+            readiness: crate::boot::ReadinessCallback::default(),
         };
         Ok((run, opened))
+    }
+
+    /// Opens this run's Postgres pools from every `PgPool.connect()` the main interpreter made,
+    /// reporting every conflict at once, and binds those handles to them (b/335 D17).
+    fn seal_pg(&self, py: Python<'_>) -> PyResult<Option<Arc<crate::runtime::RunPools>>> {
+        let mut modules = self.home_modules.clone();
+        // The script workers run: the one set for the app, else `__main__`'s.
+        match &self.source.script_path {
+            Some(script) => modules.push(crate::runtime::ModuleKey::of_path(py, script)?),
+            None => modules.extend(crate::runtime::ModuleKey::of_module(py, "__main__")?),
+        }
+        let handles: Vec<_> = crate::runtime::EngineModule::with(py, |module| module.pg_handles())?
+            .into_iter()
+            .filter(|handle| handle.made_by(&modules))
+            .collect();
+        let n = self.runs.fetch_add(1, crate::sync::Ordering::Relaxed) + 1;
+        let label = crate::runtime::RunLabel(match &self.source.script_path {
+            Some(script) => format!("server run {n} of {}", script.display()),
+            None => format!("server run {n} of this app"),
+        });
+        py.detach(|| crate::runtime::RunPools::seal(label, &handles))
+            .map_err(|e| match e {
+                crate::runtime::RunPoolsError::ConnectFailed { .. } => {
+                    pyo3::exceptions::PyConnectionError::new_err(e.to_string())
+                }
+                crate::runtime::RunPoolsError::Runtime(_) => pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
+                crate::runtime::RunPoolsError::Conflicts(_) | crate::runtime::RunPoolsError::Shared(_) => {
+                    pyo3::exceptions::PyValueError::new_err(e.to_string())
+                }
+            })
     }
 
     /// Records the script's registration boundary unless one is already set.
@@ -127,17 +191,63 @@ impl App {
         self.routes.write().seal();
     }
 
-    pub(super) fn snapshot(
+    /// Makes the counters of a run starting now, which counts its answers when its `metrics`
+    /// flag or `enable_metrics()` says so.
+    pub(super) fn start_counters(
         &self,
-        py: Python<'_>,
-        counters: std::sync::Arc<crate::telemetry::RunCounters>,
-    ) -> Site {
-        Site {
-            rules: self.rules(py),
+        metrics: bool,
+        cpus: &crate::boot::ServerCpus,
+    ) -> Arc<crate::telemetry::RunCounters> {
+        Arc::new(
+            crate::telemetry::RunCounters::new(metrics || self.metrics_path.is_some())
+                .sized_from_fallback(cpus.fallback_reason()),
+        )
+    }
+
+    /// Builds what one run serves: the app's rules, with the run's metrics page among its routes
+    /// when metrics are enabled. The app's own table never holds that route, so the routes
+    /// workers are held to and the OpenAPI document leave it out.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ValueError` when the app has its own `GET` route at the metrics path.
+    pub(super) fn snapshot(&self, py: Python<'_>, counters: Arc<crate::telemetry::RunCounters>) -> PyResult<Site> {
+        let mut rules = self.rules(py);
+        // One budget per server: its mounts' caches hold their bytes against it, apart from any
+        // other server's in the process.
+        let budget = Arc::new(mipyre_http::io::static_files::CacheBudget::new(
+            mipyre_http::io::static_files::DEFAULT_CACHE_BUDGET_BYTES,
+        ));
+        for mount in rules.routes.static_mounts() {
+            mount.cache_within(&budget);
+        }
+        if let Some(path) = &self.metrics_path {
+            let page = Py::new(py, crate::pyapi::metrics_page::MetricsPage::new(Arc::clone(&counters)))?;
+            rules
+                .routes
+                .insert(
+                    "GET",
+                    path,
+                    page.into_any(),
+                    "metrics".to_string(),
+                    HandlerPlace::Main(mipyre_http::plan::route::MainHandler::Sync(
+                        mipyre_http::plan::route::BodyMode::Buffered,
+                    )),
+                )
+                .map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "enable_metrics({path:?}) cannot serve the metrics page: {e}"
+                    ))
+                })?;
+        }
+        Ok(Site {
+            rules,
             ws_connections: crate::serve::OpenConnections::default(),
             process: self.process_lanes.clone(),
             counters,
-        }
+            pg: None,
+            clock: quanta::Clock::new(),
+        })
     }
 
     /// Returns a copy of this app's rules holding its own references to the handlers; a
@@ -147,10 +257,7 @@ impl App {
         py: Python<'_>,
     ) -> mipyre_http::plan::site::SiteRules<Py<PyAny>, mipyre_http::io::static_files::StaticMount> {
         SiteRules {
-            routes: self
-                .routes
-                .read()
-                .copy_with(|handler| handler.clone_ref(py)),
+            routes: self.routes.read().copy_with(|handler| handler.clone_ref(py)),
             settings: self.settings.clone(),
             access_log: self.access_log.on.then_some(self.access_log.sampling),
         }
@@ -167,13 +274,8 @@ impl App {
         headers: &std::collections::HashMap<String, String>,
     ) -> PyResult<()> {
         let method_key = method.to_ascii_uppercase();
-        let resp =
-            mipyre_http::plan::route::FastResponse::parse(body, content_type, status_code, headers)
-                .map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "fast response {method_key} {path}: {e}"
-                    ))
-                })?;
+        let resp = mipyre_http::plan::route::FastResponse::parse(body, content_type, status_code, headers)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("fast response {method_key} {path}: {e}")))?;
         let added = self
             .routes
             .write()
@@ -195,7 +297,7 @@ impl App {
         handler: Py<PyAny>,
         runtime: RuntimeChoice,
         stream: bool,
-    ) -> PyResult<()> {
+    ) -> PyResult<bool> {
         let handler_obj = handler.bind(py);
         // A value that cannot be called would otherwise fail only on its first request.
         if !handler_obj.is_callable() {
@@ -206,41 +308,20 @@ impl App {
             )));
         }
         let handler_name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
-        // `__call__` is checked too, for class-based views. A failing check fails the
-        // registration, because guessing sync would send an async handler to the sync pool.
-        let inspect = py.import("inspect")?;
-        let is_coroutine_function = |f: &Bound<'_, PyAny>| -> PyResult<bool> {
-            inspect.call_method1("iscoroutinefunction", (f,))?.extract()
-        };
-        let is_async = is_coroutine_function(handler_obj)?
-            || match handler_obj.getattr(pyo3::intern!(py, "__call__")) {
-                Ok(call) => is_coroutine_function(&call)?,
-                Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => false,
-                Err(e) => return Err(e),
-            };
-
-        let kind = if is_async {
+        let kind = if is_async_handler(handler_obj)? {
             HandlerKind::Async
         } else {
             HandlerKind::Sync
         };
-        let registration = RouteRegistration {
-            runtime,
-            stream,
-            kind,
-        };
-        let place = HandlerPlace::try_from(registration).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "{} {path}: {e}",
-                method.to_uppercase()
-            ))
-        })?;
+        let registration = RouteRegistration { runtime, stream, kind };
+        let place = HandlerPlace::try_from(registration)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{} {path}: {e}", method.to_uppercase())))?;
 
         let mut routes = self.routes.write();
         // Workers only know the routes the script registered, so a route added after `run()`
         // began exists only on main.
         if routes.is_sealed() && runtime != RuntimeChoice::Main {
-            return Err(RegistrationSealed::new_err(format!(
+            return Err(LateRegistrationError::new_err(format!(
                 "{} {path} is registered after app.run() started (for example from an on_startup \
                  hook). Such a route exists only in the main interpreter, so it needs runtime='main'.",
                 method.to_uppercase()
@@ -249,8 +330,34 @@ impl App {
         routes
             .insert(method, path, handler, handler_name, place)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("route error: {e}")))?;
-        Ok(())
+        Ok(kind == HandlerKind::Async)
     }
+}
+
+/// Readies a start whose workers load isolated extensions, before any of them starts: the
+/// directory their copies go in is checked once now (made private to this user if missing,
+/// refused if another user owns it or can write to it), so a bad one fails the start rather
+/// than every worker (FR-13); each worker's claim checks again. With more than one worker, the
+/// BLAS thread pools are limited to one thread each and the start says so.
+fn isolated_start(
+    py: Python<'_>,
+    isolate_dir: Option<&std::path::Path>,
+    layout: &crate::boot::ServerLayout,
+) -> PyResult<()> {
+    let Some(dir) = isolate_dir else {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            crate::boot::NoIsolateDirError.to_string(),
+        ));
+    };
+    py.import("mipyre._clone")?.call_method1("ensure_private_dir", (dir,))?;
+    if layout.workers() > 1 {
+        let limited: String = py
+            .import("mipyre._isolated.blas")?
+            .call_method0("blas_threads_limited")?
+            .extract()?;
+        println!("  BLAS: {limited} (runtime='isolated'; override: set OPENBLAS_NUM_THREADS)");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -281,24 +388,13 @@ mod tests {
 
     /// Builds an app with `REGISTERED` fast responses whose bodies count their drops into
     /// `drops`; `keep` sees each body as it goes in.
-    fn app_of_counted(
-        py: Python<'_>,
-        drops: &Arc<AtomicUsize>,
-        mut keep: impl FnMut(&bytes::Bytes),
-    ) -> App {
-        let mut app = App::new(py);
+    fn app_of_counted(py: Python<'_>, drops: &Arc<AtomicUsize>, mut keep: impl FnMut(&bytes::Bytes)) -> App {
+        let mut app = App::new(py).expect("the main interpreter's app takes a fresh map");
         for i in 0..REGISTERED {
             let body = bytes::Bytes::from_owner(DropCounter(Arc::clone(drops)));
             keep(&body);
-            app.add_fast_route(
-                "GET",
-                &format!("/c{i}"),
-                body,
-                "text/plain",
-                200,
-                &HashMap::new(),
-            )
-            .expect("a valid fast response");
+            app.add_fast_route("GET", &format!("/c{i}"), body, "text/plain", 200, &HashMap::new())
+                .expect("a valid fast response");
         }
         app
     }
@@ -324,9 +420,7 @@ mod tests {
         Python::initialize();
         let drops = Arc::new(AtomicUsize::new(0));
         let mut kept = Vec::new();
-        mipyre_subinterp::attach::with_main(|py| {
-            drop(app_of_counted(py, &drops, |b| kept.push(b.clone())))
-        });
+        mipyre_subinterp::attach::with_main(|py| drop(app_of_counted(py, &drops, |b| kept.push(b.clone()))));
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         kept.truncate(REGISTERED - 1);
         assert_eq!(drops.load(Ordering::Relaxed), 1);

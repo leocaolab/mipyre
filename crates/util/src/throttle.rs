@@ -67,7 +67,10 @@ impl LogThrottle {
                 self.held.fetch_add(1, Ordering::Relaxed);
                 return None;
             };
-            match self.open_at.compare_exchange_weak(open, next, Ordering::AcqRel, Ordering::Acquire) {
+            match self
+                .open_at
+                .compare_exchange_weak(open, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return Some(self.held.swap(0, Ordering::Relaxed)),
                 Err(current) => open = current,
             }
@@ -142,12 +145,24 @@ mod proofs {
             Some(carried) => {
                 assert!(at >= open_at);
                 assert_eq!(carried, held);
-                assert_eq!(throttle, ThrottleState { open_at: at.saturating_add(period_ns), held: 0 });
+                assert_eq!(
+                    throttle,
+                    ThrottleState {
+                        open_at: at.saturating_add(period_ns),
+                        held: 0
+                    }
+                );
                 assert!(throttle.open_at >= open_at);
             }
             None => {
                 assert!(at < open_at);
-                assert_eq!(throttle, ThrottleState { open_at, held: held + 1 });
+                assert_eq!(
+                    throttle,
+                    ThrottleState {
+                        open_at,
+                        held: held + 1
+                    }
+                );
             }
         }
     }

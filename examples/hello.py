@@ -1,4 +1,4 @@
-"""Mipyre example — decorator syntax, middleware, custom responses, static files."""
+"""Mipyre example — decorator syntax, an after_request hook, custom responses, a custom 404."""
 
 from mipyre import Mipyre, Response
 

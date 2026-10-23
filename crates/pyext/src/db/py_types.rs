@@ -38,9 +38,7 @@ impl StdlibTypes {
         Ok(Self {
             date: dt.getattr("date")?.unbind(),
             pg_epoch: datetime.call1((2000, 1, 1))?.unbind(),
-            pg_epoch_utc: datetime
-                .call((2000, 1, 1), Some(&epoch_utc_kwargs))?
-                .unbind(),
+            pg_epoch_utc: datetime.call((2000, 1, 1), Some(&epoch_utc_kwargs))?.unbind(),
             one_microsecond: timedelta.call1((0, 0, 1))?.unbind(),
             datetime: datetime.unbind(),
             timedelta: timedelta.unbind(),

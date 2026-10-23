@@ -4,7 +4,7 @@
 //! counters). The run's
 //! stop is the model's own [`Cancellable`], which counts its cancels: tokio_util's token runs its
 //! own lock, which Loom cannot see. Run with
-//! `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_pyext --lib --release --target-dir target/loom loom`.
+//! `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_pyext --lib --profile model --target-dir target/loom loom`.
 //!
 //! It proves: of a kind's workers dying at once, exactly the last one stops the run, once, and
 //! hands back the kind's first cause, which every caller reads the same; of two kinds that share
@@ -77,10 +77,17 @@ fn of_two_workers_dying_at_once_the_last_stops_the_run_once_with_the_first_cause
         let mine = one.died("one".to_string());
         let theirs = other.join().unwrap();
 
-        assert!(mine.is_some() != theirs.is_some(), "one death is the last: {mine:?}, {theirs:?}");
+        assert!(
+            mine.is_some() != theirs.is_some(),
+            "one death is the last: {mine:?}, {theirs:?}"
+        );
         assert_eq!(signal.cancels(), 1, "the run is stopped once");
         let first = kind.first_death().expect("a worker died");
-        assert_eq!(mine.or(theirs).as_deref(), Some(&*first), "the last hands back the first cause");
+        assert_eq!(
+            mine.or(theirs).as_deref(),
+            Some(&*first),
+            "the last hands back the first cause"
+        );
         let (_, cause) = first_cause(&stop).expect("the run was stopped for a cause");
         assert_eq!(cause, first);
     });
@@ -107,8 +114,16 @@ fn of_two_kinds_whose_last_workers_die_at_once_the_run_has_one_cause() {
         let seen_here = first_cause(&stop);
         let (theirs, seen_there) = other.join().unwrap();
 
-        assert_eq!(mine.as_deref(), Some("gc.collect() raised"), "the sync kind's last hands back its cause");
-        assert_eq!(theirs.as_deref(), Some("the engine stopped"), "the async kind's last hands back its cause");
+        assert_eq!(
+            mine.as_deref(),
+            Some("gc.collect() raised"),
+            "the sync kind's last hands back its cause"
+        );
+        assert_eq!(
+            theirs.as_deref(),
+            Some("the engine stopped"),
+            "the async kind's last hands back its cause"
+        );
         assert_eq!(signal.cancels(), 2, "each kind's last stops the run");
         let cause = seen_here.expect("stopped");
         assert_eq!(Some(&cause), seen_there.as_ref(), "both read the one cause that stands");

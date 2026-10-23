@@ -24,6 +24,9 @@ pub enum HttpEvent {
     /// A kept-alive HTTP/1 client sent no next request head within the request-head timeout, so
     /// the connection is closed.
     RequestHeadTimedOut,
+    /// A trusted proxy's `X-Forwarded-For` held an entry that is no IP address where the client
+    /// was looked for, so the header was ignored and the proxy taken for the client.
+    ForwardedForUnreadable,
 }
 
 const LOG_PERIOD: Duration = Duration::from_secs(60);
@@ -42,6 +45,7 @@ struct HttpEventTable<T> {
     oversized_request_head: T,
     first_request_timed_out: T,
     request_head_timed_out: T,
+    forwarded_for_unreadable: T,
 }
 
 impl<T> HttpEventTable<T> {
@@ -51,6 +55,7 @@ impl<T> HttpEventTable<T> {
             HttpEvent::OversizedRequestHead => &self.oversized_request_head,
             HttpEvent::FirstRequestTimedOut => &self.first_request_timed_out,
             HttpEvent::RequestHeadTimedOut => &self.request_head_timed_out,
+            HttpEvent::ForwardedForUnreadable => &self.forwarded_for_unreadable,
         }
     }
 }
@@ -62,6 +67,7 @@ impl HttpEventTable<OwnLine<AtomicU64>> {
             oversized_request_head: OwnLine(AtomicU64::new(0)),
             first_request_timed_out: OwnLine(AtomicU64::new(0)),
             request_head_timed_out: OwnLine(AtomicU64::new(0)),
+            forwarded_for_unreadable: OwnLine(AtomicU64::new(0)),
         }
     }
 }
@@ -73,6 +79,7 @@ impl HttpEventTable<OwnLine<LogThrottle>> {
             oversized_request_head: OwnLine(LogThrottle::new(LOG_PERIOD)),
             first_request_timed_out: OwnLine(LogThrottle::new(LOG_PERIOD)),
             request_head_timed_out: OwnLine(LogThrottle::new(LOG_PERIOD)),
+            forwarded_for_unreadable: OwnLine(LogThrottle::new(LOG_PERIOD)),
         }
     }
 }
@@ -171,7 +178,10 @@ mod tests {
 
     impl Tables {
         fn new() -> Self {
-            Tables { counts: HttpEventTable::counts(), throttles: HttpEventTable::throttles() }
+            Tables {
+                counts: HttpEventTable::counts(),
+                throttles: HttpEventTable::throttles(),
+            }
         }
 
         fn degrade(&self, event: HttpEvent, now: Duration) -> Option<u64> {
@@ -213,8 +223,8 @@ mod tests {
             Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Empty::<bytes::Bytes>::new()))
         });
         let (mut client, server) = tokio::io::duplex(4096);
-        let conn = hyper::server::conn::http1::Builder::new()
-            .serve_connection(hyper_util::rt::TokioIo::new(server), service);
+        let conn =
+            hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(server), service);
         client.write_all(b"POST / HTTP/1.1\r\nhost: t\r\n").await.unwrap();
         drop(client);
         let err = conn.await.expect_err("the head never ended");
@@ -249,8 +259,8 @@ mod tests {
             Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Empty::<bytes::Bytes>::new()))
         });
         let (mut client, server) = tokio::io::duplex(256 * 1024);
-        let conn = hyper::server::conn::http1::Builder::new()
-            .serve_connection(hyper_util::rt::TokioIo::new(server), service);
+        let conn =
+            hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(server), service);
         client.write_all(sent).await.expect("the pipe holds what is sent");
         match client_end {
             Client::Closes => {
@@ -273,7 +283,10 @@ mod tests {
             (0..200).map(|i| format!("x-{i}: v\r\n")).collect::<String>()
         );
         let cases: [(&[u8], HttpEvent); 5] = [
-            (b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03", HttpEvent::MalformedRequest),
+            (
+                b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03",
+                HttpEvent::MalformedRequest,
+            ),
             (b"GET / HTTP/9.9\r\nhost: t\r\n\r\n", HttpEvent::MalformedRequest),
             (b"GET / HTTP/1.1\r\nno colon here\r\n\r\n", HttpEvent::MalformedRequest),
             (long_uri.as_bytes(), HttpEvent::OversizedRequestHead),
@@ -297,8 +310,16 @@ mod tests {
         assert_eq!((d.total(kind), lines), (1000, 1));
         let just_before = LOG_PERIOD - Duration::from_nanos(1);
         assert_eq!(d.degrade(kind, just_before), None, "the period is not over");
-        assert_eq!(d.degrade(kind, LOG_PERIOD), Some(1000), "the 999 after the first, and the one just before");
-        assert_eq!(d.total(HttpEvent::OversizedRequestHead), 0, "the other kind is counted apart");
+        assert_eq!(
+            d.degrade(kind, LOG_PERIOD),
+            Some(1000),
+            "the 999 after the first, and the one just before"
+        );
+        assert_eq!(
+            d.total(HttpEvent::OversizedRequestHead),
+            0,
+            "the other kind is counted apart"
+        );
     }
 
     fn at(secs: u64) -> Duration {

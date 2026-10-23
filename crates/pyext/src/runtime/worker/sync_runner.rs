@@ -82,15 +82,13 @@ impl RequestRunner for SyncRunner {
         } else {
             std::cell::OnceCell::new()
         };
-        // `_bootstrap.py` has called gc.disable(), so this is the worker's only cycle collection.
+        // `_worker/bootstrap.py` has called gc.disable(), so this is the worker's only cycle collection.
         let collect = py
             .import("gc")
             .and_then(|gc| gc.getattr("collect"))
             .map_err(setup("looking up gc.collect"))?;
 
-        let owned = |v: Vec<Bound<'_, PyAny>>| -> Vec<Py<PyAny>> {
-            v.into_iter().map(Bound::unbind).collect()
-        };
+        let owned = |v: Vec<Bound<'_, PyAny>>| -> Vec<Py<PyAny>> { v.into_iter().map(Bound::unbind).collect() };
         let inline_routes = routes
             .routes
             .into_iter()
@@ -134,25 +132,15 @@ impl EventLoopProvider for SyncRunner {
         if let Some(event_loop) = self.event_loop.get() {
             return Ok(event_loop.bind(py).clone());
         }
-        let made =
-            new_event_loop(py).map_err(|e| HandlerError::python(py, RequestStage::Setup, &e))?;
-        Ok(self
-            .event_loop
-            .get_or_init(|| made.unbind())
-            .bind(py)
-            .clone())
+        let made = new_event_loop(py).map_err(|e| HandlerError::python(py, RequestStage::Setup, &e))?;
+        Ok(self.event_loop.get_or_init(|| made.unbind()).bind(py).clone())
     }
 }
 
 impl SyncRunner {
     /// Runs `route`'s hooks and handler in a `contextvars.Context` of their own: a fresh one, or
     /// the last request's left empty and unreferenced.
-    fn serve(
-        &mut self,
-        py: Python<'_>,
-        route: RouteId,
-        request: Request,
-    ) -> Result<HandlerResponse, HandlerError> {
+    fn serve(&mut self, py: Python<'_>, route: RouteId, request: Request) -> Result<HandlerResponse, HandlerError> {
         let mut spare = std::mem::take(&mut self.spare_context);
         let served = in_reused_context(py, &mut spare, |rc| self.run(py, rc, route, request));
         self.spare_context = spare;
@@ -172,8 +160,7 @@ impl SyncRunner {
             event_loop: self,
             to_response: worker_response,
         };
-        let req = Bound::new(py, request)
-            .map_err(|e| HandlerError::python(py, RequestStage::Setup, &e))?;
+        let req = Bound::new(py, request).map_err(|e| HandlerError::python(py, RequestStage::Setup, &e))?;
 
         let short_circuit = chain.before(&self.before_hooks, &req)?;
         let response = match short_circuit {
@@ -188,8 +175,7 @@ impl SyncRunner {
                 else {
                     return Err(refuse(UnansweredError::NotOnWorker(route.index())));
                 };
-                let value =
-                    chain.handler(handler, &req, ExceptionMapping::NoLoopHint { key, handler })?;
+                let value = chain.handler(handler, &req, ExceptionMapping::NoLoopHint { key, handler })?;
                 chain.after(&self.after_hooks, &req, worker_response(value)?)?
             }
         };
@@ -316,7 +302,6 @@ pub(crate) struct UnitOutcome {
     pub(crate) interrupted: bool,
 }
 
-
 impl SubInterpreterWorker<SyncRunner> {
     /// Runs `route` as a unit of work another thread can interrupt, then a `gc.collect()` if one
     /// is due. `begun` gets the unit as soon as it starts. A panic comes back as
@@ -329,7 +314,8 @@ impl SubInterpreterWorker<SyncRunner> {
     ) -> UnitOutcome {
         let worker = self.worker_id();
         // The unit's slot is made on the first request and reused, so no request allocates one.
-        let ran = self.interp.with_unit(|inline, unit, py| {
+        let ran = self.interp.with_unit(|held, unit, py| {
+            let inline = &mut held.runner;
             let target = unit.target();
             begun(target.clone());
             let response = inline.serve(py, route, request);
@@ -449,7 +435,10 @@ pub(super) mod tests {
         let mut gc = due_schedule();
         let failure = settle_collect(&mut gc, Ok(Err(raised))).expect_err("it raised");
         assert!(matches!(failure, GcCollectError::Raised(_)), "{failure:?}");
-        assert!(failure.to_string().starts_with("gc.collect() raised MemoryError"), "{failure}");
+        assert!(
+            failure.to_string().starts_with("gc.collect() raised MemoryError"),
+            "{failure}"
+        );
         assert!(gc.after_unit(), "still due");
     }
 
@@ -480,40 +469,39 @@ pub(super) mod tests {
             "b287".into(),
             |source| WorkerStartError::CreationFailed { worker: index, source },
             |py| {
-            let raised = |step| {
-                move |e: PyErr| WorkerStartError::SetupRaised {
-                    worker: index,
-                    step,
-                    raised: StartException::capture(py, &e),
-                }
-            };
-            let names = pyo3::types::PyDict::new(py);
-            py.run(app, Some(&names), None)
-                .map_err(raised("running the app's source"))?;
-            let named = |name: &str| {
-                names
-                    .get_item(name)
-                    .and_then(|v| {
-                        v.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(name.to_owned()))
-                    })
-                    .map_err(raised("reading the app's handler and hooks"))
-            };
-            let hooks = |name: &str| -> Result<Vec<Bound<'_, PyAny>>, WorkerStartError> {
-                named(name)?
-                    .try_iter()
-                    .and_then(|hooks| hooks.collect())
-                    .map_err(raised("reading the app's hooks"))
-            };
-            let routes = WorkerRoutes {
-                routes: vec![crate::runtime::worker_app::WorkerRoute {
-                    key: table.route(route).key.clone(),
-                    handler: Some(named("handler")?),
-                }],
-                before_hooks: hooks("before")?,
-                after_hooks: hooks("after")?,
-                limits: None,
-            };
-            SyncRunner::build(py, index, routes, GcPolicy::Off)
+                let raised = |step| {
+                    move |e: PyErr| WorkerStartError::SetupRaised {
+                        worker: index,
+                        step,
+                        raised: StartException::capture(py, &e),
+                    }
+                };
+                let names = pyo3::types::PyDict::new(py);
+                py.run(app, Some(&names), None)
+                    .map_err(raised("running the app's source"))?;
+                let named = |name: &str| {
+                    names
+                        .get_item(name)
+                        .and_then(|v| v.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(name.to_owned())))
+                        .map_err(raised("reading the app's handler and hooks"))
+                };
+                let hooks = |name: &str| -> Result<Vec<Bound<'_, PyAny>>, WorkerStartError> {
+                    named(name)?
+                        .try_iter()
+                        .and_then(|hooks| hooks.collect())
+                        .map_err(raised("reading the app's hooks"))
+                };
+                let routes = WorkerRoutes {
+                    routes: vec![crate::runtime::worker_app::WorkerRoute {
+                        key: table.route(route).key.clone(),
+                        handler: Some(named("handler")?),
+                    }],
+                    before_hooks: hooks("before")?,
+                    after_hooks: hooks("after")?,
+                    limits: None,
+                };
+                SyncRunner::build(py, index, routes, GcPolicy::Off)
+                    .map(|runner| super::super::Held { worker: index, runner })
             },
         )
         .map_err(|e: WorkerStartError| e.to_string())
@@ -522,10 +510,7 @@ pub(super) mod tests {
     }
 
     fn get_root() -> Request {
-        let (parts, ()) = hyper::Request::get("/")
-            .body(())
-            .expect("a valid request")
-            .into_parts();
+        let (parts, ()) = hyper::Request::get("/").body(()).expect("a valid request").into_parts();
         let head = crate::exchange::RequestHead {
             parts,
             params: Vec::new(),

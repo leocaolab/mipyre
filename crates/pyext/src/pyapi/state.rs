@@ -17,9 +17,9 @@ fn text<'py>(py: Python<'py>, key: &str, value: &StateValue) -> PyResult<Bound<'
     })
 }
 
-/// Refuses access from a process-lane worker, which holds only a forked copy of the state.
+/// Refuses access from a process-lane worker, a process apart from the server's state.
 fn guard() -> PyResult<()> {
-    crate::lane::refuse_in_lane_worker("app.state (SharedState)")
+    crate::runtime::process::refuse_in_lane_worker("app.state (SharedState)")
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
 
@@ -39,10 +39,10 @@ impl AppStateView {
 #[pymethods]
 impl AppStateView {
     #[new]
-    fn new(py: Python<'_>) -> Self {
-        AppStateView {
-            store: map_for_new(py),
-        }
+    fn new(py: Python<'_>) -> PyResult<Self> {
+        Ok(AppStateView {
+            store: map_for_new(py)?,
+        })
     }
 
     fn set(&self, key: String, value: String) -> PyResult<()> {
@@ -92,18 +92,12 @@ impl AppStateView {
     /// Return all string values; a value that is not UTF-8 raises `TypeError` naming its key.
     fn values<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyString>>> {
         guard()?;
-        self.store
-            .iter()
-            .map(|e| text(py, e.key(), e.value()))
-            .collect()
+        self.store.iter().map(|e| text(py, e.key(), e.value())).collect()
     }
 
     /// Return all `(key, value)` pairs; a value that is not UTF-8 raises `TypeError` naming
     /// its key.
-    fn items<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Vec<(Bound<'py, PyString>, Bound<'py, PyString>)>> {
+    fn items<'py>(&self, py: Python<'py>) -> PyResult<Vec<(Bound<'py, PyString>, Bound<'py, PyString>)>> {
         guard()?;
         self.store
             .iter()
@@ -156,27 +150,23 @@ impl AppStateView {
             .entry(key.clone())
             .or_insert_with(|| StateValue::Text("0".to_owned()));
         let raw = entry.value().as_text().ok_or_else(|| {
-            pyo3::exceptions::PyTypeError::new_err(format!(
-                "incr({key:?}): existing value is not valid UTF-8"
-            ))
+            pyo3::exceptions::PyTypeError::new_err(format!("incr({key:?}): existing value is not valid UTF-8"))
         })?;
         let current: i64 = raw.parse().map_err(|_| {
-            pyo3::exceptions::PyTypeError::new_err(format!(
-                "incr({key:?}): existing value {raw:?} is not an integer"
-            ))
+            pyo3::exceptions::PyTypeError::new_err(format!("incr({key:?}): existing value {raw:?} is not an integer"))
         })?;
-        let new_val = current.checked_add(amount).ok_or_else(|| {
-            pyo3::exceptions::PyOverflowError::new_err(format!("incr({key:?}): i64 overflow"))
-        })?;
+        let new_val = current
+            .checked_add(amount)
+            .ok_or_else(|| pyo3::exceptions::PyOverflowError::new_err(format!("incr({key:?}): i64 overflow")))?;
         *entry = StateValue::Text(new_val.to_string());
         Ok(new_val)
     }
 
     /// Atomically subtract `amount` from the integer under `key` and return the new value.
     fn decr(&self, key: String, amount: i64) -> PyResult<i64> {
-        let neg = amount.checked_neg().ok_or_else(|| {
-            pyo3::exceptions::PyOverflowError::new_err("decr: amount i64::MIN cannot be negated")
-        })?;
+        let neg = amount
+            .checked_neg()
+            .ok_or_else(|| pyo3::exceptions::PyOverflowError::new_err("decr: amount i64::MIN cannot be negated"))?;
         self.incr(key, neg)
     }
 

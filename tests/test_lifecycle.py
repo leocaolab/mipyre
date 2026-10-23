@@ -2,6 +2,8 @@
 
 import pytest
 from mipyre import Mipyre
+from mipyre._server_run import ServerRun, Transport
+from mipyre.engine import Deployment, ServerFlags
 from mipyre.testing import TestClient
 
 
@@ -129,14 +131,17 @@ def test_multiple_shutdown_hooks_registered():
     assert len(app._shutdown_hooks) == 2
 
 
-# b/370 (#30/#31): how a server's lifetime (`Mipyre._serve`) treats hooks that raise. `start`
-# stands in for binding and serving; `_prepare` (sealing the app, logging setup) is not under
-# test and is skipped, as in test_b149_conformance.
+# b/370 (#30/#31), b/845: how a server run (`mipyre._server_run.ServerRun`) treats hooks that
+# raise. Each test serves a main-runtime app on a real in-memory server.
 
 
-def _app_with_hooks(monkeypatch, startup=(), shutdown=()):
-    app = Mipyre()
-    monkeypatch.setattr(app, "_prepare", lambda settings: None)
+def _app_with_hooks(startup=(), shutdown=()):
+    app = Mipyre(runtime="main")
+
+    @app.get("/")
+    def index(req):
+        return "ok"
+
     for hook in startup:
         app.on_startup(hook)
     for hook in shutdown:
@@ -144,7 +149,7 @@ def _app_with_hooks(monkeypatch, startup=(), shutdown=()):
     return app
 
 
-def test_a_shutdown_hook_that_raises_is_logged_and_the_rest_still_run(monkeypatch, caplog):
+def test_a_shutdown_hook_that_raises_fails_the_run_and_the_rest_still_run():
     ran = []
 
     def closes_a_closed_pool():
@@ -154,33 +159,51 @@ def test_a_shutdown_hook_that_raises_is_logged_and_the_rest_still_run(monkeypatc
     def flushes_metrics():
         ran.append("second")
 
-    app = _app_with_hooks(monkeypatch, shutdown=[closes_a_closed_pool, flushes_metrics])
-    started = []
-    with caplog.at_level("ERROR", logger="mipyre.app"):
-        app._serve(None, started.append)  # returns: a teardown failure does not fail the run
-    assert started == [None]
+    client = TestClient(_app_with_hooks(shutdown=[closes_a_closed_pool, flushes_metrics]))
+    with pytest.raises(RuntimeError, match="pool already closed"):
+        client.close()
     assert ran == ["first", "second"]
-    [record] = [r for r in caplog.records if r.name == "mipyre.app"]
-    assert record.getMessage() == "shutdown hook closes_a_closed_pool raised"
-    assert record.exc_info is not None, "logged without its traceback"
-    assert isinstance(record.exc_info[1], RuntimeError)
-    assert str(record.exc_info[1]) == "pool already closed"
 
 
-def test_a_shutdown_hook_failure_is_logged_with_its_error_type(monkeypatch, caplog):
-    # b/413: an exception log carries the exception's type as a field, beside its traceback.
+def test_a_shutdown_hook_failure_is_raised_as_its_own_type():
     def releases_a_lock():
         raise PermissionError("not the owner")
 
-    app = _app_with_hooks(monkeypatch, shutdown=[releases_a_lock])
-    with caplog.at_level("ERROR", logger="mipyre.app"):
-        app._serve(None, lambda settings: None)
-    [record] = [r for r in caplog.records if r.name == "mipyre.app"]
-    assert record.error_type == "PermissionError"
-    assert record.exc_info is not None and isinstance(record.exc_info[1], PermissionError)
+    client = TestClient(_app_with_hooks(shutdown=[releases_a_lock]))
+    with pytest.raises(PermissionError, match="not the owner"):
+        client.close()
 
 
-def test_a_startup_hook_that_raises_fails_the_run_unbound_and_shutdown_hooks_still_run(monkeypatch):
+def test_two_shutdown_hook_failures_are_raised_together():
+    def first():
+        raise PermissionError("not the owner")
+
+    def second():
+        raise OSError("disk gone")
+
+    client = TestClient(_app_with_hooks(shutdown=[first, second]))
+    with pytest.raises(ExceptionGroup) as raised:
+        client.close()
+    assert [type(e) for e in raised.value.exceptions] == [PermissionError, OSError]
+
+
+def test_a_shutdown_hook_that_exits_stops_the_hooks_after_it():
+    ran = []
+
+    def exits():
+        ran.append("exits")
+        raise SystemExit(3)
+
+    def never_reached():
+        ran.append("later")
+
+    client = TestClient(_app_with_hooks(shutdown=[exits, never_reached]))
+    with pytest.raises(SystemExit):
+        client.close()
+    assert ran == ["exits"]
+
+
+def test_a_startup_hook_that_raises_fails_the_run_unbound_and_shutdown_hooks_still_run():
     ran = []
 
     def opens_the_db():
@@ -193,9 +216,10 @@ def test_a_startup_hook_that_raises_fails_the_run_unbound_and_shutdown_hooks_sti
     def closes_the_db():
         ran.append("shutdown")
 
-    app = _app_with_hooks(monkeypatch, startup=[opens_the_db, never_reached], shutdown=[closes_the_db])
-    started = []
+    app = _app_with_hooks(startup=[opens_the_db, never_reached], shutdown=[closes_the_db])
+    run = ServerRun(app, Deployment(), ServerFlags(), transport=Transport.MEMORY)
     with pytest.raises(ConnectionRefusedError, match="db is down"):
-        app._serve(None, started.append)
-    assert started == [], "the server was started (and bound its port) after a startup hook failed"
+        run.serve()
+    with pytest.raises(ConnectionRefusedError, match="has not started"):
+        run.connect()  # the server was never started after a startup hook failed
     assert ran == ["startup", "shutdown"]

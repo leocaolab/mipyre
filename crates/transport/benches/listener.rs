@@ -23,9 +23,7 @@ fn quickack(n: u64) {
         .build()
         .must("build the runtime");
     rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .must("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.must("bind");
         let addr = listener.local_addr().must("local_addr");
         let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
         let _client = client.must("connect");
@@ -83,9 +81,6 @@ fn accept(n: u64) {
 }
 
 fn main() {
-    let cases: [Case; 2] = [
-        ("quickack", quickack),
-        ("accept", accept),
-    ];
+    let cases: [Case; 2] = [("quickack", quickack), ("accept", accept)];
     run(&cases);
 }

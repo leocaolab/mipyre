@@ -15,13 +15,26 @@ impl std::fmt::Display for LaneIndex {
     }
 }
 
-/// A process-lane message failed to decode; the server wrote it, so this is a bug, never client input.
+/// A process-lane message failed to decode: the other end of the lane wrote bytes no encoder writes. It is never
+/// client input.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LaneDecodeError {
     #[error("malformed process-lane message: wanted {wanted} bytes at {at}, have {len}")]
     Truncated { wanted: usize, at: usize, len: usize },
-    #[error("malformed process-lane message: the slot says its message is {len} bytes; a slot holds {max}")]
-    PastSlot { len: usize, max: usize },
+    /// A count of `count` entries at `at`, each taking at least `least` bytes, which the rest of the message is too
+    /// short to hold.
+    #[error("malformed process-lane message: {count} entries of at least {least} bytes each at {at}, have {len}")]
+    CountPastEnd {
+        count: usize,
+        least: usize,
+        at: usize,
+        len: usize,
+    },
+    #[error("malformed process-lane message: {count} header lines, past the {max} a header map takes room for")]
+    TooManyLines { count: usize, max: usize },
+    /// The worker read its request's length past its slot.
+    #[error("malformed process-lane message: {0}")]
+    PastSlot(#[source] mipyre_shm::plan::slot_len::SlotLengthError),
     #[error("malformed process-lane message: {0}")]
     NotUtf8(#[source] std::str::Utf8Error),
     #[error("malformed process-lane message: {0}")]
@@ -74,7 +87,10 @@ pub(crate) struct WorkerFailure {
 pub(crate) enum WorkerExit {
     Exited(i32),
     /// `name` is the OS's name for the signal, read where the worker was reaped.
-    Signaled { signal: i32, name: String },
+    Signaled {
+        signal: i32,
+        name: String,
+    },
     Other(i32),
     Unreported(Duration),
 }
@@ -85,10 +101,9 @@ impl std::fmt::Display for WorkerExit {
             WorkerExit::Exited(code) => write!(f, "exited with status {code}"),
             WorkerExit::Signaled { signal, name } => write!(f, "killed by signal {signal} ({name})"),
             WorkerExit::Other(status) => write!(f, "wait status {status:#x}"),
-            WorkerExit::Unreported(waited) => write!(
-                f,
-                "its wait status was not reported by the template within {waited:?}"
-            ),
+            WorkerExit::Unreported(waited) => {
+                write!(f, "its wait status was not reported by the template within {waited:?}")
+            }
         }
     }
 }
@@ -103,7 +118,10 @@ mod tests {
         assert_eq!(WorkerExit::Exited(3).to_string(), "exited with status 3");
         // `lane::server`'s test pins how the lane reads the OS's name.
         let name = "Killed";
-        let killed = WorkerExit::Signaled { signal: 9, name: name.to_owned() };
+        let killed = WorkerExit::Signaled {
+            signal: 9,
+            name: name.to_owned(),
+        };
         assert_eq!(killed.to_string(), format!("killed by signal 9 ({name})"));
         assert_eq!(WorkerExit::Other(0x7f).to_string(), "wait status 0x7f");
         assert_eq!(
@@ -117,19 +135,42 @@ mod tests {
         let died = UnansweredError::WorkerDied {
             pid: 42,
             lane: LaneIndex(3),
-            ran: Duration::from_millis(5),
+            ran: Some(Duration::from_millis(5)),
             exit: WorkerExit::Exited(1),
         };
         assert_eq!(
             died.to_string(),
             "the worker running the request (pid 42, lane 3) died after 5ms: exited with status 1"
         );
+        let unseen = UnansweredError::WorkerDied {
+            pid: 42,
+            lane: LaneIndex(3),
+            ran: None,
+            exit: WorkerExit::Exited(1),
+        };
+        assert_eq!(
+            unseen.to_string(),
+            "the worker running the request (pid 42, lane 3) died: exited with status 1"
+        );
+        let untaken = UnansweredError::WorkerDiedBeforeTaking {
+            pid: 42,
+            lane: LaneIndex(3),
+            exit: WorkerExit::Exited(1),
+        };
+        assert_eq!(
+            untaken.to_string(),
+            "the worker of process lane 3 (pid 42) died before it took the request (exited with status 1); the request \
+             is not run on another worker, since the dead one could have changed it"
+        );
         let overran = UnansweredError::LaneTimedOut {
             pid: 42,
             lane: LaneIndex(3),
             ran: Duration::from_millis(1600),
             timeout: Duration::from_millis(1500),
-            exit: WorkerExit::Signaled { signal: 9, name: "Killed".to_owned() },
+            exit: WorkerExit::Signaled {
+                signal: 9,
+                name: "Killed".to_owned(),
+            },
         };
         let name = "Killed";
         assert_eq!(

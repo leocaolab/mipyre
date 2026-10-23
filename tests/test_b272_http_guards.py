@@ -65,28 +65,46 @@ def _shut_down_listeners(port: int) -> int:
     return shut
 
 
+_WORKERS_APP = """
+from mipyre.engine import MipyreApp, RuntimeChoice
+
+
+def _root(req):
+    return "ok"
+
+
+app = MipyreApp()
+app.route("GET", "/", _root, RuntimeChoice.Worker)
+"""
+
+
+def _root(req):
+    return "ok"
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="shutdown(2) on a listening socket breaks accept on Linux")
 # One per accept loop that reads a broken listener's stop: TPC's GIL-mode and sub-interpreter
-# loops (serve/tpc/), and the multi-thread server's one loop, which both modes share (so one mode
-# of it). Which errno is which failure, and that a broken listener stops, are tcp::listener's
-# tests (mipyre_transport).
+# loops (serve/tpc/), and the multi-thread server's one loop, which both topologies share (so one
+# of them). A route on a sub-interpreter is what gives a server sub-interpreter workers. Which errno
+# is which failure, and that a broken listener stops, are tcp::listener's tests (mipyre_transport).
 @pytest.mark.parametrize(
-    ("tpc", "mode"),
-    [("1", "gil"), ("1", "subinterp"), ("0", "gil")],
+    ("tpc", "workers"),
+    [("1", False), ("1", True), ("0", False)],
     ids=["tpc-gil", "tpc-subinterp", "multi_thread"],
 )
-def test_an_unusable_listener_stops_the_server_and_serve_raises(monkeypatch, tpc, mode):
+def test_an_unusable_listener_stops_the_server_and_serve_raises(tmp_path, tpc, workers):
     """A real listening socket, shut down under the running server: the fact is Linux's accept(2)
     answering EINVAL on it, which no function here produces. Which errno is which failure is a pure
     test in tcp::listener; this one checks each accept loop stops on the real one."""
-    monkeypatch.setenv("MIPYRE_TPC", tpc)
-    monkeypatch.setenv("MIPYRE_WORKERS", "2")
-    monkeypatch.setenv("MIPYRE_IO_WORKERS", "2")
     engine = mipyre.engine.MipyreApp()
-    # The sub-interpreter server names the script its workers would run; under xdist `__main__`
-    # has none. No route runs on a sub-interpreter here, so no worker runs it.
-    engine.set_script_path(os.path.abspath(__file__))
-    server = engine.start(host=HOST, port=0, mode=mode)
+    if workers:
+        # The workers execute this script, which registers the same route on their own app.
+        script = tmp_path / "b272_workers_app.py"
+        script.write_text(_WORKERS_APP)
+        engine.route("GET", "/", _root, mipyre.engine.RuntimeChoice.Worker)
+        engine.set_script_path(str(script))
+    # start() reads no environment (b/335 M5.6): the topology is its config.
+    server = engine.start(config=mipyre.engine.ServerFlags(host=HOST, port=0, tpc=tpc == "1", threads=2))
     port = server.port
     raised: list[BaseException] = []
 

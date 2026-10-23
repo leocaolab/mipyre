@@ -118,7 +118,10 @@ mod tests {
 
     impl Tables {
         fn new() -> Self {
-            Tables { counts: TcpEventTable::counts(), throttles: TcpEventTable::throttles() }
+            Tables {
+                counts: TcpEventTable::counts(),
+                throttles: TcpEventTable::throttles(),
+            }
         }
 
         fn degrade(&self, event: TcpEvent, now: Duration) -> Option<u64> {
@@ -152,7 +155,11 @@ mod tests {
         assert_eq!((counts.total(event), lines), (64, 1));
         let just_before = LOG_PERIOD - Duration::from_nanos(1);
         assert_eq!(counts.degrade(event, just_before), None, "the period is not over");
-        assert_eq!(counts.degrade(event, LOG_PERIOD), Some(64), "the next line carries the 64 held");
+        assert_eq!(
+            counts.degrade(event, LOG_PERIOD),
+            Some(64),
+            "the next line carries the 64 held"
+        );
         assert_eq!(counts.total(event), 66);
     }
 

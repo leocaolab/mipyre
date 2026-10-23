@@ -8,7 +8,7 @@ use mipyre_subinterp::InterruptTarget;
 use mipyre_tpc::{spawn, OsThread};
 
 use super::serve::serve_sync;
-use super::threads::{python_thread, AbandonedWorker, RunningSlot, WorkerThread};
+use super::threads::{python_thread, AbandonedWorker, WorkerThread};
 use super::{answer_queue_if_last, PoolJob};
 use crate::runtime::job_queue::JobReceiver;
 use crate::runtime::live_workers::WorkerLife;
@@ -62,14 +62,11 @@ impl Supervision {
         std::mem::take(&mut *self.abandoned.lock())
     }
 
-    /// Returns thread `thread` as abandoned, with the route `running` says it was in.
-    pub(super) fn abandoned_worker(&self, thread: String, running: &RunningSlot) -> AbandonedWorker {
+    /// Returns thread `thread` as abandoned while it runs route number `route`, or none.
+    pub(super) fn abandoned_worker(&self, thread: String, route: Option<usize>) -> AbandonedWorker {
         AbandonedWorker {
             thread,
-            route: running
-                .current()
-                .and_then(|route| self.routes.get(usize::try_from(route).ok()?))
-                .cloned(),
+            route: route.and_then(|route| self.routes.get(route)).cloned(),
         }
     }
 }
@@ -79,46 +76,51 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(100);
 enum LaneWork<U> {
     Idle,
     Serving {
+        /// It is the number of the route the request is for.
+        route: usize,
         since: Instant,
         unit: Option<U>,
         interrupted: Option<Instant>,
     },
 }
 
+/// What the watchdog does about a lane when it looks: nothing yet, interrupt its request, or
+/// abandon its worker.
 #[derive(Debug, PartialEq, Eq)]
-enum Step<U> {
+enum LaneAction<U> {
     Wait,
     Interrupt(U),
     Abandon,
 }
 
-/// Decides a lane's step at `now`: a request past `zombie_after` is interrupted once, and a
-/// worker still in its request `grace` after that is abandoned. It changes `work` only to record
-/// the interruption.
-fn next_step<U: Clone>(
+/// Decides what the watchdog does about a lane at `now`: a request past `zombie_after` is
+/// interrupted once, and a worker still in its request `grace` after that is abandoned. It changes
+/// `work` only to record the interruption.
+fn next_action<U: Clone>(
     work: &mut LaneWork<U>,
     now: Instant,
     zombie_after: Duration,
     grace: Duration,
-) -> Step<U> {
+) -> LaneAction<U> {
     let LaneWork::Serving {
         since,
         unit,
         interrupted,
+        ..
     } = work
     else {
-        return Step::Wait;
+        return LaneAction::Wait;
     };
     match *interrupted {
         None if now.saturating_duration_since(*since) >= zombie_after => match unit {
             Some(unit) => {
                 *interrupted = Some(now);
-                Step::Interrupt(unit.clone())
+                LaneAction::Interrupt(unit.clone())
             }
-            None => Step::Wait,
+            None => LaneAction::Wait,
         },
-        Some(at) if now.saturating_duration_since(at) >= grace => Step::Abandon,
-        _ => Step::Wait,
+        Some(at) if now.saturating_duration_since(at) >= grace => LaneAction::Abandon,
+        _ => LaneAction::Wait,
     }
 }
 
@@ -129,7 +131,7 @@ pub(crate) struct SyncLane {
     /// The worker's thread takes it when it stops serving; the watchdog takes it for the
     /// replacement when it abandons the worker, whose thread then ends counting nothing.
     life: Mutex<Option<WorkerLife>>,
-    running: RunningSlot,
+    /// The worker writes it as a request begins and ends; the watchdog and the shutdown read it.
     work: Mutex<LaneWork<InterruptTarget>>,
     /// The watchdog sets it on abandoning the worker; the thread ends after its current request.
     retired: AtomicBool,
@@ -142,7 +144,6 @@ impl SyncLane {
         Arc::new(SyncLane {
             index,
             life: Mutex::new(life),
-            running: RunningSlot::idle(),
             work: Mutex::new(LaneWork::Idle),
             retired: AtomicBool::new(false),
             handle: Mutex::new(None),
@@ -150,12 +151,8 @@ impl SyncLane {
     }
 
     pub(super) fn begin(&self, route: usize) {
-        // A route numbered past u32 is left unnamed in the shutdown's report; real tables are far
-        // smaller.
-        if let Ok(number) = u32::try_from(route) {
-            self.running.start(number);
-        }
         *self.work.lock() = LaneWork::Serving {
+            route,
             since: Instant::now(),
             unit: None,
             interrupted: None,
@@ -169,8 +166,15 @@ impl SyncLane {
     }
 
     pub(super) fn end(&self) {
-        self.running.finish();
         *self.work.lock() = LaneWork::Idle;
+    }
+
+    /// Returns the number of the route the lane's worker is running, or `None` while it is idle.
+    pub(super) fn running_route(&self) -> Option<usize> {
+        match *self.work.lock() {
+            LaneWork::Serving { route, .. } => Some(route),
+            LaneWork::Idle => None,
+        }
     }
 
     pub(super) fn retired(&self) -> bool {
@@ -182,12 +186,12 @@ impl SyncLane {
         *self.handle.lock() = Some(handle);
     }
 
-    /// Takes the lane's thread, with what it is running, to join it.
-    pub(super) fn take_thread(&self) -> Option<WorkerThread> {
+    /// Takes the lane's thread, with the lane that says what it is running, to join it.
+    pub(super) fn take_thread(self: &Arc<Self>) -> Option<WorkerThread> {
         let handle = self.handle.lock().take()?;
         Some(WorkerThread {
             handle,
-            running: self.running.clone(),
+            lane: Some(Arc::clone(self)),
         })
     }
 
@@ -262,11 +266,11 @@ pub(super) fn watch(sup: Arc<Supervision>, replacer: Arc<Replacer>, stop: crossb
         let now = Instant::now();
         let live: Vec<Arc<SyncLane>> = sup.lanes.lock().live.clone();
         for lane in live {
-            let step = next_step(&mut lane.work.lock(), now, zombie_after, grace);
-            match step {
-                Step::Wait => {}
-                Step::Interrupt(unit) => interrupt(&lane, unit),
-                Step::Abandon => abandon(&sup, &replacer, &lane),
+            let action = next_action(&mut lane.work.lock(), now, zombie_after, grace);
+            match action {
+                LaneAction::Wait => {}
+                LaneAction::Interrupt(unit) => interrupt(&lane, unit),
+                LaneAction::Abandon => abandon(&sup, &replacer, &lane),
             }
         }
     }
@@ -295,7 +299,7 @@ fn interrupt(lane: &SyncLane, unit: InterruptTarget) {
 
 fn abandon(sup: &Supervision, replacer: &Arc<Replacer>, lane: &Arc<SyncLane>) {
     lane.retired.store(true, Ordering::SeqCst);
-    let abandoned = sup.abandoned_worker(format!("mipyre-worker-{}", lane.index), &lane.running);
+    let abandoned = sup.abandoned_worker(format!("mipyre-worker-{}", lane.index), lane.running_route());
     tracing::error!(
         target: "mipyre::server",
         "worker thread {abandoned} did not end its request within {:?} of an \
@@ -342,19 +346,32 @@ mod tests {
         let grace = Duration::from_secs(2);
         let start = Instant::now();
         let mut work = LaneWork::Serving {
+            route: 0,
             since: start,
             unit: Some("unit"),
             interrupted: None,
         };
         let at = |secs: u64| start + Duration::from_secs(secs);
-        assert_eq!(next_step(&mut work, at(29), budget, grace), Step::Wait);
+        assert_eq!(next_action(&mut work, at(29), budget, grace), LaneAction::Wait);
         assert_eq!(
-            next_step(&mut work, at(31), budget, grace),
-            Step::Interrupt("unit")
+            next_action(&mut work, at(31), budget, grace),
+            LaneAction::Interrupt("unit")
         );
-        assert_eq!(next_step(&mut work, at(31), budget, grace), Step::Wait);
-        assert_eq!(next_step(&mut work, at(32), budget, grace), Step::Wait);
-        assert_eq!(next_step(&mut work, at(34), budget, grace), Step::Abandon);
+        assert_eq!(next_action(&mut work, at(31), budget, grace), LaneAction::Wait);
+        assert_eq!(next_action(&mut work, at(32), budget, grace), LaneAction::Wait);
+        assert_eq!(next_action(&mut work, at(34), budget, grace), LaneAction::Abandon);
+    }
+
+    #[test]
+    fn a_lane_says_the_route_its_worker_runs_and_none_once_it_ends() {
+        let lane = SyncLane::new(0, None);
+        assert_eq!(lane.running_route(), None);
+        lane.begin(usize::MAX);
+        assert_eq!(lane.running_route(), Some(usize::MAX));
+        lane.begin(0);
+        assert_eq!(lane.running_route(), Some(0));
+        lane.end();
+        assert_eq!(lane.running_route(), None);
     }
 
     #[test]
@@ -364,12 +381,13 @@ mod tests {
         let start = Instant::now();
         let later = start + Duration::from_secs(60);
         let mut not_begun: LaneWork<&str> = LaneWork::Serving {
+            route: 0,
             since: start,
             unit: None,
             interrupted: None,
         };
-        assert_eq!(next_step(&mut not_begun, later, budget, grace), Step::Wait);
+        assert_eq!(next_action(&mut not_begun, later, budget, grace), LaneAction::Wait);
         let mut idle: LaneWork<&str> = LaneWork::Idle;
-        assert_eq!(next_step(&mut idle, later, budget, grace), Step::Wait);
+        assert_eq!(next_action(&mut idle, later, budget, grace), LaneAction::Wait);
     }
 }

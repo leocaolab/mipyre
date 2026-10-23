@@ -8,9 +8,9 @@ from tests.conftest import feature_server_factory
 SERVER = '''
 import os, json
 from mipyre import Mipyre, Response
-from mipyre.cookies import get_cookie, set_cookie
+from mipyre.cookies import Cookie, get_cookie
 
-app = Mipyre()
+app = Mipyre(runtime=os.environ["MIPYRE_TEST_MODE"])
 
 @app.get("/__ping")
 def ping(req):
@@ -18,7 +18,7 @@ def ping(req):
 
 @app.get("/set")
 def set_route(req):
-    return set_cookie(Response(body="ok"), "sid", "abc123", httponly=True)
+    return Response(body="ok", headers={"set-cookie": Cookie("sid", "abc123", httponly=True)})
 
 @app.get("/get")
 def get_route(req):

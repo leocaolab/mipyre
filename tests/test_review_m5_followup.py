@@ -80,7 +80,8 @@ def test_cli_run_serves_an_app_importing_a_module_next_to_it(tpc):
     log_path = os.path.join(project, "server.log")
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
-            [cli, "run", "app:app", "--host", HOST, "--port", "0", "--workers", "2"],
+            [cli, "run", "app:app", "--host", HOST, "--port", "0",
+             "--subinterpreters" if tpc == "0" else "--threads", "2"],
             cwd=project,
             env={**os.environ, "MIPYRE_TPC": tpc},
             stdout=log,

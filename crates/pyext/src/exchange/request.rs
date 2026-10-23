@@ -8,14 +8,16 @@ use mipyre_http::io::body::BodyReceiver;
 use mipyre_transport::driver::Peer;
 
 use bytes::Bytes;
-use hyper::header::{HeaderMap, HeaderName, HeaderValue};
+use hyper::header::{HeaderMap, HeaderName};
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 
+use super::http_exception::HttpException;
 use super::response::{header_name, header_value};
 use mipyre_http::io::request_id::RequestId;
+use mipyre_http::plan::header::{request_authority, MAX_HEADER_LINES};
 
 #[pyclass(frozen, name = "Request", module = "mipyre.engine")]
 pub(crate) struct Request {
@@ -62,8 +64,7 @@ impl RequestBody {
     }
 }
 
-const STREAMED_BODY: &str =
-    "this route's body is streamed (stream=True): read it through req.stream, not req.body";
+const STREAMED_BODY: &str = "this route's body is streamed (body=BodyStream): read it through req.stream, not req.body";
 
 impl Request {
     fn query_str(&self) -> &str {
@@ -94,13 +95,19 @@ impl Request {
         headers: HashMap<String, String>,
         client_ip: &str,
     ) -> PyResult<Self> {
+        if headers.len() > MAX_HEADER_LINES {
+            return Err(PyValueError::new_err(format!(
+                "{} headers, past the {MAX_HEADER_LINES} lines a request carries",
+                headers.len()
+            )));
+        }
         let headers = headers
             .iter()
             .map(|(name, value)| Ok((header_name(name)?, header_value(name, value)?)))
             .collect::<PyResult<HeaderMap>>()?;
-        let client_ip_addr = client_ip.parse::<IpAddr>().map_err(|e| {
-            PyValueError::new_err(format!("client_ip {client_ip:?} is not an IP address: {e}"))
-        })?;
+        let client_ip_addr = client_ip
+            .parse::<IpAddr>()
+            .map_err(|e| PyValueError::new_err(format!("client_ip {client_ip:?} is not an IP address: {e}")))?;
         let target = if query.is_empty() {
             path.to_string()
         } else {
@@ -123,10 +130,7 @@ impl Request {
             client: Peer::Ip(client_ip_addr),
             request_id: RequestId::mint(),
         };
-        Ok(Request::new(
-            head,
-            RequestBody::Buffered(Bytes::from(body_bytes)),
-        ))
+        Ok(Request::new(head, RequestBody::Buffered(Bytes::from(body_bytes))))
     }
 
     #[getter]
@@ -149,10 +153,7 @@ impl Request {
     /// `Host` as RFC 9112 §3.2.2 requires, or `None` with neither.
     #[getter]
     fn authority(&self) -> Option<Cow<'_, str>> {
-        match self.head.parts.uri.authority() {
-            Some(authority) => Some(Cow::Borrowed(authority.as_str())),
-            None => self.head.parts.headers.get(hyper::header::HOST).map(field_text),
-        }
+        request_authority(&self.head.parts.uri, &self.head.parts.headers).map(field_text)
     }
 
     /// Builds a new `dict` of the path params on every access.
@@ -176,7 +177,8 @@ impl Request {
         )
     }
 
-    /// Returns `None` for an in-memory connection, such as `TestClient`'s default, which has no peer address.
+    /// Returns the connection's peer, or the client a trusted proxy named in `X-Forwarded-For`;
+    /// `None` for an in-memory connection, such as `TestClient`'s default, which has no peer address.
     #[getter]
     fn client_ip(&self) -> Option<String> {
         match self.head.client {
@@ -192,7 +194,7 @@ impl Request {
         self.head.request_id.to_string()
     }
 
-    /// Raises `RuntimeError` on a `stream=True` route rather than hand back an empty body that
+    /// Raises `RuntimeError` on a `body=BodyStream` route rather than hand back an empty body that
     /// was never sent.
     #[getter]
     fn body<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
@@ -202,7 +204,7 @@ impl Request {
         }
     }
 
-    /// Returns the body's chunk iterator on a `stream=True` route and `None` on any other.
+    /// Returns the body's chunk iterator on a `body=BodyStream` route and `None` on any other.
     ///
     /// A second access raises `RuntimeError`, so a hook that took the stream cannot silently leave
     /// the handler none.
@@ -212,10 +214,7 @@ impl Request {
     ///     process(chunk)
     /// ```
     #[getter]
-    fn stream(
-        &self,
-        py: Python<'_>,
-    ) -> PyResult<Option<Py<crate::exchange::body_stream::BodyStream>>> {
+    fn stream(&self, py: Python<'_>) -> PyResult<Option<Py<crate::exchange::body_stream::BodyStream>>> {
         let rx = self
             .body
             .take_stream()
@@ -224,17 +223,25 @@ impl Request {
             .transpose()
     }
 
-    /// Raises `ValueError` if the body is not UTF-8 and `RuntimeError` on a streamed body.
+    /// Raises `HTTPException(400)` if the body is not UTF-8, which answers the client 400 unless
+    /// the handler catches it, and `RuntimeError` on a streamed body.
     fn text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyString>> {
         let s = std::str::from_utf8(self.buffered_body(py)?)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            .map_err(|e| HttpException::bad_request(py, format!("the body is not UTF-8: {e}"), None))?;
         Ok(pyo3::types::PyString::new(py, s))
     }
 
-    /// Decodes the body as JSON, keeping an integer of any size exact; raises `ValueError` if it
-    /// is not JSON and `RuntimeError` on a streamed body.
+    /// Decodes the body as JSON, keeping an integer of any size exact; raises `HTTPException(400)`
+    /// if it is not JSON, which answers the client 400 unless the handler catches it, and
+    /// `RuntimeError` on a streamed body.
     fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        crate::exchange::json::loads(py, self.buffered_body(py)?)
+        crate::exchange::json::loads(py, self.buffered_body(py)?).map_err(|e| {
+            if e.is_instance_of::<pyo3::exceptions::PyValueError>(py) {
+                HttpException::bad_request(py, format!("the body is not valid JSON: {}", e.value(py)), Some(e))
+            } else {
+                e
+            }
+        })
     }
 
     /// Returns the first value on duplicate keys, as `query_params` does.
@@ -253,12 +260,7 @@ impl Request {
             // SAFETY: The thread is attached and `dict`, `key` and the value are live objects.
             let set = unsafe {
                 let value = PyString::new(py, &value);
-                ffi::PyDict_SetDefaultRef(
-                    dict.as_ptr(),
-                    key.as_ptr(),
-                    value.as_ptr(),
-                    std::ptr::null_mut(),
-                )
+                ffi::PyDict_SetDefaultRef(dict.as_ptr(), key.as_ptr(), value.as_ptr(), std::ptr::null_mut())
             };
             if set < 0 {
                 return Err(PyErr::fetch(py));
@@ -281,11 +283,7 @@ impl Request {
 
     // The buffer protocol lets `memoryview(req)` read the body in place, where `req.body`
     // copies; the view holds a strong reference to `req`, so the body outlives it.
-    unsafe fn __getbuffer__(
-        slf: Bound<'_, Self>,
-        view: *mut ffi::Py_buffer,
-        flags: std::ffi::c_int,
-    ) -> PyResult<()> {
+    unsafe fn __getbuffer__(slf: Bound<'_, Self>, view: *mut ffi::Py_buffer, flags: std::ffi::c_int) -> PyResult<()> {
         if view.is_null() {
             return Err(pyo3::exceptions::PyBufferError::new_err("NULL view"));
         }
@@ -382,7 +380,7 @@ impl RequestHeaders {
         self.map(py)
             .get_all(name)
             .iter()
-            .map(|v| field_text(v).into_owned())
+            .map(|v| field_text(v.as_bytes()).into_owned())
             .collect()
     }
 
@@ -406,10 +404,7 @@ impl RequestHeaders {
     }
 
     fn values(&self, py: Python<'_>) -> Vec<String> {
-        joined_fields(self.map(py))
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect()
+        joined_fields(self.map(py)).into_iter().map(|(_, v)| v).collect()
     }
 
     fn items(&self, py: Python<'_>) -> Vec<(String, String)> {
@@ -423,10 +418,10 @@ impl RequestHeaders {
 
 /// Falls back to ISO-8859-1 for a value that is not UTF-8 (RFC 9110 §5.5 `obs-text`), which maps
 /// every byte to a character, so no byte is lost or replaced.
-fn field_text(value: &HeaderValue) -> Cow<'_, str> {
-    match std::str::from_utf8(value.as_bytes()) {
+fn field_text(value: &[u8]) -> Cow<'_, str> {
+    match std::str::from_utf8(value) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(value.as_bytes().iter().map(|&b| char::from(b)).collect()),
+        Err(_) => Cow::Owned(value.iter().map(|&b| char::from(b)).collect()),
     }
 }
 
@@ -440,7 +435,7 @@ fn field_separator(name: &str) -> &'static str {
 
 fn joined_value(map: &HeaderMap, name: &str) -> Option<String> {
     let separator = field_separator(name);
-    let mut lines = map.get_all(name).iter().map(field_text);
+    let mut lines = map.get_all(name).iter().map(|v| field_text(v.as_bytes()));
     let first = lines.next()?.into_owned();
     Some(lines.fold(first, |mut joined, line| {
         joined.push_str(separator);
@@ -463,10 +458,7 @@ pub(crate) fn joined_fields(map: &HeaderMap) -> Vec<(String, String)> {
 mod tests {
     #[test]
     fn a_buffered_request_has_no_stream() {
-        assert!(matches!(
-            RequestBody::Buffered(Bytes::new()).take_stream(),
-            Ok(None)
-        ));
+        assert!(matches!(RequestBody::Buffered(Bytes::new()).take_stream(), Ok(None)));
     }
 
     #[test]
@@ -478,6 +470,7 @@ mod tests {
     }
 
     use super::*;
+    use hyper::header::HeaderValue;
 
     #[test]
     fn extract_headers_basic() {

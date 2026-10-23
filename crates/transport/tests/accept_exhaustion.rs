@@ -47,14 +47,9 @@ impl<'a> MakeWriter<'a> for Captured {
 
 impl Captured {
     fn count(&self, needle: &str) -> usize {
-        String::from_utf8_lossy(
-            &self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-        .matches(needle)
-        .count()
+        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+            .matches(needle)
+            .count()
     }
 }
 

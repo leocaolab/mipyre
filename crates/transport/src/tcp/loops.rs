@@ -94,8 +94,14 @@ mod tests {
         assert_eq!(
             socket_loops(2, loops(3)),
             vec![
-                SocketLoops { home: 0, duplicates: vec![2] },
-                SocketLoops { home: 1, duplicates: Vec::new() },
+                SocketLoops {
+                    home: 0,
+                    duplicates: vec![2]
+                },
+                SocketLoops {
+                    home: 1,
+                    duplicates: Vec::new()
+                },
             ]
         );
         assert_eq!(served_by_loop(2, 3), vec![vec![0], vec![1], vec![0]]);
@@ -105,7 +111,10 @@ mod tests {
     fn one_socket_is_duplicated_into_every_other_loop() {
         assert_eq!(
             socket_loops(1, loops(4)),
-            vec![SocketLoops { home: 0, duplicates: vec![1, 2, 3] }]
+            vec![SocketLoops {
+                home: 0,
+                duplicates: vec![1, 2, 3]
+            }]
         );
     }
 

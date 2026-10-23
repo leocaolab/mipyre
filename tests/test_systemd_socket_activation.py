@@ -35,7 +35,9 @@ APP = """
     def root(req):
         return "handed"
 
-    app.run(host="127.0.0.1", port=0, workers=2)
+    # No host or port: a server serving handed sockets does not use them (b/335 D19); one that
+    # binds its own gets them from the deployment (MIPYRE_HOST / MIPYRE_PORT).
+    app.run(threads=2)
 """
 
 
@@ -73,7 +75,7 @@ def _start(tmp_path, handed: socket.socket, listen_pid: str = "self", listen_fds
             stderr=subprocess.STDOUT,
             pass_fds=(handed.fileno(),),
             start_new_session=True,
-            env={**os.environ, "LISTEN_FDS": listen_fds, **(env or {})},
+            env={**os.environ, "LISTEN_FDS": listen_fds, **(env if env is not None else {})},
         )
     return proc, read_file(str(log))
 
@@ -95,7 +97,7 @@ def test_a_handed_socket_is_served_instead_of_binding_one(tmp_path):
 
 def test_sockets_handed_to_another_process_are_not_taken(tmp_path):
     handed = _handed_socket()
-    proc, output = _start(tmp_path, handed, listen_pid="1")
+    proc, output = _start(tmp_path, handed, listen_pid="1", env={"MIPYRE_HOST": "127.0.0.1", "MIPYRE_PORT": "0"})
     try:
         assert bound_port(output, proc) != handed.getsockname()[1], output()
         assert "systemd handed over" not in output(), output()
@@ -122,6 +124,19 @@ def test_extra_ports_beside_handed_sockets_stop_the_start(tmp_path):
     try:
         assert proc.wait(timeout=30) != 0, output()
         assert "LISTEN_FDS" in output() and ".socket unit" in output(), output()
+    finally:
+        kill_session(proc)
+        handed.close()
+
+
+def test_a_port_given_beside_handed_sockets_stops_the_start_naming_it(tmp_path):
+    # E2E-8(7): the .socket unit names the addresses, so a port given too is unused (D19).
+    handed = _handed_socket()
+    proc, output = _start(tmp_path, handed, env={"MIPYRE_PORT": str(_free_port())})
+    try:
+        assert proc.wait(timeout=30) != 0, output()
+        assert "port is given (MIPYRE_PORT" in output() and "LISTEN_FDS" in output(), output()
+        assert "Listening on" not in output(), output()
     finally:
         kill_session(proc)
         handed.close()

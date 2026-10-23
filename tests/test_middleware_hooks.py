@@ -6,7 +6,7 @@ instead of rebuilding it, so req attributes must be fully intact.
 
 import pytest
 from mipyre import Mipyre, Response
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 
 
 # Module level: TestClient serves it through sub-interpreter workers, which rebuild
@@ -66,9 +66,8 @@ def headers_echo(req):
 
 @pytest.fixture(scope="module")
 def client():
-    c = TestClient(app, transport="tcp")
-    yield c
-    c.close()
+    with TestServer(app) as server, TestClient(server) as c:
+        yield c
 
 
 def test_after_hook_sees_correct_path(client):

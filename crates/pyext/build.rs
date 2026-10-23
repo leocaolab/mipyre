@@ -10,8 +10,8 @@ fn main() -> io::Result<()> {
     // Cargo does not track files pulled in by `include_str!`, so without these
     // lines, editing them would NOT trigger a rebuild (the stale text stays baked
     // in). Re-run the build whenever they change.
-    println!("cargo:rerun-if-changed=../../python/mipyre/_bootstrap.py");
-    println!("cargo:rerun-if-changed=../../python/mipyre/_async_engine.py");
+    println!("cargo:rerun-if-changed=../../python/mipyre/_worker/bootstrap.py");
+    println!("cargo:rerun-if-changed=../../python/mipyre/_worker/async_engine.py");
 
     let id = format!("{}+{:016x}", env!("CARGO_PKG_VERSION"), source_tree_hash()?);
     println!("cargo:rustc-env=MIPYRE_BUILD_ID={id}");

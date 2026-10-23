@@ -1,18 +1,23 @@
 """Type stubs for mipyre.engine (Rust extension module)."""
 
 import socket
-from typing import Any, Awaitable, Callable, Dict, Iterator, List, Literal, Optional, Tuple, Union, final
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Literal, Optional, Tuple, final
+
+from typing_extensions import disjoint_base
 
 __all__ = [
-    "_mimalloc_purge_delay", "MipyreApp", "Server", "LaneSet", "StartStrategy", "BUILD_ID", "_driver_name",
-    "_driver_start_template", "_driver_start_import_worker", "_driver_fork_worker", "_routers_to_load",
-    "_set_routers_to_load", "NoWorkerScript", "RegistrationSealed", "Mode", "SizeOrigin", "GivenSize", "LogLevel",
-    "Compression", "Request", "Response", "Headers", "WebSocket", "SharedState", "Stream", "BodyStream",
-    "AbandonedWorker", "WorkerException", "BodyRejected", "PgPool", "PgCursor", "DatabaseError", "IntegrityError",
-    "UniqueViolation", "ParamError", "Metrics", "get_gil_metrics", "reset_peaks", "init_logger", "flush_logs",
-    "emit_python_log", "_python_log_level", "workrequest_counts", "_in_worker", "_owned_interpreters_at_exit", "_physical_cores", "_route_params",
+    "_mimalloc_purge_delay", "MipyreApp", "RuntimeChoice", "Server", "LaneSet", "CommandLine", "StartStrategy", "FailurePolicy", "BUILD_ID", "_driver_name",
+    "_driver_start_template", "_driver_spawn_template", "_driver_start_import_worker", "_driver_fork_worker",
+    "_routers_to_load",
+    "_set_routers_to_load", "DeclarationError", "MissingAppFileError", "LateRegistrationError", "LogLevel",
+    "Compression", "Request", "Response", "Cookie", "SameSite", "Headers", "WebSocket", "SharedState", "Stream", "BodyStream",
+    "AbandonedWorker", "WorkerException", "BodyReadError", "HTTPException", "PgPool", "PgCursor", "DatabaseError", "IntegrityError",
+    "UniqueViolation", "ParamError", "Metrics", "RunMetrics", "Flag", "_flags", "Deployment", "EntryPoint", "ConfigError", "ServerFlags", "LaneRecipe", "get_gil_metrics", "reset_peaks", "init_logger", "flush_logs", "_stop_log_writer", "_start_log_writer", "_user_cache_dir", "_log_writer_thread",
+    "emit_python_log", "_python_log_level", "workrequest_counts", "_in_worker", "_interpreters_running_python_at_exit", "_physical_cores", "_route_params", "encode_json", "_is_async_handler",
     "_worker_recv", "_worker_close", "_worker_send", "_worker_fail", "_worker_timed_out", "_worker_to_response",
-    "_worker_app_handlers", "_worker_app_hooks", "_note_isolated",
+    "_note_isolated",
 ]
 
 @final
@@ -63,12 +68,36 @@ def emit_python_log(
     pathname: str,
     lineno: int,
     worker_id: Optional[int] = None,
+    lane: Optional[int] = None,
 ) -> None:
-    """Route a Python log record through Rust tracing.
+    """Route a Python log record through Rust tracing, with the sub-interpreter worker
+    (``worker_id``) or the process-lane worker (``lane``) that logged it; neither on the
+    main interpreter.
 
     ``levelno`` is the record's numeric level; it maps to the highest standard
     threshold it reaches, so a custom level 25 logs at INFO.
     """
+    ...
+
+def _stop_log_writer() -> bool:
+    """Stop the log's writer thread, so this process runs no thread of the logger's (it is
+    about to fork), and return whether one was running. Until ``_start_log_writer()`` each
+    thread that logs writes its lines itself; the lines logged before are written out first."""
+    ...
+
+def _user_cache_dir() -> Optional[Path]:
+    """The user's cache directory by the OS's convention (``~/Library/Caches`` on macOS;
+    elsewhere an absolute ``$XDG_CACHE_HOME``, else ``~/.cache``), or ``None`` when this user
+    has no home directory."""
+    ...
+
+def _start_log_writer() -> None:
+    """Start the log's writer thread again after ``_stop_log_writer()``; a no-op with no
+    logger installed or its thread running."""
+    ...
+
+def _log_writer_thread() -> str:
+    """The name of the log's writer thread, as a process's thread list shows it."""
     ...
 
 def _python_log_level() -> Optional[int]:
@@ -78,7 +107,8 @@ def _python_log_level() -> Optional[int]:
 
 @final
 class Metrics:
-    """Snapshot of the engine counters. Times are in microseconds."""
+    """Snapshot of the process's counters: the main GIL, RSS, the connection-level events and what
+    runs degraded. Times are in microseconds. A server's own counts are ``Server.metrics()``."""
 
     gil_wait_last_us: int
     gil_wait_peak_us: int
@@ -91,34 +121,20 @@ class Metrics:
     rss_bytes: Optional[int]
     """Process RSS; ``None`` until the sampler (``MIPYRE_METRICS=1``) reads one."""
     degraded: List[str]
-    """What runs degraded, as ``key: reason``; empty while everything runs as configured."""
-    dropped_requests: int
-    """Requests the server gave up on without an answer from Python (every refusal): 503
-    overloaded or shutting down, 504 past the request budget, 502 a process-lane worker
-    died, 500 a worker dropped the request."""
-    total_requests: Optional[int]
-    """Requests counted; ``None`` while hot-path metrics are off (``MIPYRE_METRICS`` unset)."""
-    workers_serving: int
-    """Workers serving now: started, less those that stopped."""
-    workers_died: int
-    """Workers that stopped serving on their own (thread state not bound, engine failed,
-    retired), while the server ran."""
-    gc_failures: int
-    """``gc.collect()`` calls that raised or panicked; each retired its worker."""
-    workers_retired: int
-    """Workers retired because their ``gc.collect()`` failed: they take no more requests."""
-    last_worker_retirement: Optional[str]
-    """Why the last worker retired, in its own words; ``None`` while none has."""
+    """What the process runs without, as ``key: reason`` (RSS sampling, leak detection); empty while
+    everything runs as configured. What one server runs without is its ``RunMetrics.degraded``."""
     precompressed_fallbacks: int
     """Pre-compressed static files that could not be read; the original was served."""
     static_unwatched_mounts: int
     """Static mounts served uncached because their file watch failed or was lost."""
+    static_answers_cut: int
+    """Static answers sent from disk that were cut off because the file changed or failed while it was sent."""
+    static_bytes_in_flight: int
+    """Bytes static answers sent from disk hold now, read and not yet written out."""
     db_results_undeliverable: int
     """Async database results that could not reach a closed asyncio loop."""
     gil_congested_waits: int
     """GIL acquisition waits past the congestion threshold (50 ms)."""
-    cpu_sizing_fallback: Optional[str]
-    """Why the server is sized from a fallback CPU count; ``None`` when the OS gave the counts."""
     client_disconnects: int
     """Peer-gone events (reset, aborted, closed mid-IO): the client's doing. One abandoned connection can count more than once (its body read and its response write)."""
     accept_failures: int
@@ -135,12 +151,46 @@ class Metrics:
     """Connections closed because the client sent no first request within the request-head timeout of connecting."""
     request_head_timeouts: int
     """Kept-alive HTTP/1 connections closed because the client sent no next request head within the request-head timeout."""
+    forwarded_for_unreadable: int
+    """``X-Forwarded-For`` headers from a trusted proxy ignored because the entry where the client was looked for is no IP address (the proxy was taken for the client)."""
     quickack_failures: int
     """Connections without TCP_QUICKACK (the delayed-ACK optimization is off there)."""
     defer_accept_failures: int
     """Listeners without TCP_DEFER_ACCEPT (the cold-connect mitigation is off)."""
     nodelay_failures: int
     """Connections without TCP_NODELAY (they keep Nagle's algorithm)."""
+
+@final
+class RunMetrics:
+    """One server run's counts (``Server.metrics()``): what this server did, apart from any other
+    server of the process."""
+
+    cpu_sizing_fallback: Optional[str]
+    """Why the server is sized from a fallback CPU count; ``None`` when the OS gave the counts."""
+    degraded: List[str]
+    """What this server runs without, as ``key: reason``: CPU pinning, a crash-looping process lane,
+    a static mount served uncached; empty while it runs as configured."""
+    dropped_requests: int
+    """Requests the server gave up on without an answer from Python (every refusal): 503
+    overloaded or shutting down, 504 past the request budget, 502 a process-lane worker
+    died, 500 a worker dropped the request."""
+    total_requests: Optional[int]
+    """Requests counted; ``None`` while the run does not count its answers (its ``metrics`` flag is off)."""
+    workers_serving: int
+    """Workers serving now: started, less those that stopped."""
+    workers_died: int
+    """Workers that stopped serving on their own (thread state not bound, engine failed,
+    retired), while the server ran."""
+    process_workers_died: int
+    """``runtime="process"`` worker processes that died (crashed, were killed, timed out) and were replaced."""
+    gc_failures: int
+    """``gc.collect()`` calls that raised or panicked; each retired its worker."""
+    workers_retired: int
+    """Workers retired because their ``gc.collect()`` failed: they take no more requests."""
+    last_worker_retirement: Optional[str]
+    """Why the last worker retired, in its own words; ``None`` while none has."""
+    validation_failures: int
+    """Requests answered 422 because their ``body=`` model or ``query=`` string failed validation."""
     cpu_pin_failures: int
     """Threads that could not be pinned to their core (they run unpinned)."""
     cpu_qos_failures: int
@@ -156,7 +206,7 @@ class Metrics:
     drain_closed_connections: int
     """Connections still open when such a drain gave up (they were closed)."""
     stop_watcher_failures: int
-    """Stop watchers (the thread that stops a TPC run on SIGINT or SIGTERM) that panicked or were still running when their run ended."""
+    """Stop watchers (the thread that stops a server run on SIGINT or SIGTERM) that panicked or were still running when their run ended."""
     blocking_calls_left: int
     """Blocking calls (main-interpreter handlers) still running when their TPC thread's runtime was shut down, and left running."""
 
@@ -167,6 +217,129 @@ def get_gil_metrics() -> Metrics:
 def reset_peaks() -> None:
     """Clear ``gil_wait_peak_us`` and ``gil_hold_peak_us``."""
     ...
+
+@final
+class Flag:
+    """One mipyre setting of the engine's declaration table: its keys on every source, the
+    places code gives it, what its value must be, its default and its help."""
+
+    @property
+    def name(self) -> str: ...
+    @property
+    def cli(self) -> str:
+        """The ``mipyre run`` option, ``--threads``."""
+    @property
+    def env(self) -> str:
+        """The environment variable, ``MIPYRE_THREADS``."""
+    @property
+    def file(self) -> str:
+        """The ``pyproject.toml`` key in its table, ``[tool.mipyre] threads``."""
+    @property
+    def code(self) -> list[str]:
+        """Every place app code gives it, ``run(threads=)``."""
+    @property
+    def shape(self) -> str:
+        """The shape of its value in one word: ``bool``, ``count``, ``positive``,
+        ``duration``, ``positive_duration``, ``port``, ``ports``, ``host``, ``hosts``,
+        ``path``, ``slot_bytes``, ``choice``."""
+    @property
+    def expected(self) -> str:
+        """What its value must be, as an error says it."""
+    @property
+    def default(self) -> str: ...
+    @property
+    def process_wide(self) -> bool:
+        """Whether it is about the whole process (``reload``, ``log``) rather than one server."""
+    @property
+    def doc(self) -> str: ...
+
+def _flags() -> list[Flag]:
+    """Every mipyre setting, in the order ``--help`` and the docs list them."""
+
+@final
+class ConfigError(ValueError):
+    """The configuration cannot be used. ``errors`` holds every reason, one line each, with the
+    source it came from (a flag, a variable, or ``pyproject.toml`` and the line); the message is
+    those lines."""
+
+    def __new__(cls, errors: list[str]) -> ConfigError: ...
+    @property
+    def errors(self) -> list[str]: ...
+
+@final
+class EntryPoint:
+    """Which entry point started this run."""
+
+    Script: EntryPoint
+    CliRun: EntryPoint
+    CliDev: EntryPoint
+    Embedded: EntryPoint
+
+@final
+class ServerFlags:
+    """The flags app code gives one server, each a keyword named as the flag
+    (``ServerFlags(threads=2, port=0)``): the programmatic configuration of
+    ``TestClient(config=)``, ``TestServer(config=)`` and ``MipyreApp.start(config=)``. A
+    deployment value of the same flag wins over it.
+
+    :raises ConfigError: a value of the wrong shape.
+    :raises TypeError: a keyword that is no flag."""
+
+    def __new__(cls, **given: Any) -> ServerFlags: ...
+    def _with(self, **given: Any) -> ServerFlags:
+        """These flags with ``given`` set as well."""
+    def _with_lanes(self, **given: Any) -> ServerFlags:
+        """These flags with the app's ``ProcessLanes`` fields (``given``) as well."""
+    @staticmethod
+    def _from_run(**given: Any) -> ServerFlags:
+        """``run()``'s keywords, each named as ``run(name=)``."""
+
+@final
+class LaneRecipe:
+    """One app's process lanes, their flags settled: what ``mipyre._process_lane.server.start``
+    builds the lanes from."""
+
+    @property
+    def start(self) -> StartStrategy: ...
+    @property
+    def workers(self) -> int: ...
+    @property
+    def timeout_ms(self) -> int: ...
+    @property
+    def queue_per_worker(self) -> int: ...
+    @property
+    def slot_bytes(self) -> int: ...
+    @property
+    def worker_spin_us(self) -> int: ...
+    @property
+    def host_failure(self) -> FailurePolicy: ...
+
+@final
+class Deployment:
+    """What the deployment gave (command line, environment, ``pyproject.toml``), resolved once
+    at an entry point. ``Deployment()`` is none at all, for an embedded engine."""
+
+    def __init__(self) -> None: ...
+    @staticmethod
+    def from_process(flags: dict[str, str], entry: EntryPoint) -> Deployment:
+        """Read this process's environment and the ``pyproject.toml`` in its working directory,
+        once, with ``flags``, the command line's values by flag name as typed.
+
+        :raises ConfigError: every value that cannot be used.
+        :raises ValueError: a name in ``flags`` that is no flag."""
+    @property
+    def entry(self) -> EntryPoint: ...
+    def summary(self) -> list[str]:
+        """One line per value the deployment gave: the flag, the value and where it came from."""
+    def log(self, code: Optional[bool], default: bool) -> bool:
+        """Whether Python logging is on: the deployment's ``log``, else ``code``, else
+        ``default``."""
+    def reload(self, code: Optional[bool]) -> bool:
+        """Whether to reload on file changes: the deployment's ``reload``, else ``code``."""
+    def lanes(self, config: ServerFlags, physical_cores: int) -> LaneRecipe:
+        """The app's process lanes: this deployment laid over ``config`` (with the code's
+        ``ProcessLanes``), workers defaulting to ``physical_cores``."""
+
 
 @final
 class Headers:
@@ -191,11 +364,11 @@ class Headers:
 
 @final
 class BodyStream:
-    """A ``stream=True`` route's request body, read as it arrives (``req.stream``).
+    """A ``body=BodyStream`` route's request body, read as it arrives (``req.stream``).
 
     Iterating yields each chunk as ``bytes``, blocking until it arrives, and stops at the
     body's end. A body the server rejects (larger than ``max_body_size``, too slow, a
-    failed read) raises ``BodyRejected``, and every later read raises it again. Two
+    failed read) raises ``BodyReadError``, and every later read raises it again. Two
     threads reading one stream take chunks one at a time, in order.
     """
 
@@ -210,7 +383,7 @@ class BodyStream:
         """Reads the rest of the body without handing it to Python and returns its size
         in bytes.
 
-        :raises BodyRejected: the server rejected the body.
+        :raises BodyReadError: the server rejected the body.
         :raises RuntimeError: the stream was already read to its end.
         """
         ...
@@ -245,18 +418,20 @@ class Request:
     absolute-form target's authority, else the ``Host`` header; ``None`` with neither."""
     headers: Headers
     client_ip: str | None
-    """The client's IP address; ``None`` for an in-memory connection
-    (``start(transport="memory")``, ``TestClient``'s default), which has no peer address."""
+    """The client's IP address: the connection's peer, or, when the peer is one of the
+    server's ``trusted_proxies``, the address its ``X-Forwarded-For`` names. ``None`` for an
+    in-memory connection (``start(transport="memory")``, ``TestClient``'s default), which has
+    no peer address."""
     request_id: str
-    """The request's correlation id: the client's own (``app.enable_request_id()``)
+    """The request's correlation id: the client's own (``app.enable_request_id_header()``)
     or one the server minted. A 5xx body and the error's log line carry it."""
     body: bytes
     """The whole body, copied into ``bytes``; ``memoryview(req)`` reads it in place. A
-    ``stream=True`` route's body is read through ``stream``: reading it here (or through
+    ``body=BodyStream`` route's body is read through ``stream``: reading it here (or through
     ``text()``, ``json()``, ``memoryview(req)``) raises ``RuntimeError`` (``BufferError``
     for ``memoryview``)."""
     stream: Optional[BodyStream]
-    """The body as it arrives, on a ``stream=True`` route; ``None`` on any other. Taken
+    """The body as it arrives, on a ``body=BodyStream`` route; ``None`` on any other. Taken
     on first access: a second access in the same request raises ``RuntimeError``."""
     query_params: dict[str, str]
     """Query parameters, a new dict on every access. On a duplicate key the FIRST value
@@ -271,16 +446,18 @@ class Request:
     def text(self) -> str:
         """Decode the request body as UTF-8 text.
 
-        Raises ``ValueError`` if the body is not valid UTF-8, and ``RuntimeError`` on
-        a ``stream=True`` route, whose body is read through ``stream``.
+        Raises ``HTTPException(400)`` if the body is not valid UTF-8 (left uncaught, the
+        client gets that 400), and ``RuntimeError`` on a ``body=BodyStream`` route, whose body
+        is read through ``stream``.
         """
         ...
     def json(self) -> Any:
         """Parse the request body as JSON: an integer of any size stays an exact
         ``int``, a float reads back as the value sent.
 
-        :raises ValueError: the body is not well-formed JSON.
-        :raises RuntimeError: on a ``stream=True`` route, whose body is read through
+        :raises HTTPException: 400, the body is not well-formed JSON; left uncaught, the
+            client gets that 400.
+        :raises RuntimeError: on a ``body=BodyStream`` route, whose body is read through
             ``stream``.
         """
         ...
@@ -293,11 +470,11 @@ class Response:
     ``dict`` / ``list`` is JSON, a ``str`` is ``text/plain``, ``bytes`` are
     ``application/octet-stream`` — unless ``content_type`` names one.
 
-    A header value is a ``str``, or a list of ``str`` to send the name on
-    several lines (e.g. ``Set-Cookie``). A ``Content-Type`` or ``Server`` in
-    ``headers`` replaces the default. A non-``str`` value raises
-    ``TypeError`` and an invalid one (CR, LF, NUL) ``ValueError``, naming the
-    header. ``headers`` reads back with lower-case names. A ``status_code``
+    A header value is a ``str``, or a list of them to send the name on
+    several lines; under ``set-cookie`` a value may also be a ``Cookie``. A
+    ``Content-Type`` or ``Server`` in ``headers`` replaces the default. Any
+    other value raises ``TypeError``, an invalid one (CR, LF, NUL) or a
+    ``Cookie`` under another name ``ValueError``, naming the header. ``headers`` reads back with lower-case names. A ``status_code``
     that is not an HTTP status (100-999) raises ``ValueError`` here.
     """
 
@@ -313,8 +490,64 @@ class Response:
         body: object,
         status_code: int = 200,
         content_type: Optional[str] = None,
-        headers: Optional[dict[str, str | list[str]]] = None,
+        headers: Optional[dict[str, str | Cookie | list[str | Cookie]]] = None,
     ) -> Response: ...
+    @staticmethod
+    def _validation_failure(body: object, error_count: int) -> Response:
+        """The 422 for a request that failed validation with ``error_count`` errors: the server
+        counts it in the run that served the request and logs it at most once a minute for it."""
+
+@final
+class SameSite:
+    """Which sites may send a cookie along (the ``SameSite`` attribute)."""
+
+    STRICT: SameSite
+    LAX: SameSite
+    NONE: SameSite
+    """Every site; a ``Cookie`` with it must be ``secure=True``."""
+
+@final
+class Cookie:
+    """One ``Set-Cookie`` line: ``Response(headers={"set-cookie": cookie})``, or a
+    list of them, each sent on its own line.
+
+    Every part is checked when it is made: the name is an RFC 7230 token, the
+    value cookie-octets (optionally in one pair of ``"``), ``path`` / ``domain``
+    free of control characters and ``;``, ``max_age`` an ``int``, ``expires`` an
+    aware ``datetime`` (sent as an HTTP-date in GMT), and ``SameSite.NONE``
+    needs ``secure=True``. A broken rule raises ``ValueError`` naming it.
+    ``samesite=None`` is the default, ``SameSite.LAX``.
+    ``path`` is ``"/"`` unless given; ``path=None`` sends no ``Path``.
+    """
+
+    def __new__(
+        cls,
+        name: str,
+        value: str,
+        *,
+        max_age: Optional[int] = None,
+        expires: Optional[datetime] = None,
+        path: Optional[str] = ...,
+        domain: Optional[str] = None,
+        secure: bool = False,
+        httponly: bool = False,
+        samesite: Optional[SameSite] = None,
+    ) -> Cookie: ...
+    @staticmethod
+    def expired(
+        name: str,
+        *,
+        path: Optional[str] = ...,
+        domain: Optional[str] = None,
+        secure: bool = False,
+        httponly: bool = False,
+        samesite: Optional[SameSite] = None,
+    ) -> Cookie:
+        """The cookie that tells the browser to drop ``name`` (empty value,
+        ``Max-Age=0``). The browser drops only the cookie with the same path and
+        domain, and keeps an ``HttpOnly`` one unless this is ``httponly=True``
+        too: pass the attributes it was set with."""
+        ...
 
 @final
 class WebSocket:
@@ -461,47 +694,6 @@ class SharedState:
     def __repr__(self) -> str: ...
 
 @final
-class Mode:
-    """Where non-``runtime="main"`` handlers run."""
-
-    Gil: Mode
-    """Every handler on the main interpreter."""
-    Subinterp: Mode
-    """Handlers in sub-interpreter workers; ``runtime="main"`` routes on the main interpreter."""
-    @staticmethod
-    def parse(name: str) -> Mode:
-        """``"gil"`` (or ``"default"``) / ``"subinterp"`` (or ``"auto"``); anything else
-        raises ``ValueError``."""
-        ...
-    @property
-    def uses_workers(self) -> bool: ...
-
-@final
-class SizeOrigin:
-    """Where a size given to ``start()`` came from, for the note about a size the server
-    does not use: ``run()``'s argument, a direct ``engine.start()`` argument, or the
-    environment variable of the same name."""
-
-    RunArg: SizeOrigin
-    """``run(workers=)`` / ``run(io_workers=)``."""
-    StartArg: SizeOrigin
-    """``engine.start(workers=)`` / ``engine.start(io_workers=)``."""
-    EnvVar: SizeOrigin
-    """``MIPYRE_WORKERS`` / ``MIPYRE_IO_WORKERS``."""
-
-@final
-class GivenSize:
-    """A count (``workers`` / ``io_workers``) with where it was given: ``GivenSize(4,
-    SizeOrigin.StartArg)``. ``start()`` takes one or none for each count; one below 1 is a
-    ``ValueError`` there (``{name} must be >= 1, got {value}``)."""
-
-    def __new__(cls, value: int, origin: SizeOrigin) -> GivenSize: ...
-    @property
-    def value(self) -> int: ...
-    @property
-    def origin(self) -> SizeOrigin: ...
-
-@final
 class Compression:
     """An app's response-compression settings, validated when made."""
 
@@ -529,33 +721,32 @@ class Compression:
     def brotli_quality(self) -> int: ...
 
 @final
+class RuntimeChoice:
+    """Where the engine runs a route's handler: ``Worker`` (a sub-interpreter), ``Main`` (the
+    main interpreter) or ``Lane`` (a process-lane worker)."""
+
+    Worker: RuntimeChoice
+    Main: RuntimeChoice
+    Lane: RuntimeChoice
+
+@final
 class MipyreApp:
     """The engine app ``Mipyre`` wraps: routes, hooks, limits, and ``start``/``run``.
 
     Route registration raises ``ValueError`` for a bad path, a duplicate route, or
     ``stream=True`` without ``runtime="main"`` or on an ``async def`` handler (a streamed body
-    is fed only to a sync handler on the main interpreter); ``RegistrationSealed`` for a
+    is fed only to a sync handler on the main interpreter); ``LateRegistrationError`` for a
     route other than ``runtime="main"`` registered after the first server started.
     """
 
     def __init__(self) -> None: ...
-    def get(self, path: str, handler: Callable[..., Any], gil: bool = False, process: bool = False) -> None: ...
-    def post(
-        self, path: str, handler: Callable[..., Any], gil: bool = False, stream: bool = False, process: bool = False
-    ) -> None: ...
-    def put(
-        self, path: str, handler: Callable[..., Any], gil: bool = False, stream: bool = False, process: bool = False
-    ) -> None: ...
-    def delete(self, path: str, handler: Callable[..., Any], gil: bool = False) -> None: ...
     def route(
-        self,
-        method: str,
-        path: str,
-        handler: Callable[..., Any],
-        gil: bool = False,
-        stream: bool = False,
-        process: bool = False,
-    ) -> None: ...
+        self, method: str, path: str, handler: Callable[..., Any], runtime: RuntimeChoice, stream: bool = False
+    ) -> bool:
+        """Register ``handler`` for ``method`` ``path`` on ``runtime``, and return whether the
+        engine runs it as an ``async def`` handler (a function, or an object whose ``__call__``
+        is one). :raises TypeError: ``handler`` is not callable."""
+        ...
     def set_interrupt_grace(self, seconds: float) -> None:
         """Seconds an interrupted sync request's worker gets to end it before it is
         abandoned. Default 2. Per app. :raises ValueError: not a valid duration."""
@@ -571,7 +762,7 @@ class MipyreApp:
     def _use_isolation(self) -> None: ...
     def _set_process_lanes(self, lanes: LaneSet) -> None: ...
     def _has_process_routes(self) -> bool: ...
-    def _serve_lane_worker(self, lanes: LaneSet, lane: int, template_pid: int) -> None: ...
+    def _serve_lane_worker(self, lanes: LaneSet, template_pid: int) -> None: ...
     def add_fast_response(
         self,
         method: str,
@@ -586,13 +777,13 @@ class MipyreApp:
         registered."""
         ...
     def before_request(self, handler: Callable[..., Any]) -> None:
-        """:raises RegistrationSealed: registered after the first server started."""
+        """:raises LateRegistrationError: registered after the first server started."""
         ...
     def after_request(self, handler: Callable[..., Any]) -> None:
-        """:raises RegistrationSealed: registered after the first server started."""
+        """:raises LateRegistrationError: registered after the first server started."""
         ...
     def fallback(self, handler: Callable[..., Any]) -> None:
-        """:raises RegistrationSealed: registered after the first server started."""
+        """:raises LateRegistrationError: registered after the first server started."""
         ...
     def websocket(self, path: str, handler: Callable[..., Any]) -> None:
         """:raises ValueError: a handler is already registered for ``path``, or ``path`` is
@@ -654,7 +845,7 @@ class MipyreApp:
         ...
     def set_cors_config(
         self,
-        origin: str,
+        origins: list[str],
         methods: str,
         headers: str,
         expose_headers: Optional[str] = None,
@@ -664,14 +855,15 @@ class MipyreApp:
         """Apply these CORS headers to every response, and answer a preflight
         (``OPTIONS`` with ``Access-Control-Request-Method``) to a path with no
         ``OPTIONS`` route 204, with ``Access-Control-Max-Age: max_age`` when given.
-        ``origin`` is one origin, ``*``, or several separated by commas; with several,
-        a response names the request's ``Origin`` when it is one of them (and none
-        when it is not), with ``Vary: Origin``.
+        Each of ``origins`` is ``http[s]://host[:port]`` or ``*`` (any origin); an
+        origin is kept as a browser writes it (lower case, no default port). With
+        several, a response names the request's ``Origin`` when it is one of them
+        (and none when it is not), with ``Vary: Origin``.
 
         :raises ValueError: a value is not a valid header value (e.g. contains
-            a newline), ``origin`` names no origin or lists an empty one, or
-            ``origin`` lists ``*`` with ``allow_credentials``.
-        :raises RegistrationSealed: called after ``app.run()`` started.
+            a newline), ``origins`` is empty or has an entry that is not an origin,
+            or ``origins`` lists ``*`` with ``allow_credentials``.
+        :raises LateRegistrationError: called after ``app.run()`` started.
         """
         ...
     def enable_request_logging(self, enabled: bool) -> None: ...
@@ -682,10 +874,16 @@ class MipyreApp:
         ``always_status`` always log. ``ValueError`` for ``sample_n < 1`` or an
         ``always_status`` that isn't an HTTP status (100-999)."""
         ...
+    def enable_metrics(self, path: str) -> None:
+        """Serve each run's metrics page at ``GET path`` and count every answer.
+        ``ValueError`` when enabled before at another path; ``LateRegistrationError``
+        after the first server started."""
+        ...
     def set_request_id_header(self, header: str) -> None:
         """Take ``req.request_id`` from the client's ``header`` when it sends a
-        usable one (visible ASCII, at most 128 bytes); otherwise the server
-        mints one. ``ValueError`` for an invalid header name."""
+        usable one; otherwise the server mints one. Every response carries it
+        in ``header``. ``ValueError`` for an invalid header name, or for a
+        second call naming another header."""
         ...
     def enable_grpc_benchmark(self) -> None:
         """Answer ``POST /benchmark.BenchmarkService/GetSum`` (``application/grpc*``)
@@ -702,53 +900,61 @@ class MipyreApp:
         ``__main__.__file__`` (the CLI sets it to the app's module)."""
         ...
         ...
+    def _add_home_module(self, globals: dict[str, Any]) -> None:
+        """Record a module whose code makes this app's ``PgPool`` handles, by its globals."""
     def _take_abandoned_workers(self) -> List[AbandonedWorker]:
         """The worker threads this app's servers abandoned at shutdown (still
         running past the grace period); taking them clears the list."""
         ...
     def start(
         self,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        workers: Optional[GivenSize] = None,
-        mode: Union[Mode, str, None] = None,
-        io_workers: Optional[GivenSize] = None,
-        tls_cert: Optional[str] = None,
-        tls_key: Optional[str] = None,
-        extra_tls_ports: Optional[List[int]] = None,
-        extra_plain_ports: Optional[List[int]] = None,
+        deployment: Optional[Deployment] = None,
+        config: Optional[ServerFlags] = None,
         transport: Optional[Literal["tcp", "memory"]] = None,
+        command_line: Optional[CommandLine] = None,
     ) -> Server:
         """Prepare one server of this app and bind its listeners; ``Server.serve()`` runs
-        it. ``mode`` defaults to ``Mode.Gil``.
+        it. It runs sub-interpreter workers exactly when a route runs on one
+        (``RuntimeChoice.Worker``).
+
+        Its flags are ``deployment`` (what an entry point read: ``Deployment.from_process``;
+        none by default) laid over ``config`` (what the code gives: ``ServerFlags(...)``;
+        nothing by default): a value the deployment gives wins, and a server started from an
+        entry point prints each given value with where it came from, and the code value it
+        replaced. Values that cannot go together (a TLS certificate without its key, a port
+        given twice) raise ``ConfigError`` before anything starts.
 
         ``transport="memory"`` binds no socket: the server takes only the connections its
-        ``Server.connect()`` makes, served from the accept loop on as TCP ones are; giving
-        it ``host``, ``port``, TLS or extra ports raises ``ValueError`` naming them.
+        ``Server.connect()`` makes, served from the accept loop on as TCP ones are; a host,
+        port, TLS, extra ports, ``allowed_hosts`` or ``trusted_proxies`` among its flags
+        raises ``ValueError`` naming them, and it checks no request's host.
+
+        ``allowed_hosts`` are the DNS names a request's ``Host`` may be besides
+        ``localhost`` and IP addresses, which are always served; a request to any other
+        name is answered ``421`` (this stops DNS rebinding). Not given serves those two
+        only, ``["*"]`` any host (a reverse proxy in front checks it). A name with a
+        scheme, port or path, or ``"*"`` beside names, raises ``ValueError``.
+
+        ``trusted_proxies`` are IP addresses and CIDR blocks (``"10.0.0.0/8"``) of the
+        reverse proxies in front: a request whose peer is one of them has ``client_ip`` from
+        ``X-Forwarded-For``, read from the right past every trusted proxy; anyone else's
+        header is ignored. ``None`` trusts none. An entry that is neither raises
+        ``ValueError`` naming it.
 
         ``host`` is an IP address (``"127.0.0.1"``, ``"::1"``, ``"[::1]"``); anything
-        else raises ``ValueError`` naming it. ``workers`` / ``io_workers`` below 1 raise
-        ``ValueError`` (``workers must be >= 1, got 0``).
+        else raises ``ValueError`` naming it.
 
-        Which server runs decides which size it uses. A size it does not use is ignored
-        (not an error: one script can run under several ``MIPYRE_TPC`` /
-        ``MIPYRE_RUNTIME`` settings), and a ``Note:`` line on stdout says which size,
-        where it was given (the ``origin`` of ``workers`` / ``io_workers``), and why it is
+        Which server runs decides which size it uses. A size it does not use is ignored,
+        and a ``Note:`` line on stdout says which size, where it was given, and why it is
         not used:
 
-        - thread-per-core (the default): ``workers`` TPC threads (default: physical
-          cores); ``io_workers`` is not used, each TPC thread does its own IO.
-        - ``MIPYRE_TPC=0``, ``Mode.Subinterp``: ``workers`` pool sub-interpreters and
-          ``io_workers`` Tokio IO threads (both default: logical CPUs). An app none of
-          whose routes runs on a sub-interpreter starts no workers, so ``workers`` is not
-          used.
-        - ``MIPYRE_TPC=0``, ``Mode.Gil``: ``io_workers`` Tokio IO threads; ``workers``
-          is not used, every handler runs on the main interpreter.
-
-        The engine's environment variables (``MIPYRE_TPC``,
-        ``MIPYRE_GC_*``, ``MIPYRE_GIL_BRIDGE_*``, ``MIPYRE_ASYNC_QUEUE_CAPACITY``,
-        ``MIPYRE_METRICS``, ``MIPYRE_TPC_DARWIN``) are parsed once here; an invalid mode or value raises
-        ``ValueError`` before anything starts.
+        - thread-per-core (the default): ``threads`` TPC threads (default: physical
+          cores), each with its own sub-interpreter when a route runs on one;
+          ``subinterpreters`` is not used.
+        - ``tpc`` off with a route on a sub-interpreter: ``threads`` Tokio IO threads
+          and ``subinterpreters`` pool sub-interpreters (both default: logical CPUs).
+        - ``tpc`` off with none: ``threads`` Tokio IO threads; ``subinterpreters`` is
+          not used, no sub-interpreter worker starts.
 
         With ``extra_tls_ports``, ``port`` serves plain HTTP and each extra port serves
         TLS (``tls_cert``/``tls_key`` required); without them ``port`` serves TLS when a
@@ -757,19 +963,10 @@ class MipyreApp:
         starts: a port another server listens on (in this process or another, with or
         without ``SO_REUSEPORT``) raises ``OSError`` (``errno.EADDRINUSE``)."""
         ...
-    def run(
-        self,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        workers: Optional[int] = None,
-        mode: Union[Mode, str, None] = None,
-        io_workers: Optional[int] = None,
-        tls_cert: Optional[str] = None,
-        tls_key: Optional[str] = None,
-        extra_tls_ports: Optional[List[int]] = None,
-        extra_plain_ports: Optional[List[int]] = None,
-    ) -> None:
-        """``start(...).serve()``: bind, then serve until SIGINT."""
+    def run(self, **given: Any) -> None:
+        """``start(...).serve()`` from a script: this process's deployment laid over
+        ``given``, ``run()``'s keywords (``host``, ``port``, ``threads``, ...). Bind, then
+        serve until SIGINT."""
         ...
     # Feature-gated: present only in an engine built with
     # `maturin develop --release --features bench` (absent from the default build and
@@ -875,9 +1072,10 @@ def _in_worker() -> bool:
     """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
     ...
 
-def _owned_interpreters_at_exit() -> int:
-    """Wait up to the time a stopped worker thread needs to end its interpreter, and return
-    how many sub-interpreters threads still own then (GIL released while waiting)."""
+def _interpreters_running_python_at_exit() -> int:
+    """Return how many threads that own a sub-interpreter run Python; when none does, wait
+    without a deadline until every one has ended its interpreter (0) or one enters Python
+    (GIL released while waiting)."""
     ...
 
 def _mimalloc_purge_delay() -> int:
@@ -904,35 +1102,94 @@ class Server:
         :raises OSError: the socket pair could not be made.
         :raises RuntimeError: the server listens on sockets."""
         ...
-    def serve(self) -> None:
+    def serve(self, on_serving: Optional[Callable[[], object]] = None) -> None:
         """Serve until SIGINT or ``shutdown()``, blocking this thread; then drain the
-        in-flight connections and return. A server stopped before it served returns at
-        once. :raises RuntimeError: it has already served."""
+        in-flight connections and return. ``on_serving`` is called once on this thread when
+        the server serves (its workers are up, connections are taken next); if it raises,
+        the server stops and ``serve()`` raises that. A server stopped before it served
+        returns at once without calling it. :raises RuntimeError: it has already served."""
         ...
     def shutdown(self) -> None:
         """Stop this server as SIGINT does. Callable from any thread, before or during
         ``serve()``; idempotent. Other servers of the same app keep serving."""
         ...
+    def metrics(self) -> RunMetrics:
+        """This server's counts so far, apart from any other server of the process."""
+        ...
 
-class NoWorkerScript(RuntimeError):
-    """A server with sub-interpreter workers could not start: the workers rebuild the app
-    by executing its script, and ``__main__`` has no ``__file__`` (``python -c``, the
-    interactive interpreter, a host embedding Python) while no script was named. Start the
-    app from a file, or create it with ``Mipyre(runtime='main')``."""
+class DeclarationError(Exception):
+    """What the app declares cannot be served: the server does not start (or the call
+    refuses), and the app's code has to change. ``except DeclarationError`` catches the
+    whole family."""
 
-class RegistrationSealed(ValueError):
+class MissingAppFileError(DeclarationError):
+    """The app has no source file, and what it was asked to do needs one: sub-interpreter
+    workers rebuild the app by executing it, and ``run(reload=True)`` watches its directory.
+    ``__main__`` has no ``__file__`` (``python -c``, the interactive interpreter, a host
+    embedding Python) while no file was named. Start the app from a file, or create it with
+    ``Mipyre(runtime='main')``."""
+
+class LateRegistrationError(DeclarationError):
     """A route (other than ``runtime="main"``), hook or fallback registered after the app's
     registrations were sealed (the first server's start). Workers rebuild the app by
     running its script, so they would never see it."""
 
-class BodyRejected(OSError):
+class BodyReadError(OSError):
     """A streamed request body (``req.stream``) was rejected as a buffered one would be:
     larger than ``max_body_size``, too slow, or a failed read. Left uncaught, the request
     gets the buffered body's 413 / 408 / 400."""
 
+def encode_json(value: Any) -> bytes:
+    """Return ``value`` encoded as JSON, exactly as a handler's returned ``dict`` or ``list`` is.
+
+    Sets and frozensets become lists, ``UUID`` and ``Decimal`` strings, dates and datetimes
+    ISO 8601 strings, and a non-finite float ``null``.
+
+    An integer of any width is written in full, as ``json.dumps`` writes it.
+
+    :raises TypeError: for a value it cannot encode: another type (``bytes`` among them) or a
+        non-``str`` dict key.
+    :raises ValueError: as ``json.dumps`` does, for an integer with more digits than
+        ``sys.get_int_max_str_digits()`` allows.
+    """
+    ...
+
+@disjoint_base
+class HTTPException(Exception):
+    """A failure whose raiser chose what the other side is told. Raised (or let through) by
+    a handler, a hook, an ``async def`` handler or a process-lane worker, the request is
+    answered ``status_code``, with ``headers`` and the JSON body ``{"detail": detail}``,
+    and logged at debug with no traceback. The FastAPI signature and attribute names.
+
+    :param status_code: 400..=599; any other raises ``ValueError``.
+    :param detail: any JSON-encodable value; ``None`` is the status's standard phrase
+        (``http.HTTPStatus(status_code).phrase``), or stays ``None`` for a status that has
+        none. A detail that is not JSON is the raiser's bug: a generic 500, logged with
+        the traceback.
+    :param headers: response headers; a name that is not a token or a value with CR, LF
+        or NUL raises ``ValueError``.
+    """
+
+    def __init__(self, status_code: int, detail: Any = None, headers: Optional[Dict[str, str]] = None) -> None: ...
+    @property
+    def status_code(self) -> int: ...
+    @property
+    def detail(self) -> Any: ...
+    @property
+    def headers(self) -> Dict[str, str]:
+        """A new dict on every read."""
+        ...
+
 def _route_params(path: str) -> List[str]:
     """The parameter names of a route path, in order (``{*rest}`` gives ``rest``).
     ``ValueError`` for a ``:name`` segment, which the router would take literally."""
+    ...
+
+
+def _is_async_handler(handler: object) -> bool:
+    """Whether calling ``handler`` gives an awaitable, which sends its route to the async
+    workers: a coroutine function, or an object whose ``__call__`` is one. The engine's only
+    rule for it."""
     ...
 
 
@@ -967,23 +1224,16 @@ class _AsyncJob:
     def route(self) -> int: ...
     @property
     def request(self) -> Request: ...
-class _WorkerHooks:
-    @property
-    def before(self) -> List[Callable[..., Any]]: ...
-    @property
-    def after(self) -> List[Callable[..., Any]]: ...
 def _worker_recv(inbox: _AsyncInbox) -> Optional[_AsyncJob]: ...
 def _worker_close(inbox: _AsyncInbox) -> None: ...
 def _worker_send(job: _AsyncJob, response: Any) -> None: ...
 def _worker_fail(job: _AsyncJob, exception: BaseException) -> None: ...
 def _worker_timed_out(job: _AsyncJob) -> None: ...
 def _worker_to_response(value: Any) -> Response: ...
-def _worker_app_handlers() -> List[Optional[Callable[..., Any]]]: ...
-def _worker_app_hooks() -> _WorkerHooks: ...
 
-def _note_isolated(lib: str, bytes: int) -> None:
-    """Records a library a worker isolated, once per process, and announces it at once if the
-    startup line is already out."""
+def _note_isolated(lib: str, bytes: int, why: str) -> None:
+    """Records a library a worker isolated and why, once per process, and announces it at once if
+    the startup line is already out."""
     ...
 
 def _physical_cores() -> int:
@@ -1016,8 +1266,45 @@ class StartStrategy:
         ...
 
 @final
+class FailurePolicy:
+    """What a lost lane or a failed host does to the server run: ``Isolate`` (it is taken out,
+    and the server ends once no lane is left) or ``Exit`` (the server ends at the first one)."""
+
+    Isolate: FailurePolicy
+    Exit: FailurePolicy
+    @staticmethod
+    def parse(text: str) -> FailurePolicy:
+        """``"isolate"`` or ``"exit"``. :raises ValueError: anything else."""
+        ...
+    @property
+    def name(self) -> str:
+        """``"isolate"`` or ``"exit"``."""
+        ...
+
+@final
+class CommandLine:
+    """The app's part of the command line, as the entry parsed it: every interpreter's
+    ``sys.argv`` and each declared flag as ``(kind, choices, default, value)``. ``parsed`` is
+    false when nothing parsed one and the run gives an unparsed flag no value (a script that never
+    called ``flags.parse()``: ``flags`` then holds only overridden values); a test process's run is
+    the empty command line parsed."""
+
+    def __new__(
+        cls, argv: List[str], flags: Dict[str, Tuple[str, Optional[List[str]], Any, Any]], parsed: bool
+    ) -> CommandLine: ...
+    @property
+    def argv(self) -> List[str]: ...
+    @property
+    def parsed(self) -> bool: ...
+    def flag(self, name: str) -> Optional[Tuple[str, Optional[List[str]], Any, Any]]: ...
+    def encode(self) -> str: ...
+    @staticmethod
+    def decode(text: str) -> CommandLine: ...
+    def __eq__(self, value: object, /) -> bool: ...
+
+@final
 class LaneSet:
-    """The process lanes of an app: the server's, or the template's view of them."""
+    """The process lanes of an app: the server's, or one worker's lane."""
 
     def __new__(
         cls,
@@ -1027,21 +1314,19 @@ class LaneSet:
         timeout_ms: int = 30000,
         queue_per_worker: int = 128,
         server_spin_us: int = 20,
-        exit_on_failure: bool = False,
+        on_failure: FailurePolicy = ...,
     ) -> LaneSet: ...
     @staticmethod
-    def _attach(workers: int, depth: int, slot_bytes: int, worker_spin_us: int, fds: List[int]) -> LaneSet: ...
+    def _attach(lane: int, attempt: int, depth: int, slot_bytes: int, worker_spin_us: int, shm_fd: int, bell_fd: int) -> LaneSet: ...
     def _setup_template(self, message: bytes) -> None: ...
+    def _template_run(self, command_line: CommandLine) -> None: ...
     @property
     def workers(self) -> int: ...
     @property
     def template_pid(self) -> Optional[int]: ...
     def worker_pids(self) -> List[Optional[int]]: ...
-    def check_lane(self, lane: int) -> None:
-        """:raises IndexError: ``lane`` is not one of these lanes."""
-        ...
     def _attach_template(self, pid: int, fd: int) -> None: ...
-    def _report_start_failure(self, lane: int, text: str) -> None: ...
+    def _report_start_failure(self, text: str) -> None: ...
     def stats(self) -> Dict[str, Any]: ...
 
 BUILD_ID: str
@@ -1054,6 +1339,11 @@ def _driver_start_template(
     python: str, module: str, args: List[str], keep_fds: List[int], env: List[Tuple[str, str]]
 ) -> int:
     """Starts the template; 0 in a forked child (the caller becomes the template)."""
+    ...
+def _driver_spawn_template(
+    python: str, module: str, args: List[str], keep_fds: List[int], env: List[Tuple[str, str]]
+) -> int:
+    """Starts the template in a new interpreter on every platform; returns its pid."""
     ...
 def _driver_start_import_worker(
     python: str, module: str, args: List[str], keep_fds: List[int], env: List[Tuple[str, str]]

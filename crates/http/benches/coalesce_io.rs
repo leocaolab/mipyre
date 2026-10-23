@@ -21,10 +21,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use mimalloc::MiMalloc;
 use mipyre_http::io::coalesce::{coalesce, CoalescedPoll, CoalescingIo};
 use mipyre_microbench::{calls, AllocationCounter, ALLOCATIONS};
 use mipyre_transport::stream::stall::WriteStall;
-use mimalloc::MiMalloc;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Counts over mimalloc, the allocator the server runs on, so a time per allocation here is the
@@ -44,11 +44,7 @@ struct ScriptIo {
 }
 
 impl AsyncRead for ScriptIo {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         if !self.script.is_empty() {
             let n = self.script.len().min(buf.remaining());
             buf.put_slice(&self.script[..n]);
@@ -63,11 +59,7 @@ impl AsyncRead for ScriptIo {
 }
 
 impl AsyncWrite for ScriptIo {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.writes.fetch_add(1, Ordering::Relaxed);
         if self.full {
             Poll::Pending
@@ -157,10 +149,7 @@ fn h2_round(io: &mut CoalescingIo<ScriptIo>, cx: &mut Context<'_>) {
     let read = Pin::new(&mut *io).poll_read(cx, &mut buf);
     assert!(matches!(read, Poll::Ready(Ok(()))), "read: {read:?}");
     let written = Pin::new(io).poll_write(cx, &space);
-    assert!(
-        matches!(written, Poll::Ready(Ok(64))),
-        "written: {written:?}"
-    );
+    assert!(matches!(written, Poll::Ready(Ok(64))), "written: {written:?}");
 }
 
 static BODY: [u8; 18 * 1024] = [b'b'; 18 * 1024];
@@ -170,15 +159,9 @@ fn response_18k(io: &mut CoalescingIo<ScriptIo>, cx: &mut Context<'_>) {
     let head = pinned.as_mut().poll_write(cx, &[b'h'; 200]);
     assert!(matches!(head, Poll::Ready(Ok(200))), "head: {head:?}");
     let body = pinned.as_mut().poll_write(cx, &BODY);
-    assert!(
-        matches!(body, Poll::Ready(Ok(n)) if n == BODY.len()),
-        "body: {body:?}"
-    );
+    assert!(matches!(body, Poll::Ready(Ok(n)) if n == BODY.len()), "body: {body:?}");
     let flushed = pinned.poll_flush(cx);
-    assert!(
-        matches!(flushed, Poll::Ready(Ok(()))),
-        "flushed: {flushed:?}"
-    );
+    assert!(matches!(flushed, Poll::Ready(Ok(()))), "flushed: {flushed:?}");
 }
 
 fn script(full: bool, script: &'static [u8], chunk: usize) -> (ScriptIo, Arc<AtomicUsize>) {
@@ -221,11 +204,7 @@ struct BurstReader {
 }
 
 impl AsyncWrite for BurstReader {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.refuse = !self.refuse;
         if self.refuse {
             Poll::Pending
@@ -242,10 +221,7 @@ impl AsyncWrite for BurstReader {
 }
 
 fn stall_cycle(n: u64) {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-    {
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_time().build() {
         Ok(rt) => rt,
         Err(e) => panic!("no runtime for the bench: {e}"),
     };

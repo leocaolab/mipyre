@@ -1,7 +1,7 @@
-//! The Loom model of a [`Budget`] (`cache.rs`): reservations, commits and releases from two
+//! The Loom model of a [`CacheBudget`] (`cache.rs`): reservations, commits and releases from two
 //! threads against one cap, over every interleaving, running the budget's own code (its counter
 //! is Loom's here, `crate::sync`). Run with
-//! `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_http --lib --release --target-dir target/loom loom`.
+//! `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_http --lib --profile model --target-dir target/loom loom`.
 //!
 //! It proves: what the budget holds never passes its cap, at any step either thread can see;
 //! of two reservations that each fit alone but not together, exactly one is had (a refused one
@@ -12,24 +12,27 @@ use std::sync::Arc;
 
 use loom::thread;
 
-use super::Budget;
+use super::CacheBudget;
 
 const CAP: u64 = 10;
 
 /// Reserves `len` and keeps it (commits), or reports the refusal; checks the cap on the way.
-fn keep(budget: &Budget, len: u64) -> bool {
+fn keep(budget: &CacheBudget, len: u64) -> bool {
     let Some(reservation) = budget.reserve(len) else {
-        assert!(budget.held() <= CAP, "a refused reservation saw the budget past its cap");
+        assert!(
+            budget.held() <= CAP,
+            "a refused reservation saw the budget past its cap"
+        );
         return false;
     };
     assert!(budget.held() <= CAP, "a reservation took the budget past its cap");
-    reservation.commit(None);
+    reservation.commit();
     true
 }
 
 /// Both threads keep `(one, two)` bytes; returns which were had, and what is held after both.
 fn race(one: u64, two: u64) -> (bool, bool, u64) {
-    let budget = Arc::new(Budget::new(CAP));
+    let budget = Arc::new(CacheBudget::new(CAP));
     let other = Arc::clone(&budget);
     let second = thread::spawn(move || keep(&other, two));
     let first = keep(&budget, one);
@@ -60,8 +63,8 @@ fn of_two_reservations_that_fit_only_alone_exactly_one_is_had() {
 #[test]
 fn a_release_racing_a_reservation_leaves_what_was_kept() {
     loom::model(|| {
-        let budget = Arc::new(Budget::new(CAP));
-        budget.reserve(8).expect("8 of 10").commit(None);
+        let budget = Arc::new(CacheBudget::new(CAP));
+        budget.reserve(8).expect("8 of 10").commit();
         let other = Arc::clone(&budget);
         let releasing = thread::spawn(move || {
             other.release(8);
@@ -77,7 +80,7 @@ fn a_release_racing_a_reservation_leaves_what_was_kept() {
 #[test]
 fn reservations_dropped_uncommitted_hand_every_byte_back() {
     loom::model(|| {
-        let budget = Arc::new(Budget::new(CAP));
+        let budget = Arc::new(CacheBudget::new(CAP));
         let other = Arc::clone(&budget);
         let second = thread::spawn(move || drop(other.reserve(7)));
         drop(budget.reserve(7));

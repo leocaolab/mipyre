@@ -114,7 +114,7 @@ def test_a_tpc_thread_abandoned_past_the_join_deadline_exits_without_finalizing(
         if proc.poll() is None:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     log = read()
-    # The stop went down the abandoned path: the run raised WorkersAbandoned, naming the TPC
+    # The stop went down the abandoned path: the run raised AbandonedWorkersError, naming the TPC
     # thread, and `run()` exited through `os._exit` (no finalization, no abort).
     assert rc == 1, log[-3000:]
     assert "exiting without finalization" in log, log[-3000:]

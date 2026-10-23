@@ -1,6 +1,6 @@
 //! The ways a TPC run fails, and the exception each one raises.
 
-use mipyre_tpc::{SpawnError, StopWatcherError};
+use mipyre_tpc::SpawnError;
 use mipyre_transport::driver::AcceptError;
 use mipyre_transport::tcp::listener::ListenerError;
 
@@ -18,8 +18,6 @@ pub(crate) enum ServeError {
     },
     #[error(transparent)]
     NotSpawned(#[from] SpawnError),
-    #[error(transparent)]
-    StopWatcher(#[from] StopWatcherError),
     #[error(transparent)]
     NotListening(#[from] ListenerError),
     /// Every thread creates its own worker, and one failure aborts them all ([`StartGate`]).
@@ -54,7 +52,6 @@ impl ServeError {
             ServeError::ThreadPanicked { .. }
             | ServeError::RuntimeNotBuilt { .. }
             | ServeError::NotSpawned(_)
-            | ServeError::StopWatcher(_)
             | ServeError::FailedWhileStopping { .. }
             | ServeError::NotListening(_)
             | ServeError::Start(_)
@@ -74,19 +71,16 @@ impl ServeError {
             failed @ (ServeError::ThreadPanicked { .. }
             | ServeError::RuntimeNotBuilt { .. }
             | ServeError::NotSpawned(_)
-            | ServeError::StopWatcher(_)
             | ServeError::FailedWhileStopping { .. }) => pyo3::exceptions::PyRuntimeError::new_err(failed.to_string()),
             ServeError::NotListening(e) => crate::serve::listener::listener_error(e),
             ServeError::Start(e) => e.into_pyerr(py),
             ServeError::AcceptStopped(e) => crate::serve::listener::accept_stopped_error(&e),
-            failed @ ServeError::LaneHost(_) => {
+            failed @ ServeError::LaneHost(_) => pyo3::exceptions::PyRuntimeError::new_err(failed.to_string()),
+            #[cfg(target_os = "macos")]
+            failed @ ServeError::WorkerInboxClosed { .. } => {
                 pyo3::exceptions::PyRuntimeError::new_err(failed.to_string())
             }
-            #[cfg(target_os = "macos")]
-            failed @ ServeError::WorkerInboxClosed { .. } => pyo3::exceptions::PyRuntimeError::new_err(failed.to_string()),
-            ServeError::ThreadsStopped {
-                root: Some(root), ..
-            } => root.into_pyerr(py),
+            ServeError::ThreadsStopped { root: Some(root), .. } => root.into_pyerr(py),
             failed @ ServeError::ThreadsStopped { root: None, .. } => {
                 pyo3::exceptions::PyRuntimeError::new_err(failed.to_string())
             }
@@ -109,15 +103,24 @@ mod tests {
         let io_error = || io::Error::from_raw_os_error(libc::EAGAIN);
         let t = || "mipyre-tpc-0".to_string();
         let runtime_errors = [
-            ServeError::NotSpawned(SpawnError { thread: t(), source: io_error() }),
-            ServeError::RuntimeNotBuilt { thread: t(), source: io_error() },
-            ServeError::StopWatcher(StopWatcherError::RuntimeNotBuilt { thread: t(), source: io_error() }),
-            ServeError::StopWatcher(StopWatcherError::NotArmed { thread: t(), source: io_error() }),
-            ServeError::StopWatcher(StopWatcherError::NotSpawned { thread: t(), source: io_error() }),
-            ServeError::ThreadPanicked { thread: t(), message: "boom".into() },
+            ServeError::NotSpawned(SpawnError {
+                thread: t(),
+                source: io_error(),
+            }),
+            ServeError::RuntimeNotBuilt {
+                thread: t(),
+                source: io_error(),
+            },
+            ServeError::ThreadPanicked {
+                thread: t(),
+                message: "boom".into(),
+            },
             ServeError::FailedWhileStopping { threads: vec![t()] },
             ServeError::LaneHost(io_error()),
-            ServeError::ThreadsStopped { root: None, abandoned: vec![t()] },
+            ServeError::ThreadsStopped {
+                root: None,
+                abandoned: vec![t()],
+            },
         ];
         let os_errors = [
             ServeError::NotListening(ListenerError {

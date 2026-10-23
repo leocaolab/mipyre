@@ -34,4 +34,4 @@ def new_event_loop(req):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, workers=1)
+    app.run(host="127.0.0.1", port=0, threads=1)

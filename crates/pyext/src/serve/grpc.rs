@@ -22,8 +22,8 @@ use hyper::header::{HeaderValue, InvalidHeaderValue};
 use hyper::{HeaderMap, Request, Response};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
-use mipyre_http::plan::limits::Limits;
 use mipyre_http::io::body::{read_body, BodyReadError, ResponseBody};
+use mipyre_http::plan::limits::Limits;
 
 /// The canonical gRPC status codes this server emits
 /// (<https://grpc.github.io/grpc/core/md_doc_statuscodes.html>).
@@ -118,14 +118,13 @@ pub(crate) async fn handle_get_sum(
 /// multi-GB body behind an `application/grpc` content-type from exhausting memory, and the time
 /// budget keeps a stalled one from holding the connection.
 async fn read_message(body: Incoming, limits: &Limits) -> Result<Bytes, GrpcError> {
-    let limit = limits.max_body.as_usize();
-    let collected = read_body(body, limit, || limits.body_time())
-        .await
-        .map_err(|reject| match reject {
-            BodyReadError::TooLarge => GrpcError::BodyTooLarge { limit },
-            BodyReadError::TimedOut(budget) => GrpcError::BodyTimedOut(budget),
-            BodyReadError::ConnectionLost(e) => GrpcError::ConnectionLost(e),
-        })?;
+    let collected = read_body(body, limits).await.map_err(|reject| match reject {
+        BodyReadError::TooLarge => GrpcError::BodyTooLarge {
+            limit: limits.max_body.as_usize(),
+        },
+        BodyReadError::TimedOut(budget) => GrpcError::BodyTimedOut(budget),
+        BodyReadError::ConnectionLost(e) => GrpcError::ConnectionLost(e),
+    })?;
     unframe(collected)
 }
 
@@ -233,11 +232,7 @@ fn grpc_message_value(message: &str) -> Result<HeaderValue, InvalidHeaderValue> 
     HeaderValue::try_from(utf8_percent_encode(message, GRPC_MESSAGE_ENCODE).to_string())
 }
 
-fn grpc_reply(
-    data: Option<Bytes>,
-    status: GrpcStatus,
-    message: Option<&str>,
-) -> Response<ResponseBody> {
+fn grpc_reply(data: Option<Bytes>, status: GrpcStatus, message: Option<&str>) -> Response<ResponseBody> {
     let mut trailers = HeaderMap::new();
     trailers.insert("grpc-status", status.header_value());
     // Percent-encoding leaves only printable ASCII, so the Err arm is unreachable in
@@ -260,7 +255,7 @@ fn grpc_reply(
         data_frame
             .into_iter()
             .chain(std::iter::once(trailer_frame))
-            .map(Ok::<_, hyper::Error>),
+            .map(Ok::<_, std::convert::Infallible>),
     ));
     let boxed = ResponseBody::boxed(body);
 
@@ -335,13 +330,7 @@ mod tests {
     }
 
     async fn trailers(resp: Response<ResponseBody>) -> HeaderMap {
-        resp.into_body()
-            .collect()
-            .await
-            .unwrap()
-            .trailers()
-            .cloned()
-            .unwrap()
+        resp.into_body().collect().await.unwrap().trailers().cloned().unwrap()
     }
 
     #[test]
@@ -362,17 +351,11 @@ mod tests {
     fn group_and_invalid_wire_types_are_errors() {
         assert_eq!(
             decode_sum_request(&[0x1b]),
-            Err(DecodeError::UnsupportedWireType {
-                field: 3,
-                wire_type: 3
-            })
+            Err(DecodeError::UnsupportedWireType { field: 3, wire_type: 3 })
         );
         assert_eq!(
             decode_sum_request(&[0x1e]),
-            Err(DecodeError::UnsupportedWireType {
-                field: 3,
-                wire_type: 6
-            })
+            Err(DecodeError::UnsupportedWireType { field: 3, wire_type: 6 })
         );
     }
 
@@ -410,14 +393,9 @@ mod tests {
             .block_on(async {
                 use tokio::io::AsyncWriteExt;
                 let (mut client, server) = tokio::io::duplex(64);
-                client
-                    .write_all(b"\x00\x01 not http\r\n\r\n")
-                    .await
-                    .unwrap();
+                client.write_all(b"\x00\x01 not http\r\n\r\n").await.unwrap();
                 let svc = hyper::service::service_fn(|_req| async {
-                    Ok::<_, std::convert::Infallible>(hyper::Response::new(
-                        http_body_util::Empty::<Bytes>::new(),
-                    ))
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Empty::<Bytes>::new()))
                 });
                 hyper::server::conn::http1::Builder::new()
                     .serve_connection(hyper_util::rt::TokioIo::new(server), svc)
@@ -437,10 +415,7 @@ mod tests {
     #[test]
     fn frame_errors_say_what_was_wrong() {
         let e = unframe(Bytes::from_static(&[0, 0, 0, 0, 9, 1])).unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            "frame declares a 9-byte message but carries 1 bytes"
-        );
+        assert_eq!(e.to_string(), "frame declares a 9-byte message but carries 1 bytes");
         assert_eq!(e.status(), GrpcStatus::Internal);
         let e = unframe(Bytes::from_static(&[1, 0, 0, 0, 0])).unwrap_err();
         assert_eq!(e.status(), GrpcStatus::Unimplemented);
@@ -449,13 +424,7 @@ mod tests {
     #[test]
     fn bytes_after_the_message_are_an_error() {
         let e = unframe(Bytes::from_static(&[0, 0, 0, 0, 2, 8, 1, 0xff])).unwrap_err();
-        assert!(matches!(
-            e,
-            GrpcError::TrailingBytes {
-                declared: 2,
-                actual: 3
-            }
-        ));
+        assert!(matches!(e, GrpcError::TrailingBytes { declared: 2, actual: 3 }));
         assert_eq!(e.status(), GrpcStatus::Internal);
         assert_eq!(
             unframe(Bytes::from_static(&[0, 0, 0, 0, 2, 8, 1])).unwrap(),
@@ -484,9 +453,7 @@ mod tests {
                 if let Some(tx) = tx {
                     tx.send((read, started.elapsed())).unwrap();
                 }
-                Ok::<_, std::convert::Infallible>(Response::new(
-                    http_body_util::Empty::<Bytes>::new(),
-                ))
+                Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Empty::<Bytes>::new()))
             }
         });
         tokio::spawn(
@@ -507,27 +474,17 @@ mod tests {
             .unwrap();
 
         let err = read.unwrap_err();
-        assert!(
-            matches!(err, GrpcError::BodyTimedOut(b) if b == budget),
-            "{err:?}"
-        );
+        assert!(matches!(err, GrpcError::BodyTimedOut(b) if b == budget), "{err:?}");
         assert_eq!(err.status(), GrpcStatus::DeadlineExceeded);
         assert!(waited >= budget, "{waited:?}");
     }
 
     #[tokio::test]
     async fn multiline_non_ascii_message_is_percent_encoded_not_dropped() {
-        let resp = grpc_reply(
-            None,
-            GrpcStatus::Internal,
-            Some("line one\nline two: é 100%"),
-        );
+        let resp = grpc_reply(None, GrpcStatus::Internal, Some("line one\nline two: é 100%"));
         let t = trailers(resp).await;
         assert_eq!(t.get("grpc-status").unwrap(), "13");
-        assert_eq!(
-            t.get("grpc-message").unwrap(),
-            "line one%0Aline two: %C3%A9 100%25"
-        );
+        assert_eq!(t.get("grpc-message").unwrap(), "line one%0Aline two: %C3%A9 100%25");
     }
 
     #[tokio::test]

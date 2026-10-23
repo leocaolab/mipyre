@@ -4,7 +4,7 @@ app per module, and the suite's main app has no CORS."""
 from mipyre import Mipyre, Response
 
 app = Mipyre()
-app.enable_cors()
+app.enable_cors(allow_origins="*")
 
 
 @app.get("/")

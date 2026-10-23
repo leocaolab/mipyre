@@ -1,4 +1,4 @@
-//! Stands in for CPython's GIL in the slot protocol's tests and its Loom model.
+//! Stands in for CPython's GIL in the slot protocol's tests and its models.
 
 use std::marker::PhantomData;
 
@@ -31,7 +31,7 @@ impl Gil {
 
     pub(super) fn give(&self) {
         *self.held.lock() = false;
-        // At most one thread waits, because the models run two, so all means that one.
+        // Every waiter wakes and one takes the GIL; the others find it held and wait again.
         self.released.notify_all();
     }
 }

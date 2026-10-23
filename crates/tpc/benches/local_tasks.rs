@@ -16,10 +16,7 @@ fn main() {
         println!("local_task");
         return;
     }
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-    {
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_time().build() {
         Ok(rt) => rt,
         Err(e) => panic!("no runtime for the bench: {e}"),
     };

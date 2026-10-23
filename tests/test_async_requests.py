@@ -1,4 +1,4 @@
-"""How the async engine ends one request (`mipyre._async_requests`), on a plain asyncio loop
+"""How the async engine ends one request (`mipyre._worker.async_requests`), on a plain asyncio loop
 with recording answer functions: the hook chain, the budget, what counts as the request's
 failure, the fetcher that ends instead of retrying, and how the engine ends the tasks still
 pending when it stops. The engine's own wiring (a real async worker) is tested by
@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mipyre._async_requests import (
-    FETCHER_JOIN_TIMEOUT, Deadlines, Fetcher, NoHandler, end_pending, job_runner, scheduler,
+from mipyre._worker.async_requests import (
+    Deadlines, Fetcher, NoHandler, end_pending, job_runner, scheduler,
 )
 
 
@@ -292,13 +292,6 @@ def test_a_route_without_a_handler_fails_its_job_naming_the_route():
         "fail", job, NoHandler, "route 1 has no handler on this worker's app")
 
 
-# b/401: the engine waits for its fetcher with no bound of its own. 3764081f wrapped the join in
-# a 30 s timeout counted from the worker's start, and 30 s into normal serving the engine
-# cancelled every request in flight; the bound on shutdown is the shutdown side's.
-def test_the_engine_waits_for_its_fetcher_without_a_bound_of_its_own():
-    assert FETCHER_JOIN_TIMEOUT is None
-
-
 def test_waiting_for_the_fetcher_ends_when_its_inbox_closes():
     fetcher = Fetcher("t", lambda: None, _identity, lambda coroutine: None)
     fetcher.start()
@@ -325,7 +318,7 @@ def test_pending_tasks_that_honour_cancellation_end_and_none_is_reported(caplog)
     async def stop():
         tasks = [asyncio.create_task(background(n)) for n in range(2)]
         await asyncio.sleep(0)  # each task reaches its wait
-        stuck = await end_pending(tasks, timeout=60.0, worker=3)
+        stuck = await end_pending(tasks, timeout=60.0, engine="worker-3")
         return tasks, stuck
 
     tasks, stuck = asyncio.run(stop())
@@ -350,7 +343,7 @@ def test_a_task_that_ignores_cancellation_is_waited_for_only_the_timeout_and_rep
         holdout = asyncio.create_task(stubborn(released))
         honours = asyncio.create_task(polite())
         await asyncio.sleep(0)
-        stuck = await end_pending([holdout, honours], timeout=_SHORT, worker=3)
+        stuck = await end_pending([holdout, honours], timeout=_SHORT, engine="worker-3")
         still_running = not holdout.done()
         released.set()
         await holdout
@@ -363,7 +356,7 @@ def test_a_task_that_ignores_cancellation_is_waited_for_only_the_timeout_and_rep
     assert honours.cancelled()
     warnings = [r.getMessage() for r in caplog.records if r.name == "mipyre.async"]
     assert warnings == [
-        f"worker=3: 1 task(s) did not end within {_SHORT}s of being cancelled at shutdown; "
+        f"async engine worker-3: 1 task(s) did not end within {_SHORT}s of being cancelled at shutdown; "
         "the interpreter ends with them pending"
     ]
 
@@ -379,7 +372,7 @@ def test_a_task_that_fails_while_cancelled_has_its_error_collected():
     async def stop():
         task = asyncio.create_task(cleanup_fails())
         await asyncio.sleep(0)
-        stuck = await end_pending([task], timeout=60.0, worker=0)
+        stuck = await end_pending([task], timeout=60.0, engine="worker-0")
         return task, stuck
 
     task, stuck = asyncio.run(stop())
@@ -388,7 +381,7 @@ def test_a_task_that_fails_while_cancelled_has_its_error_collected():
 
 
 def test_no_pending_task_is_no_wait():
-    assert asyncio.run(end_pending([], timeout=60.0, worker=0)) == set()
+    assert asyncio.run(end_pending([], timeout=60.0, engine="worker-0")) == set()
 
 
 # b/598: `Deadlines`, one timer for the budgets of all the tasks on a loop. Its decisions are

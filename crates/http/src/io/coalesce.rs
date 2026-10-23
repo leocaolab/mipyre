@@ -27,10 +27,11 @@
 //! A failed write fails the connection: the kept bytes are dropped and the error is returned
 //! once, to the call that met it or, when a poll's end met it, to the next call.
 
-use std::io::{self, IoSlice};
-use std::pin::Pin;
 use std::cell::RefCell;
+use std::future::Future;
+use std::io::{self, IoSlice};
 use std::ops::DerefMut;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll, Waker};
@@ -38,13 +39,14 @@ use std::task::{ready, Context, Poll, Waker};
 use crate::sync::{AtomicBool, Mutex, MutexGuard, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::plan::coalesce::{
+    first_allocation, flush_holds, keeps_allocation, poll_end_writes, sniffed, ConnectionFacts, PartialPreface,
+    PollPhase, Protocol, WriteAction,
+};
 use mipyre_transport::stream::events::{self, StreamEvent};
+use mipyre_transport::stream::linger::{linger, Close, LingerBounds};
 use mipyre_transport::stream::peer_gone;
 use mipyre_util::clock;
-use crate::plan::coalesce::{
-    first_allocation, flush_holds, keeps_allocation, poll_end_writes, sniffed, ConnectionFacts,
-    PartialPreface, PollPhase, Protocol, WriteAction,
-};
 use mipyre_util::throttle::LogThrottle;
 
 const DROP_WARNING_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
@@ -164,7 +166,9 @@ impl Sharing for LocalShare {
 enum WriteOut {
     Idle,
     /// `out[sent..]` is still owed, and every call continues the write-out until `out` is empty.
-    Draining { sent: usize },
+    Draining {
+        sent: usize,
+    },
     /// A write-out started at the end of a poll failed; the next call reports it, once.
     Failed(io::Error),
 }
@@ -175,6 +179,8 @@ struct CoalesceState<T: AsyncWrite + Unpin> {
     write: WriteOut,
     unflushed: bool,
     conn: ConnectionFacts,
+    /// The peer has closed its side: a read returned EOF.
+    peer_closed: bool,
 }
 
 impl<T: AsyncWrite + Unpin> CoalesceState<T> {
@@ -320,7 +326,12 @@ impl<T: AsyncWrite + Unpin> Drop for CoalesceState<T> {
         let kept = self.out.len() - self.sent();
         let mut cx = Context::from_waker(Waker::noop());
         let written = self.poll_write_out(&mut cx);
-        say_dropped_write_out(written, kept, [&WRITE_FAILED_THROTTLE, &SOCKET_FULL_THROTTLE], clock::now());
+        say_dropped_write_out(
+            written,
+            kept,
+            [&WRITE_FAILED_THROTTLE, &SOCKET_FULL_THROTTLE],
+            clock::now(),
+        );
     }
 }
 
@@ -389,6 +400,7 @@ fn coalesce_shared<T: AsyncWrite + Unpin, S: Sharing>(inner: T) -> (CoalescingIo
             input_unread: false,
             vectored,
         },
+        peer_closed: false,
     });
     (
         CoalescingIo {
@@ -399,11 +411,7 @@ fn coalesce_shared<T: AsyncWrite + Unpin, S: Sharing>(inner: T) -> (CoalescingIo
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin, S: Sharing> AsyncRead for CoalescingIo<T, S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let mut core = S::lock(&self.shared);
         if core.conn.protocol == Protocol::Http2 {
             return Pin::new(&mut core.inner).poll_read(cx, buf);
@@ -423,6 +431,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, S: Sharing> AsyncRead for CoalescingIo<T
                 if got.is_empty() {
                     // At EOF nothing more is coming, so writing what is kept starts now.
                     core.conn.input_unread = false;
+                    core.peer_closed = true;
                     if core.owes() {
                         if let Poll::Ready(Err(e)) = core.poll_write_out(cx) {
                             return Poll::Ready(Err(e));
@@ -445,11 +454,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, S: Sharing> AsyncRead for CoalescingIo<T
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin, S: Sharing> AsyncWrite for CoalescingIo<T, S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.poll_write_vectored(cx, &[IoSlice::new(buf)])
     }
 
@@ -519,6 +524,31 @@ impl<T: AsyncRead + AsyncWrite + Unpin, S: Sharing> AsyncWrite for CoalescingIo<
     }
 }
 
+impl<T: AsyncRead + AsyncWrite + Unpin, S: Sharing> Flusher<T, S> {
+    /// Writes out what is still owed once the connection future has ended, then closes as
+    /// `close` says, lingering within `bounds` and until `stop` completes; a peer that has already
+    /// closed its side is not waited for. The write-out waits as long as the inner IO blocks, so a
+    /// write timeout below must bound it. When an upgrade handed the IO to another task, that
+    /// task's calls carry the write-out instead and this returns at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a write-out that failed, here or at an earlier poll's end.
+    pub async fn finish<F: Future<Output = ()>>(self, close: Close, bounds: LingerBounds, stop: F) -> io::Result<()> {
+        let Some(mut state) = S::sole(self.shared) else {
+            return Ok(());
+        };
+        if let Some(e) = state.take_failure() {
+            return Err(e);
+        }
+        std::future::poll_fn(|cx| state.poll_write_out(cx)).await?;
+        if close == Close::Lingering && !state.peer_closed {
+            linger(&mut state.inner, bounds, stop).await;
+        }
+        Ok(())
+    }
+}
+
 impl<T: AsyncWrite + Unpin, S: Sharing> Flusher<T, S> {
     fn enter(&self) {
         if S::passthrough(&self.shared).load(Ordering::Relaxed) {
@@ -543,23 +573,6 @@ impl<T: AsyncWrite + Unpin, S: Sharing> Flusher<T, S> {
         if let Poll::Ready(Err(e)) = core.poll_write_out(cx) {
             core.write = WriteOut::Failed(e);
         }
-    }
-
-    /// Writes out what is still owed once the connection future has ended. It waits as long as
-    /// the inner IO blocks, so a write timeout below must bound it. When an upgrade handed the IO
-    /// to another task, that task's calls carry the write-out instead and this returns at once.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error of a write-out that failed, here or at an earlier poll's end.
-    pub async fn finish(self) -> io::Result<()> {
-        let Some(mut state) = S::sole(self.shared) else {
-            return Ok(());
-        };
-        if let Some(e) = state.take_failure() {
-            return Err(e);
-        }
-        std::future::poll_fn(|cx| state.poll_write_out(cx)).await
     }
 }
 

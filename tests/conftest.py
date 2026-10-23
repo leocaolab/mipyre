@@ -27,17 +27,18 @@ import pytest
 from hypothesis import settings
 
 from mipyre import Mipyre
-from mipyre.testing import TestClient
+from mipyre.testing import TestServer
+from tests import _pyo3_fixture
 from tests._helpers import bound_port, poll_until, read_file
 from tests._test_cost import TestCost
 
 # Hypothesis (docs/property-testing.md §5, b/749): the merge gate runs every property test on the same inputs
 # (`ci`, derandomized, no example database to carry one run's finds into the next); the nightly run sets
-# MIPYRE_HYPOTHESIS_PROFILE=nightly for random inputs and many more of them. A counterexample found at night is
+# MIPYRE_TEST_HYPOTHESIS_PROFILE=nightly for random inputs and many more of them. A counterexample found at night is
 # written into its test as an explicit `@example`, so the gate keeps running it.
 settings.register_profile("ci", derandomize=True, database=None)
 settings.register_profile("nightly", derandomize=False, database=None, max_examples=10_000)
-settings.load_profile(os.environ.get("MIPYRE_HYPOTHESIS_PROFILE", "ci"))
+settings.load_profile(os.environ.get("MIPYRE_TEST_HYPOTHESIS_PROFILE", "ci"))
 
 HOST = "127.0.0.1"
 
@@ -105,27 +106,27 @@ FEATURE_PROBES = {
 }
 
 
-# T1 (b/441): a TestClient's close waits for its server's threads for the app's `shutdown_timeout`, 5 s by default,
-# and raises WorkersAbandoned past it. A test that does not set the grace itself is not testing it: its close waits
+# T1 (b/441): a TestServer's close waits for its threads for the app's `shutdown_timeout`, 5 s by default,
+# and raises AbandonedWorkersError past it. A test that does not set the grace itself is not testing it: its close waits
 # for the stop as an event, for longer than pytest-timeout's hang guard. How long idle TPC threads take to stop under
 # load is b/454; the grace's own judgement is `join_within`'s and test_b251_shutdown_timeout's. The product's
-# default is unchanged (the TestClient's own behaviour is public API).
+# default is unchanged (the TestServer's own behaviour is public API).
 TEST_SHUTDOWN_GRACE_S = 3600.0
 
 
 def _waiting_for_the_stop(init):
     default = Mipyre().shutdown_timeout
 
-    def __init__(self, app, *args, **kwargs):
+    def _start(self, app, *args, **kwargs):
         if app.shutdown_timeout == default:
             app.shutdown_timeout = TEST_SHUTDOWN_GRACE_S
         init(self, app, *args, **kwargs)
 
-    return __init__
+    return _start
 
 
 def pytest_configure(config):
-    TestClient.__init__ = _waiting_for_the_stop(TestClient.__init__)
+    TestServer._start = _waiting_for_the_stop(TestServer._start)
     config.addinivalue_line(
         "markers", "needs_feature(name): needs a build with the named test-only cargo feature (--features <name>)"
     )
@@ -200,18 +201,15 @@ class ServerHandle:
 def _boot(script: str, mode: str) -> tuple[subprocess.Popen, int]:
     """Start a Mipyre server from a script string on a port the kernel picks. Returns
     the process handle and the bound port (from the server's startup line).
-    `mode` "gil" runs the server with MIPYRE_RUNTIME=main (every handler on the main
-    interpreter); "subinterp" leaves the default runtime. $MIPYRE_MODE names the mode
-    for scripts that report it; Mipyre itself does not read it.
+    `mode` "gil" serves every handler on the main interpreter, "subinterp" leaves the default
+    runtime: the script reads $MIPYRE_TEST_MODE (the runtime, "main" or "subinterp") and passes
+    it as `Mipyre(runtime=...)`, since an app's runtime is its code's (b/335 D9).
     """
     fd, path = tempfile.mkstemp(prefix="mipyre_test_", suffix=".py")
     with os.fdopen(fd, "w") as f:
         f.write(script)
     env = dict(os.environ)
-    env["MIPYRE_MODE"] = mode
-    env.pop("MIPYRE_RUNTIME", None)
-    if mode == "gil":
-        env["MIPYRE_RUNTIME"] = "main"
+    env["MIPYRE_TEST_MODE"] = "main" if mode == "gil" else "subinterp"
     env["MIPYRE_PORT"] = "0"
     # Output goes to a file, not a pipe: nobody drains a pipe while tests run, so a chatty
     # server could block on a full one, and `_teardown` scans the whole log, shutdown
@@ -318,3 +316,9 @@ def fork_panic_lines(log_text: str) -> list[str]:
         line for line in log_text.splitlines()
         if any(t in line for t in FORK_PANIC_TEXTS)
     ]
+
+
+@pytest.fixture(scope="session")
+def pyo3_fixture_dirs(tmp_path_factory):
+    """{variant: dir holding the importable PyO3 fixture module} (`tests/_pyo3_fixture.py`)."""
+    return _pyo3_fixture.build(tmp_path_factory.mktemp("pyo3_fixtures"))

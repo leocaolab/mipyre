@@ -22,9 +22,16 @@ pub(crate) struct Site {
     /// Counts the WebSocket connections this run has open, against `limits.ws.max_connections`.
     pub(crate) ws_connections: crate::serve::websocket::OpenConnections,
     /// Is present when the app has `runtime="process"` routes.
-    pub(crate) process: Option<Arc<crate::lane::ServerLanes>>,
+    pub(crate) process: Option<Arc<crate::runtime::process::ServerLanes>>,
     /// Is shared by every serving thread's copy of the site.
     pub(crate) counters: Arc<crate::telemetry::RunCounters>,
+    /// The run's Postgres pools (b/335 D17), opened when it sealed; `None` when its main
+    /// interpreter connected to none.
+    pub(crate) pg: Option<Arc<crate::runtime::RunPools>>,
+    /// Times answers. quanta reads the CPU's counter when it ticks at one rate on every core (an
+    /// invariant TSC) and the monotonic clock otherwise; the counter is calibrated once per
+    /// process, when the first site is built, before any request is served.
+    pub(crate) clock: quanta::Clock,
 }
 
 impl Site {
@@ -39,6 +46,8 @@ impl Site {
             ws_connections: self.ws_connections.clone(),
             process: self.process.clone(),
             counters: Arc::clone(&self.counters),
+            pg: self.pg.clone(),
+            clock: self.clock.clone(),
         }
     }
 }

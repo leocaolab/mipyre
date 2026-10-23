@@ -7,9 +7,10 @@ use pyo3::types::{PyDict, PyList};
 use sqlx::postgres::PgRow;
 
 use super::cell;
-use super::error::{DbError, TaskError};
+use crate::runtime::{DbRuntime, OpenPool, TaskError};
+
+use super::error::DbError;
 use super::query::{bind, QueryMethod, SqlQuery};
-use super::runtime::{recv_batch, runtime};
 
 /// Bounds the rows in flight to a `PgCursor` while prefetching enough to hide the server round
 /// trip from a fast consumer.
@@ -20,11 +21,7 @@ const CURSOR_CAPACITY: usize = 8;
 type CursorItem = Result<PgRow, DbError>;
 
 /// Runs the statement and sends its rows to the cursor, then an error if one occurred.
-async fn drive_cursor(
-    pool: sqlx::PgPool,
-    stmt: SqlQuery,
-    tx: tokio::sync::mpsc::Sender<CursorItem>,
-) {
+async fn drive_cursor(pool: sqlx::PgPool, stmt: SqlQuery, tx: tokio::sync::mpsc::Sender<CursorItem>) {
     if let Err(e) = stream_rows(&pool, stmt, &tx).await {
         #[expect(
             clippy::let_underscore_must_use,
@@ -131,8 +128,12 @@ pub(super) struct PgCursor {
     rows: crate::sync::Mutex<CursorRows>,
 }
 
+/// The runtime the cursor's query streams on, which waiting for its next batch runs on too.
+struct CursorRuntime(std::sync::Arc<DbRuntime>);
+
 /// Holds a cursor's row channel and the messages read from it but not yet taken.
 struct CursorRows {
+    runtime: CursorRuntime,
     /// Is `None` once the stream has ended, whether the channel closed or waiting on it failed.
     rx: Option<tokio::sync::mpsc::Receiver<CursorItem>>,
     buf: std::collections::VecDeque<CursorItem>,
@@ -153,7 +154,7 @@ impl CursorRows {
         let Some(rx) = self.rx.take() else {
             return Ok(None);
         };
-        let (rx, batch) = recv_batch(rx, CURSOR_CAPACITY)?;
+        let (rx, batch) = self.runtime.0.recv_batch(rx, CURSOR_CAPACITY)?;
         // An empty batch means the channel closed, so the receiver is let go.
         if !batch.is_empty() {
             self.rx = Some(rx);
@@ -164,20 +165,17 @@ impl CursorRows {
 }
 
 impl PgCursor {
-    /// Starts streaming `stmt`'s rows from `pool` on the DB runtime.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TaskError`] when the DB runtime cannot be built.
-    pub(super) fn open(pool: sqlx::PgPool, stmt: SqlQuery) -> Result<Self, TaskError> {
+    /// Starts streaming `stmt`'s rows from `open`'s pool on its runtime.
+    pub(super) fn open(open: OpenPool, stmt: SqlQuery) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(CURSOR_CAPACITY);
-        runtime()?.spawn(drive_cursor(pool, stmt, tx));
-        Ok(Self {
+        open.runtime.spawn(drive_cursor(open.pool, stmt, tx));
+        Self {
             rows: crate::sync::Mutex::new(CursorRows {
+                runtime: CursorRuntime(open.runtime),
                 rx: Some(rx),
                 buf: std::collections::VecDeque::new(),
             }),
-        })
+        }
     }
 
     /// Returns the next message, taking a buffered row without releasing the GIL when the lock

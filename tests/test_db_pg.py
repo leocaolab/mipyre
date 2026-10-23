@@ -8,10 +8,9 @@ Skipped entirely unless `MIPYRE_TEST_PG_DSN` is set. To run locally::
     export MIPYRE_TEST_PG_DSN="postgres://postgres:mipyre@127.0.0.1:5433/mipyretest"
     pytest tests/test_db_pg.py
 
-The pool is a global in the Rust side, which means these tests must share
-a single `PgPool.connect()` per process. pytest's default process-per-run
-model is fine — all tests here use a module-scoped fixture that sets up
-a schema once.
+Outside a server run each `PgPool.connect()` handle opens a pool of its own on its first
+query; in a run, every handle to one DSN shares the run's pool. The tests here use a
+module-scoped fixture that sets up a schema once.
 """
 
 import datetime
@@ -23,6 +22,7 @@ import uuid
 
 import pytest
 
+from mipyre import Mipyre
 from mipyre.db import PgPool
 from mipyre.testing import TestClient
 
@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def pool():
-    # Rust-side PgPool is a process global; connect() is idempotent.
+    # Outside a server run this handle opens a pool of its own on its first query.
     p = PgPool.connect(PG_DSN)
     # Fresh schema per test module.
     p.execute("DROP TABLE IF EXISTS mipyre_test_rows")
@@ -131,7 +131,7 @@ def test_handler_can_query(pool):
     # Module level (workers rebuild the app by executing its module).
     from tests.apps.db_pg_query import app
 
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         resp = c.get("/users/carol")
         assert resp.status_code == 200
         assert resp.json() == {"name": "carol", "value": 100}
@@ -146,10 +146,75 @@ def test_unsupported_param_type_raises(pool):
 
 
 def test_connect_is_idempotent(pool):
-    """Calling connect() again with same DSN returns a usable handle."""
-    again = PgPool.connect(PG_DSN)
-    # Uses the same underlying pool.
-    assert again.fetch_scalar("SELECT 1") == 1
+    """Calling connect() again with the same DSN in one run returns a handle to the same pool
+    (b/335 D17: the run's pool for the DSN). One connection, so both see one backend."""
+    # A DSN of its own: the module's pool already fixed this DSN's size.
+    dsn = PG_DSN + ("&" if "?" in PG_DSN else "?") + "application_name=idempotent"
+    one = PgPool.connect(dsn, max_connections=1)
+    again = PgPool.connect(dsn)
+    app = Mipyre(runtime="main")
+
+    @app.get("/backends")
+    def backends(req):
+        return [one.fetch_scalar("SELECT pg_backend_pid()"), again.fetch_scalar("SELECT pg_backend_pid()")]
+
+    with TestClient(app) as c:
+        first, second = c.get("/backends").json()
+    assert first == second
+
+
+# Holds a session advisory lock in a process of its own (outside the run under test) until its
+# stdin closes; it says "locked" once it holds it.
+_LOCK_HOLDER_SCRIPT = r"""
+import sys
+from mipyre.db import PgPool
+
+holder = PgPool.connect(sys.argv[1], max_connections=1)
+holder.execute("SELECT pg_advisory_lock($1)", int(sys.argv[2]))
+print("locked", flush=True)
+sys.stdin.read()
+"""
+
+
+def test_an_async_query_in_flight_when_a_run_takes_its_handle_still_answers():
+    """b/968: a handle that queried before a run opened a pool of its own; when the run seals it
+    binds the handle to the run's pool (b/335 D17), and a query already running on the old pool
+    still gets its answer. The query waits on a lock held across the seal, so it is in flight
+    then; before the fix the seal dropped the old pool's runtime and the query failed with
+    "the runtime shut down"."""
+    import asyncio
+    import concurrent.futures
+    import threading
+
+    key = uuid.uuid4().int >> 65
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_HOLDER_SCRIPT, PG_DSN, str(key)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout.readline() == "locked\n"
+        held = PgPool.connect(PG_DSN)
+        issued = threading.Event()
+
+        async def held_query():
+            answer = held.fetch_scalar_async(
+                "SELECT $2::text FROM (SELECT pg_advisory_xact_lock_shared($1)) AS waited", key, "answered"
+            )
+            issued.set()
+            return await answer
+
+        with concurrent.futures.ThreadPoolExecutor(1) as waiter:
+            outcome = waiter.submit(asyncio.run, held_query())
+            assert issued.wait(30)
+            app = Mipyre(runtime="main")
+            app.get("/")(lambda req: "up")
+
+            with TestClient(app):
+                holder.stdin.close()
+                assert outcome.result(30) == "answered"
+    finally:
+        holder.kill()
+        holder.wait(30)
 
 
 # ---------------------------------------------------------------------------

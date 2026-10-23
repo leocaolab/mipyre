@@ -60,7 +60,7 @@ mimalloc = { version = "0.1", default-features = false }
 
 # The Loom models (`src/io/static_files/cache/loom_model.rs`), built only under `--cfg sync_model`, which swaps `src/sync.rs`'s names
 # for Loom's in this crate and in every package built with it, so Loom is a dependency under that cfg only:
-# `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_http --lib --release --target-dir target/loom loom`.
+# `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_http --lib --profile model --target-dir target/loom loom`.
 [target.'cfg(sync_model)'.dependencies]
 loom = "0.7"
 
@@ -74,6 +74,10 @@ harness = false
 # The per-call benches, one per module they measure (`mipyre_microbench::run`).
 [[bench]]
 name = "request_id"
+harness = false
+
+[[bench]]
+name = "answer"
 harness = false
 
 [[bench]]
@@ -106,4 +110,16 @@ harness = false
 
 [[bench]]
 name = "request"
+harness = false
+
+[[bench]]
+name = "cross_origin"
+harness = false
+
+[[bench]]
+name = "cross_origin_upgrade"
+harness = false
+
+[[bench]]
+name = "forwarded"
 harness = false

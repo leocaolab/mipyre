@@ -33,9 +33,7 @@ async fn wire(response: Response<Bytes>) -> String {
     let response = std::sync::Mutex::new(Some(response.map(Full::new)));
     let service = hyper::service::service_fn(move |_: hyper::Request<hyper::body::Incoming>| {
         let taken = response.lock().ok().and_then(|mut r| r.take());
-        async move {
-            Ok::<_, Infallible>(taken.unwrap_or_else(|| Response::new(Full::new(Bytes::new()))))
-        }
+        async move { Ok::<_, Infallible>(taken.unwrap_or_else(|| Response::new(Full::new(Bytes::new())))) }
     });
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let conn = tokio::spawn(
@@ -51,10 +49,7 @@ async fn wire(response: Response<Bytes>) -> String {
     // answers and then closes.
     client.shutdown().await.expect("the write half is closed");
     let mut raw = Vec::new();
-    client
-        .read_to_end(&mut raw)
-        .await
-        .expect("the response is read");
+    client.read_to_end(&mut raw).await.expect("the response is read");
     conn.await
         .expect("the connection task")
         .expect("the connection is served");
@@ -78,8 +73,7 @@ fn expected(lines: &[&str], body: &str) -> String {
 #[tokio::test]
 async fn a_fast_response_goes_out_as_registered() {
     let headers = HashMap::from([("X-Probe".to_string(), "yes".to_string())]);
-    let fast = FastResponse::parse(Bytes::from(b"ok".to_vec()), "text/plain", 200, &headers)
-        .expect("a valid response");
+    let fast = FastResponse::parse(Bytes::from(b"ok".to_vec()), "text/plain", 200, &headers).expect("a valid response");
     let server = format!("server: {SERVER_HEADER}");
     let want = expected(
         &[
@@ -98,8 +92,8 @@ async fn a_fast_response_goes_out_as_registered() {
 
 #[tokio::test]
 async fn a_fast_response_with_another_status_goes_out_with_it() {
-    let fast = FastResponse::parse(Bytes::from_static(b""), "text/html", 503, &HashMap::new())
-        .expect("a valid response");
+    let fast =
+        FastResponse::parse(Bytes::from_static(b""), "text/html", 503, &HashMap::new()).expect("a valid response");
     let server = format!("server: {SERVER_HEADER}");
     let want = expected(
         &[
@@ -117,12 +111,7 @@ async fn a_fast_response_with_another_status_goes_out_with_it() {
 #[tokio::test]
 async fn a_handlers_dict_goes_out_as_json() {
     let body = br#"{"id":1}"#;
-    let data = HandlerResponse::new(
-        StatusCode::OK,
-        Bytes::copy_from_slice(body),
-        JSON,
-        HeaderLines::new(),
-    );
+    let data = HandlerResponse::new(StatusCode::OK, Bytes::copy_from_slice(body), JSON, HeaderLines::new());
     let server = format!("server: {SERVER_HEADER}");
     let want = expected(
         &[
@@ -185,10 +174,10 @@ async fn a_path_no_route_has_is_a_404() {
             "HTTP/1.1 404 Not Found",
             "content-type: application/json",
             &server,
-            "content-length: 21",
+            "content-length: 22",
             "date: <date>",
         ],
-        r#"{"error":"not found"}"#,
+        r#"{"detail":"not found"}"#,
     );
     assert_eq!(wire(reject_response(RouteMiss::NotFound)).await, want);
 }
@@ -202,10 +191,10 @@ async fn a_method_no_route_has_is_a_405_with_allow() {
             "content-type: application/json",
             &server,
             "allow: GET, HEAD",
-            "content-length: 30",
+            "content-length: 31",
             "date: <date>",
         ],
-        r#"{"error":"method not allowed"}"#,
+        r#"{"detail":"method not allowed"}"#,
     );
     let miss = RouteMiss::MethodNotAllowed(HeaderValue::from_static("GET, HEAD"));
     assert_eq!(wire(reject_response(miss)).await, want);

@@ -10,7 +10,7 @@ Usage::
 
     @app.get("/me")
     def me(req):
-        return {"user": ctx.get("user_id"), "trace": ctx.request_id()}
+        return {"user": ctx.get("user_id"), "trace": req.request_id}
 
 The context is a per-request dictionary. Values set during the request
 are visible to the request's hooks, its handler, and everything they call
@@ -22,9 +22,8 @@ request's before-hooks, handler and after-hooks inside a fresh
 on any thread. An ``async def`` hook or handler runs in that same context,
 so what it sets is seen by the rest of the request, sync or async.
 
-``request_id()`` is a dedicated accessor because it's the canonical
-correlation ID everyone needs and we don't want every caller to know
-the magic key. Other values live under user-chosen keys.
+The request's id is ``req.request_id``; code deep in a call that has no ``req`` can be
+handed it the same way, with ``ctx.set("request_id", req.request_id)`` in a before hook.
 """
 
 from __future__ import annotations
@@ -32,8 +31,6 @@ from __future__ import annotations
 from contextvars import ContextVar
 from typing import Any
 
-
-_REQUEST_ID_KEY = "__mipyre_request_id__"
 
 # "No per-request dict yet": a private object, not a shared `{}` default, so no caller
 # can hold the default and two requests never share one mutable dict.
@@ -63,12 +60,6 @@ class _Ctx:
 
     def clear(self) -> None:
         _current.set(_UNSET)
-
-    def request_id(self) -> str | None:
-        return self.get(_REQUEST_ID_KEY)
-
-    def set_request_id(self, rid: str) -> None:
-        self.set(_REQUEST_ID_KEY, rid)
 
     def snapshot(self) -> dict[str, Any]:
         """Return a **shallow** copy of the current context dict.

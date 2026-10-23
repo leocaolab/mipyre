@@ -1,68 +1,145 @@
-//! Measures GIL contention and process RSS, and snapshots every counter the engine keeps.
+//! Measures the main interpreter's GIL and process RSS, and snapshots every counter the engine
+//! keeps; both are the process's.
 //!
 //! GIL waits are measured by the main-interpreter handler call as it acquires the GIL on the real
 //! request path, so measuring adds no contention of its own. RSS comes from a sampler thread that
 //! takes no GIL and runs only while a server with metrics serves.
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::time::Duration;
 
 use mipyre_http::io::events::{self as http_events, HttpEvent};
+use mipyre_http::io::static_files::degraded::{self as static_files, StaticDegradation};
 use mipyre_transport::stream::events::{self as stream_events, StreamEvent};
 use mipyre_transport::tcp::events::{self as tcp_events, TcpEvent};
 use mipyre_transport::tls::events::{self as tls_events, TlsEvent};
 use mipyre_util::clock;
 use mipyre_util::throttle::LogThrottle;
-use mipyre_http::io::static_files::degraded::{self as static_files, StaticDegradation};
 use pyo3::prelude::*;
 
 use super::degraded;
-use super::{clear_degraded, set_degraded};
-
-pub(crate) static GIL_LATENCY_LAST_US: AtomicU64 = AtomicU64::new(0);
-/// The peak lasts until `reset_peaks()`.
-pub(crate) static GIL_LATENCY_MAX_US: AtomicU64 = AtomicU64::new(0);
-/// Counts the handler calls that acquired the GIL.
-pub(crate) static GIL_PROBE_COUNT: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GIL_TOTAL_WAIT_US: AtomicU64 = AtomicU64::new(0);
-
-/// The sampler's latest RSS read in bytes. It is `None` until the sampler has read once, after a
-/// read that failed, and once the last server with `MIPYRE_METRICS=1` stopped.
-static MEMORY_RSS_BYTES: parking_lot::Mutex<Option<u64>> = parking_lot::Mutex::new(None);
-
-pub(crate) static GIL_QUEUE_LENGTH: std::sync::atomic::AtomicIsize =
-    std::sync::atomic::AtomicIsize::new(0);
-/// The peak handler GIL hold lasts until `reset_peaks()`.
-pub(crate) static GIL_HOLD_MAX_US: AtomicU64 = AtomicU64::new(0);
 
 /// A GIL wait longer than this is congestion.
 const GIL_CONGESTED_WARN_US: u64 = 50_000;
 
-/// Congestion logs one line a minute, because under load every request past the threshold would.
-static GIL_CONGESTED_THROTTLE: LogThrottle = LogThrottle::new(Duration::from_secs(60));
+/// The main interpreter's GIL as the handler calls that take it measure it, on the real request
+/// path. CPython has one main interpreter per process, so this is one lock for every server in
+/// the process: two servers' bridges (and a multi-thread server's blocking calls) wait on the same
+/// GIL, and these are that lock's facts, not any one server's.
+pub(crate) struct MainGil {
+    last_wait_us: AtomicU64,
+    /// The peak lasts until [`MainGil::reset_peaks`].
+    peak_wait_us: AtomicU64,
+    /// Counts the handler calls that acquired the GIL.
+    waits: AtomicU64,
+    total_wait_us: AtomicU64,
+    /// Handler calls waiting for the GIL now.
+    queue_length: AtomicIsize,
+    /// The peak handler GIL hold lasts until [`MainGil::reset_peaks`].
+    peak_hold_us: AtomicU64,
+    /// Waits past [`GIL_CONGESTED_WARN_US`].
+    congested_waits: AtomicU64,
+    /// Congestion logs one line a minute, because under load every request past the threshold
+    /// would.
+    congested_log: LogThrottle,
+}
 
-/// Records one GIL acquisition wait. A wait past [`GIL_CONGESTED_WARN_US`] is counted and logged
-/// at most once a minute, with how many such waits were held back since the last line.
-#[inline]
-pub(crate) fn record_gil_wait(wait_us: u64) {
-    GIL_LATENCY_LAST_US.store(wait_us, Ordering::Relaxed);
-    GIL_LATENCY_MAX_US.fetch_max(wait_us, Ordering::Relaxed);
-    GIL_TOTAL_WAIT_US.fetch_add(wait_us, Ordering::Relaxed);
-    GIL_PROBE_COUNT.fetch_add(1, Ordering::Relaxed);
+/// The main GIL's counts, read at one moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MainGilCounts {
+    pub(crate) last_wait_us: u64,
+    pub(crate) peak_wait_us: u64,
+    pub(crate) waits: u64,
+    pub(crate) total_wait_us: u64,
+    pub(crate) queue_length: isize,
+    pub(crate) peak_hold_us: u64,
+    pub(crate) congested_waits: u64,
+}
 
-    if wait_us > GIL_CONGESTED_WARN_US {
-        degraded::count_gil_congested_wait();
-        if let Some(held) = GIL_CONGESTED_THROTTLE.admit(clock::now()) {
-            tracing::warn!(
-                target: "mipyre::server",
-                latency_ms = wait_us / 1000,
-                held,
-                "GIL congested (measured on real request)"
-            );
+/// The process's main interpreter's GIL (an E-T3 home: one per process, by CPython).
+pub(crate) static MAIN_GIL: MainGil = MainGil::new();
+
+impl MainGil {
+    const fn new() -> Self {
+        MainGil {
+            last_wait_us: AtomicU64::new(0),
+            peak_wait_us: AtomicU64::new(0),
+            waits: AtomicU64::new(0),
+            total_wait_us: AtomicU64::new(0),
+            queue_length: AtomicIsize::new(0),
+            peak_hold_us: AtomicU64::new(0),
+            congested_waits: AtomicU64::new(0),
+            congested_log: LogThrottle::new(Duration::from_secs(60)),
         }
     }
+
+    /// Counts a handler call that starts waiting for the GIL.
+    #[inline]
+    pub(crate) fn queued(&self) {
+        self.queue_length.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a handler call that got the GIL after waiting `wait_us`.
+    #[inline]
+    pub(crate) fn acquired(&self, wait_us: u64) {
+        self.queue_length.fetch_sub(1, Ordering::Relaxed);
+        self.record_wait(wait_us);
+    }
+
+    /// Records how long a handler call held the GIL.
+    #[inline]
+    pub(crate) fn released(&self, hold_us: u64) {
+        self.peak_hold_us.fetch_max(hold_us, Ordering::Relaxed);
+    }
+
+    /// Records one GIL acquisition wait. A wait past [`GIL_CONGESTED_WARN_US`] is counted and
+    /// logged at most once a minute, with how many such waits were held back since the last line.
+    #[inline]
+    fn record_wait(&self, wait_us: u64) {
+        self.last_wait_us.store(wait_us, Ordering::Relaxed);
+        self.peak_wait_us.fetch_max(wait_us, Ordering::Relaxed);
+        self.total_wait_us.fetch_add(wait_us, Ordering::Relaxed);
+        self.waits.fetch_add(1, Ordering::Relaxed);
+
+        if wait_us > GIL_CONGESTED_WARN_US {
+            self.congested_waits.fetch_add(1, Ordering::Relaxed);
+            if let Some(held) = self.congested_log.admit(clock::now()) {
+                tracing::warn!(
+                    target: "mipyre::server",
+                    latency_ms = wait_us / 1000,
+                    held,
+                    "GIL congested (measured on real request)"
+                );
+            }
+        }
+    }
+
+    pub(crate) fn read(&self) -> MainGilCounts {
+        MainGilCounts {
+            last_wait_us: self.last_wait_us.load(Ordering::Relaxed),
+            peak_wait_us: self.peak_wait_us.load(Ordering::Relaxed),
+            waits: self.waits.load(Ordering::Relaxed),
+            total_wait_us: self.total_wait_us.load(Ordering::Relaxed),
+            queue_length: self.queue_length.load(Ordering::Relaxed),
+            peak_hold_us: self.peak_hold_us.load(Ordering::Relaxed),
+            congested_waits: self.congested_waits.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Clears the wait and hold peaks, starting a new peak window.
+    pub(crate) fn reset_peaks(&self) {
+        self.peak_wait_us.store(0, Ordering::Relaxed);
+        self.peak_hold_us.store(0, Ordering::Relaxed);
+    }
 }
+
+/// The sampler's latest RSS read in bytes. It is `None` until the sampler has read once, after a
+/// read that failed, and once the last server with `MIPYRE_METRICS=1` stopped.
+static MEMORY_RSS_BYTES: parking_lot::Mutex<Option<u64>> = parking_lot::Mutex::new(None);
+/// Holds why RSS is not sampled while it is not: the sampler's last read failed, or its thread
+/// could not start. The sampler writes it, `read_counters` lists it.
+static RSS_SAMPLING_DEGRADED: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
 
 /// Counts the holders of a thread shared by every server serving with metrics, so the thread runs
 /// exactly while someone holds it. The first holder spawns it and the last one to go takes it to
@@ -111,15 +188,12 @@ impl<T> Holders<T> {
 /// samples.
 type SamplerThread = (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>);
 
-static SAMPLER: parking_lot::Mutex<Holders<SamplerThread>> =
-    parking_lot::Mutex::new(Holders::new());
+static SAMPLER: parking_lot::Mutex<Holders<SamplerThread>> = parking_lot::Mutex::new(Holders::new());
 
 /// Keeps RSS sampling on while held, one per serving run with `MIPYRE_METRICS=1`. When the last
 /// holder drops it the thread is joined, because it must not outlive `Py_Finalize`, which may
 /// unload this library under it, and `rss_bytes` reads `None` again rather than a stale value.
 pub(crate) struct RssSamplingGuard(());
-
-const RSS_DEGRADED: super::Component = super::Component::RssSampling;
 
 impl RssSamplingGuard {
     /// Starts sampling for this holder.
@@ -129,13 +203,18 @@ impl RssSamplingGuard {
     /// Returns the spawn error when the thread cannot be started, with the sampler not held; the
     /// caller decides to serve without RSS and say so.
     pub(crate) fn start() -> std::io::Result<Self> {
-        SAMPLER.lock().acquire(|| -> std::io::Result<SamplerThread> {
-            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-            let handle = std::thread::Builder::new()
-                .name("mipyre-rss-sampler".to_string())
-                .spawn(move || sample_rss_until_stopped(stop_rx))?;
-            Ok((stop_tx, handle))
-        })?;
+        SAMPLER
+            .lock()
+            .acquire(|| -> std::io::Result<SamplerThread> {
+                let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+                let handle = std::thread::Builder::new()
+                    .name("mipyre-rss-sampler".to_string())
+                    .spawn(move || sample_rss_until_stopped(stop_rx))?;
+                Ok((stop_tx, handle))
+            })
+            .inspect_err(|e| {
+                *RSS_SAMPLING_DEGRADED.lock() = Some(format!("the sampler thread could not start: {e}"));
+            })?;
         Ok(RssSamplingGuard(()))
     }
 }
@@ -161,7 +240,7 @@ impl Drop for RssSamplingGuard {
             tracing::error!(target: "mipyre::server", ?panic, "RSS sampler thread panicked");
         }
         *MEMORY_RSS_BYTES.lock() = None;
-        clear_degraded(&RSS_DEGRADED);
+        *RSS_SAMPLING_DEGRADED.lock() = None;
     }
 }
 
@@ -175,7 +254,7 @@ fn sample_rss_until_stopped(stop: std::sync::mpsc::Receiver<()>) {
         let rss = match get_rss_bytes() {
             Ok(bytes) => {
                 warn_on_failure = true;
-                clear_degraded(&RSS_DEGRADED);
+                *RSS_SAMPLING_DEGRADED.lock() = None;
                 Some(bytes)
             }
             Err(e) => {
@@ -183,15 +262,14 @@ fn sample_rss_until_stopped(stop: std::sync::mpsc::Receiver<()>) {
                     tracing::warn!(target: "mipyre::server", error = %e,
                         "RSS read failed; metrics report rss_bytes=None until a read succeeds");
                 }
-                set_degraded(RSS_DEGRADED, format!("RSS read failed: {e}"));
+                *RSS_SAMPLING_DEGRADED.lock() = Some(format!("RSS read failed: {e}"));
                 warn_on_failure = false;
                 None
             }
         };
         *MEMORY_RSS_BYTES.lock() = rss;
         // Only a disconnect, when the last holder dropped, ends the wait early.
-        if stop.recv_timeout(RSS_SAMPLE_INTERVAL) != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        {
+        if stop.recv_timeout(RSS_SAMPLE_INTERVAL) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
             break;
         }
     }
@@ -202,9 +280,7 @@ fn get_rss_bytes() -> std::io::Result<u64> {
     #[cfg(target_os = "macos")]
     {
         let info = mach_task_self_info().map_err(|kr| {
-            std::io::Error::other(format!(
-                "task_info(MACH_TASK_BASIC_INFO) returned kern_return_t {kr}"
-            ))
+            std::io::Error::other(format!("task_info(MACH_TASK_BASIC_INFO) returned kern_return_t {kr}"))
         })?;
         Ok(info.resident_size)
     }
@@ -300,32 +376,20 @@ pub(crate) struct Counters {
     pub(crate) gil_hold_peak_us: u64,
     /// It is `None` while the sampler has no successful read.
     pub(crate) rss_bytes: Option<u64>,
-    /// Every refusal counts here, a request the server answered without Python: 503 overloaded
-    /// or shutting down, 504 past the request budget, 502 a process-lane worker died, 500 a worker
-    /// dropped the request.
-    pub(crate) dropped_requests: u64,
-    /// It is `None` while hot-path metrics are off (`MIPYRE_METRICS` unset).
-    pub(crate) total_requests: Option<u64>,
-    pub(crate) workers_serving: i64,
-    /// Workers count here when they stop on their own (thread state not bound, engine failed,
-    /// retired) while the server runs.
-    pub(crate) workers_died: u64,
-    /// Each `gc.collect()` that raised or panicked counts here and retired its worker.
-    pub(crate) gc_failures: u64,
-    /// A retired worker takes no more requests.
-    pub(crate) workers_retired: u64,
-    pub(crate) last_worker_retirement: Option<String>,
     /// A pre-compressed static file that could not be read counts here, and the original was
     /// served.
     pub(crate) precompressed_fallbacks: u64,
     /// A static mount counts here when its file watch failed or was lost, so it is served uncached.
     pub(crate) static_unwatched_mounts: u64,
+    /// A static file's answer sent from disk counts here when it was cut off because the file
+    /// changed, ended early or could not be read while it was sent.
+    pub(crate) static_answers_cut: u64,
+    /// The bytes static answers sent from disk hold now: read and not yet written out.
+    pub(crate) static_bytes_in_flight: u64,
     /// An async database result counts here when its asyncio loop was closed.
     pub(crate) db_results_undeliverable: u64,
     /// A GIL wait counts here when it is past the congestion threshold of 50 ms.
     pub(crate) gil_congested_waits: u64,
-    /// It is `None` when the OS gave the CPU counts the server is sized from.
-    pub(crate) cpu_sizing_fallback: Option<String>,
     /// A peer going away (reset, aborted, closed mid-IO) counts here; one abandoned connection
     /// can count twice, for its body read and its response write.
     pub(crate) client_disconnects: u64,
@@ -347,64 +411,52 @@ pub(crate) struct Counters {
     /// It counts kept-alive HTTP/1 connections closed because no next request head came within
     /// the request-head timeout.
     pub(crate) request_head_timeouts: u64,
+    /// It counts trusted proxies' `X-Forwarded-For` headers ignored because the entry where the
+    /// client was looked for is no IP address.
+    pub(crate) forwarded_for_unreadable: u64,
     /// It counts connections without TCP_QUICKACK, where the delayed-ACK optimization is off.
     pub(crate) quickack_failures: u64,
     /// It counts listeners without TCP_DEFER_ACCEPT, where the cold-connect mitigation is off.
     pub(crate) defer_accept_failures: u64,
     /// It counts connections without TCP_NODELAY, which keep Nagle's algorithm.
     pub(crate) nodelay_failures: u64,
-    pub(crate) cpu_pin_failures: u64,
-    /// It counts macOS threads whose QoS class could not be raised, so they may run on efficiency
-    /// cores.
-    pub(crate) cpu_qos_failures: u64,
-    /// It counts failed reads of the process's CPU affinity, after which no thread was pinned.
-    pub(crate) cpu_affinity_unreadable: u64,
-    /// It counts failed reads of the physical core topology, after which no thread was pinned.
-    pub(crate) cpu_topology_unreadable: u64,
-    /// It counts starts with more TPC threads than CPUs to pin them to; the extra threads run
-    /// unpinned.
-    pub(crate) cpu_threads_beyond_cpus: u64,
-    /// It counts drains of stopped accept loops that ran out of time.
-    pub(crate) drain_timeouts: u64,
-    /// It counts the connections such a drain closed when it gave up.
-    pub(crate) drain_closed_connections: u64,
-    /// It counts stop watchers, the threads that stop a TPC run on SIGINT or SIGTERM, that
-    /// panicked or were still running when their run ended.
-    pub(crate) stop_watcher_failures: u64,
-    /// It counts blocking calls, the main-interpreter handlers, still running when their TPC
-    /// thread's runtime shut down; they were left running.
-    pub(crate) blocking_calls_left: u64,
     /// Each component running degraded is one `key: reason` line.
     pub(crate) degraded: Vec<String>,
+}
+
+/// Returns what the process runs without, as `component: reason` lines, asking each owner: the
+/// RSS sampler and, in a leak-detecting build, its recorder. What a server runs without is its
+/// own (`Server.metrics().degraded`).
+fn process_degraded() -> Vec<String> {
+    let rss = RSS_SAMPLING_DEGRADED
+        .lock()
+        .clone()
+        .map(|reason| format!("rss_sampling: {reason}"));
+    #[cfg(feature = "leak_detect")]
+    let leak = super::leak_detect::degraded().map(|reason| format!("leak_detect: {reason}"));
+    #[cfg(not(feature = "leak_detect"))]
+    let leak = None;
+    rss.into_iter().chain(leak).collect()
 }
 
 /// Reads every counter without resetting anything.
 pub(crate) fn read_counters() -> Counters {
     let degradations = degraded::read();
-    let runs = super::run_counters::process_counts();
-    // This is `None` when the latest run does not count requests, or none ran.
-    let total_requests = runs.as_ref().and_then(|runs| runs.requests);
-    let runs = runs.unwrap_or_default();
+    let gil = MAIN_GIL.read();
     Counters {
-        gil_wait_last_us: GIL_LATENCY_LAST_US.load(Ordering::Relaxed),
-        gil_wait_peak_us: GIL_LATENCY_MAX_US.load(Ordering::Relaxed),
-        gil_wait_count: GIL_PROBE_COUNT.load(Ordering::Relaxed),
-        gil_wait_total_us: GIL_TOTAL_WAIT_US.load(Ordering::Relaxed),
-        gil_queue_length: GIL_QUEUE_LENGTH.load(Ordering::Relaxed),
-        gil_hold_peak_us: GIL_HOLD_MAX_US.load(Ordering::Relaxed),
+        gil_wait_last_us: gil.last_wait_us,
+        gil_wait_peak_us: gil.peak_wait_us,
+        gil_wait_count: gil.waits,
+        gil_wait_total_us: gil.total_wait_us,
+        gil_queue_length: gil.queue_length,
+        gil_hold_peak_us: gil.peak_hold_us,
         rss_bytes: *MEMORY_RSS_BYTES.lock(),
-        dropped_requests: runs.refused,
-        total_requests,
-        workers_serving: runs.workers_serving,
-        workers_died: runs.workers_died,
-        gc_failures: runs.gc_failures,
-        workers_retired: runs.workers_retired,
-        last_worker_retirement: runs.last_worker_retirement,
         precompressed_fallbacks: static_files::total(StaticDegradation::PrecompressedFallback),
         static_unwatched_mounts: static_files::total(StaticDegradation::UnwatchedMount),
+        static_answers_cut: static_files::total(StaticDegradation::AnswerCut),
+        static_bytes_in_flight: mipyre_http::io::static_files::bytes_in_flight(),
         db_results_undeliverable: degradations.db_results_undeliverable,
-        gil_congested_waits: degradations.gil_congested_waits,
-        cpu_sizing_fallback: degradations.cpu_sizing_fallback,
+        gil_congested_waits: gil.congested_waits,
         client_disconnects: tcp_events::total(TcpEvent::PeerGoneInQueue) + stream_events::total(StreamEvent::PeerGone),
         accept_failures: tcp_events::total(TcpEvent::AcceptFailed) + stream_events::total(StreamEvent::RegisterFailed),
         accept_exhausted: tcp_events::total(TcpEvent::AcceptExhausted),
@@ -413,32 +465,54 @@ pub(crate) fn read_counters() -> Counters {
         oversized_request_heads: http_events::total(HttpEvent::OversizedRequestHead),
         first_request_timeouts: http_events::total(HttpEvent::FirstRequestTimedOut),
         request_head_timeouts: http_events::total(HttpEvent::RequestHeadTimedOut),
+        forwarded_for_unreadable: http_events::total(HttpEvent::ForwardedForUnreadable),
         quickack_failures: tcp_events::total(TcpEvent::QuickackFailed),
         defer_accept_failures: tcp_events::total(TcpEvent::DeferAcceptFailed),
         nodelay_failures: tcp_events::total(TcpEvent::NodelayFailed),
-        cpu_pin_failures: runs.cpu_pin_failures,
-        cpu_qos_failures: runs.cpu_qos_failures,
-        cpu_affinity_unreadable: runs.cpu_affinity_unreadable,
-        cpu_topology_unreadable: runs.cpu_topology_unreadable,
-        cpu_threads_beyond_cpus: runs.cpu_threads_beyond_cpus,
-        drain_timeouts: runs.drain_timeouts,
-        drain_closed_connections: runs.drain_closed_connections,
-        stop_watcher_failures: runs.stop_watcher_failures,
-        blocking_calls_left: runs.blocking_calls_left,
-        degraded: super::degraded_list(),
+        degraded: process_degraded(),
     }
 }
 
 /// Clear the GIL wait and hold peaks, starting a new peak window.
 #[pyfunction]
 pub(crate) fn reset_peaks() {
-    GIL_LATENCY_MAX_US.store(0, Ordering::Relaxed);
-    GIL_HOLD_MAX_US.store(0, Ordering::Relaxed);
+    MAIN_GIL.reset_peaks();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wait_is_congestion_only_past_the_threshold() {
+        let gil = MainGil::new();
+        gil.record_wait(GIL_CONGESTED_WARN_US);
+        assert_eq!(gil.read().congested_waits, 0);
+        gil.record_wait(GIL_CONGESTED_WARN_US + 1);
+        assert_eq!(gil.read().congested_waits, 1);
+    }
+
+    #[test]
+    fn waits_add_up_and_the_peaks_hold_until_reset() {
+        let gil = MainGil::new();
+        gil.record_wait(30);
+        gil.record_wait(10);
+        gil.released(7);
+        let counts = gil.read();
+        assert_eq!(
+            (
+                counts.last_wait_us,
+                counts.peak_wait_us,
+                counts.waits,
+                counts.total_wait_us,
+                counts.peak_hold_us
+            ),
+            (10, 30, 2, 40, 7)
+        );
+        gil.reset_peaks();
+        let counts = gil.read();
+        assert_eq!((counts.peak_wait_us, counts.peak_hold_us, counts.waits), (0, 0, 2));
+    }
 
     #[test]
     fn two_holders_spawn_one_thread_and_only_the_last_release_stops_it() {

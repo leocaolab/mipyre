@@ -78,13 +78,8 @@ pub fn create_reuseport_listener(
     use socket2::{Domain, Protocol, Socket, Type};
 
     let failed = |call: SocketCall| move |source| ListenerError { call, addr, source };
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-        .map_err(failed(SocketCall::Create))?;
+    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(failed(SocketCall::Create))?;
 
     socket
         .set_reuse_address(true)
@@ -96,9 +91,7 @@ pub fn create_reuseport_listener(
         .set_nonblocking(true)
         .map_err(failed(SocketCall::SetNonblocking))?;
 
-    socket
-        .bind(&addr.into())
-        .map_err(failed(SocketCall::Bind))?;
+    socket.bind(&addr.into()).map_err(failed(SocketCall::Bind))?;
 
     if let Some((errno, held)) = refused_option(
         TcpEvent::DeferAcceptFailed,
@@ -192,9 +185,7 @@ fn probe_free(addr: SocketAddr) -> Result<SocketAddr, ListenerError> {
     socket
         .set_reuse_address(true)
         .map_err(failed(SocketCall::SetReuseAddress))?;
-    socket
-        .bind(&addr.into())
-        .map_err(failed(SocketCall::Bind))?;
+    socket.bind(&addr.into()).map_err(failed(SocketCall::Bind))?;
     socket
         .local_addr()
         .map_err(failed(SocketCall::LocalAddr))?
@@ -229,7 +220,10 @@ impl BoundListeners {
     /// listeners.
     pub(crate) fn of_groups(groups: Vec<Vec<Listener>>) -> Self {
         debug_assert!(!groups.is_empty(), "copies is a NonZeroUsize");
-        debug_assert!(groups.iter().all(|g| !g.is_empty()), "the constructors refuse no listeners");
+        debug_assert!(
+            groups.iter().all(|g| !g.is_empty()),
+            "the constructors refuse no listeners"
+        );
         BoundListeners { groups }
     }
 
@@ -432,11 +426,7 @@ fn consequence(failure: AcceptFailure) -> AcceptConsequence {
             AcceptLog::Debug("accept() failed for one connection"),
             AcceptStep::Retry,
         ),
-        AcceptFailure::ListenerBroken => (
-            Some(TcpEvent::AcceptFailed),
-            AcceptLog::Quiet,
-            AcceptStep::Stop,
-        ),
+        AcceptFailure::ListenerBroken => (Some(TcpEvent::AcceptFailed), AcceptLog::Quiet, AcceptStep::Stop),
         AcceptFailure::Unexpected => (
             Some(TcpEvent::AcceptFailed),
             AcceptLog::ThrottledWarn("accept() error"),
@@ -452,9 +442,7 @@ fn classify(e: &std::io::Error) -> AcceptFailure {
         AcceptFailure::Exhausted
     } else if peer_gone(e) {
         AcceptFailure::PeerGone
-    } else if e.kind() == std::io::ErrorKind::Interrupted
-        || code.is_some_and(os::is_one_connection_code)
-    {
+    } else if e.kind() == std::io::ErrorKind::Interrupted || code.is_some_and(os::is_one_connection_code) {
         AcceptFailure::NewSocketFailed
     } else if code.is_some_and(os::is_listener_broken_code) {
         AcceptFailure::ListenerBroken
@@ -540,9 +528,7 @@ mod tests {
         // No SO_REUSEPORT on the holder, so the server's socket can't join it.
         let holder = std::net::TcpListener::bind(loopback(0)).unwrap();
         let addr = holder.local_addr().unwrap();
-        let err = bind(addr, 2)
-            .err()
-            .expect("the port is taken");
+        let err = bind(addr, 2).err().expect("the port is taken");
         assert_eq!(err.call, SocketCall::Bind);
         assert_eq!(err.source.kind(), std::io::ErrorKind::AddrInUse);
         assert_eq!(err.errno(), Some(libc::EADDRINUSE));
@@ -554,9 +540,7 @@ mod tests {
         // between the two servers.
         let other = create_reuseport_listener(loopback(0), OPTIONS).unwrap();
         let addr = other.local_addr().unwrap();
-        let err = bind(addr, 2)
-            .err()
-            .expect("the port is another server's");
+        let err = bind(addr, 2).err().expect("the port is another server's");
         assert_eq!(err.call, SocketCall::Bind);
         assert_eq!(err.errno(), Some(libc::EADDRINUSE));
         assert_eq!(err.addr, addr);
@@ -581,8 +565,7 @@ mod tests {
         assert_eq!(err.addr, addr);
         assert_eq!(err.source.kind(), std::io::ErrorKind::AddrInUse);
         assert!(
-            err.to_string()
-                .starts_with(&format!("bind for {addr} failed: ")),
+            err.to_string().starts_with(&format!("bind for {addr} failed: ")),
             "{err}"
         );
     }
@@ -597,10 +580,16 @@ mod tests {
 
     #[test]
     fn a_failure_that_took_one_connection_is_classed_so() {
-        for k in [std::io::ErrorKind::ConnectionAborted, std::io::ErrorKind::ConnectionReset] {
+        for k in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
             assert_eq!(classify(&kind(k)), AcceptFailure::PeerGone, "{k:?}");
         }
-        assert_eq!(classify(&kind(std::io::ErrorKind::Interrupted)), AcceptFailure::NewSocketFailed);
+        assert_eq!(
+            classify(&kind(std::io::ErrorKind::Interrupted)),
+            AcceptFailure::NewSocketFailed
+        );
         assert_eq!(classify(&errno(libc::EINTR)), AcceptFailure::NewSocketFailed);
     }
 
@@ -614,7 +603,10 @@ mod tests {
     #[test]
     fn running_out_of_descriptors_is_exhaustion_and_anything_else_unexpected() {
         assert_eq!(classify(&errno(libc::EMFILE)), AcceptFailure::Exhausted);
-        assert_eq!(classify(&kind(std::io::ErrorKind::PermissionDenied)), AcceptFailure::Unexpected);
+        assert_eq!(
+            classify(&kind(std::io::ErrorKind::PermissionDenied)),
+            AcceptFailure::Unexpected
+        );
     }
 
     /// An interrupted accept() is nobody's failure.

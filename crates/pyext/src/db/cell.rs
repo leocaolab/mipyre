@@ -32,10 +32,7 @@ fn cell_to_py(py: Python<'_>, value: PgValueRef<'_>) -> PyResult<Py<PyAny>> {
     let kind = PgKind::of(&value.type_info());
     let bytes = value.as_bytes().map_err(wire_error)?;
     Ok(match kind {
-        PgKind::Bool => decode::<bool>(value)?
-            .into_pyobject(py)?
-            .to_owned()
-            .into_any(),
+        PgKind::Bool => decode::<bool>(value)?.into_pyobject(py)?.to_owned().into_any(),
         PgKind::Int2 => decode::<i16>(value)?.into_pyobject(py)?.into_any(),
         PgKind::Int4 => decode::<i32>(value)?.into_pyobject(py)?.into_any(),
         PgKind::Int8 => decode::<i64>(value)?.into_pyobject(py)?.into_any(),
@@ -46,11 +43,7 @@ fn cell_to_py(py: Python<'_>, value: PgValueRef<'_>) -> PyResult<Py<PyAny>> {
         PgKind::Json => json(py, bytes)?,
         PgKind::Jsonb => match bytes.split_first() {
             Some((&JSONB_VERSION, text)) => json(py, text)?,
-            _ => {
-                return Err(PyRuntimeError::new_err(
-                    "jsonb value without version 1 header",
-                ))
-            }
+            _ => return Err(PyRuntimeError::new_err("jsonb value without version 1 header")),
         },
         PgKind::Numeric => {
             let text = numeric::decode(bytes).map_err(wire_error)?;
@@ -98,11 +91,7 @@ fn timestamp(py: Python<'_>, micros: i64, utc: bool) -> PyResult<Bound<'_, PyAny
         return Err(infinity(if utc { "timestamptz" } else { "timestamp" }));
     }
     let types = StdlibTypes::get(py)?;
-    let epoch = if utc {
-        &types.pg_epoch_utc
-    } else {
-        &types.pg_epoch
-    };
+    let epoch = if utc { &types.pg_epoch_utc } else { &types.pg_epoch };
     let offset = types.timedelta.bind(py).call1((0, 0, micros))?;
     epoch.bind(py).add(offset)
 }

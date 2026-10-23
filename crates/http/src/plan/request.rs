@@ -102,7 +102,7 @@ impl<H, D> NoRoute<'_, '_, H, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::route::{BodyMode, HandlerPlace};
+    use crate::plan::route::{BodyMode, HandlerPlace, MainHandler};
     use crate::plan::static_plan::Copies;
     use http::header::{HeaderValue, ACCEPT_ENCODING};
 
@@ -123,7 +123,7 @@ mod tests {
             "/users/{id}",
             1,
             "user".into(),
-            HandlerPlace::Main(BodyMode::Buffered),
+            HandlerPlace::Main(MainHandler::Sync(BodyMode::Buffered)),
         )
         .unwrap();
         t.insert(
@@ -131,20 +131,13 @@ mod tests {
             "/items",
             2,
             "items".into(),
-            HandlerPlace::Main(BodyMode::Buffered),
+            HandlerPlace::Main(MainHandler::Sync(BodyMode::Buffered)),
         )
         .unwrap();
-        let fast = FastResponse::parse(
-            bytes::Bytes::from_static(b"ok"),
-            "text/plain",
-            200,
-            &Default::default(),
-        )
-        .unwrap();
+        let fast =
+            FastResponse::parse(bytes::Bytes::from_static(b"ok"), "text/plain", 200, &Default::default()).unwrap();
         t.add_fast_response("GET", "/health", fast).unwrap();
-        t.add_static_mount(Mount(
-            StaticMountRule::new("/static", Copies::Precompressed).unwrap(),
-        ));
+        t.add_static_mount(Mount(StaticMountRule::new("/static", Copies::Precompressed).unwrap()));
         t
     }
 
@@ -152,10 +145,7 @@ mod tests {
 
     fn grpc_headers() -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/grpc+proto"),
-        );
+        h.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc+proto"));
         h
     }
 
@@ -212,14 +202,14 @@ mod tests {
             "/upload",
             3,
             "upload".into(),
-            HandlerPlace::Main(BodyMode::Streamed),
+            HandlerPlace::Main(MainHandler::Sync(BodyMode::Streamed)),
         )
         .unwrap();
         let h = HeaderMap::new();
         match decide(&Method::POST, "/upload", &h, &t) {
             RequestDecision::Route { call, .. } => {
                 assert!(
-                    matches!(call, HandlerCall::Main(_, BodyMode::Streamed)),
+                    matches!(call, HandlerCall::Main(_, MainHandler::Sync(BodyMode::Streamed))),
                     "{call:?}"
                 );
             }
@@ -235,7 +225,7 @@ mod tests {
             RequestDecision::Route { call, params } => {
                 assert_eq!(
                     call,
-                    HandlerCall::Main(t.route(t.route_id(0)).handler, BodyMode::Buffered)
+                    HandlerCall::Main(t.route(t.route_id(0)).handler, MainHandler::Sync(BodyMode::Buffered))
                 );
                 assert_eq!(params, vec![("id".to_string(), "7".to_string())]);
             }
@@ -272,9 +262,7 @@ mod tests {
         }
         for method in [Method::POST, Method::DELETE] {
             assert_eq!(
-                no_route(&t, &method, "/static/a.js", &h)
-                    .static_lookups()
-                    .count(),
+                no_route(&t, &method, "/static/a.js", &h).static_lookups().count(),
                 0,
                 "{method}"
             );
@@ -287,9 +275,7 @@ mod tests {
         let h = HeaderMap::new();
         assert_eq!(
             no_route(&t, &Method::GET, "/items", &h).after_static_miss(),
-            StaticMissAnswer::Miss(RouteMiss::MethodNotAllowed(HeaderValue::from_static(
-                "POST"
-            )))
+            StaticMissAnswer::Miss(RouteMiss::MethodNotAllowed(HeaderValue::from_static("POST")))
         );
         assert_eq!(
             no_route(&t, &Method::GET, "/nowhere", &h).after_static_miss(),
@@ -303,7 +289,7 @@ mod tests {
         t.set_fallback(9);
         let h = HeaderMap::new();
         match no_route(&t, &Method::GET, "/items", &h).after_static_miss() {
-            StaticMissAnswer::Fallback(HandlerCall::Main(target, BodyMode::Buffered)) => {
+            StaticMissAnswer::Fallback(HandlerCall::Main(target, MainHandler::Sync(BodyMode::Buffered))) => {
                 assert_eq!(*t.handler(target), 9);
             }
             other => panic!("expected the fallback on main, buffered: {other:?}"),

@@ -23,7 +23,7 @@ def serve(tmp_path, target: str, **env):
     full.update({k: str(v) for k, v in env.items()})
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "mipyre", "run", target, "--port", "0", "--workers", "2"],
+            [sys.executable, "-m", "mipyre", "run", target, "--port", "0", "--threads", "2"],
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=full, cwd=ROOT,
         )
     return proc, bound_port(read_file(log_path), proc), log_path
@@ -102,7 +102,7 @@ def test_routes_of_one_file_can_run_in_different_runtimes(tmp_path):
 
 def test_an_unknown_runtime_is_a_registration_error():
     from mipyre import Mipyre, Router
-    from mipyre._runtime import RuntimeDeclarationError
+    from mipyre import RuntimeDeclarationError
 
     with pytest.raises(RuntimeDeclarationError, match="runtime='gpu' is not one of"):
         Mipyre(runtime="gpu")
@@ -134,9 +134,3 @@ def test_the_removed_route_flags_are_errors_quoting_the_new_spelling():
         app.post("/y", lambda req: 1, process=True)
     assert app.routes == []
 
-
-def test_isolate_is_an_error_naming_the_new_way():
-    from mipyre import Mipyre
-
-    with pytest.raises(TypeError, match=r"app.isolate\('numpy'\) was removed .*runtime='process'"):
-        Mipyre().isolate("numpy")

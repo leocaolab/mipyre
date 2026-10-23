@@ -1,11 +1,13 @@
 //! Defines the Python `Response` and converts its header lines to and from Python.
 
-use hyper::header::{HeaderMap, HeaderName, HeaderValue};
+use hyper::header::{HeaderMap, HeaderName, HeaderValue, SET_COOKIE};
 use hyper::StatusCode;
+use mipyre_http::plan::response::{HeaderLines, MAX_HANDLER_LINES};
 use pyo3::exceptions::{PyTypeError, PyValueError};
-use mipyre_http::plan::response::HeaderLines;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
+
+use super::cookie::Cookie;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("invalid HTTP status {0}")]
@@ -26,9 +28,9 @@ pub(crate) fn http_status(code: u16) -> Result<StatusCode, InvalidStatus> {
 /// # Errors
 ///
 /// Raises `TypeError` for a non-`str` name or value and `ValueError` for an invalid one, each
-/// naming the header.
+/// naming the header, or for more than [`MAX_HANDLER_LINES`] lines.
 pub(crate) fn response_headers_from_py(dict: &Bound<'_, PyDict>) -> PyResult<HeaderMap> {
-    let mut map = HeaderMap::with_capacity(dict.len());
+    let mut map = HeaderMap::with_capacity(dict.len().min(MAX_HANDLER_LINES));
     each_header_line(dict, |name, value| {
         map.append(name, value);
     })?;
@@ -45,7 +47,7 @@ pub(crate) struct HeaderType {
 
 /// Sets the first `content-type` apart while the other lines keep the order given.
 fn response_lines_from_py(dict: &Bound<'_, PyDict>) -> PyResult<(HeaderLines, Option<HeaderType>)> {
-    let mut lines = HeaderLines::with_capacity(dict.len());
+    let mut lines = HeaderLines::with_capacity(dict.len().min(MAX_HANDLER_LINES));
     let mut header_type = None;
     each_header_line(dict, |name, value| {
         if let Some(value) = lines.append(name, value) {
@@ -56,30 +58,32 @@ fn response_lines_from_py(dict: &Bound<'_, PyDict>) -> PyResult<(HeaderLines, Op
     Ok((lines, header_type))
 }
 
-fn each_header_line(
-    dict: &Bound<'_, PyDict>,
-    mut put: impl FnMut(HeaderName, HeaderValue),
-) -> PyResult<()> {
+/// Hands `put` each line, at most [`MAX_HANDLER_LINES`] of them: a name with a list of values is a
+/// line per value, so the names alone do not bound the lines.
+fn each_header_line(dict: &Bound<'_, PyDict>, mut put: impl FnMut(HeaderName, HeaderValue)) -> PyResult<()> {
+    let mut room = MAX_HANDLER_LINES;
     for (key, value) in dict.iter() {
-        let key = key.cast::<PyString>().map_err(|_| {
-            PyTypeError::new_err(format!(
-                "response header name must be str, got {}",
-                type_name(&key)
-            ))
-        })?;
+        let key = key
+            .cast::<PyString>()
+            .map_err(|_| PyTypeError::new_err(format!("response header name must be str, got {}", type_name(&key))))?;
         let key = key.to_str()?;
         let name = header_name(key)?;
-        for item in header_items(key, &value)? {
-            put(name.clone(), header_value(key, str_item(key, &item)?)?);
+        let items = header_items(&value);
+        room = room
+            .checked_sub(items.len())
+            .ok_or_else(|| too_many_lines(dict.len()))?;
+        for item in items {
+            let value = match item.cast::<PyString>() {
+                Ok(text) => header_value(key, text.to_str()?)?,
+                Err(_) => cookie_line(&name, key, &item)?,
+            };
+            put(name.clone(), value);
         }
     }
     Ok(())
 }
 
-pub(crate) fn response_headers_to_py<'py>(
-    map: &HeaderMap,
-    py: Python<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn response_headers_to_py<'py>(map: &HeaderMap, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     lines_to_py(map, None, py)
 }
 
@@ -111,25 +115,30 @@ fn lines_to_py<'py>(
     Ok(dict)
 }
 
-fn header_items<'py>(key: &str, value: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+fn header_items<'py>(value: &Bound<'py, PyAny>) -> Vec<Bound<'py, PyAny>> {
     if let Ok(list) = value.cast::<PyList>() {
-        return Ok(list.iter().collect());
+        return list.iter().collect();
     }
     if let Ok(tuple) = value.cast::<PyTuple>() {
-        return Ok(tuple.iter().collect());
+        return tuple.iter().collect();
     }
-    str_item(key, value)?;
-    Ok(vec![value.clone()])
+    vec![value.clone()]
 }
 
-fn str_item<'a>(key: &str, item: &'a Bound<'_, PyAny>) -> PyResult<&'a str> {
-    let text = item.cast::<PyString>().map_err(|_| {
-        PyTypeError::new_err(format!(
-            "response header {key:?}: value must be str or a list of str, got {}",
+/// Reads a header value that is not a `str`: a `Cookie`, whose line was checked when it was
+/// made, and only under `set-cookie`.
+#[cold]
+fn cookie_line(name: &HeaderName, key: &str, item: &Bound<'_, PyAny>) -> PyResult<HeaderValue> {
+    match item.cast::<Cookie>() {
+        Ok(cookie) if *name == SET_COOKIE => Ok(cookie.get().line.clone()),
+        Ok(_) => Err(PyValueError::new_err(format!(
+            "response header {key:?}: a Cookie goes under \"set-cookie\" only"
+        ))),
+        Err(_) => Err(PyTypeError::new_err(format!(
+            "response header {key:?}: value must be str or a list of str (a Cookie under set-cookie), got {}",
             type_name(item)
-        ))
-    })?;
-    text.to_str()
+        ))),
+    }
 }
 
 fn type_name(obj: &Bound<'_, PyAny>) -> String {
@@ -137,6 +146,13 @@ fn type_name(obj: &Bound<'_, PyAny>) -> String {
         Ok(name) => name.to_string(),
         Err(e) => format!("<type name unavailable: {e}>"),
     }
+}
+
+#[cold]
+fn too_many_lines(names: usize) -> PyErr {
+    PyValueError::new_err(format!(
+        "response headers give more than {MAX_HANDLER_LINES} lines (from {names} names), the most a response carries"
+    ))
 }
 
 /// Raises `ValueError` naming an invalid header name.
@@ -147,9 +163,8 @@ pub(crate) fn header_name(name: &str) -> PyResult<HeaderName> {
 
 /// Raises `ValueError` naming the header for a value with CR, LF, NUL or another control byte.
 pub(crate) fn header_value(name: &str, value: &str) -> PyResult<HeaderValue> {
-    HeaderValue::from_str(value).map_err(|e| {
-        PyValueError::new_err(format!("header {name:?}: invalid value {value:?}: {e}"))
-    })
+    HeaderValue::from_str(value)
+        .map_err(|e| PyValueError::new_err(format!("header {name:?}: invalid value {value:?}: {e}")))
 }
 
 /// These content types are kept as static values, so a `Response` with one copies nothing and
@@ -185,16 +200,12 @@ fn content_type_value(ct: &str) -> PyResult<HeaderValue> {
 
 /// Prefers a `Content-Type` in `headers` over `given`, and is what `content_type` reads back, so
 /// Python sees the type that is sent.
-pub(crate) fn sent_content_type<'a>(
-    headers: &'a HeaderMap,
-    given: Option<&'a HeaderValue>,
-) -> Option<&'a HeaderValue> {
+pub(crate) fn sent_content_type<'a>(headers: &'a HeaderMap, given: Option<&'a HeaderValue>) -> Option<&'a HeaderValue> {
     headers.get(hyper::header::CONTENT_TYPE).or(given)
 }
 
 pub(crate) fn header_text(value: &HeaderValue) -> PyResult<&str> {
-    std::str::from_utf8(value.as_bytes())
-        .map_err(|e| PyValueError::new_err(format!("header value is not UTF-8: {e}")))
+    std::str::from_utf8(value.as_bytes()).map_err(|e| PyValueError::new_err(format!("header value is not UTF-8: {e}")))
 }
 
 #[pyclass(frozen, name = "Response", module = "mipyre.engine")]
@@ -207,6 +218,8 @@ pub(crate) struct Response {
     pub(crate) header_type: Option<HeaderType>,
     /// These are every header line except the `Content-Type`, in the order given.
     pub(crate) headers: HeaderLines,
+    /// Set on the 422 a request that failed validation gets, with its number of errors.
+    pub(crate) validation_errors: Option<std::num::NonZeroU32>,
 }
 
 impl Response {
@@ -221,9 +234,9 @@ impl Response {
 
 #[pymethods]
 impl Response {
-    /// Creates a response; `headers` maps a name to a `str`, or to a list of `str` for a header
-    /// sent on several lines such as `Set-Cookie`, and a `Content-Type` or `Server` in it
-    /// replaces the default.
+    /// Creates a response; `headers` maps a name to a value or a list of values for a header
+    /// sent on several lines. A value is a `str`, or under `set-cookie` a `Cookie`; a
+    /// `Content-Type` or `Server` in it replaces the default.
     #[new]
     #[pyo3(signature = (body, status_code=200, content_type=None, headers=None))]
     fn new(
@@ -234,16 +247,31 @@ impl Response {
     ) -> PyResult<Self> {
         let status = http_status(status_code)?;
         let content_type = content_type.map(content_type_value).transpose()?;
-        let (headers, header_type) = headers
-            .map(response_lines_from_py)
-            .transpose()?
-            .unwrap_or_default();
+        let (headers, header_type) = headers.map(response_lines_from_py).transpose()?.unwrap_or_default();
         Ok(Response {
             body,
             status,
             content_type,
             header_type,
             headers,
+            validation_errors: None,
+        })
+    }
+
+    /// The 422 for a request that failed validation with `error_count` errors (`body` is the
+    /// JSON detail): the server counts it in the run that served the request and logs it at most
+    /// once a minute for that run.
+    #[staticmethod]
+    fn _validation_failure(body: Py<PyAny>, error_count: u32) -> PyResult<Self> {
+        let errors = std::num::NonZeroU32::new(error_count)
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("a validation failure has at least one error"))?;
+        Ok(Response {
+            body,
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            content_type: Some(HeaderValue::from_static("application/json")),
+            header_type: None,
+            headers: HeaderLines::default(),
+            validation_errors: Some(errors),
         })
     }
 
@@ -272,9 +300,7 @@ mod tests {
     #[test]
     fn an_invalid_status_is_refused_where_python_hands_it_over() {
         assert_eq!(http_status(1000), Err(InvalidStatus(1000)));
-        assert!(InvalidStatus(1000)
-            .to_string()
-            .contains("invalid HTTP status 1000"));
+        assert!(InvalidStatus(1000).to_string().contains("invalid HTTP status 1000"));
         assert_eq!(http_status(201).unwrap(), StatusCode::CREATED);
     }
 }

@@ -10,11 +10,11 @@ use pyo3::exceptions::{PyImportError, PyModuleNotFoundError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyModule};
 
-use super::exec::{bundled, exec_in, new_module, ExecFailure, PythonSource, ScriptFailure};
+use super::exec::{bundled, exec_in, new_module, ExecFailure, ExtensionLoader, PythonSource, ScriptFailure};
 use super::program::WorkerProgram;
 use super::{RequestRunner, WorkerIndex};
 use crate::exchange::error::PyException;
-use crate::runtime::worker_app::{self, WorkerRoutes};
+use crate::runtime::worker_app::{self, EngineModule, WorkerAssignment, WorkerRoutes};
 use mipyre_http::plan::route::RouteManifest;
 
 /// The script's module in a worker is not `__main__`, so a script's
@@ -108,40 +108,20 @@ pub(crate) enum WorkerStartError {
          interpreter has {expected} route(s). A worker executes the whole script and serves \
          the app it registers routes on; don't register routes only in the main interpreter."
     )]
-    NoRoutes {
+    NoRoutes { worker: WorkerIndex, expected: usize },
+    #[error("worker {worker}: {source}; a new worker interpreter has none")]
+    SecondAssignment {
         worker: WorkerIndex,
-        expected: usize,
-    },
-    #[error(
-        "worker {worker}: its interpreter already had {state} before the worker set it; a new \
-         worker interpreter has none"
-    )]
-    StateAlreadySet {
-        worker: WorkerIndex,
-        state: InterpreterState,
+        source: crate::runtime::worker_app::SecondAssignmentError,
     },
     /// The panic is caught on the worker's thread, and its interpreter is ended before the unwind
     /// goes on.
     #[error("worker {worker}: its start panicked: {message}")]
-    Panicked {
-        worker: WorkerIndex,
-        message: String,
-    },
+    Panicked { worker: WorkerIndex, message: String },
     /// The thread could not be given its turn, ended without reporting, or could not take its
     /// verdict. This is not expected, and the start fails rather than wait.
     #[error("start {position}: the thread ended before its start was done")]
     ReportLost { position: usize },
-}
-
-/// A per-interpreter value a worker sets once, as it starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum InterpreterState {
-    #[error("the running app's shared-state map")]
-    SharedMap,
-    #[error("main's route table")]
-    RouteManifest,
-    #[error("its routers")]
-    Routers,
 }
 
 impl WorkerStartError {
@@ -152,7 +132,7 @@ impl WorkerStartError {
             | WorkerStartError::SetupRaised { .. }
             | WorkerStartError::NulInSource { .. }
             | WorkerStartError::NoRoutes { .. }
-            | WorkerStartError::StateAlreadySet { .. } => "prepare_failed",
+            | WorkerStartError::SecondAssignment { .. } => "prepare_failed",
             WorkerStartError::Panicked { .. } => "panicked",
             WorkerStartError::ReportLost { .. } => "report_lost",
         }
@@ -170,8 +150,9 @@ impl WorkerStartError {
 
     fn raised(&self) -> Option<&StartException> {
         match self {
-            WorkerStartError::ScriptRaised { raised, .. }
-            | WorkerStartError::SetupRaised { raised, .. } => Some(raised),
+            WorkerStartError::ScriptRaised { raised, .. } | WorkerStartError::SetupRaised { raised, .. } => {
+                Some(raised)
+            }
             _ => None,
         }
     }
@@ -201,6 +182,8 @@ pub(crate) struct WorkerSpec<'a> {
     /// It is main's route table up to its seal, which the script must register.
     pub(crate) expected: &'a RouteManifest,
     pub(crate) store: &'a crate::runtime::AppStore,
+    /// The run's Postgres pools, which the worker's `PgPool.connect()` binds to.
+    pub(crate) pg: Option<&'a std::sync::Arc<crate::runtime::RunPools>>,
     pub(crate) gc: GcPolicy,
     /// A worker whose script set other limits warns that they are ignored.
     pub(crate) limits: mipyre_http::plan::limits::Limits,
@@ -212,6 +195,7 @@ pub(crate) struct WorkerRecipe {
     program: WorkerProgram,
     expected: RouteManifest,
     store: crate::runtime::AppStore,
+    pg: Option<std::sync::Arc<crate::runtime::RunPools>>,
     gc: GcPolicy,
     limits: mipyre_http::plan::limits::Limits,
 }
@@ -221,6 +205,7 @@ impl WorkerRecipe {
         program: &WorkerProgram,
         expected: &RouteManifest,
         store: &crate::runtime::AppStore,
+        pg: Option<std::sync::Arc<crate::runtime::RunPools>>,
         gc: GcPolicy,
         limits: mipyre_http::plan::limits::Limits,
     ) -> Self {
@@ -228,6 +213,7 @@ impl WorkerRecipe {
             program: program.clone(),
             expected: expected.clone(),
             store: store.clone(),
+            pg,
             gc,
             limits,
         }
@@ -238,6 +224,7 @@ impl WorkerRecipe {
             program: &self.program,
             expected: &self.expected,
             store: &self.store,
+            pg: self.pg.as_ref(),
             gc: self.gc,
             limits: self.limits,
         }
@@ -249,7 +236,7 @@ impl WorkerRecipe {
 
     /// Logs the per-process isolation report once `workers` workers of this recipe started.
     pub(crate) fn report_started(&self, workers: usize) {
-        if self.program.isolation {
+        if self.program.isolation.is_some() {
             crate::runtime::report_startup(workers);
         }
     }
@@ -261,8 +248,9 @@ fn run(
     worker: WorkerIndex,
     src: &PythonSource<'_>,
     module: &Bound<'_, PyModule>,
+    loader: ExtensionLoader,
 ) -> Result<(), WorkerStartError> {
-    exec_in(py, src, module).map_err(|e| WorkerStartError::exec(py, worker, src.file(), e))
+    exec_in(py, src, module, loader).map_err(|e| WorkerStartError::exec(py, worker, src.file(), e))
 }
 
 pub(super) fn prepare<R: RequestRunner>(
@@ -279,54 +267,76 @@ pub(super) fn prepare<R: RequestRunner>(
     };
     let program = spec.program;
 
-    // This comes before the script, because a `MipyreApp` or `SharedState` it creates must see
-    // the running app's map.
-    crate::runtime::hand_to_worker(py, spec.store)
-        .map_err(|state| WorkerStartError::StateAlreadySet { worker, state })?;
-
     // This comes before any import, so the bootstrap and the script resolve imports as on main.
     PyList::new(py, program.import_path.iter().map(|p| p.as_os_str()))
         .and_then(|path| py.import("sys")?.setattr("path", path))
         .map_err(setup("setting sys.path to main's"))?;
-
+    let loader = if program.isolation.is_some() {
+        ExtensionLoader::IsolationAdapter
+    } else {
+        ExtensionLoader::CPython
+    };
     let bootstrap = new_module(py, BOOTSTRAP_MODULE, None)
         .and_then(|m| {
             use mipyre_subinterp::isolation::{SOURCE, SOURCE_FILE};
             m.setattr("WORKER_ID", worker.get())?;
-            m.setattr("ISOLATION_SOURCE", program.isolation.then_some(SOURCE))?;
+            m.setattr("ISOLATION_SOURCE", program.isolation.as_ref().map(|_| SOURCE))?;
+            m.setattr("ISOLATE_DIR", program.isolation.as_deref())?;
             m.setattr("ISOLATION_FILE", SOURCE_FILE)?;
             Ok(m)
         })
         .map_err(setup("creating the bootstrap module"))?;
     // The log bridge runs first in the same namespace, because the bootstrap installs it before
     // the package can be imported.
-    run(py, worker, &bundled!("mipyre/_log_bridge.py"), &bootstrap)?;
-    // The isolation adapter that the bootstrap runs makes its private copies with these
-    // functions; like the log bridge they must be there before the package can be imported.
-    if program.isolation {
-        run(py, worker, &bundled!("mipyre/_clone.py"), &bootstrap)?;
+    run(py, worker, &bundled!("mipyre/_log/bridge.py"), &bootstrap, loader)?;
+    // The isolation adapter that the bootstrap runs makes its private copies with the first and
+    // judges the extension files with the second; like the log bridge they must be there before
+    // the package can be imported.
+    if program.isolation.is_some() {
+        run(py, worker, &bundled!("mipyre/_clone.py"), &bootstrap, loader)?;
+        run(
+            py,
+            worker,
+            &bundled!("mipyre/_worker/extension_support.py"),
+            &bootstrap,
+            loader,
+        )?;
     }
-    run(py, worker, &bundled!("mipyre/_bootstrap.py"), &bootstrap)?;
+    run(py, worker, &bundled!("mipyre/_worker/bootstrap.py"), &bootstrap, loader)?;
 
-    // This comes before the script, because its app is matched by key against main's table and
-    // its `Mipyre(routers=...)` imports these routers.
-    worker_app::expect(py, spec.expected.clone(), program.routers.clone())
-        .map_err(|state| WorkerStartError::StateAlreadySet { worker, state })?;
+    // This is the first point `mipyre.engine` can be reached (the bootstrap installs what the
+    // package's import needs), and comes before the script: a `MipyreApp` or `SharedState` it
+    // creates must see the running app's map, its app is matched by key against main's table,
+    // and its `Mipyre(routers=...)` imports these routers.
+    let assignment = WorkerAssignment::Subinterpreter {
+        expected: spec.expected.clone(),
+        routers: program.routers.clone(),
+        store: spec.store.clone(),
+        pg: spec.pg.cloned(),
+    };
+    EngineModule::with(py, |module| module.assign(assignment))
+        .map_err(setup("reaching this interpreter's mipyre.engine"))?
+        .map_err(|source| WorkerStartError::SecondAssignment { worker, source })?;
+
+    // This comes after the bootstrap, which the package's import needs, and before the script,
+    // which may parse `sys.argv` or read its flags as it is executed.
+    Bound::new(py, program.command_line.clone())
+        .and_then(|line| py.import("mipyre.flags")?.call_method1("_install", (line,)))
+        .map_err(setup("installing the run's command line (sys.argv and flag values)"))?;
 
     // The script is a real module compiled with its own path, so tracebacks point at it,
     // `from __future__` imports work and `typing.get_type_hints` finds it in `sys.modules`.
-    let script_module = new_module(py, SCRIPT_MODULE, Some(&program.script_path))
-        .map_err(setup("creating the script module"))?;
-    let script = PythonSource::new(&program.script, &program.script_path).map_err(|source| {
-        WorkerStartError::NulInSource {
+    let script_module =
+        new_module(py, SCRIPT_MODULE, Some(&program.script_path)).map_err(setup("creating the script module"))?;
+    let script =
+        PythonSource::new(&program.script, &program.script_path).map_err(|source| WorkerStartError::NulInSource {
             worker,
             file: program.script_path.clone(),
             source,
-        }
-    })?;
-    run(py, worker, &script, &script_module)?;
+        })?;
+    run(py, worker, &script, &script_module, loader)?;
 
-    crate::exchange::to_response::require_json(py).map_err(setup("loading the JSON serializer"))?;
+    crate::exchange::require_json(py).map_err(setup("loading the JSON serializer"))?;
 
     let routes = registered_routes(py, worker, spec)?;
     R::build(py, worker, routes, spec.gc)

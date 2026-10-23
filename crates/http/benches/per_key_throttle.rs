@@ -19,7 +19,9 @@ const CAPACITY: NonZeroUsize = NonZeroUsize::new(KEYS).expect("256 is not zero")
 /// Holds back a remembered path's lines in a full table of 256 paths.
 fn per_key_throttles_admit_held(n: u64) {
     let mut throttles: PerKeyThrottles<PathBuf> = PerKeyThrottles::new(PERIOD, CAPACITY);
-    let paths: Vec<PathBuf> = (0..KEYS).map(|i| PathBuf::from(format!("/srv/static/private/{i}.html"))).collect();
+    let paths: Vec<PathBuf> = (0..KEYS)
+        .map(|i| PathBuf::from(format!("/srv/static/private/{i}.html")))
+        .collect();
     for path in &paths {
         throttles.admit(path.as_path(), Duration::ZERO);
     }
@@ -30,8 +32,6 @@ fn per_key_throttles_admit_held(n: u64) {
 }
 
 fn main() {
-    let cases: [Case; 1] = [
-        ("per_key_throttles_admit_held", per_key_throttles_admit_held),
-    ];
+    let cases: [Case; 1] = [("per_key_throttles_admit_held", per_key_throttles_admit_held)];
     run(&cases);
 }

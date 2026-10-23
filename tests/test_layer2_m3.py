@@ -22,7 +22,7 @@ import pytest
 
 import mipyre.engine as engine
 from tests.conftest import fork_panic_lines
-from mipyre import Mipyre
+from mipyre import LateRegistrationError, Mipyre
 from tests._helpers import answers, bound_port, poll_until, read_file
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -97,7 +97,7 @@ def test_non_gil_route_after_seal_raises_with_method_and_path():
 
     app._engine._seal_registrations()
 
-    with pytest.raises(ValueError, match=r"GET /late .*runtime='main'"):
+    with pytest.raises(LateRegistrationError, match=r"GET /late .*runtime='main'"):
         @app.get("/late")
         def late(req):
             return "no"
@@ -118,8 +118,8 @@ def test_seal_is_idempotent():
     # A second run() (TestClient retries on port races) seals again: no error, and the
     # rule still holds.
     app._engine._seal_registrations()
-    with pytest.raises(ValueError, match=r"POST /x "):
-        app._engine.route("POST", "/x", lambda req: "no", False)
+    with pytest.raises(LateRegistrationError, match=r"POST /x "):
+        app._engine.route("POST", "/x", lambda req: "no", engine.RuntimeChoice.Worker)
 
 
 def test_on_startup_non_gil_route_fails_startup(tmp_path):
@@ -145,7 +145,7 @@ def test_on_startup_non_gil_route_fails_startup(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# FR-13: pydantic only for routes with model=
+# FR-13: pydantic only for routes with body=
 # ---------------------------------------------------------------------------
 
 
@@ -198,7 +198,7 @@ def test_request_id_is_per_request_under_concurrency(tmp_path):
         import asyncio, os
         from mipyre import Mipyre
         app = Mipyre(runtime="main")
-        app.enable_request_id()
+        app.enable_request_id_header()
         RENDEZVOUS = os.environ["RID_RENDEZVOUS"]
 
         @app.get("/ping")
@@ -239,50 +239,6 @@ def test_request_id_is_per_request_under_concurrency(tmp_path):
     assert mismatched == []
 
 
-def test_request_id_hooks_keep_interleaved_requests_apart():
-    """FR-14 at M3: two requests whose hooks interleave on one event-loop thread (as async
-    requests do in a worker's loop, M4) each get their own id back. The GIL-mode E2E above
-    can't catch a thread-local: there, one request's hooks run back to back on one thread."""
-    import asyncio
-
-    from mipyre.engine import Response
-    from mipyre.observability import install_request_id
-
-    class _App:
-        def before_request(self, fn):
-            self.before = fn
-
-        def after_request(self, fn):
-            self.after = fn
-
-    class _Req:
-        def __init__(self, rid):
-            self.headers = {"x-request-id": rid}
-            # The engine writes the id once, from the client's header (M4); the hooks
-            # read `req.request_id`.
-            self.request_id = rid
-
-    app = _App()
-    install_request_id(app, "X-Request-ID")
-
-    async def one(rid, first_done, second_done, first):
-        req = _Req(rid)
-        app.before(req)
-        if first:
-            first_done.set()
-            await second_done.wait()  # the other request's before hook runs in between
-        else:
-            await first_done.wait()
-            second_done.set()
-        return app.after(req, Response(body="ok")).headers["x-request-id"]
-
-    async def main():
-        a, b = asyncio.Event(), asyncio.Event()
-        return await asyncio.gather(one("id-1", a, b, True), one("id-2", a, b, False))
-
-    assert asyncio.run(main()) == ["id-1", "id-2"]
-
-
 # ---------------------------------------------------------------------------
 # E2E-3b + E2E-1 subset: app.run() only under a __main__ guard, MIPYRE_LOG=1, /mcp
 # ---------------------------------------------------------------------------
@@ -299,12 +255,15 @@ def test_main_guard_logging_and_mcp_in_subinterp_mode(tmp_path):
         def w(req):
             return {"ok": True}
 
-        @app.mcp.tool(description="add two numbers")
+        from mipyre.mcp import MCPServer
+        mcp = MCPServer(app)
+
+        @mcp.tool(description="add two numbers")
         def add(a: int, b: int) -> int:
             return a + b
 
         if __name__ == "__main__":
-            app.run(host="127.0.0.1", port=0, workers=2)
+            app.run(host="127.0.0.1", port=0, threads=2)
     """)
     proc = _start(script, log_path, {"MIPYRE_LOG": "1"})
     try:

@@ -1,9 +1,9 @@
 //! Drives every hyper connection the server serves, the in-memory bench's included, so a bench
 //! number is the production per-request cost.
 
+use crate::sync::{AtomicBool, Ordering};
 use std::future::Future;
 use std::pin::Pin;
-use crate::sync::{AtomicBool, Ordering};
 use std::task::Poll;
 
 use hyper::body::Incoming;
@@ -15,11 +15,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use mipyre_http::io::body::ResponseBody;
 use mipyre_http::io::coalesce::{coalesce, coalesce_local, CoalescedPoll, Flusher, Sharing};
 use mipyre_http::io::events::{self, HttpEvent};
+use mipyre_http::io::static_files::FileSendError;
 
-use mipyre_http::plan::limits::HEADER_READ_TIMEOUT;
+use mipyre_http::plan::limits::{HEADER_READ_TIMEOUT, LINGER_IDLE_TIMEOUT};
 use mipyre_transport::stream::events::{self as stream_events, StreamEvent};
-use mipyre_transport::stream::stall::WRITE_TIMEOUT;
+use mipyre_transport::stream::linger::{Close, LingerBounds};
 use mipyre_transport::stream::stall::WriteStall;
+use mipyre_transport::stream::stall::WRITE_TIMEOUT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConnectionTimeouts {
@@ -27,6 +29,9 @@ pub(crate) struct ConnectionTimeouts {
     /// meanwhile, and on HTTP/1 from each response to the next complete head. Without it a client
     /// holds a connection's fd and task for as long as it likes by sending nothing.
     pub(crate) request_head: std::time::Duration,
+    /// It bounds the gap between the client's bytes while a connection the server is done with
+    /// reads off what the client still sends.
+    pub(crate) linger_idle: std::time::Duration,
 }
 
 impl ConnectionTimeouts {
@@ -34,7 +39,17 @@ impl ConnectionTimeouts {
     /// kept with the listener.
     pub(crate) const DEFAULT: Self = Self {
         request_head: HEADER_READ_TIMEOUT,
+        linger_idle: LINGER_IDLE_TIMEOUT,
     };
+
+    /// Returns the bounds of a lingering close: a client that keeps sending holds the connection
+    /// no longer than an idle one is held waiting for its next request head.
+    fn linger(self) -> LingerBounds {
+        LingerBounds {
+            idle: self.linger_idle,
+            limit: self.request_head,
+        }
+    }
 }
 
 /// Spawns hyper's tasks on the TPC thread's `LocalSet`, since connection futures hold the
@@ -60,20 +75,10 @@ where
 /// own `LocalStop`, never the shared token. HTTP/1 responses produced in one poll share one write
 /// (docs/write-coalescing.md). A connection with no first request within `timeouts.request_head`
 /// is closed and counted.
-pub(crate) async fn drive_connection<IO, S, E, F>(
-    io: IO,
-    svc: S,
-    exec: E,
-    timeouts: ConnectionTimeouts,
-    stop: F,
-)
+pub(crate) async fn drive_connection<IO, S, E, F>(io: IO, svc: S, exec: E, timeouts: ConnectionTimeouts, stop: F)
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    S: hyper::service::Service<
-        Request<Incoming>,
-        Response = hyper::Response<ResponseBody>,
-        Error = hyper::Error,
-    >,
+    S: hyper::service::Service<Request<Incoming>, Response = hyper::Response<ResponseBody>, Error = hyper::Error>,
     S::Future: 'static,
     E: HttpServerConnExec<S::Future, ResponseBody>,
     F: std::future::Future<Output = ()>,
@@ -91,19 +96,10 @@ where
 
 /// Works like [`drive_connection`] for a connection that stays on this thread and is never
 /// upgraded: the IO and its flusher share state without a lock, so the IO need not be `Send`.
-pub(crate) async fn drive_local_connection<IO, S, F>(
-    io: IO,
-    svc: S,
-    timeouts: ConnectionTimeouts,
-    stop: F,
-)
+pub(crate) async fn drive_local_connection<IO, S, F>(io: IO, svc: S, timeouts: ConnectionTimeouts, stop: F)
 where
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
-    S: hyper::service::Service<
-        Request<Incoming>,
-        Response = hyper::Response<ResponseBody>,
-        Error = hyper::Error,
-    >,
+    S: hyper::service::Service<Request<Incoming>, Response = hyper::Response<ResponseBody>, Error = hyper::Error>,
     S::Future: 'static,
     F: std::future::Future<Output = ()>,
 {
@@ -128,9 +124,7 @@ fn connection_builder<E>(exec: E, timeouts: ConnectionTimeouts) -> AutoBuilder<E
 }
 
 /// Lets `serve` drive both of hyper's connection types.
-trait GracefulConnection:
-    std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
-{
+trait GracefulConnection: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> {
     fn graceful_shutdown(self: std::pin::Pin<&mut Self>);
 }
 
@@ -167,10 +161,9 @@ async fn serve<C, T, K, F>(
     flusher: Flusher<T, K>,
     timeouts: ConnectionTimeouts,
     stop: F,
-)
-where
+) where
     C: GracefulConnection,
-    T: AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
     K: Sharing,
     F: std::future::Future<Output = ()>,
 {
@@ -178,21 +171,21 @@ where
     // and never an HTTP/2 connection's wait for a stream: until the first request, the deadline
     // below is the connection's only bound.
     let first_request_by = tokio::time::Instant::now() + timeouts.request_head;
+    tokio::pin!(stop);
     // The connection (and the IO it holds) ends with this block, so `finish` below sees
     // whether anyone else (an upgrade) still holds the IO.
-    let ended = {
+    let (ended, stopping) = {
         let conn = NewConnection {
             conn,
             deadline: Some(tokio::time::sleep_until(first_request_by)),
             requested,
         };
         tokio::pin!(conn);
-        tokio::pin!(stop);
         let mut graceful_sent = false;
         loop {
             let polled = CoalescedPoll::new(conn.as_mut(), &flusher);
             tokio::select! {
-                end = polled => break end,
+                end = polled => break (end, graceful_sent),
                 () = &mut stop, if !graceful_sent => {
                     conn.as_mut().project().conn.graceful_shutdown();
                     graceful_sent = true;
@@ -208,17 +201,21 @@ where
             Stage::Opening
         }
     };
-    let ended = match ended {
-        End::Ended(res) => res.map_err(|e| (e, stage())),
+    let close = match ended {
+        End::Ended(Ok(())) => close_after(None, stopping),
+        End::Ended(Err(e)) => {
+            let stage = stage();
+            report_connection_error(e.as_ref(), stage, timeouts.request_head);
+            close_after(Some(connection_end(e.as_ref(), stage)), stopping)
+        }
         End::NoFirstRequest => {
             report_no_first_request(timeouts.request_head);
-            Ok(())
+            Close::Now
         }
     };
-    if let Err((e, stage)) = ended {
-        report_connection_error(e.as_ref(), stage, timeouts.request_head);
-    }
-    if let Err(e) = flusher.finish().await {
+    // A stop that comes while the connection lingers ends the wait: the answer is out by then,
+    // and what the client still sends is no reason to hold the stop up.
+    if let Err(e) = flusher.finish(close, timeouts.linger(), stop).await {
         report_connection_error(&e, Stage::Serving, timeouts.request_head);
     }
 }
@@ -315,18 +312,25 @@ enum ConnectionEnd {
     /// The client closed, reset or aborted, or cut a message short.
     PeerGone,
     /// The client stopped reading for `limit`.
-    WriteStalled { limit: std::time::Duration },
+    WriteStalled {
+        limit: std::time::Duration,
+    },
     /// hyper refused the request head and has already answered 400, 414 or 431.
     BadRequest(HttpEvent),
     NoFirstRequest,
     /// A kept-alive connection went idle, or left a head unfinished, past the head timeout.
     NoNextRequest,
+    /// A static file's answer was cut off while it was sent, because the file changed or failed;
+    /// the body reports it.
+    AnswerCut,
     Failed,
 }
 
 /// Returns what ended a connection that failed with `e` at `stage`.
 fn connection_end(e: &(dyn std::error::Error + 'static), stage: Stage) -> ConnectionEnd {
-    if events::peer_went_away(e) {
+    if answer_cut(e).is_some() {
+        ConnectionEnd::AnswerCut
+    } else if events::peer_went_away(e) {
         ConnectionEnd::PeerGone
     } else if let Some(stalled) = write_stalled(e) {
         ConnectionEnd::WriteStalled { limit: stalled.limit }
@@ -344,12 +348,29 @@ fn connection_end(e: &(dyn std::error::Error + 'static), stage: Stage) -> Connec
     }
 }
 
+/// Returns how to close a connection hyper is done with, by what ended it: `None` when hyper
+/// ended it cleanly. hyper ends cleanly after the client closed (then nothing is waited for) or
+/// after it answered and chose to close, as for `Connection: close` or a body it did not read,
+/// and it answers a bad request before it errs: in those cases the client may still be sending.
+/// Once the server is stopping nothing is waited for, so a stop is not held up by clients that
+/// keep their connections open.
+fn close_after(end: Option<ConnectionEnd>, stopping: bool) -> Close {
+    match end {
+        _ if stopping => Close::Now,
+        None | Some(ConnectionEnd::BadRequest(_)) => Close::Lingering,
+        Some(
+            ConnectionEnd::PeerGone
+            | ConnectionEnd::WriteStalled { .. }
+            | ConnectionEnd::NoFirstRequest
+            | ConnectionEnd::NoNextRequest
+            | ConnectionEnd::AnswerCut
+            | ConnectionEnd::Failed,
+        ) => Close::Now,
+    }
+}
+
 /// Counts and logs a connection that failed with `e`, by what ended it.
-fn report_connection_error(
-    e: &(dyn std::error::Error + 'static),
-    stage: Stage,
-    request_head: std::time::Duration,
-) {
+fn report_connection_error(e: &(dyn std::error::Error + 'static), stage: Stage, request_head: std::time::Duration) {
     match connection_end(e, stage) {
         // A client going away is normal under load and is not logged.
         ConnectionEnd::PeerGone => {}
@@ -386,8 +407,21 @@ fn report_connection_error(
             events::count(HttpEvent::RequestHeadTimedOut);
             tracing::debug!(target: "mipyre::server", error = %e, "no next request head; closing the connection");
         }
+        // It is counted and logged per file, throttled, since every client of a file being
+        // rewritten meets it.
+        ConnectionEnd::AnswerCut => {
+            if let Some(cut) = answer_cut(e) {
+                cut.report();
+            }
+        }
         ConnectionEnd::Failed => tracing::warn!(target: "mipyre::server", error = %e, "Connection error"),
     }
+}
+
+/// Finds the static file answer that was cut off along `e`'s source chain, if that is why the
+/// connection failed.
+fn answer_cut<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a FileSendError> {
+    std::iter::successors(Some(e), |e| e.source()).find_map(|e| e.downcast_ref::<FileSendError>())
 }
 
 /// Finds the write stall along `e`'s source chain, if that is why the connection failed.
@@ -433,7 +467,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn a_write_stall_is_found_inside_the_io_error_hyper_wraps() {
         let limit = std::time::Duration::from_secs(10);
@@ -466,7 +499,10 @@ mod tests {
             mipyre_transport::stream::stall::WriteStallError { limit },
         ));
         let log = reported(&stalled);
-        assert!(log.lines().all(|l| l.contains("write stalled") && l.contains("10s")), "{log}");
+        assert!(
+            log.lines().all(|l| l.contains("write stalled") && l.contains("10s")),
+            "{log}"
+        );
         let timed_out = Wrapper(std::io::Error::from(std::io::ErrorKind::TimedOut));
         let log = reported(&timed_out);
         let line = log.lines().find(|l| l.contains("Connection error")).expect(&log);
@@ -486,9 +522,7 @@ mod tests {
     }
 
     /// Answers every request 200 with an empty body.
-    async fn ok(
-        _: Request<Incoming>,
-    ) -> Result<hyper::Response<ResponseBody>, hyper::Error> {
+    async fn ok(_: Request<Incoming>) -> Result<hyper::Response<ResponseBody>, hyper::Error> {
         Ok(hyper::Response::new(ResponseBody::Full(http_body_util::Full::new(
             bytes::Bytes::new(),
         ))))
@@ -544,9 +578,19 @@ mod tests {
             let malformed = HttpEvent::MalformedRequest;
             let oversized = HttpEvent::OversizedRequestHead;
             let cases: [(&str, &[u8], HttpEvent, &str); 5] = [
-                ("a TLS ClientHello", b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03", malformed, "400"),
+                (
+                    "a TLS ClientHello",
+                    b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03",
+                    malformed,
+                    "400",
+                ),
                 ("a bad version", b"GET / HTTP/9.9\r\nhost: t\r\n\r\n", malformed, "400"),
-                ("a header without a colon", b"GET / HTTP/1.1\r\nno colon here\r\n\r\n", malformed, "400"),
+                (
+                    "a header without a colon",
+                    b"GET / HTTP/1.1\r\nno colon here\r\n\r\n",
+                    malformed,
+                    "400",
+                ),
                 ("a URI too long", long_uri.as_bytes(), oversized, "414"),
                 ("too many headers", many_headers.as_bytes(), oversized, "431"),
             ];
@@ -593,7 +637,10 @@ mod tests {
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(HEADER_READ_TIMEOUT)
                 .serve_connection(TokioIo::new(server), service_fn(ok));
-            client.write_all(b"GET / HTTP/1.1\r\nHost: t\r\n").await.expect("the pipe holds it");
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+                .await
+                .expect("the pipe holds it");
             let err = conn.await.expect_err("the head never finished");
             drop(client);
             err
@@ -609,9 +656,12 @@ mod tests {
             use tokio::io::AsyncWriteExt;
 
             let (mut client, server) = tokio::io::duplex(4096);
-            let conn = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(server), service_fn(ok));
-            client.write_all(b"GET / HTTP/9.9\r\n\r\n").await.expect("the pipe holds it");
+            let conn =
+                hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(server), service_fn(ok));
+            client
+                .write_all(b"GET / HTTP/9.9\r\n\r\n")
+                .await
+                .expect("the pipe holds it");
             // The client stays open until the server is done: had it closed, the 400 would fail
             // to go out and end the connection as a broken pipe (the peer going away) instead.
             let err = conn.await.expect_err("no request");
@@ -652,22 +702,91 @@ mod tests {
     fn a_failed_connection_ends_by_what_its_error_chain_says() {
         let limit = std::time::Duration::from_secs(10);
         let io = std::io::Error::from;
-        let stall = || std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            mipyre_transport::stream::stall::WriteStallError { limit },
-        );
+        let stall = || {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                mipyre_transport::stream::stall::WriteStallError { limit },
+            )
+        };
         let cases: [(&str, Box<dyn std::error::Error>, ConnectionEnd); 7] = [
-            ("a reset", Box::new(Wrapper(io(std::io::ErrorKind::ConnectionReset))), ConnectionEnd::PeerGone),
-            ("a broken pipe", Box::new(io(std::io::ErrorKind::BrokenPipe)), ConnectionEnd::PeerGone),
-            ("a stall hyper wraps", Box::new(Wrapper(stall())), ConnectionEnd::WriteStalled { limit }),
+            (
+                "a reset",
+                Box::new(Wrapper(io(std::io::ErrorKind::ConnectionReset))),
+                ConnectionEnd::PeerGone,
+            ),
+            (
+                "a broken pipe",
+                Box::new(io(std::io::ErrorKind::BrokenPipe)),
+                ConnectionEnd::PeerGone,
+            ),
+            (
+                "a stall hyper wraps",
+                Box::new(Wrapper(stall())),
+                ConnectionEnd::WriteStalled { limit },
+            ),
             ("a bare stall", Box::new(stall()), ConnectionEnd::WriteStalled { limit }),
-            ("a timeout that is no stall", Box::new(Wrapper(io(std::io::ErrorKind::TimedOut))), ConnectionEnd::Failed),
-            ("a refused write", Box::new(io(std::io::ErrorKind::PermissionDenied)), ConnectionEnd::Failed),
-            ("a parse error", Box::new(parse_error()), ConnectionEnd::BadRequest(HttpEvent::MalformedRequest)),
+            (
+                "a timeout that is no stall",
+                Box::new(Wrapper(io(std::io::ErrorKind::TimedOut))),
+                ConnectionEnd::Failed,
+            ),
+            (
+                "a refused write",
+                Box::new(io(std::io::ErrorKind::PermissionDenied)),
+                ConnectionEnd::Failed,
+            ),
+            (
+                "a parse error",
+                Box::new(parse_error()),
+                ConnectionEnd::BadRequest(HttpEvent::MalformedRequest),
+            ),
         ];
         for (what, e, end) in cases {
             assert_eq!(connection_end(e.as_ref(), Stage::Serving), end, "{what}");
             assert_eq!(connection_end(e.as_ref(), Stage::Opening), end, "{what} while opening");
+        }
+    }
+
+    #[test]
+    fn a_connection_lingers_only_where_the_client_may_still_be_sending_and_not_once_stopping() {
+        let cases = [
+            (None, Close::Lingering),
+            (
+                Some(ConnectionEnd::BadRequest(HttpEvent::MalformedRequest)),
+                Close::Lingering,
+            ),
+            (Some(ConnectionEnd::PeerGone), Close::Now),
+            (
+                Some(ConnectionEnd::WriteStalled {
+                    limit: std::time::Duration::from_secs(10),
+                }),
+                Close::Now,
+            ),
+            (Some(ConnectionEnd::NoFirstRequest), Close::Now),
+            (Some(ConnectionEnd::NoNextRequest), Close::Now),
+            (Some(ConnectionEnd::Failed), Close::Now),
+        ];
+        for (end, close) in cases {
+            assert_eq!(close_after(end, false), close, "{end:?}");
+            assert_eq!(close_after(end, true), Close::Now, "{end:?} while stopping");
+        }
+    }
+
+    #[test]
+    fn a_lingering_close_is_bounded_by_the_request_head_timeout_and_the_idle_gap_given() {
+        let secs = std::time::Duration::from_secs;
+        for (request_head, linger_idle) in [(secs(10), secs(2)), (secs(3), secs(1))] {
+            let timeouts = ConnectionTimeouts {
+                request_head,
+                linger_idle,
+            };
+            assert_eq!(
+                timeouts.linger(),
+                LingerBounds {
+                    idle: linger_idle,
+                    limit: request_head
+                }
+            );
         }
     }
 }

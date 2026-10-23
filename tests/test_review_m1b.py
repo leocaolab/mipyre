@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import http.client
-import json
 import os
 import signal
 import subprocess
@@ -22,7 +21,7 @@ import urllib.request
 
 import pytest
 
-from tests._helpers import answers, bound_port, poll_until, settle
+from tests._helpers import answers, bound_port, metric_count, poll_until, settle
 
 HOST = "127.0.0.1"
 STARTUP_TIMEOUT_S = 30
@@ -31,11 +30,14 @@ STARTUP_TIMEOUT_S = 30
 class Server:
     def __init__(self, tmp_path, script: str, env: dict[str, str], ready_path: str = "/"):
         self.port: int | None = None
-        self.script = tmp_path / "app.py"
-        self.script.write_text(textwrap.dedent(script).replace("__PORT__", "0"))
-        self.log = tmp_path / "server.log"
         full_env = dict(os.environ)
         full_env.update(env)
+        # `__SIZE__=n` in a script sizes its sub-interpreters: one per TPC thread, or the pool's
+        # with MIPYRE_TPC=0.
+        size = "subinterpreters" if full_env.get("MIPYRE_TPC") == "0" else "threads"
+        self.script = tmp_path / "app.py"
+        self.script.write_text(textwrap.dedent(script).replace("__PORT__", "0").replace("__SIZE__", size))
+        self.log = tmp_path / "server.log"
         with open(self.log, "w") as log:
             self.proc = subprocess.Popen(
                 [sys.executable, str(self.script)],
@@ -91,9 +93,10 @@ def server(tmp_path):
 # ---------------------------------------------------------------------------
 
 NON_ASCII_CT_APP = """
+    import os
     from mipyre import Mipyre, Response
 
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
     app.enable_compression(min_size=16)
 
     @app.get("/")
@@ -112,7 +115,7 @@ NON_ASCII_CT_APP = """
 @pytest.mark.parametrize("mode", ["subinterp", "gil"])
 def test_non_ascii_content_type_is_served_uncompressed(server, mode):
     # "gil": every handler on the main interpreter, the app's runtime "main".
-    s = server(NON_ASCII_CT_APP, {"MIPYRE_RUNTIME": "main"} if mode == "gil" else {})
+    s = server(NON_ASCII_CT_APP, {"MIPYRE_TEST_MODE": "main"} if mode == "gil" else {})
     s.wait_ready()
 
     req = urllib.request.Request(
@@ -130,6 +133,7 @@ def test_non_ascii_content_type_is_served_uncompressed(server, mode):
 
 GC_COUNTING_APP = """
     import gc
+    import os
     from mipyre import Mipyre
 
     # gc.disable() runs at worker init, so every collection here is the framework's.
@@ -141,7 +145,7 @@ GC_COUNTING_APP = """
 
     gc.callbacks.append(_on_gc)
 
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def root(req):
@@ -157,7 +161,7 @@ GC_COUNTING_APP = """
     def gc_count(req):
         return str(_collections[0])
 
-    app.run(host="127.0.0.1", port=__PORT__, workers=1)
+    app.run(host="127.0.0.1", port=__PORT__, __SIZE__=1)
 """
 
 
@@ -212,6 +216,7 @@ def test_idle_gc_failsafe_trips_on_keep_alive_connection(server):
 
 FAILING_GC_APP = """
     import gc
+    import os
     from mipyre import Mipyre
 
     class BadGcError(Exception):
@@ -223,7 +228,7 @@ FAILING_GC_APP = """
 
     gc.collect = _collect  # the worker's scheduled collect now fails
 
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def root(req):
@@ -233,7 +238,7 @@ FAILING_GC_APP = """
     def work(req):
         return "done"
 
-    app.run(host="127.0.0.1", port=__PORT__, workers=1)
+    app.run(host="127.0.0.1", port=__PORT__, __SIZE__=1)
 """
 
 
@@ -277,7 +282,7 @@ def test_a_failed_gc_collect_retires_the_only_worker_and_stops_the_server(server
 
 ONE_FAILING_GC_APP = """
     import gc, os
-    from mipyre import Mipyre, get_gil_metrics
+    from mipyre import Mipyre
 
     _real_collect = gc.collect
 
@@ -292,9 +297,10 @@ ONE_FAILING_GC_APP = """
 
     gc.collect = _collect
 
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
     # WARN: the retired TPC thread's line once its listeners are closed is the test's event.
     app.enable_access_log(level="warn")
+    app.enable_metrics()
 
     @app.get("/")
     def root(req):
@@ -304,13 +310,7 @@ ONE_FAILING_GC_APP = """
     def work(req):
         return "done"
 
-    @app.get("/retired")
-    def retired(req):
-        m = get_gil_metrics()
-        return {"retired": m.workers_retired, "why": m.last_worker_retirement,
-                "gc_failures": m.gc_failures}
-
-    app.run(host="127.0.0.1", port=__PORT__, workers=2)
+    app.run(host="127.0.0.1", port=__PORT__, __SIZE__=2)
 """
 
 
@@ -333,13 +333,11 @@ def test_a_retired_worker_takes_no_more_requests_and_the_others_serve(server, tm
     for i in range(40):
         status, body = _get_fresh(s, "/work")
         assert status == 200, f"request {i} after the retirement got {status}: {body}\n{s.output()[-3000:]}"
-    status, body = _get_fresh(s, "/retired")
-    assert status == 200, body
-    got = json.loads(body)
+    status, page = _get_fresh(s, "/metrics")
+    assert status == 200, page
     # A server of its own, and one collect failed: exactly one retirement.
-    assert got["retired"] == 1, got
-    assert got["gc_failures"] == 1, got
-    assert "retired: gc.collect() raised MemoryError: b142-injected" in got["why"], got
+    assert metric_count(page, "mipyre_workers_retired_total") == 1, page
+    assert metric_count(page, "mipyre_gc_failures_total") == 1, page
     assert s.proc.poll() is None, "the server stopped with a worker still serving"
     retired = [line for line in s.output().splitlines() if "the worker retires" in line]
     assert len(retired) == 1, retired
@@ -362,6 +360,7 @@ def _get_fresh(s: Server, path: str) -> tuple[int, str]:
 # the collect (`GcCollectError::Panicked`) is unit-tested beside `runtime::worker::gc_failure`.
 BASE_EXCEPTION_GC_APP = """
     import gc
+    import os
     from mipyre import Mipyre
 
     class Boom(BaseException):
@@ -372,13 +371,13 @@ BASE_EXCEPTION_GC_APP = """
 
     gc.collect = _collect
 
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def root(req):
         return "ok"
 
-    app.run(host="127.0.0.1", port=__PORT__, workers=1)
+    app.run(host="127.0.0.1", port=__PORT__, __SIZE__=1)
 """
 
 
@@ -402,15 +401,16 @@ def test_a_base_exception_in_gc_collect_retires_the_last_worker_and_stops_the_se
 
 # The app test_darwin_fanout starts.
 PLAIN_APP = """
+    import os
     from mipyre import Mipyre
 
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def root(req):
         return "ok"
 
-    app.run(host="127.0.0.1", port=__PORT__, workers=2)
+    app.run(host="127.0.0.1", port=__PORT__, __SIZE__=2)
 """
 
 
@@ -422,7 +422,7 @@ MIXED_APP = """
     import os
     from mipyre import Mipyre
 
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def root(req):
@@ -432,21 +432,21 @@ MIXED_APP = """
     async def aroot(req):
         return "async"
 
-    app.run(host="127.0.0.1", port=__PORT__, workers=int(os.environ["M1B_WORKERS"]))
+    app.run(host="127.0.0.1", port=__PORT__)
 """
 
 POOL_ENV = {"MIPYRE_TPC": "0"}
 
 
 def test_one_worker_mixed_sync_async_pool_is_startup_error(server):
-    s = server(MIXED_APP, {**POOL_ENV, "M1B_WORKERS": "1"})
+    s = server(MIXED_APP, {**POOL_ENV, "MIPYRE_SUBINTERPRETERS": "1"})
     assert s.wait_exit() != 0
     out = s.output()
-    assert "workers=1" in out and "sync" in out and "async" in out, out
+    assert "subinterpreters=1" in out and "sync" in out and "async" in out, out
 
 
 def test_pool_split_banner_matches_served_pools(server):
-    s = server(MIXED_APP, {**POOL_ENV, "M1B_WORKERS": "3"})
+    s = server(MIXED_APP, {**POOL_ENV, "MIPYRE_SUBINTERPRETERS": "3"})
     s.wait_ready()
 
     with urllib.request.urlopen(f"http://{HOST}:{s.port}/async", timeout=60) as resp:

@@ -11,7 +11,9 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::InterpreterHandle;
 
+use crate::entry::{marked, ThreadAtExit, IN_PYTHON, WATCHED};
 use crate::finalization::{FinalizationHold, Ownership, FINALIZATION};
+use crate::sync::AtomicPtr;
 use crate::sync::{AtomicU64, Condvar, Mutex, Ordering};
 
 #[derive(Debug, thiserror::Error)]
@@ -49,9 +51,8 @@ impl NewInterpreterError {
     ///
     /// `status.func` and `status.err_msg` must be NULL or NUL-terminated, as CPython guarantees.
     unsafe fn from_status(status: &ffi::PyStatus) -> Self {
-        let text = |p: *const std::ffi::c_char| {
-            (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
-        };
+        let text =
+            |p: *const std::ffi::c_char| (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned());
         NewInterpreterError::Refused {
             func: text(status.func),
             message: text(status.err_msg),
@@ -93,7 +94,6 @@ impl<R: Releasable> SubInterpreter<R> {
         }
     }
 }
-
 
 impl<R: Releasable> Drop for SubInterpreter<R> {
     fn drop(&mut self) {
@@ -178,14 +178,11 @@ impl Drop for EndOnUnwind {
     }
 }
 
-/// Prints `label` with the time since the first call and the thread name to stderr when
-/// `MIPYRE_B183_TRACE` is set.
+/// Prints `label` with the time since the first call and the thread name to stderr; only a
+/// build with the `startup_trace` feature has it, and that build is the one that measures.
 #[cfg(feature = "startup_trace")]
 pub fn trace(label: &str) {
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    if std::env::var_os("MIPYRE_B183_TRACE").is_none() {
-        return;
-    }
     let t0 = *T0.get_or_init(std::time::Instant::now);
     eprintln!(
         "TRACE {:>9.3}ms {:<22} {}",
@@ -300,6 +297,10 @@ impl<R: Releasable> SubInterpreter<R> {
             Ok(held) => {
                 let saved = ffi::PyEval_SaveThread();
                 debug_assert_eq!(saved, new_tstate.as_ptr());
+                debug_assert!(
+                    crate::entry::aligned(saved),
+                    "a thread state's address has a bit the entry word uses"
+                );
                 Ok(SubInterpreter {
                     tstate: new_tstate,
                     label,
@@ -397,10 +398,7 @@ impl<R: Releasable> SubInterpreter<R> {
     ///
     /// CPython aborts the process when another thread state is current on the calling thread,
     /// such as inside a `Python::attach` or another worker's `with_gil`.
-    pub fn with_gil<T>(
-        &mut self,
-        f: impl for<'py> FnOnce(&mut R, Python<'py>) -> T,
-    ) -> std::thread::Result<T> {
+    pub fn with_gil<T>(&mut self, f: impl for<'py> FnOnce(&mut R, Python<'py>) -> T) -> std::thread::Result<T> {
         let held = &mut *self.held;
         // SAFETY: `self.tstate` was made on this thread, which the worker never leaves, and lives
         // until `end` consumes the worker.
@@ -451,30 +449,83 @@ unsafe fn enter<T>(
 ) -> std::thread::Result<T> {
     let tstate = tstate.as_ptr();
     // While `f` runs the thread state is in use, not kept, so `detach_for_idle` leaves it alone.
-    let kept = KEPT.with(|k| k.replace(std::ptr::null_mut()));
+    let mut kept = ENTRY.with(|e| e.swap(IN_PYTHON, Ordering::Relaxed));
     if kept != tstate {
-        if !kept.is_null() {
-            // Another worker kept on this thread is saved first, though a TPC thread has one.
-            ffi::PyEval_SaveThread();
+        // Null, or this thread already in a unit: CPython aborts on the restore below then.
+        if kept.addr() & !IN_PYTHON.addr() == 0 {
+            ffi::PyEval_RestoreThread(tstate);
+        } else {
+            if kept.addr() & WATCHED != 0 {
+                kept = python_entered_while_watched(kept);
+            }
+            if kept != tstate {
+                // Another worker kept on this thread is saved first, though a TPC thread has one.
+                if !kept.is_null() {
+                    ffi::PyEval_SaveThread();
+                }
+                ffi::PyEval_RestoreThread(tstate);
+            }
         }
-        ffi::PyEval_RestoreThread(tstate);
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: This worker's thread state is current and stays current for `f`.
         Python::attach_current(f)
     }));
     if KEEP.with(Cell::get) {
-        KEPT.with(|k| k.set(tstate));
+        ENTRY.with(|e| e.store(tstate, Ordering::Relaxed));
     } else {
         let saved = ffi::PyEval_SaveThread();
         debug_assert_eq!(saved, tstate);
+        ENTRY.with(|e| e.store(std::ptr::null_mut(), Ordering::Relaxed));
     }
     result
 }
 
+/// Tells the exit watching this thread that Python runs on it again, and returns the word
+/// `kept` without the exit's mark.
+#[cold]
+#[inline(never)]
+fn python_entered_while_watched(kept: *mut ffi::PyThreadState) -> *mut ffi::PyThreadState {
+    FINALIZATION.python_entered_while_watched();
+    kept.with_addr(kept.addr() & !WATCHED)
+}
+
+/// A thread's entry word ([`crate::entry`]), for the exit to mark from another thread.
+///
+/// [`Finalization::own`](crate::finalization) makes it on the owning thread and keeps it in the
+/// owners' list until that thread gives its interpreter up, which the thread does before it ends
+/// and its thread-locals are freed: so while one is held its word is alive.
+pub(crate) struct ThreadEntry(*const AtomicPtr<ffi::PyThreadState>);
+
+// SAFETY: The word is an atomic, alive while the entry is held (above).
+unsafe impl Send for ThreadEntry {}
+
+impl ThreadEntry {
+    /// The calling thread's word.
+    pub(crate) fn this_thread() -> Self {
+        ThreadEntry(ENTRY.with(std::ptr::from_ref))
+    }
+
+    /// Marks the word for the exit unless a unit runs on the thread, and says which.
+    pub(crate) fn mark(&self) -> ThreadAtExit {
+        // SAFETY: The word is alive while the entry is held (the type's invariant).
+        let word = unsafe { &*self.0 };
+        let mut seen = word.load(Ordering::Relaxed);
+        loop {
+            let Some(marking) = marked(seen.addr()) else {
+                return ThreadAtExit::RunningPython;
+            };
+            match word.compare_exchange_weak(seen, seen.with_addr(marking), Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return ThreadAtExit::OutsidePython,
+                Err(now) => seen = now,
+            }
+        }
+    }
+}
+
 thread_local! {
     static KEEP: Cell<bool> = const { Cell::new(false) };
-    static KEPT: Cell<*mut ffi::PyThreadState> = const { Cell::new(std::ptr::null_mut()) };
+    pub(crate) static ENTRY: AtomicPtr<ffi::PyThreadState> = const { AtomicPtr::new(std::ptr::null_mut()) };
 }
 
 /// Keeps this thread's worker thread state current between units of work from now on.
@@ -491,12 +542,15 @@ pub fn detach_for_idle() {
         clippy::let_underscore_must_use,
         reason = "`try_with` fails only while this thread's thread-locals are being destroyed: the thread is ending, and there is no kept state left to read"
     )]
-    let _ = KEPT.try_with(|kept| {
-        if !kept.get().is_null() {
-            // SAFETY: `enter` sets the kept thread state only while it is current, and only this
-            // clears it.
+    let _ = ENTRY.try_with(|entry| {
+        let word = entry.load(Ordering::Relaxed);
+        // Above `IN_PYTHON` is a thread state, marked or not: null, `WATCHED` alone and
+        // `IN_PYTHON` keep none.
+        if word.addr() > IN_PYTHON.addr() {
+            // SAFETY: `enter` keeps a thread state in the word only while it is current, and only
+            // this takes it out; the exit only adds `WATCHED`, which the clear below keeps.
             unsafe { ffi::PyEval_SaveThread() };
-            kept.set(std::ptr::null_mut());
+            entry.fetch_and(WATCHED, Ordering::Relaxed);
         }
     });
 }
@@ -664,10 +718,7 @@ impl UnitHost for SlotThread {
         // SAFETY: The token proves a thread state is current, NULL clears, and the only exception
         // set is the static `KeyboardInterrupt` type.
         let reached = unsafe {
-            ffi::PyThreadState_SetAsyncExc(
-                self.thread as std::ffi::c_long,
-                exc.unwrap_or(std::ptr::null_mut()),
-            )
+            ffi::PyThreadState_SetAsyncExc(self.thread as std::ffi::c_long, exc.unwrap_or(std::ptr::null_mut()))
         };
         reached != 0
     }
@@ -779,8 +830,7 @@ impl UnitPhase {
 
     /// Returns `None` when no interruption is outstanding.
     fn take_back(self) -> Option<UnitPhase> {
-        (self == UnitPhase::RunningInterruptOutstanding)
-            .then_some(UnitPhase::RunningInterruptTakenBack)
+        (self == UnitPhase::RunningInterruptOutstanding).then_some(UnitPhase::RunningInterruptTakenBack)
     }
 
     /// Returns whether an exception set on the unit's thread may still be there, including one set
@@ -1050,16 +1100,10 @@ impl<H: UnitHost> UnitState<H> {
 
     /// Begins the next run, keeping the count, and returns it with the word before.
     fn begin_run(&self) -> (RunId, u64) {
-        let before = match self
-            .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
-                let next = run_of(word).next().0;
-                Some(
-                    (next << RUN_SHIFT)
-                        | (word & (COUNT_MASK << PHASE_BITS))
-                        | UnitPhase::Running as u64,
-                )
-            }) {
+        let before = match self.state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+            let next = run_of(word).next().0;
+            Some((next << RUN_SHIFT) | (word & (COUNT_MASK << PHASE_BITS)) | UnitPhase::Running as u64)
+        }) {
             Ok(before) | Err(before) => before,
         };
         (run_of(before).next(), before)
@@ -1067,11 +1111,9 @@ impl<H: UnitHost> UnitState<H> {
 
     /// Ends the run, keeping the run and the count, and returns the phase before.
     fn end_phase(&self) -> UnitPhase {
-        let before = match self
-            .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
-                Some((word & !PHASE_MASK) | UnitPhase::from_word(word).end() as u64)
-            }) {
+        let before = match self.state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+            Some((word & !PHASE_MASK) | UnitPhase::from_word(word).end() as u64)
+        }) {
             Ok(before) | Err(before) => before,
         };
         UnitPhase::from_word(before)
@@ -1187,7 +1229,15 @@ mod test_gil;
 
 #[cfg(test)]
 #[cfg(sync_model)]
+mod model_host;
+
+#[cfg(test)]
+#[cfg(all(sync_model, not(sync_shuttle)))]
 mod loom_model;
+
+#[cfg(test)]
+#[cfg(all(sync_model, sync_shuttle))]
+mod shuttle_model;
 
 #[cfg(test)]
 #[cfg(not(sync_model))]
@@ -1227,14 +1277,7 @@ mod tests {
                     true,
                     false,
                 ),
-                UnitPhase::Ended => (
-                    UnitPhase::EndedInterrupted,
-                    None,
-                    UnitPhase::Ended,
-                    true,
-                    false,
-                    false,
-                ),
+                UnitPhase::Ended => (UnitPhase::EndedInterrupted, None, UnitPhase::Ended, true, false, false),
                 UnitPhase::EndedInterrupted => (
                     UnitPhase::EndedInterrupted,
                     None,
@@ -1248,16 +1291,8 @@ mod tests {
             assert_eq!(phase.take_back(), take_back, "take_back on {phase:?}");
             assert_eq!(phase.end(), end, "end on {phase:?}");
             assert_eq!(phase.has_ended(), has_ended, "has_ended on {phase:?}");
-            assert_eq!(
-                phase.was_interrupted(),
-                was_interrupted,
-                "was_interrupted on {phase:?}"
-            );
-            assert_eq!(
-                phase.exception_may_be_pending(),
-                pending,
-                "pending on {phase:?}"
-            );
+            assert_eq!(phase.was_interrupted(), was_interrupted, "was_interrupted on {phase:?}");
+            assert_eq!(phase.exception_may_be_pending(), pending, "pending on {phase:?}");
         }
         assert_eq!(UnitPhase::ALL.len(), 5);
     }
@@ -1267,39 +1302,37 @@ mod tests {
     fn a_pending_interruption_is_taken_back_by_the_unit_end_or_drop() {
         Python::initialize();
         let serve = crate::python_thread("take-back-serve".into()).spawn(|| {
-            let mut worker =
-                SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                    "take-back".into(), std::convert::identity,
-                    |_py| Ok(Nothing),
-                )
+            let mut worker = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
+                "take-back".into(),
+                std::convert::identity,
+                |_py| Ok(Nothing),
+            )
             .expect("a sub-interpreter on its serving thread");
             worker.with_gil(|_held, _py| ()).expect("no panic");
             assert!(!worker.unit_slot_made(), "with_gil makes no unit slot");
             for dropped in [false, true] {
-                let interrupted_then_ended =
-                    |_held: &mut Nothing, unit: WorkUnit<'_>, py: Python<'_>| {
-                        let target = unit.target();
-                        let interrupting = crate::python_thread("interrupting".into())
-                            .spawn(move || {
-                                target.interrupt().expect("set");
-                                target
-                            })
-                            .expect("spawn the interrupting thread");
-                        let target =
-                            py.detach(|| interrupting.join().expect("the interruption ends"));
-                        if dropped {
-                            drop(unit);
-                        } else {
-                            unit.end();
-                        }
-                        assert!(target.interrupted(), "the interruption was not recorded");
-                        let two: i32 = py
-                            .eval(c"1 + 1", None, None)
-                            .expect("no exception left pending on the thread")
-                            .extract()
-                            .expect("an int");
-                        assert_eq!(two, 2);
-                    };
+                let interrupted_then_ended = |_held: &mut Nothing, unit: WorkUnit<'_>, py: Python<'_>| {
+                    let target = unit.target();
+                    let interrupting = crate::python_thread("interrupting".into())
+                        .spawn(move || {
+                            target.interrupt().expect("set");
+                            target
+                        })
+                        .expect("spawn the interrupting thread");
+                    let target = py.detach(|| interrupting.join().expect("the interruption ends"));
+                    if dropped {
+                        drop(unit);
+                    } else {
+                        unit.end();
+                    }
+                    assert!(target.interrupted(), "the interruption was not recorded");
+                    let two: i32 = py
+                        .eval(c"1 + 1", None, None)
+                        .expect("no exception left pending on the thread")
+                        .extract()
+                        .expect("an int");
+                    assert_eq!(two, 2);
+                };
                 let ran = worker.with_unit(interrupted_then_ended);
                 ran.expect("no panic in the unit");
                 assert!(worker.unit_slot_made(), "the first unit makes the slot");
@@ -1316,15 +1349,7 @@ mod tests {
     fn the_unit_phase_transitions_are_the_table() {
         use UnitPhase::*;
         let table = [
-            (
-                Running,
-                RunningInterruptOutstanding,
-                None,
-                Ended,
-                false,
-                false,
-                false,
-            ),
+            (Running, RunningInterruptOutstanding, None, Ended, false, false, false),
             (
                 RunningInterruptOutstanding,
                 RunningInterruptOutstanding,
@@ -1359,17 +1384,62 @@ mod tests {
             assert_eq!(phase.take_back(), taken_back, "take_back on {phase:?}");
             assert_eq!(phase.end(), ended, "end on {phase:?}");
             assert_eq!(phase.has_ended(), has_ended, "has_ended on {phase:?}");
-            assert_eq!(
-                phase.was_interrupted(),
-                was_interrupted,
-                "was_interrupted on {phase:?}"
-            );
+            assert_eq!(phase.was_interrupted(), was_interrupted, "was_interrupted on {phase:?}");
             assert_eq!(
                 phase.exception_may_be_pending(),
                 pending,
                 "exception_may_be_pending on {phase:?}"
             );
         }
+    }
+
+    /// The exit, on another thread, finds the unit running and leaves the word alone; once the
+    /// unit is over it marks the word, and the next unit removes the mark as it enters.
+    #[test]
+    fn the_exit_marks_a_thread_only_between_units_and_entering_removes_the_mark() {
+        use std::sync::mpsc;
+        Python::initialize();
+        let (entry_out, entry_in) = mpsc::channel::<ThreadEntry>();
+        let (in_unit, is_in_unit) = mpsc::channel::<()>();
+        let (looked, has_looked) = mpsc::channel::<ThreadAtExit>();
+        let (unit_over, is_unit_over) = mpsc::channel::<()>();
+        let (marked, is_marked) = mpsc::channel::<()>();
+        let serve = crate::python_thread("watched".into())
+            .spawn(move || {
+                let mut worker = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
+                    "watched".into(),
+                    std::convert::identity,
+                    |_py| Ok(Nothing),
+                )
+                .expect("a sub-interpreter on its serving thread");
+                entry_out.send(ThreadEntry::this_thread()).unwrap();
+                let seen = worker
+                    .with_gil(|_held, _py| {
+                        in_unit.send(()).unwrap();
+                        has_looked.recv().unwrap()
+                    })
+                    .expect("no panic");
+                unit_over.send(()).unwrap();
+                is_marked.recv().unwrap();
+                let marked_word = ENTRY.with(|e| e.load(Ordering::Relaxed)).addr();
+                let in_unit_word = worker.with_gil(|_held, _py| ENTRY.with(|e| e.load(Ordering::Relaxed)).addr());
+                worker.end_on_own_thread();
+                (seen, marked_word, in_unit_word.expect("no panic"))
+            })
+            .expect("spawn the worker thread");
+        let entry = entry_in.recv().unwrap();
+        is_in_unit.recv().unwrap();
+        // The worker thread waits on `has_looked`, so its word is alive.
+        looked.send(entry.mark()).unwrap();
+        is_unit_over.recv().unwrap();
+        // The worker thread waits on `is_marked`, so its word is alive.
+        let after = entry.mark();
+        marked.send(()).unwrap();
+        let (seen, marked_word, in_unit_word) = serve.join().expect("the worker thread ends");
+        assert_eq!(seen, ThreadAtExit::RunningPython);
+        assert_eq!(after, ThreadAtExit::OutsidePython);
+        assert_eq!(marked_word & WATCHED, WATCHED);
+        assert_eq!(in_unit_word, IN_PYTHON.addr());
     }
 
     struct Nothing;
@@ -1384,7 +1454,8 @@ mod tests {
         let outcome = std::thread::spawn(|| {
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                    "prepare-panics".into(), std::convert::identity,
+                    "prepare-panics".into(),
+                    std::convert::identity,
                     |_py| -> Result<Nothing, NewInterpreterError> { panic!("prepare panics") },
                 )
             }))
@@ -1407,24 +1478,25 @@ mod tests {
     #[test]
     fn a_kept_worker_ended_without_detaching_leaves_no_thread_state() {
         Python::initialize();
-        let serve = crate::python_thread("keep-end-serve".into()).spawn(move || {
-            let mut worker =
-                SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                    "keep-end".into(), std::convert::identity,
+        let serve = crate::python_thread("keep-end-serve".into())
+            .spawn(move || {
+                let mut worker = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
+                    "keep-end".into(),
+                    std::convert::identity,
                     |_py| Ok(Nothing),
                 )
-            .expect("a sub-interpreter on its serving thread");
-            keep_attached_until_idle();
-            worker.with_gil(|_held, _py| {}).expect("no panic");
-            worker.end_on_own_thread();
-            // SAFETY: This is always safe to call.
-            let current = unsafe { ffi::PyThreadState_GetUnchecked() };
-            assert!(
-                current.is_null(),
-                "the thread is left on a thread state after the end: {current:?}"
-            );
-        })
-        .expect("spawn the worker thread");
+                .expect("a sub-interpreter on its serving thread");
+                keep_attached_until_idle();
+                worker.with_gil(|_held, _py| {}).expect("no panic");
+                worker.end_on_own_thread();
+                // SAFETY: This is always safe to call.
+                let current = unsafe { ffi::PyThreadState_GetUnchecked() };
+                assert!(
+                    current.is_null(),
+                    "the thread is left on a thread state after the end: {current:?}"
+                );
+            })
+            .expect("spawn the worker thread");
         serve.join().expect("the worker thread ends");
     }
 
@@ -1434,14 +1506,16 @@ mod tests {
         std::thread::spawn(|| {
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                    "prepare-panics-then".into(), std::convert::identity,
+                    "prepare-panics-then".into(),
+                    std::convert::identity,
                     |_py| -> Result<Nothing, NewInterpreterError> { panic!("prepare boom") },
                 )
             }))
             .is_err();
             assert!(panicked);
             let again = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                "after-panic".into(), std::convert::identity,
+                "after-panic".into(),
+                std::convert::identity,
                 |_py| Ok(Nothing),
             )
             .expect("a second sub-interpreter can be built on the same thread");
@@ -1468,12 +1542,12 @@ mod tests {
         Python::initialize();
         let target = crate::python_thread("leak-serve".into())
             .spawn(|| {
-                let mut worker =
-                    SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                        "leak".into(), std::convert::identity,
-                        |_py| Ok(Nothing),
-                    )
-                    .expect("a sub-interpreter on its serving thread");
+                let mut worker = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
+                    "leak".into(),
+                    std::convert::identity,
+                    |_py| Ok(Nothing),
+                )
+                .expect("a sub-interpreter on its serving thread");
                 let target = worker
                     .with_unit(|_held, unit, _py| {
                         let target = unit.target();
@@ -1499,13 +1573,13 @@ mod tests {
         InInterpreter(i64),
     }
 
-
     #[test]
     fn a_prepare_that_fails_ends_its_interpreter() {
         Python::initialize();
         let failed_in = std::thread::spawn(|| {
             let failed = SubInterpreter::<Nothing>::create_on_this_thread::<PrepareError>(
-                "prepare-fails".into(), PrepareError::Refused,
+                "prepare-fails".into(),
+                PrepareError::Refused,
                 |py| Err(PrepareError::InInterpreter(InterpreterHandle::current(py).id())),
             );
             let id = match failed {
@@ -1516,7 +1590,8 @@ mod tests {
             // SAFETY: This is always safe to call.
             assert!(unsafe { ffi::PyThreadState_GetUnchecked() }.is_null());
             let again = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                "after-failed-prepare".into(), std::convert::identity,
+                "after-failed-prepare".into(),
+                std::convert::identity,
                 |_py| Ok(Nothing),
             )
             .expect("a second sub-interpreter can be built on the same thread");

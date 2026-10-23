@@ -9,7 +9,7 @@ docs/design/code-review-cced8c2-roadmap.md, M3), except the cases marked as regr
 coverage.
 
 Serving paths, as `app.run` picks them:
-  - "gil"   MIPYRE_RUNTIME=main, MIPYRE_TPC=0  → handlers on main
+  - "gil"   MIPYRE_TEST_MODE=main, MIPYRE_TPC=0  → handlers on main
   - "tpc"   default runtime                        → TPC inline sub-interpreters
   - "pool"  default runtime, MIPYRE_TPC=0        → sub-interp pool (sync + async workers)
 """
@@ -26,7 +26,7 @@ import textwrap
 
 import pytest
 
-from tests._helpers import bound_port, read_file
+from tests._helpers import bound_port, read_file, set_subinterpreters
 
 from mipyre import Response
 
@@ -73,14 +73,14 @@ class Server:
             f.write(textwrap.dedent(script))
         self.log_path = self.script_path + ".log"
         env = dict(os.environ)
-        env.pop("MIPYRE_RUNTIME", None)
+        env.pop("MIPYRE_TEST_MODE", None)
         if (runtime := PATHS[path]["runtime"]) is not None:
-            env["MIPYRE_RUNTIME"] = runtime
+            env["MIPYRE_TEST_MODE"] = runtime
         env["M3_PORT"] = "0"
-        env["M3_WORKERS"] = str(workers)
         env.pop("MIPYRE_TPC", None)
         if (tpc := PATHS[path]["tpc"]) is not None:
             env["MIPYRE_TPC"] = tpc
+        set_subinterpreters(env, str(workers))
         with open(self.log_path, "w") as log:
             self.proc = subprocess.Popen(
                 [PYTHON, self.script_path],
@@ -137,7 +137,7 @@ import os
 from mipyre import Mipyre, Response
 from mipyre.cookies import get_cookies
 
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 # -- one response mapping --------------------------------------------------
 
@@ -249,7 +249,7 @@ def cookies(req):
 async def async_cookies(req):
     return {"cookie": req.headers.get("cookie"), "cookies": get_cookies(req)}
 
-app.run(host="127.0.0.1", port=int(os.environ["M3_PORT"]), workers=int(os.environ["M3_WORKERS"]))
+app.run(host="127.0.0.1", port=int(os.environ["M3_PORT"]))
 """
 
 

@@ -9,11 +9,11 @@ that misses a count and another that counts twice cannot cancel out.
 """
 
 import asyncio
-import os
 
 import pytest
-from mipyre import Mipyre, get_gil_metrics
-from mipyre.testing import TestClient
+from mipyre import Mipyre
+from mipyre.engine import ServerFlags
+from mipyre.testing import TestClient, TestServer
 
 websockets = pytest.importorskip("websockets")
 
@@ -49,15 +49,8 @@ def ws_echo(ws):
 @pytest.fixture(scope="module")
 def client():
     # The switch is read when the server starts: the run's counters count requests or not.
-    before = os.environ.get("MIPYRE_METRICS")
-    os.environ["MIPYRE_METRICS"] = "1"
-    c = TestClient(app, transport="tcp")
-    yield c
-    c.close()
-    if before is None:
-        del os.environ["MIPYRE_METRICS"]
-    else:
-        os.environ["MIPYRE_METRICS"] = before
+    with TestServer(app, config=ServerFlags(metrics=True)) as server, TestClient(server) as c:
+        yield c
 
 
 ANSWERS = [
@@ -70,9 +63,9 @@ ANSWERS = [
 ]
 
 
-def total_requests() -> int:
-    total = get_gil_metrics().total_requests
-    assert total is not None, "metrics are off: MIPYRE_METRICS was not read at server start"
+def total_requests(client: TestClient) -> int:
+    total = client.server.metrics().total_requests
+    assert total is not None, "metrics are off: the metrics flag was not read at server start"
     return total
 
 
@@ -86,13 +79,15 @@ def ws_round_trip(port: int) -> None:
 
 
 def test_each_path_is_counted_exactly_once(client):
+    # The server is this test's own: its count is every request sent to it, nothing else.
+    sent = 0
     for method, path, status in ANSWERS:
-        before = total_requests()
         for _ in range(ROUNDS):
             assert client.request(method, path).status_code == status, (method, path)
-        assert total_requests() - before == ROUNDS, (method, path)
+        sent += ROUNDS
+        assert total_requests(client) == sent, (method, path)
 
-    before = total_requests()
     for _ in range(ROUNDS):
         ws_round_trip(client.port)
-    assert total_requests() - before == ROUNDS, "websocket"
+    sent += ROUNDS
+    assert total_requests(client) == sent, "websocket"

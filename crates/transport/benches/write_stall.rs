@@ -43,7 +43,10 @@ const RESPONSE_BODY: &[u8] = b"{\"message\":\"Hello, World!\"}";
 fn write_stall_vectored(n: u64) {
     let mut io = mipyre_transport::stream::stall::WriteStall::new(Sink, Duration::from_secs(30));
     let mut cx = Context::from_waker(std::task::Waker::noop());
-    let bufs = [std::io::IoSlice::new(RESPONSE_HEAD), std::io::IoSlice::new(RESPONSE_BODY)];
+    let bufs = [
+        std::io::IoSlice::new(RESPONSE_HEAD),
+        std::io::IoSlice::new(RESPONSE_BODY),
+    ];
     measure("write_stall_vectored", n, |_| {
         let polled = Pin::new(&mut io).poll_write_vectored(&mut cx, black_box(&bufs));
         assert!(matches!(black_box(polled), Poll::Ready(Ok(_))));
@@ -51,8 +54,6 @@ fn write_stall_vectored(n: u64) {
 }
 
 fn main() {
-    let cases: [Case; 1] = [
-        ("write_stall_vectored", write_stall_vectored),
-    ];
+    let cases: [Case; 1] = [("write_stall_vectored", write_stall_vectored)];
     run(&cases);
 }

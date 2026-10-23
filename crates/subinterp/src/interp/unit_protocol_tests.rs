@@ -13,13 +13,13 @@ use super::{InterruptError, RunId, UnitHost, UnitPhase, UnitState, COUNT_MASK};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Call {
-    Visit { alive: bool },
+    Visit {
+        alive: bool,
+    },
     /// `None` means the exception was cleared.
     SetRaise(Option<RunId>),
     GaveUpGil,
 }
-
-
 
 struct RecordingHost {
     gil: Gil,
@@ -147,7 +147,10 @@ fn an_end_waits_for_an_interruption_in_flight_which_then_sets_nothing() {
     };
     gave_up.recv().expect("the end gives the GIL up to wait");
     // The interruption holds its pass, so the end cannot have returned.
-    assert!(ended.try_recv().is_err(), "the end returned with an interruption in flight");
+    assert!(
+        ended.try_recv().is_err(),
+        "the end returned with an interruption in flight"
+    );
 
     go.send(()).expect("the interruption is paused");
     interrupting
@@ -165,7 +168,11 @@ fn an_end_waits_for_an_interruption_in_flight_which_then_sets_nothing() {
     assert_eq!(*slot.host.pending.lock(), None);
     assert_eq!(slot.in_flight(), 0);
     let phase = slot.phase_of_run(run).expect("no run began since");
-    assert_eq!(phase, UnitPhase::Ended, "an interruption that set nothing marked the run");
+    assert_eq!(
+        phase,
+        UnitPhase::Ended,
+        "an interruption that set nothing marked the run"
+    );
 }
 
 #[test]
@@ -204,14 +211,17 @@ fn an_interruption_is_set_marked_and_taken_back_once() {
 
     slot.interrupt(run, run).expect("the host always enters");
     assert_eq!(*slot.host.pending.lock(), Some(run));
-    assert_eq!(
-        slot.phase_of_run(run),
-        Some(UnitPhase::RunningInterruptOutstanding)
-    );
+    assert_eq!(slot.phase_of_run(run), Some(UnitPhase::RunningInterruptOutstanding));
 
     let gil = slot.host.gil.take();
-    assert!(slot.take_interruption(gil), "the outstanding interruption is taken back");
-    assert!(!slot.take_interruption(gil), "nothing is outstanding after the take-back");
+    assert!(
+        slot.take_interruption(gil),
+        "the outstanding interruption is taken back"
+    );
+    assert!(
+        !slot.take_interruption(gil),
+        "nothing is outstanding after the take-back"
+    );
     slot.host.gil.give();
     end(&slot);
 
@@ -254,7 +264,10 @@ fn an_interruption_of_a_run_that_outlived_its_thread_state_reports_it() {
     let (run, _) = slot.begin_run();
     thread_state_gone(&slot);
 
-    assert!(matches!(slot.interrupt(run, run), Err(InterruptError::UnitThreadGone { .. })));
+    assert!(matches!(
+        slot.interrupt(run, run),
+        Err(InterruptError::UnitThreadGone { .. })
+    ));
 
     assert_eq!(
         slot.host.calls(),

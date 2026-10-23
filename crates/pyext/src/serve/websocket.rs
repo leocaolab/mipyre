@@ -11,15 +11,15 @@
 //! methods it calls block and would stall other connections on a shared loop; sharing one needs an
 //! awaitable `WebSocket` API fed from the message pump.
 
+use crate::sync::{AtomicUsize, Ordering};
 use std::future::Future;
 use std::ops::ControlFlow;
-use crate::sync::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::future::Either;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -34,25 +34,25 @@ use tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tungstenite::Message;
 
 use crate::exchange;
+use crate::exchange::RequestBody;
 use crate::exchange::{
-    connection_channels, refuse, Capacity, ConnectionEnds, ErrorRecord, HandlerEnds, HandlerError,
-    PyException, QueueEntry, QueueSender, UnansweredError, ReplyHolder, RequestHead, RequestLabel,
-    RequestStage, WebSocket, WebSocketMessage,
+    connection_channels, refuse, Capacity, ConnectionEnds, ErrorRecord, HandlerEnds, HandlerError, PyException,
+    QueueEntry, QueueSender, ReplyHolder, RequestHead, RequestLabel, RequestStage, UnansweredError, WebSocket,
+    WebSocketMessage,
 };
 use crate::runtime::{answer_if_awaited, main_chain, RequestContext};
 use crate::serve::pipeline::{
-    await_reply, cors_origin, fail, finish, reply_or_lost, AcceptEncoding, AccessTimer,
-    ResponseSource,
+    await_reply, client_of, cors_origin, fail, finish, refused_site, reply_or_lost, AcceptEncoding, AccessTimer,
+    Requester, ResponseSource,
 };
 use crate::serve::respond::http_response;
 use crate::serve::site::Site;
-use mipyre_http::plan::limits::WsLimits;
-use mipyre_http::plan::response::HandlerResponse;
-use mipyre_http::plan::route::{Params, WsRouteId};
-use mipyre_http::plan::ws::WsHandshake;
-use crate::exchange::RequestBody;
 use mipyre_http::io::body::{full_body, ResponseBody};
 use mipyre_http::io::request_id::RequestId;
+use mipyre_http::plan::limits::WsLimits;
+use mipyre_http::plan::response::{site_miss_response, HandlerResponse};
+use mipyre_http::plan::route::{Params, WsRouteId};
+use mipyre_http::plan::ws::WsHandshake;
 use mipyre_subinterp::context::PyContext;
 
 // ---------------------------------------------------------------------------
@@ -62,9 +62,7 @@ use mipyre_subinterp::context::PyContext;
 /// Returns tungstenite's settings, which refuse any message or frame past `max_message_bytes`.
 fn tungstenite_config(limits: WsLimits) -> WebSocketConfig {
     let max = Some(limits.max_message_bytes.as_usize());
-    WebSocketConfig::default()
-        .max_message_size(max)
-        .max_frame_size(max)
+    WebSocketConfig::default().max_message_size(max).max_frame_size(max)
 }
 
 /// Counts the WebSocket connections one server run has open.
@@ -110,23 +108,11 @@ fn wants_websocket(req: &Request<Incoming>, site: &Site) -> Option<WsRouteMatch>
     Some(WsRouteMatch { route, params })
 }
 
-/// Says whether a site's connections may upgrade to WebSocket. It is decided once per site: with no
-/// WebSocket route a connection's service has no upgrade branch, and a TPC connection is driven
-/// without a lock.
-#[derive(Clone)]
-pub(crate) enum Upgrades {
-    WebSocket(Arc<Site>),
-    Off,
-}
-
-impl Upgrades {
-    pub(crate) fn of(site: &Arc<Site>) -> Self {
-        if site.rules.routes.has_websocket_routes() {
-            Upgrades::WebSocket(Arc::clone(site))
-        } else {
-            Upgrades::Off
-        }
-    }
+/// Returns the site a connection answers WebSocket upgrades against, or `None` when it has no
+/// WebSocket route. It is decided once per site: without one a connection's service has no upgrade
+/// branch, and a TPC connection is driven without a lock.
+pub(crate) fn upgrade_site(site: &Arc<Site>) -> Option<Arc<Site>> {
+    site.rules.routes.has_websocket_routes().then(|| Arc::clone(site))
 }
 
 /// Upgrades `req` when it asks for one of `site`'s WebSocket routes, and hands it to `handle`
@@ -153,22 +139,15 @@ where
 )]
 fn accept_header(key: &HeaderValue) -> HeaderValue {
     let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
-    HeaderValue::from_str(&accept)
-        .expect("base64 output of derive_accept_key is a valid header value")
+    HeaderValue::from_str(&accept).expect("base64 output of derive_accept_key is a valid header value")
 }
 
 fn ws_upgrade_response(key: &HeaderValue) -> Response<ResponseBody> {
     let mut resp = Response::new(Full::new(Bytes::new()));
     *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
     let headers = resp.headers_mut();
-    headers.insert(
-        hyper::header::UPGRADE,
-        HeaderValue::from_static("websocket"),
-    );
-    headers.insert(
-        hyper::header::CONNECTION,
-        HeaderValue::from_static("Upgrade"),
-    );
+    headers.insert(hyper::header::UPGRADE, HeaderValue::from_static("websocket"));
+    headers.insert(hyper::header::CONNECTION, HeaderValue::from_static("Upgrade"));
     headers.insert(hyper::header::SEC_WEBSOCKET_ACCEPT, accept_header(key));
     full_body(resp)
 }
@@ -179,16 +158,27 @@ async fn handle_websocket(
     mut req: Request<Incoming>,
     ws: WsRouteMatch,
     site: Arc<Site>,
-    client: mipyre_transport::driver::Peer,
+    peer: mipyre_transport::driver::Peer,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let timer = AccessTimer::start(&site);
     let origin = cors_origin(&site, req.headers());
+    let client = client_of(peer, req.headers(), &site);
+    if let Some(miss) = refused_site(&req, true, &site) {
+        let resp = full_body(site_miss_response(miss).map(Full::new));
+        return Ok(finish(
+            resp,
+            &site,
+            req.method(),
+            req.uri().path(),
+            Requester::Headers(req.headers(), &client),
+            timer,
+            origin,
+            ResponseSource::WebSocket,
+        ));
+    }
     let upgrade = hyper::upgrade::on(&mut req);
     let (parts, _body) = req.into_parts();
-    let request_id = RequestId::of(
-        &parts.headers,
-        site.rules.settings.request_id_header.as_ref(),
-    );
+    let request_id = RequestId::of(&parts.headers, site.rules.settings.request_id_header.as_ref());
     let head = RequestHead {
         parts,
         params: ws.params,
@@ -196,6 +186,7 @@ async fn handle_websocket(
         request_id,
     };
     let label = head.label();
+    let client = head.client;
     let resp = match WsHandshake::parse(&head.parts) {
         Ok(handshake) => answer_upgrade(&site, ws.route, handshake, head, upgrade, &label).await,
         Err(e) => {
@@ -209,6 +200,7 @@ async fn handle_websocket(
         &site,
         &label.method,
         label.uri.path(),
+        Requester::Given(&label.id, &client),
         timer,
         origin,
         ResponseSource::WebSocket,
@@ -251,9 +243,7 @@ async fn answer_upgrade(
     label: &RequestLabel,
 ) -> Response<ResponseBody> {
     let limits = site.rules.settings.limits.ws;
-    let Some(slot) =
-        ConnectionSlot::try_acquire(&site.ws_connections, limits.max_connections.get())
-    else {
+    let Some(slot) = ConnectionSlot::try_acquire(&site.ws_connections, limits.max_connections.get()) else {
         tracing::debug!(target: "mipyre::server", path = label.uri.path(), max_connections = limits.max_connections.get(),
             "WebSocket connection limit reached; answered 503");
         return fail(
@@ -270,19 +260,15 @@ async fn answer_upgrade(
     let (answer_tx, answer_rx) = oneshot::channel();
     let accept_encoding = AcceptEncoding::of(&head, site.rules.settings.compression.as_ref());
     let request = exchange::Request::new(head, RequestBody::Buffered(Bytes::new()));
-    let handle =
-        match spawn_handler_thread(Arc::clone(site), route, request, handler_ends, answer_tx) {
-            Ok(handle) => handle,
-            Err(e) => return fail(HandlerError::ThreadNotSpawned(e), label, &site.counters),
-        };
+    let handle = match spawn_handler_thread(Arc::clone(site), route, request, handler_ends, answer_tx) {
+        Ok(handle) => handle,
+        Err(e) => return fail(HandlerError::ThreadNotSpawned(e), label, &site.counters),
+    };
     let thread = HandlerThread { handle, slot };
 
     let answer = reply_or_lost(answer_rx, ReplyHolder::WebsocketHandler);
     let budget = site.rules.settings.limits.request_budget;
-    match await_reply(budget, answer)
-        .await
-        .map(Result::transpose)
-    {
+    match await_reply(budget, answer).await.map(Result::transpose) {
         Ok(None) => {}
         Ok(Some(response)) => {
             thread.join().await;
@@ -352,32 +338,27 @@ fn spawn_handler_thread(
     hooks_answer: oneshot::Sender<Result<Option<HandlerResponse>, ErrorRecord>>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let main = pyo3::sync::InterpreterHandle::main();
-    handler_thread()
-        .spawn(move || {
-            mipyre_subinterp::attach::with_interpreter(main, move |py| {
-                let label = request.label();
-                match PyContext::new(py) {
-                    // The handshake is still waiting and answers with this error as a 500.
-                    Err(making) => {
-                        let error =
-                            HandlerError::python(py, RequestStage::Setup, &making).log(&label);
-                        answer_if_awaited(hooks_answer, Err(error));
-                    }
-                    Ok(ctx) => {
-                        let mut rc = RequestContext::enter(ctx);
-                        serve_connection(py, &mut rc, &site, route, request, ends, hooks_answer);
-                        // The connection ran; nothing waits for an answer any more.
-                        if let Err(exit) = rc.exit() {
-                            drop(
-                                HandlerError::python(py, RequestStage::ContextExit, &exit)
-                                    .log(&label),
-                            );
-                        }
+    handler_thread().spawn(move || {
+        mipyre_subinterp::attach::with_interpreter(main, move |py| {
+            let label = request.label();
+            match PyContext::new(py) {
+                // The handshake is still waiting and answers with this error as a 500.
+                Err(making) => {
+                    let error = HandlerError::python(py, RequestStage::Setup, &making).log(&label);
+                    answer_if_awaited(hooks_answer, Err(error));
+                }
+                Ok(ctx) => {
+                    let mut rc = RequestContext::enter(ctx);
+                    serve_connection(py, &mut rc, &site, route, request, ends, hooks_answer);
+                    // The connection ran; nothing waits for an answer any more.
+                    if let Err(exit) = rc.exit() {
+                        drop(HandlerError::python(py, RequestStage::ContextExit, &exit).log(&label));
                     }
                 }
-                drop(site);
-            });
-        })
+            }
+            drop(site);
+        });
+    })
 }
 
 fn serve_connection<'py>(
@@ -442,9 +423,7 @@ fn run_handler(py: Python<'_>, handler: &Py<PyAny>, ws: WebSocket, label: &Reque
     };
     // An `async def` handler returns a coroutine that must be driven on a fresh loop.
     let coroutine = py.import("asyncio").and_then(|asyncio| {
-        let is_coro = asyncio
-            .call_method1("iscoroutine", (&result,))?
-            .extract::<bool>()?;
+        let is_coro = asyncio.call_method1("iscoroutine", (&result,))?.extract::<bool>()?;
         Ok((asyncio, is_coro))
     });
     match coroutine {
@@ -546,10 +525,7 @@ fn into_message(msg: WebSocketMessage) -> Message {
 /// select arm from reading the socket, so flow control reaches the client through the TCP window.
 async fn forward(incoming: &QueueSender, msg: WebSocketMessage) -> ControlFlow<()> {
     let permit = incoming.budget.reserve(msg.len()).await;
-    match incoming.tx.send(QueueEntry {
-        msg,
-        _budget: permit,
-    }) {
+    match incoming.tx.send(QueueEntry { msg, _budget: permit }) {
         Ok(()) => ControlFlow::Continue(()),
         // The Python side is gone.
         Err(_) => ControlFlow::Break(()),
@@ -593,10 +569,7 @@ where
     if let Err(e) = io.shutdown().await {
         tracing::debug!(target: "mipyre::server", error = %e, "WebSocket write shutdown failed");
     }
-    if tokio::time::timeout(CLOSE_LINGER, discard_until_eof(io))
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(CLOSE_LINGER, discard_until_eof(io)).await.is_err() {
         tracing::debug!(target: "mipyre::server", linger = ?CLOSE_LINGER,
             "WebSocket peer did not close in time; dropping the connection");
     }

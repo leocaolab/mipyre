@@ -80,7 +80,7 @@ pub(super) fn serve_sync(
     worker.end_on_own_thread();
 }
 
-/// Runs the async engine (`_async_engine.py`) until its inbox closes or it stops; requests it
+/// Runs the async engine (`_worker/async_engine.py`) until its inbox closes or it stops; requests it
 /// still held were answered as it let go of them (see `AsyncJob`). The last async worker to die
 /// answers `queued`.
 pub(super) fn serve_async(

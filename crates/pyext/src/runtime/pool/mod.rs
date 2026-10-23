@@ -29,12 +29,14 @@ pub(crate) use self::split::{split_workers_for_routes, RouteKinds, WorkerCounts}
 pub(crate) use self::threads::{AbandonedWorker, PoolThreads};
 
 use self::serve::{serve_async, serve_sync};
-use self::threads::{join_failed_start, python_thread, RunningSlot, WorkerThread};
+use self::threads::{join_failed_start, python_thread, WorkerThread};
 use self::watchdog::{watch, Replacer, Supervision, SyncLane};
 
+/// Carries a reply to a request's caller; an error in it has already been logged.
+pub(crate) type ReplySender<T> = tokio::sync::oneshot::Sender<Result<T, ErrorRecord>>;
+
 /// Carries a worker's reply; an error in it has already been logged.
-pub(crate) type PoolReplySender =
-    tokio::sync::oneshot::Sender<Result<HandlerResponse, ErrorRecord>>;
+pub(crate) type PoolReplySender = ReplySender<HandlerResponse>;
 
 /// Hands `value` to whoever waits on `tx`. The waiter is gone only when it gave up on the
 /// request (it timed out, its client went away, the server stopped): there is nobody left
@@ -100,21 +102,35 @@ impl PoolJob {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PoolError {
-    #[error(transparent)]
-    Start(#[from] StartError),
+    /// `abandoned` are the started workers' threads still running when the failed start
+    /// stopped waiting for them.
+    #[error("{source}")]
+    Start {
+        source: StartError,
+        abandoned: Vec<AbandonedWorker>,
+    },
     #[error("could not spawn the thread of worker {index}: {source}")]
     ThreadNotSpawned {
         index: WorkerIndex,
         source: std::io::Error,
+        abandoned: Vec<AbandonedWorker>,
     },
     #[error("could not spawn the sub-interpreter watchdog: {0}")]
     WatchdogNotSpawned(std::io::Error),
 }
 
 impl PoolError {
+    /// Returns the worker threads the failed start left running.
+    pub(crate) fn abandoned(&self) -> &[AbandonedWorker] {
+        match self {
+            PoolError::Start { abandoned, .. } | PoolError::ThreadNotSpawned { abandoned, .. } => abandoned,
+            PoolError::WatchdogNotSpawned(_) => &[],
+        }
+    }
+
     pub(crate) fn into_pyerr(self, py: Python<'_>) -> PyErr {
         match self {
-            PoolError::Start(e) => e.into_pyerr(py),
+            PoolError::Start { source, .. } => source.into_pyerr(py),
             other @ (PoolError::ThreadNotSpawned { .. } | PoolError::WatchdogNotSpawned(_)) => {
                 pyo3::exceptions::PyRuntimeError::new_err(other.to_string())
             }
@@ -176,8 +192,7 @@ impl InterpreterPool {
         let sync_count = NonZeroUsize::new(split.sync_workers);
         let async_count = NonZeroUsize::new(split.async_workers);
         // The queues in use bound how many large bodies may be buffered at once.
-        let total_permits =
-            sync_count.map_or(0, |_| sync_capacity) + async_count.map_or(0, |_| async_capacity);
+        let total_permits = sync_count.map_or(0, |_| sync_capacity) + async_count.map_or(0, |_| async_capacity);
 
         let (sync_lives, sync_worker_lives) = LiveWorkers::new(
             WorkerKind::PoolSync,
@@ -191,12 +206,7 @@ impl InterpreterPool {
             stop.clone(),
             Arc::clone(counters),
         );
-        let routes: Vec<RouteKey> = recipe
-            .expected()
-            .routes
-            .iter()
-            .map(|r| r.key.clone())
-            .collect();
+        let routes: Vec<RouteKey> = recipe.expected().routes.iter().map(|r| r.key.clone()).collect();
         let sup = Supervision::new(routes);
         let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(0);
         let replacer = Arc::new(Replacer {
@@ -238,8 +248,12 @@ impl InterpreterPool {
                 }
                 Err(source) => {
                     gate.abort();
-                    join_failed_start(threads, &sync_lanes, shutdown_timeout);
-                    return Err(PoolError::ThreadNotSpawned { index, source });
+                    let abandoned = join_failed_start(threads, &sync_lanes, shutdown_timeout);
+                    return Err(PoolError::ThreadNotSpawned {
+                        index,
+                        source,
+                        abandoned,
+                    });
                 }
             }
         }
@@ -258,15 +272,16 @@ impl InterpreterPool {
                 serve_async(worker, inbox, &queued, life)
             });
             match spawned {
-                Ok(handle) => async_handles.push(WorkerThread {
-                    handle,
-                    running: RunningSlot::idle(),
-                }),
+                Ok(handle) => async_handles.push(WorkerThread { handle, lane: None }),
                 Err(source) => {
                     gate.abort();
                     threads.threads.append(&mut async_handles);
-                    join_failed_start(threads, &sync_lanes, shutdown_timeout);
-                    return Err(PoolError::ThreadNotSpawned { index, source });
+                    let abandoned = join_failed_start(threads, &sync_lanes, shutdown_timeout);
+                    return Err(PoolError::ThreadNotSpawned {
+                        index,
+                        source,
+                        abandoned,
+                    });
                 }
             }
         }
@@ -278,8 +293,11 @@ impl InterpreterPool {
         mipyre_subinterp::trace("settled");
         if let Err(aborted) = settled {
             threads.threads.append(&mut async_handles);
-            join_failed_start(threads, &sync_lanes, shutdown_timeout);
-            return Err(PoolError::Start(aborted));
+            let abandoned = join_failed_start(threads, &sync_lanes, shutdown_timeout);
+            return Err(PoolError::Start {
+                source: aborted,
+                abandoned,
+            });
         }
         recipe.report_started(n);
         sup.watch_lanes(sync_lanes);
@@ -302,9 +320,7 @@ impl InterpreterPool {
     }
 
     pub(crate) fn async_workers(&self) -> usize {
-        self.async_queue
-            .as_ref()
-            .map_or(0, |queue| queue.workers.get())
+        self.async_queue.as_ref().map_or(0, |queue| queue.workers.get())
     }
 
     /// Queues a request on the worker kind that runs it without waiting; a full queue is an
@@ -326,9 +342,7 @@ impl WorkerQueue {
     fn submit(&self, req: PoolJob) -> Result<(), UnansweredError> {
         let group = WorkerGroup::Subinterp;
         self.work_tx.try_send(req).map_err(|e| match e {
-            JobSendError::QueueFull => {
-                UnansweredError::Overloaded(Capacity::WorkQueue(group))
-            }
+            JobSendError::QueueFull => UnansweredError::Overloaded(Capacity::WorkQueue(group)),
             // The cause is read only here, off the hot path.
             JobSendError::NoReceiverLeft => match self.lives.first_death() {
                 Some(cause) => UnansweredError::WorkersDied { group, cause },
@@ -365,9 +379,7 @@ mod tests {
 
     type ReplyReceiver = tokio::sync::oneshot::Receiver<Result<HandlerResponse, ErrorRecord>>;
 
-    fn queue_of(
-        n: usize,
-    ) -> (JobReceiver<PoolJob>, Vec<ReplyReceiver>) {
+    fn queue_of(n: usize) -> (JobReceiver<PoolJob>, Vec<ReplyReceiver>) {
         let mut table = RouteTable::<(), ()>::new();
         table
             .insert("GET", "/", (), "index".into(), HandlerPlace::Worker(HandlerKind::Async))
@@ -376,26 +388,18 @@ mod tests {
         let (tx, rx) = job_queue(n);
         let replies = (0..n)
             .map(|_| {
-                let (parts, ()) = hyper::Request::get("/")
-                    .body(())
-                    .expect("a valid request")
-                    .into_parts();
+                let (parts, ()) = hyper::Request::get("/").body(()).expect("a valid request").into_parts();
                 let head = crate::exchange::RequestHead {
                     parts,
                     params: Vec::new(),
-                    client: mipyre_transport::driver::Peer::Ip(
-                        std::net::Ipv4Addr::LOCALHOST.into(),
-                    ),
+                    client: mipyre_transport::driver::Peer::Ip(std::net::Ipv4Addr::LOCALHOST.into()),
                     request_id: mipyre_http::io::request_id::RequestId::mint(),
                 };
                 let (reply, answered) = tokio::sync::oneshot::channel();
                 tx.try_send(PoolJob {
                     route,
                     kind: HandlerKind::Async,
-                    request: Request::new(
-                        head,
-                        crate::exchange::RequestBody::Buffered(Default::default()),
-                    ),
+                    request: Request::new(head, crate::exchange::RequestBody::Buffered(Default::default())),
                     reply,
                 })
                 .expect("the queue is open");
@@ -410,10 +414,7 @@ mod tests {
         table
             .insert("GET", "/", (), "index".into(), HandlerPlace::Worker(kind))
             .expect("one route");
-        let (parts, ()) = hyper::Request::get("/")
-            .body(())
-            .expect("a valid request")
-            .into_parts();
+        let (parts, ()) = hyper::Request::get("/").body(()).expect("a valid request").into_parts();
         let head = crate::exchange::RequestHead {
             parts,
             params: Vec::new(),
@@ -424,10 +425,7 @@ mod tests {
         let job = PoolJob {
             route: table.route_id(0),
             kind,
-            request: Request::new(
-                head,
-                crate::exchange::RequestBody::Buffered(Default::default()),
-            ),
+            request: Request::new(head, crate::exchange::RequestBody::Buffered(Default::default())),
             reply,
         };
         (job, answered)
@@ -458,7 +456,10 @@ mod tests {
             pool.submit(sync),
             Err(UnansweredError::NoWorkers(WorkerGroup::Subinterp))
         ));
-        assert!(queued.try_recv().is_none(), "the sync request went onto the async queue");
+        assert!(
+            queued.try_recv().is_none(),
+            "the sync request went onto the async queue"
+        );
 
         let (r#async, _) = job(HandlerKind::Async);
         assert!(pool.submit(r#async).is_ok());

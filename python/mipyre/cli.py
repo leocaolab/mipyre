@@ -3,15 +3,23 @@
 Entry point for the ``mipyre`` console script. Three subcommands:
 
 - ``mipyre run <module:attr>``   production-ish launch (no reload)
-- ``mipyre dev <module:attr>``   hot-reload + DEBUG logging
+- ``mipyre dev <module:attr>``   hot-reload, access log on (logs at INFO)
 - ``mipyre routes <module:attr>`` print the registered route table
 
 The target is a ``module:attr`` string identifying a Mipyre app, just like
 gunicorn/uvicorn. ``attr`` defaults to ``app``.
 
+Before the first ``--``: mipyre's own options and the flags the app declares
+(:mod:`mipyre.flags`), parsed once after the app is imported; ``--help`` lists both. What
+follows the first ``--`` is the app's own command line: mipyre does not read it, and every
+interpreter that runs the app (main, each sub-interpreter, each process worker) has
+``sys.argv == [<the app's file>, *those arguments]``.
+
 Examples::
 
     mipyre run examples.hello:app --port 8080
+    mipyre run examples.hello:app --port 8080 --db-dsn postgres://localhost/app
+    mipyre run examples.hello:app --port 8080 -- --debug
     mipyre dev examples.hello
     mipyre routes examples.hello
 """
@@ -21,39 +29,52 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
-from mipyre._runtime import ProcessLanes
-from mipyre.app import _Launch
+from mipyre import _server_run, flags
+from mipyre._server_run import Launch
+from mipyre.engine import ConfigError, Deployment, EntryPoint, ServerFlags
 
 if TYPE_CHECKING:
     from mipyre.app import Mipyre
 
 
-# The target `mipyre run` loaded (`module:attr` or `path.py:attr`): a process-lane worker
-# imports the app the same way.
-LOADED_TARGET: str | None = None
+def _importable_cwd() -> None:
+    """Make the current directory importable — same ergonomic as uvicorn."""
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
+
+
+def _set_app_argv(target: str, app_args: list[str]) -> None:
+    """``sys.argv`` becomes the app's command line before any of the app is imported, so an app
+    that parses it as it is imported reads its own arguments; the workers copy main's. Finding
+    the app's file imports the packages above a dotted module, so they see the app's arguments
+    behind the target as given; then ``argv[0]`` becomes the file."""
+    from mipyre import _target
+
+    _importable_cwd()
+    sys.argv = [target, *app_args]
+    try:
+        sys.argv[0] = _target.target_file(target)
+    except (ValueError, _target.MissingTargetError) as e:
+        sys.exit(f"mipyre: {e}")
 
 
 def _load_app(target: str) -> "Mipyre":
     """Resolve ``module[:attr]`` (or ``path/to/app.py[:attr]``) → Mipyre instance.
     Importing the module runs its top-level code, which registers routes on the app."""
-    global LOADED_TARGET
-    from mipyre import _runtime
+    from mipyre import _target
 
-    # Make the current directory importable — same ergonomic as uvicorn.
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
+    _importable_cwd()
     try:
-        module_name, attr = _runtime.split_target(target)
+        module_name, attr = _target.split_target(target)
     except ValueError as e:
         sys.exit(f"mipyre: {e}")
     try:
-        module, app = _runtime.import_target(target)
-    except ImportError as e:
-        sys.exit(f"mipyre: cannot import {module_name!r}: {e}")
-    except AttributeError as e:
+        module, app = _target.import_target(target)
+    except _target.MissingTargetError as e:
         sys.exit(f"mipyre: {e}")
 
     from mipyre.app import Mipyre
@@ -65,83 +86,46 @@ def _load_app(target: str) -> "Mipyre":
     # `__main__` is this file, so point them at the app's module instead.
     module_file = getattr(module, "__file__", None)
     if module_file:
-        app._set_app_file(os.path.abspath(module_file))
-    LOADED_TARGET = f"{os.path.abspath(module_name)}:{attr}" if module_name.endswith(".py") else f"{module_name}:{attr}"
+        _server_run.set_app_file(app, os.path.abspath(module_file))
     return app
 
 
-def _export_runtime_flag(args: argparse.Namespace) -> None:
-    """``--runtime`` becomes ``MIPYRE_RUNTIME``: every interpreter that rebuilds the app (the
-    server's, each sub-interpreter re-executing the app's script, each process-lane worker)
-    resolves the app's runtime as it is constructed, and the environment is what they all
-    read. ``MIPYRE_RUNTIME_SOURCE`` lets an error name the flag rather than the variable."""
-    if getattr(args, "runtime", None):
-        os.environ["MIPYRE_RUNTIME"] = args.runtime
-        os.environ["MIPYRE_RUNTIME_SOURCE"] = f"mipyre run --runtime {args.runtime}"
+def _cmd_run(args: argparse.Namespace, import_app: Callable[[], Mipyre]) -> None:
+    deployment = _deployment(args, EntryPoint.CliRun)
+    # Before the app is imported, while this process runs no other thread: the template is
+    # forked from it (Linux) and holds no app code, so an app that starts threads as it is
+    # imported (numpy's BLAS pool, a polars query) can still serve process routes. If the app
+    # has none, its run dismisses the template.
+    from mipyre._process_lane import server as lane_server
 
-
-def _lane_flags(args: argparse.Namespace) -> ProcessLanes:
-    """``--process-*``: the deployment's process-lane settings, below what the code
-    declares and above the environment."""
-    return ProcessLanes(
-        start=args.process_start,
-        workers=args.process_workers,
-        timeout=args.process_timeout,
-        queue_per_worker=args.process_queue,
-        slot_bytes=args.process_slot_bytes,
+    template = lane_server.start_template_with_driver(
+        "mipyre run, before it imports the app,",
+        "mipyre has not imported the app yet, so code that ran before it started them: a "
+        "sitecustomize, a .pth file, a PYTHONSTARTUP script. Keep that code from starting "
+        "threads, or serve the app with app.run() (`python app.py`), which starts the template "
+        "as a new interpreter after it imports the app.",
     )
+    app = import_app()
+    launch = Launch(template=template)
+    _server_run.run(app, deployment, ServerFlags(), launch, reload=deployment.reload(None))
 
 
-def _cmd_run(args: argparse.Namespace) -> None:
-    # Normalize empty strings to None so `--tls-cert ""` is rejected, not
-    # silently forwarded to app.run() as a bogus file path.
-    tls_cert = args.tls_cert or None
-    tls_key = args.tls_key or None
-    if (tls_cert is None) != (tls_key is None):
-        sys.exit("mipyre: --tls-cert and --tls-key must be specified together")
-    _export_runtime_flag(args)
-    # Before the app is imported: process-lane workers fork from a template that holds no
-    # app code. If the app has no process routes, the template is dismissed.
-    from mipyre import _process_lane
-
-    _process_lane.start_template()
-    app = _load_app(args.target)
-    app._run(
-        os.environ,
-        _Launch(lanes=_lane_flags(args)),
-        host=args.host,
-        port=args.port,
-        workers=args.workers,
-        io_workers=args.io_workers,
-        reload=False,
-        tls_cert=tls_cert,
-        tls_key=tls_key,
-    )
+def _cmd_dev(args: argparse.Namespace, import_app: Callable[[], Mipyre]) -> None:
+    deployment = _deployment(args, EntryPoint.CliDev)
+    app = import_app()
+    # `mipyre dev` reloads, and logs unless the deployment's `log` says otherwise.
+    _server_run.run(app, deployment, ServerFlags(), Launch(log=True), reload=True)
 
 
-def _cmd_dev(args: argparse.Namespace) -> None:
-    app = _load_app(args.target)
-    app._run(
-        os.environ,
-        # `mipyre dev` logs unless MIPYRE_LOG says otherwise.
-        _Launch(log=os.environ.get("MIPYRE_LOG", "1") == "1"),
-        host=args.host,
-        port=args.port,
-        workers=args.workers,
-        reload=True,
-    )
-
-
-def _cmd_routes(args: argparse.Namespace) -> None:
-    app = _load_app(args.target)
+def _cmd_routes(args: argparse.Namespace, import_app: Callable[[], Mipyre]) -> None:
+    app = import_app()
     rows: list[tuple[str, str, str, str]] = []
     for route in app.routes:
-        flags = [f"runtime={route.runtime}"] + [
-            name for name, on in (("stream", route.stream), ("async", route.is_async)) if on
-        ]
-        if route.model is not None:
-            flags.append(f"model={route.model}")
-        rows.append((route.method, route.path, route.handler, ",".join(flags)))
+        flags = [f"runtime={route.runtime}"] + (["async"] if route.is_async else [])
+        if route.body is not None:
+            flags.append(f"body={route.body.__name__}")
+        handler = getattr(route.handler, "__qualname__", getattr(route.handler, "__name__", repr(route.handler)))
+        rows.append((route.method, route.path, handler, ",".join(flags)))
     for fast in app.fast_routes:
         rows.append((fast.method, fast.path, f"<fast:{fast.body_bytes}B>", f"status={fast.status_code}"))
 
@@ -160,22 +144,91 @@ def _cmd_routes(args: argparse.Namespace) -> None:
     print(f"\n{len(rows)} route(s)")
 
 
-def _add_run_flags(p: argparse.ArgumentParser) -> None:
-    p.add_argument("target", help="module[:attr], e.g. examples.hello:app")
-    p.add_argument("--host", default=None, help="bind address (default 127.0.0.1)")
-    p.add_argument("--port", type=int, default=None, help="bind port (default 8000)")
-    p.add_argument("--workers", type=int, default=None, help="sub-interpreter count")
-    p.add_argument("--io-workers", type=int, default=None, help="Tokio I/O thread count")
-    p.add_argument("--tls-cert", default=None)
-    p.add_argument("--tls-key", default=None)
-    p.add_argument("--runtime", choices=("subinterp", "isolated", "process", "main"), default=None,
-                   help="the app's runtime when its code names none (deployment default)")
-    p.add_argument("--process-workers", type=int, default=None, help="process-lane workers")
-    p.add_argument("--process-start", choices=("import", "fork"), default=None,
-                   help="how process workers get the app: import it (default) or fork from a template that did")
-    p.add_argument("--process-timeout", type=float, default=None, help="process handler timeout, seconds")
-    p.add_argument("--process-queue", type=int, default=None, help="requests per process worker before 503")
-    p.add_argument("--process-slot-bytes", type=int, default=None, help="max request / answer bytes")
+class _Options:
+    """mipyre's own options of one subcommand, each with the line that adds it: an app flag of
+    the same name is refused naming that line."""
+
+    def __init__(self, parser: argparse.ArgumentParser) -> None:
+        self.parser = parser
+        self.sites: dict[str, flags._Site] = {}
+
+    def add(self, *names: str, **kwargs: Any) -> None:
+        caller = sys._getframe(1)
+        action = self.parser.add_argument(*names, **kwargs)
+        self.sites[action.dest] = flags._Site(caller.f_code.co_filename, caller.f_lineno)
+
+
+def _add_flags(o: _Options, *, reload: bool) -> None:
+    """mipyre's settings as options, from the engine's declaration table: each takes its value
+    as typed (the engine reads it, with the environment and ``pyproject.toml``); a boolean
+    given bare is on, ``--allowed-host`` and ``--trusted-proxy`` are repeatable. ``mipyre dev``
+    is the reloader itself, so it has no ``--reload``."""
+    from mipyre.engine import _flags
+
+    for flag in _flags():
+        if flag.name == "reload" and not reload:
+            continue
+        help = f"{flag.doc} ({flag.env}; default: {flag.default})"
+        if flag.shape == "bool":
+            o.add(flag.cli, dest=flag.name, nargs="?", const="true", default=None, metavar="BOOL", help=help)
+        elif flag.shape == "hosts":
+            o.add(flag.cli, dest=flag.name, action="append", default=None, metavar="NAME", help=help)
+        elif flag.shape == "proxies":
+            o.add(flag.cli, dest=flag.name, action="append", default=None, metavar="ADDR", help=help)
+        else:
+            o.add(flag.cli, dest=flag.name, default=None, help=help)
+
+
+def _add_run_flags(o: _Options) -> None:
+    _add_flags(o, reload=True)
+
+
+def _add_dev_flags(o: _Options) -> None:
+    _add_flags(o, reload=False)
+
+
+def _given_flags(args: argparse.Namespace) -> dict[str, str]:
+    """The settings given on the command line, by flag name, as typed (``--allowed-host``'s
+    and ``--trusted-proxy``'s repeats joined by commas)."""
+    from mipyre.engine import _flags
+
+    given: dict[str, str] = {}
+    for flag in _flags():
+        value = getattr(args, flag.name, None)
+        if value is not None:
+            given[flag.name] = ",".join(value) if isinstance(value, list) else value
+    return given
+
+
+def _deployment(args: argparse.Namespace, entry: EntryPoint) -> Deployment:
+    """Read the deployment once, before anything starts: every setting that cannot be used is
+    printed, with where it came from, and ends the process with status 2."""
+    try:
+        return Deployment.from_process(_given_flags(args), entry)
+    except ConfigError as e:
+        for line in str(e).splitlines():
+            print(f"mipyre: {line}", file=sys.stderr)
+        raise SystemExit(2) from None
+
+
+def _subcommand(sub, name: str, help: str, add_flags: Callable[[_Options], None] | None) -> _Options:
+    """Add subcommand ``name``. Its parser has no ``--help`` of its own: the help is given once
+    the app's flags are known (``_parse_with_app_flags``), and an argument it does not know may
+    be one of them."""
+    p = sub.add_parser(name, help=help, add_help=False, allow_abbrev=False,
+                       usage="%(prog)s target [options] [-- APP_ARGS ...]")
+    p.add_argument("target", nargs="?", help="module[:attr], e.g. examples.hello:app")
+    options = _Options(p)
+    if add_flags is not None:
+        add_flags(options)
+    return options
+
+
+def _full_parser(own: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Return a parser of ``own``'s options with ``--help``, to which the app's flags are added."""
+    return argparse.ArgumentParser(
+        prog=own.prog, usage=own.usage, description=own.description, parents=[own], allow_abbrev=False
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -183,30 +236,34 @@ def main(argv: list[str] | None = None) -> None:
         prog="mipyre",
         description="Mipyre — high-performance Python web framework powered by Rust.",
     )
-    try:
-        from mipyre import __version__ as _v
-    except (ImportError, AttributeError):
-        _v = "dev"
-    parser.add_argument("--version", action="version", version=f"mipyre {_v}")
+    from mipyre import __version__
+
+    parser.add_argument("--version", action="version", version=f"mipyre {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    commands = {
+        "run": (_subcommand(sub, "run", "start the server", _add_run_flags), _cmd_run),
+        "dev": (_subcommand(sub, "dev", "start with hot-reload and the access log on (logs at INFO)", _add_dev_flags),
+                _cmd_dev),
+        "routes": (_subcommand(sub, "routes", "print the route table", None), _cmd_routes),
+    }
 
-    p_run = sub.add_parser("run", help="start the server")
-    _add_run_flags(p_run)
-    p_run.set_defaults(func=_cmd_run)
+    mine, app_args = flags._split_command_line(sys.argv[1:] if argv is None else argv)
+    args, rest = parser.parse_known_args(mine)
+    own, command = commands[args.cmd]
+    tokens = mine[mine.index(args.cmd) + 1 :]
+    if args.target is None:
+        _full_parser(own.parser).parse_args(tokens)  # prints the help and exits, or refuses what is unknown
+        own.parser.error("the following arguments are required: target")
 
-    p_dev = sub.add_parser("dev", help="start with hot-reload + debug logging")
-    p_dev.add_argument("target", help="module[:attr]")
-    p_dev.add_argument("--host", default="127.0.0.1")
-    p_dev.add_argument("--port", type=int, default=None)
-    p_dev.add_argument("--workers", type=int, default=None)
-    p_dev.set_defaults(func=_cmd_dev)
+    flags._begin(rest, own.parser.prog, own.sites)
+    _set_app_argv(args.target, app_args)
 
-    p_routes = sub.add_parser("routes", help="print the route table")
-    p_routes.add_argument("target", help="module[:attr]")
-    p_routes.set_defaults(func=_cmd_routes)
+    def import_app() -> Mipyre:
+        app = _load_app(args.target)
+        flags._seal(_full_parser(own.parser), tokens)
+        return app
 
-    args = parser.parse_args(argv)
-    args.func(args)
+    command(args, import_app)
 
 
 if __name__ == "__main__":

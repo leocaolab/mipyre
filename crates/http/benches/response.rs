@@ -1,10 +1,7 @@
 //! Measures building the responses the engine sends, with and without CORS headers; the bodies the
 //! server answers by itself are measured in `error_body`.
 // The package's clippy.toml is plan/'s list; a bench measures the world through io/.
-#![expect(
-    clippy::disallowed_macros,
-    reason = "a bench prints what it measured"
-)]
+#![expect(clippy::disallowed_macros, reason = "a bench prints what it measured")]
 
 use std::alloc::System;
 use std::collections::HashMap;
@@ -25,14 +22,9 @@ static GLOBAL: AllocationCounter<System> = AllocationCounter(System);
 
 /// Serves a thread's own copy of a pre-built response, as the fast path does per request.
 fn fast_to_response(n: u64) {
-    let fast = FastResponse::parse(
-        Bytes::from(b"ok".to_vec()),
-        "text/plain",
-        200,
-        &HashMap::new(),
-    )
-    .must("a valid fast response")
-    .own_copy();
+    let fast = FastResponse::parse(Bytes::from(b"ok".to_vec()), "text/plain", 200, &HashMap::new())
+        .must("a valid fast response")
+        .own_copy();
     measure("fast_to_response", n, |_| {
         black_box(black_box(&fast).to_response());
     });
@@ -106,7 +98,7 @@ fn not_found(n: u64) {
 
 /// Returns a thread's own copy of CORS settings that add three headers.
 fn cors() -> Cors {
-    Cors::parse("*", "GET, POST", "content-type", None, false, None)
+    Cors::parse(&["*".to_string()], "GET, POST", "content-type", None, false, None)
         .must("valid CORS settings")
         .own_copy()
 }
@@ -135,7 +127,7 @@ fn build_response_json_cors(n: u64) {
 fn build_response_json_cors_several(n: u64) {
     const BODY: &[u8] = br#"{"id":1,"name":"mipyre","tags":["a","b","c"],"price":12.5,"ok":true}"#;
     let cors = Cors::parse(
-        "https://a.example, https://b.example, https://app.example",
+        &["https://a.example", "https://b.example", "https://app.example"].map(String::from),
         "GET, POST",
         "content-type",
         None,

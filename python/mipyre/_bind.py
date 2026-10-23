@@ -1,30 +1,33 @@
 """Turns a route's handler into the callable the engine dispatches: path params, the
-``model=`` body and the ``query=`` string bound to the parameters its signature declares,
+``body=`` model and the ``query=`` string bound to the parameters its signature declares,
 and a 422 for a body or query that fails validation."""
 
 from __future__ import annotations
 
 import functools
 import inspect
-import json
-import logging
 from typing import Callable
 
-from mipyre.engine import Response, _route_params
+from mipyre.engine import Response, _is_async_handler, _route_params
+
+DETAIL_LIMIT = 20
 
 
 def bind_handler(fn: Callable, path: str, model: type | None, query: type | None = None) -> Callable:
-    """The callable the engine dispatches for a route: ``fn`` itself when it
-    takes only the request, else a wrapper that validates the body against
-    ``model`` and the query string against ``query`` and injects the path params
-    ``fn`` declares. Signature mistakes and a path the router would not take as
-    written (``:name``) raise here, at registration, not on every request."""
+    """Return the callable the engine dispatches for a route: ``fn`` itself when it takes
+    only the request, else a wrapper that injects the path params ``fn`` declares and, with
+    ``model`` / ``query``, validates the body and the query string first (a 422 when they do
+    not validate). Signature mistakes and a path the router would not take as written
+    (``:name``) raise here, at registration, not on every request.
+
+    The wrapper is a plain function that returns what ``fn`` returns: for an async ``fn``,
+    its coroutine, which the engine awaits, so a request pays for no coroutine of the
+    wrapper's own. It is marked a coroutine function exactly when the engine takes ``fn``
+    for one (`_is_async_handler`), so its route goes to the same workers ``fn``'s would."""
     template = frozenset(_route_params(path))
-    if query is not None:
-        return _bind_query(fn, path, template, model, query)
-    if model is None:
+    if model is None and query is None:
         return _bind_path_params(fn, path, template)
-    return _bind_model(fn, path, template, model)
+    return _bind_validated(fn, path, template, model, query)
 
 
 def _bind_path_params(fn: Callable, path: str, template: frozenset[str]) -> Callable:
@@ -37,122 +40,77 @@ def _bind_path_params(fn: Callable, path: str, template: frozenset[str]) -> Call
         return fn  # hot path — the handler is registered as is
     _require_accepts(fn, leading=1, names=names)
 
-    # Every name is in the template, so the router always fills it: `p[n]`, never a
-    # silent None.
-    if inspect.iscoroutinefunction(fn):
-        async def bound_async(req):
+    if _takes_every_param(names, template):
+        def bound(req):
+            return fn(req, **req.params)
+    else:
+        def bound(req):
             p = req.params
-            return await fn(req, **{n: p[n] for n in names})
-        return _named_like(bound_async, fn)
-
-    def bound(req):
-        p = req.params
-        return fn(req, **{n: p[n] for n in names})
-    return _named_like(bound, fn)
+            return fn(req, **{n: p[n] for n in names})
+    return _wrapping(bound, fn, _is_async_handler(fn))
 
 
-def _bind_model(fn: Callable, path: str, template: frozenset[str], model: type) -> Callable:
-    """``fn(req, body, **path_params)`` or ``fn(body, **path_params)``, by the rule
-    ``_takes_request`` checks at registration."""
-    # Imported here, only for routes that declare model=: importing pydantic at
-    # module level would load pydantic_core in every worker of every app. If it
-    # can't be imported, route registration fails with the ImportError.
-    from pydantic import BaseModel, ValidationError
-
-    if not (isinstance(model, type) and issubclass(model, BaseModel)):
-        raise TypeError(f"model= must be a pydantic BaseModel subclass, got {model!r}")
-    sig = inspect.signature(fn)
-    takes_request = _takes_request(fn, sig, template, (("body", model),))
-    names = _path_param_names(fn, sig, path, template, leading=2 if takes_request else 1)
-    if names:
-        _require_accepts(fn, leading=2 if takes_request else 1, names=names)
-
-    def args(req, body):
-        return (req, body) if takes_request else (body,)
-
-    def kwargs(req):
-        p = req.params
-        return {n: p[n] for n in names}
-
-    if inspect.iscoroutinefunction(fn):
-        async def bound_async(req):
-            try:
-                body = model.model_validate_json(req.body)
-            except ValidationError as e:
-                return _validation_error_response(e)
-            return await fn(*args(req, body), **kwargs(req))
-        return _named_like(bound_async, fn)
-
-    def bound(req):
-        try:
-            body = model.model_validate_json(req.body)
-        except ValidationError as e:
-            return _validation_error_response(e)
-        return fn(*args(req, body), **kwargs(req))
-    return _named_like(bound, fn)
-
-
-def _bind_query(
-    fn: Callable, path: str, template: frozenset[str], model: type | None, query: type
+def _bind_validated(
+    fn: Callable, path: str, template: frozenset[str], model: type | None, query: type | None
 ) -> Callable:
-    """``fn(req, body, query, **path_params)`` or without ``req``, and without ``body`` when
-    the route has no ``model=``; by the rule ``_takes_request`` checks at registration."""
-    # Imported here, only for routes that declare query= (as for model=).
+    """Bind ``fn(req, body, query, **path_params)``, or the same without ``req``, without
+    ``body`` when the route has no ``body=`` model and without ``query`` when it has no
+    ``query=``, by the rule ``_takes_request`` checks at registration."""
+    # Imported here, only for routes that declare a body= model or query=: importing pydantic at
+    # module level would load pydantic_core in every worker of every app. If it can't be
+    # imported, route registration fails with the ImportError.
     from pydantic import BaseModel, ValidationError
 
     from mipyre._query import QueryFields
 
     if model is not None and not (isinstance(model, type) and issubclass(model, BaseModel)):
-        raise TypeError(f"model= must be a pydantic BaseModel subclass, got {model!r}")
-    if not (isinstance(query, type) and issubclass(query, BaseModel)):
+        raise TypeError(f"body= must be a pydantic BaseModel subclass or BodyStream, got {model!r}")
+    if query is not None and not (isinstance(query, type) and issubclass(query, BaseModel)):
         raise TypeError(f"query= must be a pydantic BaseModel subclass, got {query!r}")
-    fields = QueryFields.of(query)
+    query_input = QueryFields.of(query).input if query is not None else None
     sig = inspect.signature(fn)
-    declared = ((("body", model),) if model is not None else ()) + (("query", query),)
+    declared = ((("body", model),) if model is not None else ()) + (
+        (("query", query),) if query is not None else ()
+    )
     takes_request = _takes_request(fn, sig, template, declared)
     leading = len(declared) + takes_request
     names = _path_param_names(fn, sig, path, template, leading=leading)
     if names:
         _require_accepts(fn, leading=leading, names=names)
-
-    def call_args(req) -> tuple[list, list[dict]]:
-        """The handler's positional arguments, or the errors that answer 422 instead."""
-        args: list = [req] if takes_request else []
-        detail: list[dict] = []
-        if model is not None:
-            try:
-                args.append(model.model_validate_json(req.body))
-            except ValidationError as e:
-                detail.extend(_validation_errors(e, "body"))
-        given, repeated = fields.input(req.query_params_all())
-        if repeated:
-            # The repeated key was left out of `given`; validating would add "missing" for it.
-            detail.extend(repeated)
-            return args, detail
-        try:
-            args.append(query.model_validate(given))
-        except ValidationError as e:
-            detail.extend(_validation_errors(e, "query", loc=("query",)))
-        return args, detail
-
-    def kwargs(req):
-        p = req.params
-        return {n: p[n] for n in names}
-
-    if inspect.iscoroutinefunction(fn):
-        async def bound_async(req):
-            args, detail = call_args(req)
-            if detail:
-                return _unprocessable(detail)
-            return await fn(*args, **kwargs(req))
-        return _named_like(bound_async, fn)
+    every_param = _takes_every_param(names, template)
+    is_async = _is_async_handler(fn)
+    unprocessable = _unprocessable_awaitable if is_async else _unprocessable
+    # Looked up once: a classmethod read off the class makes a new bound method each time.
+    validate_body = model.model_validate_json if model is not None else None
+    validate_query = query.model_validate if query is not None else None
 
     def bound(req):
-        args, detail = call_args(req)
-        if detail:
-            return _unprocessable(detail)
-        return fn(*args, **kwargs(req))
-    return _named_like(bound, fn)
+        args = (req,) if takes_request else ()
+        errors = None
+        if validate_body is not None:
+            try:
+                args += (validate_body(req.body),)
+            except ValidationError as e:
+                errors = _errors(e)
+        if query_input is not None:
+            given, repeated = query_input(req.query_params_all())
+            if repeated:
+                # The repeated key was left out of `given`; validating would add "missing" for it.
+                errors = (errors or []) + repeated
+            else:
+                try:
+                    args += (validate_query(given),)
+                except ValidationError as e:
+                    errors = (errors or []) + _errors(e, ("query",))
+        if errors is not None:
+            return unprocessable(errors)
+        if not names:
+            return fn(*args)
+        if every_param:
+            return fn(*args, **req.params)
+        p = req.params
+        return fn(*args, **{n: p[n] for n in names})
+    return _wrapping(bound, fn, is_async)
 
 
 def _takes_request(
@@ -162,7 +120,7 @@ def _takes_request(
     declared: tuple[tuple[str, type], ...],
 ) -> bool:
     """The rule for a route that validates values for its handler (``declared``: the body
-    for ``model=``, then the query for ``query=``): the handler's leading positional
+    for ``body=``, then the query for ``query=``): the handler's leading positional
     parameters that are not path params are the request and those values, in that order,
     or the values alone; every other parameter names a path param. Whether it takes the
     request follows from that count, never from a guess. A signature the rule rejects raises
@@ -178,7 +136,7 @@ def _takes_request(
             break
         leading.append(param)
     values = ", ".join(what for what, _ in declared)
-    with_ = " and ".join(f"{'model' if what == 'body' else what}=" for what, _ in declared)
+    with_ = " and ".join(f"{what}=" for what, _ in declared)
     forms = f"fn(req, {values}, **path_params) or fn({values}, **path_params)"
     if len(leading) < len(declared):
         what, cls = declared[len(leading)]
@@ -205,22 +163,8 @@ def _annotated_as(param: inspect.Parameter, cls: type) -> bool:
     return param.annotation is cls or param.annotation in (cls.__name__, cls.__qualname__)
 
 
-def _validation_error_response(e) -> Response:
-    logging.getLogger("mipyre.validation").warning(
-        "request body validation failed: %s", type(e).__name__, exc_info=True
-    )
-    return Response(
-        body=json.dumps({"detail": e.errors(include_url=False, include_input=False)}),
-        status_code=422,
-        content_type="application/json",
-    )
-
-
-def _validation_errors(e, what: str, loc: tuple[str, ...] = ()) -> list[dict]:
-    """pydantic's errors for one part of the request, each ``loc`` led by ``loc``."""
-    logging.getLogger("mipyre.validation").warning(
-        "request %s validation failed: %s", what, type(e).__name__, exc_info=True
-    )
+def _errors(e, loc: tuple[str, ...] = ()) -> list[dict]:
+    """Return pydantic's errors for one part of the request, each ``loc`` led by ``loc``."""
     errors = e.errors(include_url=False, include_input=False)
     if loc:
         for error in errors:
@@ -228,13 +172,25 @@ def _validation_errors(e, what: str, loc: tuple[str, ...] = ()) -> list[dict]:
     return errors
 
 
-def _unprocessable(detail: list[dict]) -> Response:
-    """The 422 of a ``model=`` route, with the errors of every part that failed."""
-    return Response(
-        body=json.dumps({"detail": detail}),
-        status_code=422,
-        content_type="application/json",
-    )
+def _unprocessable(errors: list[dict]) -> Response:
+    """Return the 422 for a request that failed validation: the first ``DETAIL_LIMIT``
+    errors and how many there were, so a body that fails in a million places costs a
+    bounded answer. A validator's exception in an error's ``ctx`` goes out as its text, as in
+    pydantic's own JSON.
+
+    The client decides how many of these there are, so the server counts each in the run
+    that served it (``mipyre_validation_failures_total``) and logs at most one line a minute
+    for that run, saying how many were not logged since the last one."""
+    from pydantic_core import to_json
+
+    body = to_json({"detail": errors[:DETAIL_LIMIT], "error_count": len(errors)}, fallback=str)
+    return Response._validation_failure(body, len(errors))
+
+
+async def _unprocessable_awaitable(errors: list[dict]) -> Response:
+    """Return the 422 from a coroutine, for the wrapper of an async handler: whoever calls a
+    coroutine function awaits what it returns, so the 422 must be awaitable too."""
+    return _unprocessable(errors)
 
 
 def _path_param_names(
@@ -257,6 +213,13 @@ def _path_param_names(
     return names
 
 
+def _takes_every_param(names: tuple[str, ...], template: frozenset[str]) -> bool:
+    """Return whether the handler takes every param of the URL template, so the router's
+    params can be handed over as they are. Every name is in the template (checked at
+    registration), and the router fills every one of them: `p[n]` is never a silent None."""
+    return len(names) == len(template)
+
+
 def _require_accepts(fn: Callable, leading: int, names: tuple[str, ...]) -> None:
     """The path params are read off ``inspect.signature(fn)``, which follows a decorator's
     ``__wrapped__`` to the function it wraps. The call goes to ``fn`` itself, so it must take
@@ -277,8 +240,10 @@ def _require_accepts(fn: Callable, leading: int, names: tuple[str, ...]) -> None
         ) from None
 
 
-def _named_like(wrapper: Callable, fn: Callable) -> Callable:
+def _wrapping(wrapper: Callable, fn: Callable, is_async: bool) -> Callable:
     # Only the names, not fn's __doc__ / __dict__; __wrapped__ lets inspect.signature and
     # static analyzers see fn's own signature.
-    return functools.update_wrapper(wrapper, fn, assigned=("__name__", "__qualname__"), updated=())
-
+    functools.update_wrapper(wrapper, fn, assigned=("__name__", "__qualname__"), updated=())
+    if is_async:
+        inspect.markcoroutinefunction(wrapper)
+    return wrapper

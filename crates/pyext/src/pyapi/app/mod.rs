@@ -6,15 +6,16 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use tokio_util::sync::CancellationToken;
 
-use crate::boot::{AppSource, ServerSizes};
-use crate::runtime::AbandonedWorker;
-use crate::pyapi::config::PyGivenSize;
+use crate::boot::{AppSource, Deployment, EntryPoint, ServerFlags, ServerRecipe};
 use crate::pyapi::state::AppStateView;
+use crate::runtime::AbandonedWorker;
 use crate::serve::Routes;
 use mipyre_http::plan::cors::Cors;
+use mipyre_http::plan::cross_origin::HostNames;
+use mipyre_http::plan::forwarded::Proxies;
 use mipyre_http::plan::limits::{
-    connection_limit, BodyMinRate, BodyTimeLimit, ByteLimit, InterruptGrace, MessageByteLimit,
-    RequestBudget, ShutdownTimeout, WsLimitError,
+    connection_limit, BodyMinRate, BodyTimeLimit, ByteLimit, InterruptGrace, MessageByteLimit, RequestBudget,
+    ShutdownTimeout, WsLimitError,
 };
 use mipyre_http::plan::route::RuntimeChoice;
 use mipyre_http::plan::site::{AccessLog, ServeSettings};
@@ -24,8 +25,20 @@ mod bench;
 mod register;
 mod server;
 
+pub(crate) use self::register::is_async_handler;
 pub(crate) use self::server::Server;
-use self::server::{positive, Transport};
+use self::server::Transport;
+
+/// What one run of the app was started with: its flags settled, the names its requests' host
+/// may be, the proxies that may name its requests' client, and the command line its workers get.
+struct RunSettings {
+    recipe: ServerRecipe,
+    names: HostNames,
+    proxies: Proxies,
+    command_line: crate::runtime::CommandLine,
+    /// The server takes TCP connections, not only in-memory ones.
+    tcp: bool,
+}
 
 /// The access log's on/off switch and sampling are kept together, so turning it back on keeps
 /// the sampling set before.
@@ -45,17 +58,24 @@ pub(crate) struct App {
     access_log: AccessLogSetting,
     /// Each server's run adds the worker threads it abandoned at shutdown to this.
     abandoned: crate::boot::AbandonedWorkers,
-    process_lanes: Option<Arc<crate::lane::ServerLanes>>,
+    process_lanes: Option<Arc<crate::runtime::process::ServerLanes>>,
+    /// Each run serves its metrics page at this path, through the app's hooks, when it is set.
+    metrics_path: Option<String>,
+    /// Counts this app's server runs, to name each in an error.
+    runs: crate::sync::AtomicU64,
+    /// The modules whose code makes this app's `PgPool` handles (where it was created, its
+    /// routers'), besides its script: a run takes only theirs (b/335 D17, q/157 C).
+    home_modules: Vec<crate::runtime::ModuleKey>,
 }
 
 pyo3::create_exception!(
     mipyre.engine,
-    RegistrationSealed,
-    pyo3::exceptions::PyValueError,
+    LateRegistrationError,
+    crate::runtime::DeclarationError,
     "A route or hook registered after the app's registrations were sealed (the first \
      server's start). Workers rebuild the app by running its script, so they only have \
      what the script registered: a late hook would silently skip every worker route. A \
-     ValueError."
+     DeclarationError."
 );
 
 #[pymethods]
@@ -91,15 +111,15 @@ impl App {
     }
 
     #[new]
-    fn new(py: Python<'_>) -> Self {
-        App {
+    fn new(py: Python<'_>) -> PyResult<Self> {
+        Ok(App {
             routes: Arc::new(crate::sync::RwLock::new(Routes::new())),
             source: AppSource {
                 script_path: None,
                 routers: Vec::new(),
                 isolation: false,
             },
-            store: crate::runtime::map_for_new(py),
+            store: crate::runtime::map_for_new(py)?,
             settings: ServeSettings::defaults(),
             access_log: AccessLogSetting {
                 on: false,
@@ -107,7 +127,10 @@ impl App {
             },
             abandoned: crate::boot::AbandonedWorkers::default(),
             process_lanes: None,
-        }
+            metrics_path: None,
+            runs: crate::sync::AtomicU64::new(0),
+            home_modules: Vec::new(),
+        })
     }
 
     /// Set the routers a sub-interpreter worker imports, which are those with
@@ -124,7 +147,7 @@ impl App {
 
     /// Set the process lanes this app's `runtime="process"` routes run on; they must be set
     /// before the first server starts.
-    fn _set_process_lanes(&mut self, lanes: &crate::lane::LaneSet) -> PyResult<()> {
+    fn _set_process_lanes(&mut self, lanes: &crate::runtime::process::LaneSet) -> PyResult<()> {
         self.process_lanes = Some(Arc::clone(lanes.server("_set_process_lanes")?));
         Ok(())
     }
@@ -133,17 +156,16 @@ impl App {
         self.routes.read().uses_lane()
     }
 
-    /// Serve `lane` of `lanes` for this app in a process-lane worker until killed; it never
+    /// Serve the lane of `lanes` for this app in a process-lane worker until killed; it never
     /// returns normally.
     fn _serve_lane_worker(
         &self,
         py: Python<'_>,
-        lanes: &crate::lane::LaneSet,
-        lane: usize,
+        lanes: &crate::runtime::process::LaneSet,
         template_pid: i32,
     ) -> PyResult<()> {
-        let template_pid = crate::lane::pid_from_python(template_pid)?;
-        lanes.serve_worker(py, lane, self.rules(py), template_pid)
+        let template_pid = crate::runtime::process::pid_from_python(template_pid)?;
+        lanes.serve_worker(py, self.rules(py), template_pid)
     }
 
     /// Take the worker threads this app's servers abandoned at shutdown; a second call
@@ -158,10 +180,10 @@ impl App {
     /// Set this app's CORS configuration: its headers go on every response, and the engine
     /// answers a preflight (an `OPTIONS` with `Access-Control-Request-Method`) to a path with no
     /// `OPTIONS` route of its own.
-    #[pyo3(signature = (origin, methods, headers, expose_headers=None, allow_credentials=false, max_age=None))]
+    #[pyo3(signature = (origins, methods, headers, expose_headers=None, allow_credentials=false, max_age=None))]
     fn set_cors_config(
         &mut self,
-        origin: String,
+        origins: Vec<String>,
         methods: String,
         headers: String,
         expose_headers: Option<String>,
@@ -169,13 +191,13 @@ impl App {
         max_age: Option<u32>,
     ) -> PyResult<()> {
         if self.routes.read().is_sealed() {
-            return Err(RegistrationSealed::new_err(
+            return Err(LateRegistrationError::new_err(
                 "CORS is set after app.run() started (for example from an on_startup hook); \
                  set it at module level, before the app serves",
             ));
         }
         let cors = Cors::parse(
-            &origin,
+            &origins,
             &methods,
             &headers,
             expose_headers.as_deref().filter(|s| !s.is_empty()),
@@ -196,17 +218,43 @@ impl App {
             .add_grpc_method(mipyre_http::plan::route::GrpcMethod::BenchmarkGetSum);
     }
 
-    /// Take a request's id from the client's `header` when it is visible ASCII of at most 128
-    /// bytes; otherwise the server mints one. Either way it is `req.request_id`, and a 5xx
-    /// reports it.
+    /// Serve each run's metrics at `GET path` and count every answer of every run; a second call
+    /// with the same path changes nothing, and one with another path raises `ValueError`.
+    fn enable_metrics(&mut self, path: String) -> PyResult<()> {
+        if self.routes.read().is_sealed() {
+            return Err(LateRegistrationError::new_err(
+                "metrics are enabled after app.run() started (for example from an on_startup \
+                 hook); enable them at module level, before the app serves",
+            ));
+        }
+        match &self.metrics_path {
+            Some(enabled) if *enabled != path => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "enable_metrics: already enabled at {enabled:?}, asked again at {path:?}"
+            ))),
+            _ => {
+                self.metrics_path = Some(path);
+                Ok(())
+            }
+        }
+    }
+
+    /// Take a request's id from the client's `header` when it is a usable id; otherwise the
+    /// server mints one. Either way it is `req.request_id`, a 5xx reports it, and every response
+    /// carries it in `header`. Naming the same header again changes nothing; naming another
+    /// raises `ValueError`.
     fn set_request_id_header(&mut self, header: &str) -> PyResult<()> {
         let name = hyper::header::HeaderName::from_bytes(header.as_bytes()).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "invalid request-id header name {header:?}: {e}"
-            ))
+            pyo3::exceptions::PyValueError::new_err(format!("invalid request-id header name {header:?}: {e}"))
         })?;
-        self.settings.request_id_header = Some(name);
-        Ok(())
+        match &self.settings.request_id_header {
+            Some(set) if *set != name => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "the request-id header is already {set}, asked again as {name}"
+            ))),
+            _ => {
+                self.settings.request_id_header = Some(name);
+                Ok(())
+            }
+        }
     }
 
     fn enable_request_logging(&mut self, enabled: bool) {
@@ -220,15 +268,9 @@ impl App {
     /// responses alike. `sample_n=0` or an `always_status` that is not an HTTP status raises
     /// `ValueError`.
     #[pyo3(signature = (sample_n=1, always_status=None))]
-    fn set_request_log_sampling(
-        &mut self,
-        sample_n: u64,
-        always_status: Option<u16>,
-    ) -> PyResult<()> {
+    fn set_request_log_sampling(&mut self, sample_n: u64, always_status: Option<u16>) -> PyResult<()> {
         let sample_n = std::num::NonZeroU64::new(sample_n).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(
-                "sample_n must be at least 1 (1 logs every request)",
-            )
+            pyo3::exceptions::PyValueError::new_err("sample_n must be at least 1 (1 logs every request)")
         })?;
         let always_status = always_status
             .map(|code| {
@@ -259,8 +301,8 @@ impl App {
     /// Set the seconds each step of a request may take: its whole body arriving (408 past
     /// it), then its handler answering (504 past it). The default is 30.
     fn set_request_timeout(&mut self, seconds: f64) -> PyResult<()> {
-        self.settings.limits.request_budget = RequestBudget::from_secs(seconds)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.settings.limits.request_budget =
+            RequestBudget::from_secs(seconds).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(())
     }
 
@@ -271,8 +313,8 @@ impl App {
     /// Set how many bytes of request body earn one more second past the request timeout. The
     /// default is 1024.
     fn set_body_min_rate(&mut self, bytes_per_second: i64) -> PyResult<()> {
-        self.settings.limits.body_min_rate = BodyMinRate::new(bytes_per_second)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.settings.limits.body_min_rate =
+            BodyMinRate::new(bytes_per_second).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(())
     }
 
@@ -283,8 +325,8 @@ impl App {
     /// Set the seconds a request body may take at most, whatever it earns by arriving. The
     /// default is 600.
     fn set_body_time_limit(&mut self, seconds: f64) -> PyResult<()> {
-        self.settings.limits.body_time_limit = BodyTimeLimit::from_secs(seconds)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.settings.limits.body_time_limit =
+            BodyTimeLimit::from_secs(seconds).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(())
     }
 
@@ -295,8 +337,8 @@ impl App {
     /// Set the seconds an interrupted sync request's worker gets to end it before it is
     /// abandoned. The default is 2.
     fn set_interrupt_grace(&mut self, seconds: f64) -> PyResult<()> {
-        self.settings.limits.interrupt_grace = InterruptGrace::from_secs(seconds)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.settings.limits.interrupt_grace =
+            InterruptGrace::from_secs(seconds).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(())
     }
 
@@ -307,8 +349,8 @@ impl App {
     /// Set the seconds a shutdown waits for each of the app's threads to finish its requests
     /// and end its interpreter. The default is 5.
     fn set_shutdown_timeout(&mut self, seconds: f64) -> PyResult<()> {
-        self.settings.limits.shutdown_timeout = ShutdownTimeout::from_secs(seconds)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.settings.limits.shutdown_timeout =
+            ShutdownTimeout::from_secs(seconds).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(())
     }
 
@@ -319,8 +361,7 @@ impl App {
     /// Set the largest WebSocket message and frame in bytes, in either direction. The default
     /// is 1 MiB.
     fn set_max_websocket_message_size(&mut self, size: i64) -> PyResult<()> {
-        self.settings.limits.ws.max_message_bytes =
-            MessageByteLimit::new(size).map_err(ws_limit_error)?;
+        self.settings.limits.ws.max_message_bytes = MessageByteLimit::new(size).map_err(ws_limit_error)?;
         Ok(())
     }
 
@@ -331,8 +372,7 @@ impl App {
     /// Set how many WebSocket connections may be open at once; an upgrade beyond it is
     /// answered 503. The default is 1024.
     fn set_max_websocket_connections(&mut self, count: i64) -> PyResult<()> {
-        self.settings.limits.ws.max_connections =
-            connection_limit(count).map_err(ws_limit_error)?;
+        self.settings.limits.ws.max_connections = connection_limit(count).map_err(ws_limit_error)?;
         Ok(())
     }
 
@@ -372,10 +412,7 @@ impl App {
     /// Turn this app's response compression on with a `Compression`, or off with `None`, the
     /// default.
     #[pyo3(signature = (settings))]
-    fn configure_compression(
-        &mut self,
-        settings: Option<&Bound<'_, crate::pyapi::config::Compression>>,
-    ) {
+    fn configure_compression(&mut self, settings: Option<&Bound<'_, crate::pyapi::config::Compression>>) {
         self.settings.compression = settings.map(|s| s.get().settings());
     }
 
@@ -400,98 +437,39 @@ impl App {
         self.source.script_path = Some(path);
     }
 
+    /// Records a module whose code makes this app's `PgPool` handles, by its globals.
+    fn _add_home_module(&mut self, globals: &Bound<'_, pyo3::types::PyDict>) -> PyResult<()> {
+        let key = crate::runtime::ModuleKey::of_globals(globals)?;
+        if !self.home_modules.contains(&key) {
+            self.home_modules.push(key);
+        }
+        Ok(())
+    }
+
     /// Return the app's shared state, one map for every interpreter of the process.
     #[getter]
     fn state(&self) -> AppStateView {
         AppStateView::of(self.store.clone())
     }
 
-    #[pyo3(signature = (path, handler, gil=false, process=false))]
-    fn get(
-        slf: &Bound<'_, Self>,
-        path: &str,
-        handler: Py<PyAny>,
-        gil: bool,
-        process: bool,
-    ) -> PyResult<()> {
-        Self::register_route(
-            slf,
-            "GET",
-            path,
-            handler,
-            runtime_choice("GET", path, gil, process)?,
-            false,
-        )
-    }
-
-    #[pyo3(signature = (path, handler, gil=false, stream=false, process=false))]
-    fn post(
-        slf: &Bound<'_, Self>,
-        path: &str,
-        handler: Py<PyAny>,
-        gil: bool,
-        stream: bool,
-        process: bool,
-    ) -> PyResult<()> {
-        Self::register_route(
-            slf,
-            "POST",
-            path,
-            handler,
-            runtime_choice("POST", path, gil, process)?,
-            stream,
-        )
-    }
-
-    #[pyo3(signature = (path, handler, gil=false, stream=false, process=false))]
-    fn put(
-        slf: &Bound<'_, Self>,
-        path: &str,
-        handler: Py<PyAny>,
-        gil: bool,
-        stream: bool,
-        process: bool,
-    ) -> PyResult<()> {
-        Self::register_route(
-            slf,
-            "PUT",
-            path,
-            handler,
-            runtime_choice("PUT", path, gil, process)?,
-            stream,
-        )
-    }
-
-    #[pyo3(signature = (path, handler, gil=false))]
-    fn delete(slf: &Bound<'_, Self>, path: &str, handler: Py<PyAny>, gil: bool) -> PyResult<()> {
-        Self::register_route(
-            slf,
-            "DELETE",
-            path,
-            handler,
-            runtime_choice("DELETE", path, gil, false)?,
-            false,
-        )
-    }
-
-    #[pyo3(signature = (method, path, handler, gil=false, stream=false, process=false))]
+    /// Registers `handler` for `method` `path` on `runtime`, and returns whether the engine
+    /// runs it as an `async def` handler.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` for a combination of `runtime`, `stream` and handler kind no serving
+    /// path runs, `TypeError` for a handler that is not callable, and `LateRegistrationError`
+    /// for a route off the main interpreter registered once the app is sealed.
+    #[pyo3(signature = (method, path, handler, runtime, stream=false))]
     fn route(
         slf: &Bound<'_, Self>,
         method: &str,
         path: &str,
         handler: Py<PyAny>,
-        gil: bool,
+        runtime: PyRuntimeChoice,
         stream: bool,
-        process: bool,
-    ) -> PyResult<()> {
-        Self::register_route(
-            slf,
-            method,
-            path,
-            handler,
-            runtime_choice(method, path, gil, process)?,
-            stream,
-        )
+    ) -> PyResult<bool> {
+        Self::register_route(slf, method, path, handler, runtime.into(), stream)
     }
 
     fn before_request(slf: &Bound<'_, Self>, handler: Py<PyAny>) -> PyResult<()> {
@@ -546,31 +524,25 @@ impl App {
     /// Prepare one server of this app and bind its listeners; a port in use raises
     /// `OSError(EADDRINUSE)` here.
     ///
+    /// Its flags are `deployment` (what the entry point read; none by default) laid over
+    /// `config` (what the code gives; nothing by default): a deployment value wins (b/335 D7).
     /// Nothing serves until the returned `Server`'s `serve()`, and its `shutdown()` stops only
-    /// that server. `transport="memory"` binds no socket and takes only connections made with
-    /// the server's `connect()`, so it refuses host, port and TLS arguments.
-    #[pyo3(signature = (
-        host=None, port=None, workers=None, mode=None, io_workers=None,
-        tls_cert=None, tls_key=None, extra_tls_ports=None, extra_plain_ports=None,
-        transport=None,
-    ))]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one parameter per Python keyword argument of `start()`"
-    )]
+    /// that server. `allowed_hosts` are the DNS names a request's host may be besides
+    /// `localhost` and IP addresses (`["*"]`: any); any other host is answered 421.
+    /// `trusted_proxies` are the addresses and CIDR blocks whose `X-Forwarded-For` names a
+    /// request's client (`req.client_ip`); with none the peer is the client.
+    /// `transport="memory"` binds no socket and takes only connections made with the server's
+    /// `connect()`, so it refuses the socket flags and checks no host. The workers get
+    /// `command_line` (`sys.argv` and the flag values); without one, main's `sys.argv` and no
+    /// parsed flags.
+    #[pyo3(signature = (deployment=None, config=None, transport=None, command_line=None))]
     fn start(
         &self,
         py: Python<'_>,
-        host: Option<&str>,
-        port: Option<u16>,
-        workers: Option<PyGivenSize>,
-        mode: Option<&Bound<'_, PyAny>>,
-        io_workers: Option<PyGivenSize>,
-        tls_cert: Option<&str>,
-        tls_key: Option<&str>,
-        extra_tls_ports: Option<Vec<u16>>,
-        extra_plain_ports: Option<Vec<u16>>,
+        deployment: Option<PyRef<'_, Deployment>>,
+        config: Option<PyRef<'_, ServerFlags>>,
         transport: Option<&str>,
+        command_line: Option<crate::runtime::CommandLine>,
     ) -> PyResult<Server> {
         // A worker executes the whole script, so an unguarded `app.run()` in a raw-engine
         // script reaches here during the worker's init, which must not start a server.
@@ -583,83 +555,77 @@ impl App {
             ));
         }
         crate::exchange::require_json(py)?;
-        let sizing = ServerSizes {
-            workers: positive("workers", workers)?,
-            io_workers: positive("io_workers", io_workers)?,
+        let none = Deployment::default();
+        let deployment = deployment.as_deref().unwrap_or(&none);
+        let nothing = ServerFlags::default();
+        let values = deployment.over(config.as_deref().unwrap_or(&nothing));
+        let transport = server::transport(transport)?;
+        if transport == Transport::Memory {
+            server::refuse_socket_flags(&values)?;
+        }
+        let recipe = ServerRecipe::of(values)?;
+        if deployment.entry != EntryPoint::Embedded {
+            for line in recipe.values.summary() {
+                println!("  {line}");
+            }
+        }
+        let command_line = match command_line {
+            Some(line) => line,
+            None => crate::runtime::CommandLine::of_main(py)?,
         };
         let stop = CancellationToken::new();
-        let bound = match server::transport(transport)? {
+        let (parts, bound) = match transport {
             Transport::Tcp => {
-                let specs = server::listener_set(
-                    host,
-                    port,
-                    tls_cert,
-                    tls_key,
-                    extra_tls_ports,
-                    extra_plain_ports,
-                )?;
-                let (run, ()) =
-                    self.server_run(py, sizing, mode, &stop, |loops| Ok((server::bind(&specs, loops)?, ())))?;
-                server::BoundServer::tcp(run)
+                let specs = server::listener_set(&recipe.values)?;
+                let addresses = server::address_flags(&recipe.values);
+                let names = match &recipe.values.allowed_hosts {
+                    Some(given) => HostNames::parse(given.value())
+                        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
+                    None => HostNames::LOCALHOST,
+                };
+                let proxies = Proxies::parse(recipe.values.trusted_proxies.as_ref().map_or(&[][..], |p| p.value()))
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                let settings = RunSettings {
+                    recipe,
+                    names,
+                    proxies,
+                    command_line,
+                    tcp: true,
+                };
+                let (run, ()) = self.server_run(py, settings, &stop, |loops| {
+                    Ok((server::bind(&specs, loops, &addresses)?, ()))
+                })?;
+                (server::RunSources::of(&run.site), server::BoundServer::tcp(run))
             }
             Transport::Memory => {
-                server::refuse_socket_args(
-                    host,
-                    port,
-                    tls_cert,
-                    tls_key,
-                    extra_tls_ports.as_deref(),
-                    extra_plain_ports.as_deref(),
-                )?;
-                let (run, connector) = self.server_run(py, sizing, mode, &stop, |loops| {
+                // No browser reaches a server without a socket, so no host is checked.
+                let settings = RunSettings {
+                    recipe,
+                    names: HostNames::Any,
+                    proxies: Proxies::default(),
+                    command_line,
+                    tcp: false,
+                };
+                let (run, connector) = self.server_run(py, settings, &stop, |loops| {
                     Ok(mipyre_transport::memory::memory_listeners(loops))
                 })?;
-                server::BoundServer::memory(run, connector)
+                (
+                    server::RunSources::of(&run.site),
+                    server::BoundServer::memory(run, connector),
+                )
             }
         };
-        Ok(Server::new(stop, bound))
+        Ok(Server::new(stop, bound, parts))
     }
 
-    /// Bind with `start()`, then serve until SIGINT.
-    #[pyo3(signature = (
-        host=None, port=None, workers=None, mode=None, io_workers=None,
-        tls_cert=None, tls_key=None, extra_tls_ports=None, extra_plain_ports=None,
-    ))]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one parameter per Python keyword argument of `run()`"
-    )]
-    fn run(
-        &self,
-        py: Python<'_>,
-        host: Option<&str>,
-        port: Option<u16>,
-        workers: Option<i64>,
-        mode: Option<&Bound<'_, PyAny>>,
-        io_workers: Option<i64>,
-        tls_cert: Option<&str>,
-        tls_key: Option<&str>,
-        extra_tls_ports: Option<Vec<u16>>,
-        extra_plain_ports: Option<Vec<u16>>,
-    ) -> PyResult<()> {
-        let run_arg = |value: i64| PyGivenSize {
-            value,
-            origin: crate::boot::SizeOrigin::RunArg,
-        };
-        self.start(
-            py,
-            host,
-            port,
-            workers.map(run_arg),
-            mode,
-            io_workers.map(run_arg),
-            tls_cert,
-            tls_key,
-            extra_tls_ports,
-            extra_plain_ports,
-            None,
-        )?
-        .serve(py)
+    /// Bind with `start()`, then serve until SIGINT: a script's entry point, so its flags are
+    /// this process's deployment laid over `run()`'s keywords.
+    #[pyo3(signature = (**given))]
+    fn run(&self, py: Python<'_>, given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<()> {
+        let config = Py::new(py, crate::pyapi::config::run_flags(given)?)?;
+        let deployment = Py::new(py, Deployment::from_process(&[], EntryPoint::Script)?)?;
+        self.start(py, Some(deployment.borrow(py)), Some(config.borrow(py)), None, None)?
+            .serve(py, None)
     }
 
     /// Measure the framework without TCP: TPC sub-interpreter workers serve in-memory
@@ -717,17 +683,31 @@ impl App {
     }
 }
 
-/// Returns the runtime a route's `gil=` and `process=` arguments name; setting both is a
-/// `ValueError`.
-fn runtime_choice(method: &str, path: &str, gil: bool, process: bool) -> PyResult<RuntimeChoice> {
-    match (gil, process) {
-        (false, false) => Ok(RuntimeChoice::Worker),
-        (true, false) => Ok(RuntimeChoice::Main),
-        (false, true) => Ok(RuntimeChoice::Lane),
-        (true, true) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "{} {path}: runtime='process' and runtime='main' exclude each other: a route runs in one place",
-            method.to_uppercase()
-        ))),
+/// Where the engine runs a route's handler: a sub-interpreter worker, the main interpreter, or a
+/// process lane.
+#[pyclass(
+    module = "mipyre.engine",
+    name = "RuntimeChoice",
+    eq,
+    eq_int,
+    frozen,
+    hash,
+    from_py_object
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PyRuntimeChoice {
+    Worker,
+    Main,
+    Lane,
+}
+
+impl From<PyRuntimeChoice> for RuntimeChoice {
+    fn from(choice: PyRuntimeChoice) -> Self {
+        match choice {
+            PyRuntimeChoice::Worker => RuntimeChoice::Worker,
+            PyRuntimeChoice::Main => RuntimeChoice::Main,
+            PyRuntimeChoice::Lane => RuntimeChoice::Lane,
+        }
     }
 }
 
@@ -736,7 +716,7 @@ fn runtime_choice(method: &str, path: &str, gil: bool, process: bool) -> PyResul
 fn refuse_sealed_hook(routes: &Routes, what: &str) -> PyResult<()> {
     match routes.is_sealed() {
         false => Ok(()),
-        true => Err(RegistrationSealed::new_err(format!(
+        true => Err(LateRegistrationError::new_err(format!(
             "{what} is registered after app.run() started (for example from an on_startup \
              hook). Workers only run what the script registered, so every worker route would \
              skip it; register it at module level."
@@ -747,4 +727,3 @@ fn refuse_sealed_hook(routes: &Routes, what: &str) -> PyResult<()> {
 fn ws_limit_error(e: WsLimitError) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
 }
-

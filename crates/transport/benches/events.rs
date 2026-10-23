@@ -39,8 +39,6 @@ fn tcp_event_count(n: u64) {
 }
 
 fn main() {
-    let cases: [Case; 1] = [
-        ("tcp_event_count", tcp_event_count),
-    ];
+    let cases: [Case; 1] = [("tcp_event_count", tcp_event_count)];
     run(&cases);
 }

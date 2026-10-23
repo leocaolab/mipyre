@@ -223,39 +223,61 @@ def _run(body: str) -> str:
     return proc.stdout + proc.stderr  # the Rust log goes to stderr
 
 
+# A server run of an app whose handlers run on the main interpreter: the run opens one pool per
+# DSN from every PgPool.connect() still held when it starts (b/335 D17, q/154 A).
+_RUN = """
+from mipyre import Mipyre
+from mipyre.testing import TestClient
+
+def serve(*handles):
+    app = Mipyre(runtime="main")
+    app.get("/q")(lambda req: [h.fetch_scalar("SELECT current_setting('application_name')") for h in handles])
+    with TestClient(app) as c:
+        return c.get("/q").json()
+"""
+
+
 def test_another_dsn_gets_a_pool_of_its_own():
-    """b/545: a process may use more than one database (a read replica, another store); each
-    DSN has its own pool, and the first is not disturbed by the second."""
-    out = _run("""
+    """b/545: a run may use more than one database (a read replica, another store); each DSN
+    has its own pool in the run, and the first is not disturbed by the second. Two calls of one
+    run naming different values of a setting for one DSN stop its start."""
+    out = _run(_RUN + textwrap.dedent("""
         first = PgPool.connect(DSN, max_connections=2)
         other = PgPool.connect(DSN + "?application_name=other", max_connections=3)
-        print("OTHER", other.fetch_scalar("SELECT current_setting('application_name')"))
-        print("FIRST", first.fetch_scalar("SELECT current_setting('application_name')") != "other")
-        print("SAME", PgPool.connect(DSN).fetch_scalar("SELECT 1"))
+        same = PgPool.connect(DSN)
+        names = serve(other, first, same)
+        print("OTHER", names[0])
+        print("FIRST", names[1] != "other")
+        print("SAME", names[2] == names[1])
+        fourth = PgPool.connect(DSN + "?application_name=other", max_connections=4)
         try:
-            PgPool.connect(DSN + "?application_name=other", max_connections=4)
+            serve(other)
         except ValueError as e:
             print("REFUSED", e)
-    """)
+    """))
     assert "OTHER other" in out, out
     assert "FIRST True" in out, out
-    assert "SAME 1" in out, out
-    assert "REFUSED PgPool is already connected with max_connections=3, not 4" in out, out
+    assert "SAME True" in out, out
+    assert "REFUSED" in out and "PgPool is already connected with max_connections=3, not 4" in out, out
 
 
 def test_second_connect_with_other_settings_raises():
-    out = _run("""
-        PgPool.connect(DSN, max_connections=2)
-        for kwargs in ({"max_connections": 3}, {"acquire_timeout_secs": 5}):
-            try:
-                PgPool.connect(DSN, **kwargs)
-            except ValueError as e:
-                print("REFUSED", e)
-        print("STILL_WORKS", PgPool.connect(DSN).fetch_scalar("SELECT 1"))
-    """)
+    """Every setting two calls of one run name differently is refused at once, when the run
+    starts; without them the run starts."""
+    out = _run(_RUN + textwrap.dedent("""
+        kept = PgPool.connect(DSN, max_connections=2)
+        refused = [PgPool.connect(DSN, **kwargs) for kwargs in ({"max_connections": 3}, {"acquire_timeout_secs": 5})]
+        try:
+            serve(kept)
+        except ValueError as e:
+            for line in str(e).splitlines():
+                print("REFUSED", line.split(": ", 1)[1])
+        del refused
+        print("STILL_WORKS", serve(kept) is not None)
+    """))
     assert "REFUSED PgPool is already connected with max_connections=2, not 3" in out, out
     assert "REFUSED PgPool is already connected with acquire_timeout_secs=30, not 5" in out, out
-    assert "STILL_WORKS 1" in out
+    assert "STILL_WORKS True" in out
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +345,7 @@ def kinds(req):
     }
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ["MIPYRE_PORT"]), workers=2)
+    app.run(host="127.0.0.1", port=int(os.environ["MIPYRE_PORT"]), threads=2)
 '''
 
 

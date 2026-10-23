@@ -1,13 +1,58 @@
-//! Waits for a running server's stop: SIGINT, SIGTERM (what systemd sends), or
+//! Waits for a server run's stop: SIGINT, SIGTERM (what systemd sends), or
 //! `Server.shutdown()`.
 
+use std::time::Instant;
+
+use mipyre_tpc::{ShutdownDeadline, StopWatcherError, ThreadJoinError};
 use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio_util::sync::CancellationToken;
+
+use crate::runtime::ServerRunStop;
+use crate::telemetry::RunCounters;
+
+/// The name of the thread that stops a server run on SIGINT or SIGTERM.
+const STOP_WATCHER: &str = "mipyre-stop";
+
+/// Runs `run` (the whole of a server run, its start included) while a thread stops it on SIGINT
+/// or SIGTERM, then ends that thread by `deadline`; a watcher that did not end cleanly is logged
+/// and counted in `counters`. A signal that comes while the run is still starting stops it as soon
+/// as the start reaches the stop, instead of being left to Python, which would not see it until
+/// the run ends.
+///
+/// # Errors
+///
+/// Returns why the watcher could not start; `run` is not called then, because a server that
+/// would ignore its stop signals must not start.
+pub(crate) fn watching_stop_signals<R>(
+    stop: &ServerRunStop,
+    counters: &RunCounters,
+    deadline: &ShutdownDeadline,
+    run: impl FnOnce() -> R,
+) -> Result<R, StopWatcherError> {
+    let watcher = mipyre_tpc::spawn_stop_watcher(STOP_WATCHER, stop, StopSignals::install, until_stopped)?;
+    let ran = run();
+    if let Err(failure) = watcher.finish(deadline.fix(Instant::now())) {
+        report_stop_watcher_failure(&failure, counters);
+    }
+    Ok(ran)
+}
+
+/// Logs and counts a stop watcher that panicked or was left running at its join deadline; the
+/// run's stop was cancelled either way.
+fn report_stop_watcher_failure(failure: &ThreadJoinError, counters: &RunCounters) {
+    counters.stop_watcher_failure();
+    tracing::error!(
+        target: "mipyre::server",
+        thread = STOP_WATCHER,
+        error = %failure,
+        "the stop watcher thread did not end cleanly"
+    );
+}
 
 /// The registered stop signals. They are registered inside the runtime that waits on them,
 /// before anything is spawned, so a signal that cannot be registered fails the start instead of
 /// leaving a server that cannot be stopped.
-pub(crate) struct StopSignals {
+struct StopSignals {
     interrupt: Signal,
     terminate: Signal,
 }
@@ -15,7 +60,7 @@ pub(crate) struct StopSignals {
 impl StopSignals {
     /// Registers both signals; the error names the first that failed and keeps the OS error's
     /// kind.
-    pub(crate) fn install() -> std::io::Result<Self> {
+    fn install() -> std::io::Result<Self> {
         Ok(Self {
             interrupt: registered(StopSignal::Interrupt, signal(SignalKind::interrupt()))?,
             terminate: registered(StopSignal::Terminate, signal(SignalKind::terminate()))?,
@@ -50,14 +95,12 @@ struct StopSignalError {
 /// Wraps a failed registration in an `io::Error` that names the signal and keeps the OS error's
 /// kind.
 fn registered<S>(signal: StopSignal, result: std::io::Result<S>) -> std::io::Result<S> {
-    result.map_err(|source| {
-        std::io::Error::new(source.kind(), StopSignalError { signal, source })
-    })
+    result.map_err(|source| std::io::Error::new(source.kind(), StopSignalError { signal, source }))
 }
 
 /// Resolves once the server should stop, then cancels `stop` so every accept loop and
 /// connection sees it: on SIGINT or SIGTERM, or when `Server.shutdown()` cancelled `stop`.
-pub(crate) async fn until_stopped(stop: CancellationToken, mut signals: StopSignals) {
+async fn until_stopped(stop: CancellationToken, mut signals: StopSignals) {
     tokio::select! {
         _ = signals.interrupt.recv() => {}
         _ = signals.terminate.recv() => {}
@@ -93,6 +136,22 @@ mod tests {
             assert_eq!(inner.signal, signal);
             assert_eq!(registered(signal, Ok(7)).expect("registered"), 7);
         }
+    }
+
+    /// Checks that a stop watcher that did not end cleanly is logged with its own error and counted.
+    #[test]
+    fn a_stop_watcher_that_did_not_end_cleanly_is_said_and_counted() {
+        let counters = RunCounters::new(false);
+        let failure = ThreadJoinError::StillRunning;
+        let log = crate::exchange::captured_log(|| report_stop_watcher_failure(&failure, &counters));
+        assert_eq!(counters.read().stop_watcher_failures, 1);
+        let line = log
+            .lines()
+            .find(|l| l.contains("stop watcher thread did not end cleanly"))
+            .unwrap_or_else(|| panic!("the failure was not said:\n{log}"));
+        assert!(line.contains("\"thread\":\"mipyre-stop\""), "{line}");
+        assert!(line.contains("still running at the join deadline"), "{line}");
+        assert!(line.contains("\"level\":\"ERROR\""), "{line}");
     }
 
     /// A real SIGTERM to this process stops the server the way SIGINT does; only `kill` makes the

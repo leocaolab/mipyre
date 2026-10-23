@@ -20,7 +20,7 @@ import urllib.request
 
 import pytest
 
-from tests._helpers import answers, bound_port, read_file
+from tests._helpers import answers, bound_port, read_file, set_subinterpreters
 
 RAISE_IN_WORKER_SCRIPT = r'''
 import os
@@ -42,7 +42,7 @@ if interpreters.get_current().id != interpreters.get_main().id and os.environ.ge
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, workers=3)
+    app.run(host="127.0.0.1", port=0)
 '''
 
 
@@ -54,6 +54,7 @@ def run_script(tmp_path, env_extra, *, script=RAISE_IN_WORKER_SCRIPT, timeout=90
     log_path = tmp_path / "app.log"
     env = dict(os.environ)
     env.update(env_extra)
+    set_subinterpreters(env, "3")
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
             [sys.executable, str(script_path)],
@@ -78,6 +79,7 @@ def serve_and_get(tmp_path, env_extra):
     log_path = tmp_path / "app.log"
     env = dict(os.environ)
     env.update(env_extra)
+    set_subinterpreters(env, "3")
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
             [sys.executable, str(script_path)],

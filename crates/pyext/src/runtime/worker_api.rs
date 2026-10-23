@@ -1,5 +1,6 @@
-//! Provides the functions a sub-interpreter worker's async engine (`_async_engine.py`) calls to
-//! take requests and answer them.
+//! Provides the functions an async engine (`_worker/async_engine.py`) calls to take requests and answer
+//! them: a sub-interpreter worker's, and main's for its `async def` routes on the thread-per-core
+//! server.
 //!
 //! Each engine gets its own [`AsyncInbox`] rather than a process-global channel, so two pools in
 //! one process never see each other's requests.
@@ -12,15 +13,16 @@ use pyo3::prelude::*;
 
 use super::hook_chain::worker_response;
 use super::job_queue::JobReceiver;
-use super::pool::{PoolJob, PoolReplySender};
+use super::main_bridge::{BridgeJob, BridgeReplySender};
+use super::main_call::main_reply;
+use super::pool::{PoolJob, PoolReplySender, ReplySender};
+use super::worker::async_engine::EngineRoutes;
 use super::worker_app;
 use crate::exchange::error::{
-    refuse, HandlerError, UnansweredError, ReplyHolder, RequestLabel, RequestStage, ResponseError,
+    refuse, HandlerError, ReplyHolder, RequestLabel, RequestStage, ResponseError, UnansweredError,
 };
 use crate::exchange::request::Request;
 use mipyre_http::plan::limits::RequestBudget;
-use mipyre_http::plan::response::HandlerResponse;
-use mipyre_http::plan::route::RouteId;
 
 mod guard;
 use guard::worker_api_function;
@@ -72,11 +74,11 @@ where
     }
 }
 
-/// Holds one async worker's view of the pool's queue and its own stop flag, which the engine sets
-/// when it stops so its fetcher thread returns.
+/// Holds one async engine's view of its queue and its own stop flag, which the engine sets when it
+/// stops so its fetcher thread returns.
 #[pyclass(module = "mipyre.engine", frozen, name = "_AsyncInbox")]
 pub(crate) struct AsyncInbox {
-    requests: JobReceiver<PoolJob>,
+    requests: EngineQueue,
     /// Is set by `_worker_close`, which then wakes the queue's sleeping receivers to see it.
     closed: AtomicBool,
     task_budget: Duration,
@@ -93,9 +95,52 @@ fn async_task_budget(request: RequestBudget) -> Duration {
     budget - ASYNC_TASK_MARGIN.min(budget / 2)
 }
 
+/// The queue an async engine takes its requests from: an async worker's is the pool's, main's is
+/// the bridge's own.
+enum EngineQueue {
+    Pool(JobReceiver<PoolJob>),
+    Main(JobReceiver<BridgeJob>),
+}
+
+impl EngineQueue {
+    /// Wakes the queue's sleeping receivers, so a closed inbox is seen.
+    fn wake_all(&self) {
+        match self {
+            EngineQueue::Pool(requests) => requests.wake_all(),
+            EngineQueue::Main(requests) => requests.wake_all(),
+        }
+    }
+}
+
+/// Where an async engine's answer to one request goes, which decides what the answer may be: only
+/// main can answer with a `Stream`.
+enum EngineReply {
+    Pool(PoolReplySender),
+    Main(BridgeReplySender),
+}
+
+impl EngineReply {
+    fn is_closed(&self) -> bool {
+        match self {
+            EngineReply::Pool(reply) => reply.is_closed(),
+            EngineReply::Main(reply) => reply.is_closed(),
+        }
+    }
+}
+
 impl AsyncInbox {
     /// Gives each task of the engine [`async_task_budget`] of `request`.
     pub(crate) fn new(requests: JobReceiver<PoolJob>, request: RequestBudget) -> Self {
+        Self::of(EngineQueue::Pool(requests), request)
+    }
+
+    /// Takes main's `async def` routes' requests from the bridge's queue, each job's target
+    /// indexing the engine's handlers.
+    pub(crate) fn for_main(requests: JobReceiver<BridgeJob>, request: RequestBudget) -> Self {
+        Self::of(EngineQueue::Main(requests), request)
+    }
+
+    fn of(requests: EngineQueue, request: RequestBudget) -> Self {
         AsyncInbox {
             requests,
             closed: AtomicBool::new(false),
@@ -107,13 +152,23 @@ impl AsyncInbox {
         self.task_budget
     }
 
-    /// Returns the next request whose caller still waits, dropping unrun the ones whose caller
-    /// gave up, or `None` once the channel or this inbox is closed.
-    fn next_live(&self) -> Option<PoolJob> {
+    /// Returns the next request whose caller still waits, with its handler's index and where its
+    /// answer goes, dropping unrun the ones whose caller gave up, or `None` once the channel or
+    /// this inbox is closed.
+    fn next_live(&self) -> Option<(usize, Request, EngineReply)> {
         loop {
-            let request = self.requests.recv_unless(&self.closed)?;
-            if !request.reply.is_closed() {
-                return Some(request);
+            let (index, request, reply) = match &self.requests {
+                EngineQueue::Pool(requests) => {
+                    let (route, request, reply) = requests.recv_unless(&self.closed)?.into_request();
+                    (route.index(), request, EngineReply::Pool(reply))
+                }
+                EngineQueue::Main(requests) => {
+                    let BridgeJob { target, request, reply } = requests.recv_unless(&self.closed)?;
+                    (target.index(), request, EngineReply::Main(reply))
+                }
+            };
+            if !reply.is_closed() {
+                return Some((index, request, reply));
             }
             PoolJob::inc_completed();
         }
@@ -124,7 +179,8 @@ impl AsyncInbox {
 /// error if the engine lets go of it unanswered.
 #[pyclass(module = "mipyre.engine", frozen, name = "_AsyncJob")]
 pub(crate) struct AsyncJob {
-    route: RouteId,
+    /// Indexes the engine's handlers: a worker's by route, main's by handler.
+    route: usize,
     #[pyo3(get)]
     request: Py<Request>,
     reply: JobReply,
@@ -135,37 +191,59 @@ pub(crate) struct AsyncJob {
 /// names the request.
 struct JobReply {
     label: RequestLabel,
-    reply: Mutex<Option<PoolReplySender>>,
+    reply: Mutex<Option<EngineReply>>,
 }
 
 #[pymethods]
 impl AsyncJob {
     #[getter]
     fn route(&self) -> usize {
-        self.route.index()
+        self.route
     }
 }
 
 impl JobReply {
-    fn new(label: RequestLabel, reply: PoolReplySender) -> Self {
+    fn new(label: RequestLabel, reply: EngineReply) -> Self {
         JobReply {
             label,
             reply: Mutex::new(Some(reply)),
         }
     }
 
-    /// Answers this request.
+    /// Takes where the answer goes.
     ///
     /// # Errors
     ///
     /// Fails when the request was already answered, which is a bug in the engine.
-    fn answer(&self, result: Result<HandlerResponse, HandlerError>) -> PyResult<()> {
-        let reply = self
-            .reply
+    fn take(&self) -> PyResult<EngineReply> {
+        self.reply
             .lock()
             .take()
-            .ok_or_else(|| PyRuntimeError::new_err("this request was already answered"))?;
-        self.send(reply, result);
+            .ok_or_else(|| PyRuntimeError::new_err("this request was already answered"))
+    }
+
+    /// Answers this request with what its handler or a hook returned, mapped as its caller takes
+    /// it: a worker's as a response, main's also as a `Stream`.
+    fn answer(&self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        match self.take()? {
+            EngineReply::Pool(reply) => {
+                send_answer(reply, &self.label, worker_response(value).map_err(HandlerError::from));
+            }
+            EngineReply::Main(reply) => {
+                send_answer(reply, &self.label, main_reply(value).map_err(HandlerError::from));
+            }
+        }
+        Ok(())
+    }
+
+    /// Answers this request with `error`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the request was already answered, which is a bug in the engine.
+    fn answer_error(&self, error: HandlerError) -> PyResult<()> {
+        let reply = self.take()?;
+        self.send_error(reply, error);
         Ok(())
     }
 
@@ -173,26 +251,25 @@ impl JobReply {
     fn fail(&self, error: HandlerError) {
         let pending = self.reply.lock().take();
         match pending {
-            Some(reply) => self.send(reply, Err(error)),
+            Some(reply) => self.send_error(reply, error),
             None => {
                 let _logged = error.log(&self.label);
             }
         }
     }
 
-    fn send(&self, reply: PoolReplySender, result: Result<HandlerResponse, HandlerError>) {
-        send_answer(reply, &self.label, result);
+    fn send_error(&self, reply: EngineReply, error: HandlerError) {
+        match reply {
+            EngineReply::Pool(reply) => send_answer(reply, &self.label, Err(error)),
+            EngineReply::Main(reply) => send_answer(reply, &self.label, Err(error)),
+        }
     }
 }
 
 /// Logs an error with the request's label, then sends `result` to the waiting caller.
 ///
 /// A caller that stopped waiting already said why, so the dropped result is noted only at debug.
-fn send_answer(
-    reply: PoolReplySender,
-    label: &RequestLabel,
-    result: Result<HandlerResponse, HandlerError>,
-) {
+fn send_answer<T>(reply: ReplySender<T>, label: &RequestLabel, result: Result<T, HandlerError>) {
     let result = result.map_err(|e| e.log(label));
     if reply.send(result).is_err() {
         tracing::debug!(target: "mipyre::server", request_id = %label.id, "nobody waits any more (the caller's budget ran out, or its client went away); dropping the result");
@@ -203,10 +280,7 @@ fn send_answer(
 impl Drop for JobReply {
     fn drop(&mut self) {
         if let Some(reply) = self.reply.get_mut().take() {
-            self.send(
-                reply,
-                Err(refuse(UnansweredError::WorkerLost(ReplyHolder::AsyncEngine))),
-            );
+            self.send_error(reply, refuse(UnansweredError::WorkerLost(ReplyHolder::AsyncEngine)));
         }
     }
 }
@@ -244,21 +318,19 @@ fn _worker_recv(py: Python<'_>, inbox: &Bound<'_, AsyncInbox>) -> Option<AsyncJo
 raising through py;
 {
         let inbox = inbox.get();
-        let Some(request) = py.detach(|| inbox.next_live()) else {
+        let Some((route, request, reply)) = py.detach(|| inbox.next_live()) else {
             return Ok(None);
         };
-        let (route, request, reply) = request.into_request();
-        let label = request.label();
+        let reply = JobReply::new(request.label(), reply);
         match Py::new(py, request) {
             Ok(request) => Ok(Some(AsyncJob {
                 route,
                 request,
-                reply: JobReply::new(label, reply),
+                reply,
                 task_budget: inbox.task_budget,
             })),
             Err(e) => {
-                let error = HandlerError::python(py, RequestStage::Setup, &e);
-                send_answer(reply, &label, Err(error));
+                reply.fail(HandlerError::python(py, RequestStage::Setup, &e));
                 Err(e)
             }
         }
@@ -282,9 +354,7 @@ worker_api_function! {
 fn _worker_send(job: &Bound<'_, AsyncJob>, response: Bound<'_, PyAny>) -> ();
 raising through job.py();
 {
-        job.get()
-            .reply
-            .answer(worker_response(response).map_err(HandlerError::from))
+        job.get().reply.answer(response)
     }
 }
 
@@ -327,7 +397,7 @@ answering &job.get().reply;
 {
         let job = job.get();
         job.reply
-            .answer(Err(refuse(UnansweredError::TimedOut(job.task_budget))))
+            .answer_error(refuse(UnansweredError::TimedOut(job.task_budget)))
     }
 }
 
@@ -360,52 +430,48 @@ fn registered_routes(py: Python<'_>) -> PyResult<worker_app::WorkerRoutes<'_>> {
     })
 }
 
-worker_api_function! {
-/// Returns the worker app's handlers indexed like main's route table.
-fn _worker_app_handlers(py: Python<'_>) -> Vec<Option<Py<PyAny>>>;
-raising through py;
-{
-        Ok(registered_routes(py)?
+/// Returns what the worker's async engine serves: its app's handlers, indexed like main's route
+/// table, and its hooks.
+pub(crate) fn worker_engine_routes(py: Python<'_>) -> PyResult<EngineRoutes> {
+    let routes = registered_routes(py)?;
+    let unbind = |hooks: Vec<Bound<'_, PyAny>>| hooks.into_iter().map(Bound::unbind).collect();
+    Ok(EngineRoutes {
+        before: unbind(routes.before_hooks),
+        after: unbind(routes.after_hooks),
+        handlers: routes
             .routes
             .into_iter()
             .map(|r| r.handler.map(Bound::unbind))
-            .collect())
-    }
-}
-
-#[pyclass(module = "mipyre.engine", frozen, get_all, name = "_WorkerHooks")]
-pub(crate) struct WorkerHooks {
-    before: Vec<Py<PyAny>>,
-    after: Vec<Py<PyAny>>,
-}
-
-worker_api_function! {
-fn _worker_app_hooks(py: Python<'_>) -> WorkerHooks;
-raising through py;
-{
-        let routes = registered_routes(py)?;
-        let unbind = |hooks: Vec<Bound<'_, PyAny>>| hooks.into_iter().map(Bound::unbind).collect();
-        Ok(WorkerHooks {
-            before: unbind(routes.before_hooks),
-            after: unbind(routes.after_hooks),
-        })
-    }
+            .collect(),
+        streams: false,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::guard::{no_panic, no_panic_answering, panicked};
+    use super::*;
     use crate::exchange::{captured_log_from, captured_log_value, label};
     use mipyre_http::io::request_id::RequestId;
+    use mipyre_http::plan::response::HandlerResponse;
+
+    /// The main interpreter records no worker app: a worker engine's routes are then the startup
+    /// error (b/135), never an empty table that fails every request with a KeyError.
+    #[test]
+    fn a_worker_engine_without_an_app_fails_its_start() {
+        Python::initialize();
+        mipyre_subinterp::attach::with_main(|py| {
+            let Err(e) = worker_engine_routes(py) else {
+                panic!("the main interpreter has no worker app");
+            };
+            assert!(e.to_string().contains("has no app"), "{e}");
+        });
+    }
 
     #[test]
     fn the_async_task_budget_ends_before_the_callers() {
         let default = mipyre_http::plan::limits::Limits::DEFAULT.request_budget;
-        assert_eq!(
-            async_task_budget(default) + ASYNC_TASK_MARGIN,
-            default.get()
-        );
+        assert_eq!(async_task_budget(default) + ASYNC_TASK_MARGIN, default.get());
         for seconds in [0.001, 1.0, 3.0, 4.0, 30.0, 600.0] {
             let request = RequestBudget::from_secs(seconds).unwrap();
             let task = async_task_budget(request);
@@ -434,22 +500,13 @@ mod tests {
     fn a_panic_in_a_call_that_answers_nothing_is_raised_as_the_engines_runtime_error() {
         pyo3::Python::initialize();
         mipyre_subinterp::attach::with_main(|py| {
-            let raised = no_panic("_worker_to_response", py, panicking)
-                .expect_err("the panic comes out as an exception");
+            let raised =
+                no_panic("_worker_to_response", py, panicking).expect_err("the panic comes out as an exception");
             let value = raised.value(py);
             // PyO3's PanicException is a BaseException the fetcher thread would die on.
             assert!(raised.is_instance_of::<PyRuntimeError>(py), "{raised}");
-            assert_eq!(
-                value.get_type().name().unwrap().to_string(),
-                "_EnginePanic"
-            );
-            let carried = value
-                .cast::<EnginePanic>()
-                .unwrap()
-                .get()
-                .error
-                .lock()
-                .take();
+            assert_eq!(value.get_type().name().unwrap().to_string(), "_EnginePanic");
+            let carried = value.cast::<EnginePanic>().unwrap().get().error.lock().take();
             assert!(
                 matches!(&carried, Some(HandlerError::Panicked { payload }) if payload == "in _worker_to_response: boom"),
                 "{carried:?}"
@@ -460,7 +517,7 @@ mod tests {
     #[test]
     fn a_job_dropped_unanswered_answers_itself_and_an_answered_one_does_not() {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let dropped = JobReply::new(label(&RequestId::mint()), tx);
+        let dropped = JobReply::new(label(&RequestId::mint()), EngineReply::Pool(tx));
         captured_log_value(|| drop(dropped));
         match rx.try_recv().expect("the dropped job was answered") {
             Err(logged) => assert!(
@@ -474,10 +531,12 @@ mod tests {
         }
 
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let answered = JobReply::new(label(&RequestId::mint()), tx);
+        let answered = JobReply::new(label(&RequestId::mint()), EngineReply::Pool(tx));
         captured_log_value(|| {
             answered
-                .answer(Err(HandlerError::Panicked { payload: "its own answer".into() }))
+                .answer_error(HandlerError::Panicked {
+                    payload: "its own answer".into(),
+                })
                 .expect("the first answer")
         });
         drop(answered);
@@ -493,7 +552,7 @@ mod tests {
     #[test]
     fn a_panic_in_a_call_that_answers_a_request_fails_it_once_and_returns() {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let reply = JobReply::new(label(&RequestId::mint()), tx);
+        let reply = JobReply::new(label(&RequestId::mint()), EngineReply::Pool(tx));
         let returned = captured_log_value(|| no_panic_answering("_worker_fail", &reply, panicking));
         assert!(returned.is_ok(), "the call returns normally");
         let answered = rx.try_recv().expect("the request was answered");

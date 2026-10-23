@@ -1,7 +1,7 @@
 """An `async def` hook on a sync path, then a `def` handler that runs a loop of its own (b/550).
 
 The hook's coroutine runs on the thread's event loop, marked running only for that run
-(`mipyre._awaitable.run`): the handler after it, in the same request and on the same thread,
+(`mipyre._worker.awaitable.run`): the handler after it, in the same request and on the same thread,
 may call `asyncio.run()`, which refuses to start while another loop runs. On a worker and on
 the main interpreter (`runtime="main"`, a bridge thread), each over one keep-alive connection so
 one thread serves every request in turn.
@@ -14,7 +14,7 @@ import http.client
 import pytest
 
 from mipyre import Mipyre
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 
 SEEN = contextvars.ContextVar("b550_seen", default="unset")
 
@@ -43,7 +43,7 @@ def on_the_main_interpreter(req):
 
 @pytest.fixture(scope="module")
 def conn():
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         c = http.client.HTTPConnection("127.0.0.1", client.port, timeout=10)
         yield c
         c.close()

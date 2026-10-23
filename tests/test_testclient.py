@@ -1,8 +1,10 @@
 """Tests for TestClient and HTTP verbs."""
 
+import threading
+
 import pytest
 from mipyre import Mipyre, Response
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 
 
 # Module level: TestClient serves it through sub-interpreter workers, which rebuild
@@ -143,3 +145,74 @@ def test_binary_response_preserved(cors_client):
     resp = cors_client.get("/binary")
     assert resp.status_code == 200
     assert resp.body[:2] == b"\xff\xd8", f"JPEG magic bytes corrupted: {resp.body[:4]}"
+
+
+# ---------------------------------------------------------------------------
+# b/845: a TestClient serves as the real server does (moved from the breaker pass)
+# ---------------------------------------------------------------------------
+
+
+def test_testclient_start_sends_no_request_to_the_apps_routes():
+    """A TestClient that has made no request has run no handler: the app's `/` (a side
+    effect, a counter, an audit row) must not see a request the test never made."""
+    app = Mipyre(runtime="main")
+    hits = []
+
+    @app.get("/")
+    def index(req):
+        hits.append(req.path)
+        return "index"
+
+    with TestClient(app):
+        pass
+    assert hits == []
+
+
+def test_testclient_raw_body_post_carries_no_content_type_it_was_not_given():
+    """`post(body=b"...")` with no headers: the server must see what the test sent. urllib
+    adds `application/x-www-form-urlencoded` to any request with data."""
+    app = Mipyre(runtime="main")
+
+    @app.post("/echo")
+    def echo(req):
+        return {"content_type": req.headers.get("content-type")}
+
+    with TestClient(app) as memory, TestServer(app) as server, TestClient(server) as tcp:
+        for c in (memory, tcp):
+            assert c.post("/echo", body=b"raw bytes").json() == {"content_type": None}
+            given = c.post("/echo", body=b"raw bytes", headers={"Content-Type": "text/csv"})
+            assert given.json() == {"content_type": "text/csv"}
+
+
+def test_testclient_whose_start_fails_leaves_no_server_running(monkeypatch):
+    """When the server does not serve in time (here: a startup hook still waiting), the
+    constructor raises, and it first stops the server it started: the caller never got the
+    object, so nothing else could close it. The hook is let go when the client stops the
+    run, so the run then ends by itself. (The ready time is injected small.)"""
+    import mipyre.testing as testing
+    from mipyre._server_run import ServerRun
+
+    monkeypatch.setattr(testing, "_READY_TIMEOUT_S", 0.5)
+    release = threading.Event()
+    stop = ServerRun.stop
+
+    def stop_and_release(run):
+        stop(run)
+        release.set()
+
+    monkeypatch.setattr(ServerRun, "stop", stop_and_release)
+    app = Mipyre(runtime="main")
+
+    @app.on_startup
+    def waits_for_a_dependency():
+        release.wait()
+
+    @app.get("/")
+    def index(req):
+        return "ok"
+
+    before = {t.ident for t in threading.enumerate() if t.name == "mipyre-testserver"}
+    with pytest.raises(TimeoutError, match="did not serve within"):
+        TestClient(app)
+    alive = [t for t in threading.enumerate() if t.name == "mipyre-testserver" and t.ident not in before]
+    assert alive == [], "the failed TestClient left its server thread running"

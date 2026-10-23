@@ -17,7 +17,10 @@ static GLOBAL: AllocationCounter<System> = AllocationCounter(System);
 fn overloaded_response(n: u64) {
     let id = RequestId::mint();
     measure("overloaded_response", n, |_| {
-        black_box(response::overloaded_response(black_box("server overloaded"), black_box(&id)));
+        black_box(response::overloaded_response(
+            black_box("server overloaded"),
+            black_box(&id),
+        ));
     });
 }
 

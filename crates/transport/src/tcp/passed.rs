@@ -55,11 +55,7 @@ fn too_many(count: usize) -> PassedError {
     }
 }
 
-fn handed_count(
-    listen_pid: Option<&str>,
-    listen_fds: Option<&str>,
-    own_pid: u32,
-) -> Result<usize, PassedError> {
+fn handed_count(listen_pid: Option<&str>, listen_fds: Option<&str>, own_pid: u32) -> Result<usize, PassedError> {
     let Some(pid) = listen_pid else {
         return Ok(0);
     };
@@ -172,11 +168,14 @@ fn spread(
     let placed = socket_loops(sockets.len(), copies);
     for ((index, handed), SocketLoops { home, duplicates }) in sockets.into_iter().zip(placed) {
         for i in duplicates {
-            let socket = handed.socket.try_clone().map_err(|source| PassedError::SystemCallFailed {
-                index,
-                call: SocketCall::TryClone,
-                source,
-            })?;
+            let socket = handed
+                .socket
+                .try_clone()
+                .map_err(|source| PassedError::SystemCallFailed {
+                    index,
+                    call: SocketCall::TryClone,
+                    source,
+                })?;
             loops[i].push((
                 index,
                 Listener {
@@ -208,23 +207,14 @@ impl BoundListeners {
     /// on one fails. A handed-over
     /// connection (`Accept=yes`) is refused here, because it would fail every `accept()` while
     /// the accept loop only logs and backs off, and the server would look alive and serve nothing.
-    pub fn passed(
-        sockets: Vec<std::net::TcpListener>,
-        copies: std::num::NonZeroUsize,
-    ) -> Result<Self, PassedError> {
+    pub fn passed(sockets: Vec<std::net::TcpListener>, copies: std::num::NonZeroUsize) -> Result<Self, PassedError> {
         if sockets.is_empty() {
             return Err(PassedError::NoSockets);
         }
         let mut groups: Vec<Vec<Listener>> = (0..copies.get()).map(|_| Vec::new()).collect();
         let mut by_addr: Vec<(std::net::SocketAddr, Vec<(usize, Listener)>)> = Vec::new();
         for (index, socket) in sockets.into_iter().enumerate() {
-            let failed = |call: SocketCall| {
-                move |source| PassedError::SystemCallFailed {
-                    index,
-                    call,
-                    source,
-                }
-            };
+            let failed = |call: SocketCall| move |source| PassedError::SystemCallFailed { index, call, source };
             require_tcp(&socket, index)?;
             if !os::is_listening(&socket).map_err(failed(SocketCall::CheckListening))? {
                 return Err(PassedError::NotListening { index });
@@ -320,12 +310,21 @@ mod tests {
     #[test]
     fn a_malformed_activation_variable_is_refused_with_its_value() {
         let err = handed_count(Some("seven"), Some("2"), 7).unwrap_err();
-        assert!(matches!(err, PassedError::Environment { var: "LISTEN_PID", .. }), "{err}");
+        assert!(
+            matches!(err, PassedError::Environment { var: "LISTEN_PID", .. }),
+            "{err}"
+        );
         assert!(err.to_string().contains("\"seven\""), "{err}");
         let err = handed_count(Some("7"), Some("-1"), 7).unwrap_err();
-        assert!(matches!(err, PassedError::Environment { var: "LISTEN_FDS", .. }), "{err}");
+        assert!(
+            matches!(err, PassedError::Environment { var: "LISTEN_FDS", .. }),
+            "{err}"
+        );
         let err = handed_count(Some("7"), Some(&u64::MAX.to_string()), 7).unwrap_err();
-        assert!(matches!(err, PassedError::Environment { var: "LISTEN_FDS", .. }), "{err}");
+        assert!(
+            matches!(err, PassedError::Environment { var: "LISTEN_FDS", .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -379,47 +378,31 @@ mod tests {
         let (_served, _) = server.accept().unwrap();
         let connection = std::net::TcpListener::from(std::os::fd::OwnedFd::from(client));
         let err = BoundListeners::passed(
-            vec![
-                std::net::TcpListener::bind(loopback(0)).unwrap(),
-                connection,
-            ],
+            vec![std::net::TcpListener::bind(loopback(0)).unwrap(), connection],
             two(),
         )
         .err()
         .expect("a connection is not a listener");
-        assert!(
-            matches!(err, PassedError::NotListening { index: 1 }),
-            "{err:?}"
-        );
+        assert!(matches!(err, PassedError::NotListening { index: 1 }), "{err:?}");
         assert!(err.to_string().contains("Accept=yes"), "{err}");
     }
 
     #[test]
     fn a_passed_socket_never_put_in_listen_is_refused_as_not_listening() {
-        let bound_only =
-            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        let bound_only = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
         bound_only.bind(&loopback(0).into()).unwrap();
         let bound_only = std::net::TcpListener::from(std::os::fd::OwnedFd::from(bound_only));
         let err = BoundListeners::passed(vec![bound_only], two())
             .err()
             .expect("a socket never put in listen() is not a listener");
-        assert!(
-            matches!(err, PassedError::NotListening { index: 0 }),
-            "{err:?}"
-        );
-        assert!(
-            err.to_string().contains(os::LISTENING_QUERY),
-            "{err}"
-        );
+        assert!(matches!(err, PassedError::NotListening { index: 0 }), "{err:?}");
+        assert!(err.to_string().contains(os::LISTENING_QUERY), "{err}");
     }
 
     #[test]
     fn a_blocking_passed_listener_comes_out_nonblocking() {
         let handed = std::net::TcpListener::bind(loopback(0)).unwrap();
-        assert!(
-            !is_nonblocking(&handed),
-            "std binds blocking, as systemd hands over"
-        );
+        assert!(!is_nonblocking(&handed), "std binds blocking, as systemd hands over");
         let addr = handed.local_addr().unwrap();
         let bound = BoundListeners::passed(vec![handed], two()).unwrap();
         for group in bound.groups() {
@@ -545,6 +528,9 @@ mod tests {
         let groups = group_fds(&bound);
         assert!(groups.iter().all(|g| g.len() == 1), "{groups:?}");
         assert_eq!((groups[0][0], groups[1][0]), (fds[0], fds[1]));
-        assert!(!fds.contains(&groups[2][0]) && !fds.contains(&groups[3][0]), "{groups:?}");
+        assert!(
+            !fds.contains(&groups[2][0]) && !fds.contains(&groups[3][0]),
+            "{groups:?}"
+        );
     }
 }

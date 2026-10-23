@@ -16,7 +16,8 @@ import threading
 import pytest
 
 from mipyre import Mipyre, Response, Stream
-from mipyre.testing import TestClient
+from mipyre._server_run import runs_of
+from mipyre.testing import TestClient, TestServer
 from tests._helpers import poll_until
 
 BIG = 200 * 1024
@@ -54,12 +55,12 @@ def sse(req):
 
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(app, transport="tcp") as c:
+    with TestServer(app) as server, TestClient(server) as c:
         yield c
 
 
 def _get(path, extra=""):
-    return f"GET {path} HTTP/1.1\r\nHost: t\r\n{extra}\r\n".encode()
+    return f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra}\r\n".encode()
 
 
 class _Reader:
@@ -137,7 +138,7 @@ def test_a_response_followed_by_half_a_request_arrives_at_once(client):
         # closed the connection, and then the second request below could not be answered.
         status, _, body = reader.response()
         assert (status, body) == (200, b"a")
-        sock.sendall(b"TP/1.1\r\nHost: t\r\n\r\n")
+        sock.sendall(b"TP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
         assert reader.response()[2] == b"b"
 
 
@@ -221,12 +222,12 @@ def tls_port(tmp_path_factory):
         daemon=True,
     )
     t.start()
-    servers = poll_until(lambda: list(tls_app._servers), timeout=None, what="TLS bind")
-    port = servers[0].port
+    runs = poll_until(lambda: runs_of(tls_app).serving(), timeout=None, what="TLS bind")
+    port = runs[0].port
     poll_until(lambda: _tls_answers(port), timeout=None, what="TLS serving")
     yield port
-    for srv in servers:
-        srv.shutdown()
+    for run in runs:
+        run.stop()
     t.join(10)
 
 
@@ -259,7 +260,7 @@ def test_tls_a_response_followed_by_half_a_request_arrives_at_once(tls_port):
         # closed the connection, and then the second request below could not be answered.
         status, _, body = reader.response()
         assert (status, body) == (200, b"a")
-        sock.sendall(b"TP/1.1\r\nHost: t\r\n\r\n")
+        sock.sendall(b"TP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
         assert reader.response()[2] == b"b"
 
 

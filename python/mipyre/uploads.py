@@ -25,6 +25,8 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from urllib.parse import unquote_to_bytes
 
+from mipyre.engine import HTTPException
+
 
 def _split_header_params(value: str) -> list[str]:
     """Split a header on top-level ``;`` separators; a ``;`` inside an RFC 2045
@@ -106,9 +108,10 @@ class FormPart:
 _MAX_PADDING = 64
 
 
-class MultipartError(ValueError):
-    """The request body is not well-formed multipart/form-data, or is beyond the limits
-    ``parse_multipart`` was given."""
+class MultipartError(HTTPException):
+    """The request body is not well-formed multipart/form-data (400), or is beyond the
+    limits ``parse_multipart`` was given (413). An ``HTTPException``: left uncaught, the
+    client gets that status and the reason as ``detail``."""
 
 
 class Form(Mapping[str, FormPart]):
@@ -151,9 +154,10 @@ class Form(Mapping[str, FormPart]):
 def parse_multipart(req, *, max_parts: int = 1000, max_part_header_bytes: int = 16 * 1024) -> Form:
     """Parse multipart/form-data from request. A text field's ``filename`` is None.
 
-    Raises MultipartError when the body is not well-formed multipart/form-data, has
-    more than ``max_parts`` parts, or a part whose header section is longer than
-    ``max_part_header_bytes``. Both limits are checked before the part is parsed.
+    Raises MultipartError (an ``HTTPException``) when the body is not well-formed
+    multipart/form-data (400), has more than ``max_parts`` parts, or a part whose header
+    section is longer than ``max_part_header_bytes`` (413). Both limits are checked
+    before the part is parsed.
     """
     if max_parts < 1 or max_part_header_bytes < 1:
         raise ValueError(
@@ -175,10 +179,10 @@ def _boundary(content_type: str) -> str:
     # RFC 9110 §8.3.1: the type, subtype and parameter names are case-insensitive; the
     # boundary value is not. A quoted boundary may contain ";".
     if media_type.strip().lower() != "multipart/form-data":
-        raise MultipartError(f"Expected multipart/form-data, got: {content_type}")
+        raise MultipartError(400, f"Expected multipart/form-data, got: {content_type}")
     boundary = _header_params(params).get("boundary")
     if not boundary:
-        raise MultipartError(f"Missing boundary in Content-Type: {content_type}")
+        raise MultipartError(400, f"Missing boundary in Content-Type: {content_type}")
     return boundary
 
 
@@ -203,13 +207,14 @@ def _ext_value(value: str) -> str:
     codec = _EXT_VALUE_CHARSETS.get(charset.strip().lower())
     if not (sep1 and sep2) or codec is None:
         raise MultipartError(
+            400,
             f"filename*={value!r} is not charset'language'value with charset UTF-8 or "
             "ISO-8859-1 (RFC 8187)"
         )
     try:
         return unquote_to_bytes(encoded).decode(codec)
     except UnicodeDecodeError as e:
-        raise MultipartError(f"filename*={value!r} is not valid {charset}: {e}") from None
+        raise MultipartError(400, f"filename*={value!r} is not valid {charset}: {e}") from None
 
 
 def _line_break(body: bytes, boundary: str) -> bytes:
@@ -218,7 +223,7 @@ def _line_break(body: bytes, boundary: str) -> bytes:
     dash = b"--" + boundary.encode()
     start = body.find(dash)
     if start == -1:
-        raise MultipartError(f"no delimiter line --{boundary} in the body")
+        raise MultipartError(400, f"no delimiter line --{boundary} in the body")
     line_end = body[start + len(dash):start + len(dash) + _MAX_PADDING].lstrip(b" \t")
     return b"\r\n" if line_end.startswith(b"\r\n") else b"\n"
 
@@ -237,21 +242,22 @@ def _split_parts(body: bytes, boundary: str, nl: bytes, max_parts: int) -> list[
     """
     segments = (nl + body).split(nl + b"--" + boundary.encode(), max_parts + 1)
     if len(segments) < 2:
-        raise MultipartError(f"no delimiter line --{boundary} in the body")
+        raise MultipartError(400, f"no delimiter line --{boundary} in the body")
 
     parts: list[bytes] = []
     for segment in segments[1:]:  # segments[0] is the preamble
         if segment.startswith(b"--"):
             return parts
         if len(parts) == max_parts:
-            raise MultipartError(f"body has more than max_parts={max_parts} parts")
+            raise MultipartError(413, f"body has more than max_parts={max_parts} parts")
         padding, sep, part = segment.partition(nl)
         if not sep or padding.strip(b" \t"):
             raise MultipartError(
+                400,
                 f"delimiter --{boundary} is followed by {padding[:40]!r}, not a line break"
             )
         parts.append(part)
-    raise MultipartError(f"body ends without the closing delimiter --{boundary}--")
+    raise MultipartError(400, f"body ends without the closing delimiter --{boundary}--")
 
 
 def _parse_part(part: bytes, nl: bytes, max_header_bytes: int) -> FormPart:
@@ -260,9 +266,10 @@ def _parse_part(part: bytes, nl: bytes, max_header_bytes: int) -> FormPart:
         (b"", nl, part[len(nl):]) if part.startswith(nl) else part.partition(nl + nl)
     )
     if not sep:
-        raise MultipartError(f"part has no blank line after its headers: {part[:80]!r}")
+        raise MultipartError(400, f"part has no blank line after its headers: {part[:80]!r}")
     if len(header_section) > max_header_bytes:
         raise MultipartError(
+            413,
             f"part's header section is {len(header_section)} bytes, more than "
             f"max_part_header_bytes={max_header_bytes}: {header_section[:80]!r}"
         )
@@ -282,6 +289,7 @@ def _parse_part(part: bytes, nl: bytes, max_header_bytes: int) -> FormPart:
     filename = _ext_value(params["filename*"]) if "filename*" in params else params.get("filename")
     if not field_name:
         raise MultipartError(
+            400,
             f"part has no field name in its Content-Disposition: {disposition!r}"
         )
 

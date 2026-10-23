@@ -7,18 +7,20 @@ read resources, and use prompt templates.
 Usage::
 
     from mipyre import Mipyre
+    from mipyre.mcp import MCPServer
 
     app = Mipyre()
+    mcp = MCPServer(app)
 
-    @app.mcp.tool(description="Add two numbers")
+    @mcp.tool(description="Add two numbers")
     def add(a: int, b: int) -> int:
         return a + b
 
-    @app.mcp.resource("config://app")
+    @mcp.resource("config://app")
     def get_config():
         return {"version": "1.0", "debug": False}
 
-    @app.mcp.prompt("greeting", description="Generate a greeting")
+    @mcp.prompt("greeting", description="Generate a greeting")
     def greeting(name: str) -> str:
         return f"Hello {name}, how can I help you today?"
 
@@ -35,28 +37,39 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable
 
-from mipyre import _csrf
-from mipyre._bounded import call_with_timeout
-from mipyre._errors import log_server_error
-from mipyre.engine import Response
+from mipyre.engine import HTTPException, Response, encode_json
+from mipyre._rpc import media_type, unsupported_media_type
 
 if TYPE_CHECKING:
-    from mipyre.app import Mipyre
+    from mipyre import Mipyre
 
 _log = logging.getLogger(__name__)
 
 # `/mcp` takes a JSON-RPC body only (MCP's HTTP transport).
-_BODY_TYPES = {"application/json": "application/json"}
-
-# Upper bound on how long a tool/resource/prompt handler, sync or async, may run before
-# it is abandoned with an internal error: a hung handler must not hold the /mcp request.
-_HANDLER_TIMEOUT_S = 30.0
+_BODY_TYPES = frozenset({"application/json"})
 
 
-def _call(handler: Callable, arguments: dict) -> Any:
-    """``handler(**arguments)``, driven to a value if it is async, within
-    ``_HANDLER_TIMEOUT_S`` (``TimeoutError`` past it)."""
-    return call_with_timeout(lambda: handler(**arguments), _HANDLER_TIMEOUT_S)
+class ToolError(Exception):
+    """Raised by a tool to report a failure to the model that called it: the call's result
+    carries the message with ``isError: true``, and nothing is logged. Any other exception
+    is the server's failure: the client gets -32603 and the traceback is logged."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def _then(value: Any, finish: Callable[[Any], Any]) -> Any:
+    """Return ``finish(value)``; when ``value`` is awaitable (an ``async def`` handler's
+    coroutine), a coroutine that awaits it first. The ``/mcp`` route returns that coroutine
+    and the engine drives it, as it does any handler's."""
+    if not inspect.isawaitable(value):
+        return finish(value)
+
+    async def finish_later() -> Any:
+        return finish(await value)
+
+    return finish_later()
 
 
 def _as_text(result: Any) -> str:
@@ -125,10 +138,23 @@ _JSON_TYPE_CHECKS: dict[str, Callable[[object], bool]] = {
 }
 
 
+def _json_equal(a: object, b: object) -> bool:
+    """Whether two decoded JSON values are the same JSON value: ``true`` is not ``1`` and
+    ``1`` is ``1.0``, as JSON Schema compares ``enum`` and ``const``."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(map(_json_equal, a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
+    return type(a) is type(b) and a == b
+
+
 def _json_type_name(value: object) -> str:
     return next(
-        (name for name in ("null", "boolean", "integer", "number", "string", "array", "object")
-         if _JSON_TYPE_CHECKS[name](value)),
+        (name for name, check in _JSON_TYPE_CHECKS.items() if check(value)),
         type(value).__name__,
     )
 
@@ -146,9 +172,9 @@ def _check_value(schema: dict, value: object, where: str) -> None:
         names = expected if isinstance(expected, list) else [expected]
         if not any(_JSON_TYPE_CHECKS[n](value) for n in names):
             raise _Invalid(f"{where}: expected {' or '.join(names)}, got {_json_type_name(value)}")
-    if "enum" in schema and value not in schema["enum"]:
+    if "enum" in schema and not any(_json_equal(value, option) for option in schema["enum"]):
         raise _Invalid(f"{where}: {value!r} is not one of {schema['enum']!r}")
-    if "const" in schema and value != schema["const"]:
+    if "const" in schema and not _json_equal(value, schema["const"]):
         raise _Invalid(f"{where}: must be {schema['const']!r}, got {value!r}")
     if "anyOf" in schema:
         reasons = []
@@ -217,7 +243,7 @@ class JsonRpcError(Exception):
 class _Params:
     """What a handler accepts by name, read off its signature at registration."""
 
-    names: frozenset[str]
+    names: tuple[str, ...]  # in signature order
     required: tuple[str, ...]
     accepts_any: bool  # **kwargs
 
@@ -232,13 +258,13 @@ class _Params:
             )
         named = [p for p in params if p.kind in _NAMED]
         return cls(
-            names=frozenset(p.name for p in named),
+            names=tuple(p.name for p in named),
             required=tuple(p.name for p in named if p.default is inspect.Parameter.empty),
             accepts_any=any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params),
         )
 
     def check(self, arguments: dict) -> None:
-        unexpected = [] if self.accepts_any else sorted(set(arguments) - self.names)
+        unexpected = [] if self.accepts_any else sorted(a for a in arguments if a not in self.names)
         if unexpected:
             raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"unexpected argument(s): {unexpected}")
         missing = [n for n in self.required if n not in arguments]
@@ -268,24 +294,87 @@ class _Resource:
 
 
 @dataclass(frozen=True)
+class _PromptArgument:
+    """One argument a prompt template takes, as ``prompts/list`` announces it."""
+
+    name: str
+    description: str | None
+    required: bool
+
+    def as_json(self) -> dict:
+        announced: dict[str, Any] = {"name": self.name, "required": self.required}
+        if self.description is not None:
+            announced["description"] = self.description
+        return announced
+
+
+_PROMPT_ARGUMENT_KEYS = frozenset({"name", "description", "required"})
+
+
+def _prompt_arguments(prompt: str, declared: object, params: _Params) -> tuple[_PromptArgument, ...]:
+    """The arguments ``prompt`` announces: ``declared`` (MCP's ``{"name", "description",
+    "required"}`` objects) checked against what its handler takes, or, without it, the
+    handler's parameters. ``TypeError`` / ``ValueError`` name the entry a client could
+    never call it with."""
+    if declared is None:
+        return tuple(_PromptArgument(n, None, n in params.required) for n in params.names)
+    if not isinstance(declared, (list, tuple)):
+        raise TypeError(f"MCP prompt {prompt!r}: arguments= takes a list of dicts, got {type(declared).__name__}")
+    arguments = tuple(_prompt_argument(prompt, entry) for entry in declared)
+    names = [a.name for a in arguments]
+    repeated = sorted({n for n in names if names.count(n) > 1})
+    if repeated:
+        raise ValueError(f"MCP prompt {prompt!r}: arguments= names {repeated} more than once")
+    untaken = [] if params.accepts_any else [n for n in names if n not in params.names]
+    if untaken:
+        raise ValueError(f"MCP prompt {prompt!r}: arguments= declares {untaken}, which its handler does not take")
+    required = {a.name for a in arguments if a.required}
+    unannounced = [n for n in params.required if n not in required]
+    if unannounced:
+        raise ValueError(
+            f"MCP prompt {prompt!r}: its handler requires {unannounced}, which arguments= "
+            "does not declare as required"
+        )
+    return arguments
+
+
+def _prompt_argument(prompt: str, entry: object) -> _PromptArgument:
+    if not isinstance(entry, dict):
+        raise TypeError(f"MCP prompt {prompt!r}: each of arguments= is a dict, got {type(entry).__name__}")
+    unknown = sorted(set(entry) - _PROMPT_ARGUMENT_KEYS)
+    if unknown:
+        raise ValueError(f"MCP prompt {prompt!r}: argument {entry!r} has unknown key(s) {unknown}")
+    name, description, required = entry.get("name"), entry.get("description"), entry.get("required", False)
+    if not isinstance(name, str) or not name:
+        raise TypeError(f"MCP prompt {prompt!r}: argument {entry!r} needs a non-empty str 'name'")
+    if description is not None and not isinstance(description, str):
+        raise TypeError(f"MCP prompt {prompt!r}: argument {name!r} has a non-str 'description'")
+    if not isinstance(required, bool):
+        raise TypeError(f"MCP prompt {prompt!r}: argument {name!r} has a non-bool 'required'")
+    return _PromptArgument(name, description, required)
+
+
+@dataclass(frozen=True)
 class _Prompt:
     name: str
     description: str
-    arguments: list[dict]
+    arguments: tuple[_PromptArgument, ...]
     params: _Params
     handler: Callable
 
 
 class MCPServer:
-    """MCP protocol handler — registers tools, resources, and prompts."""
+    """An MCP server on ``app``: its tools, resources and prompts, served at ``POST /mcp``
+    on the main interpreter."""
 
-    def __init__(self) -> None:
+    def __init__(self, app: Mipyre) -> None:
+        """Register ``POST /mcp`` on ``app`` (not in its OpenAPI document: the contract is
+        JSON-RPC, which ``tools/list`` describes) and its startup line."""
         self._tools: dict[str, _Tool] = {}
         self._resources: dict[str, _Resource] = {}
         self._prompts: dict[str, _Prompt] = {}
-
-    def is_empty(self) -> bool:
-        return not (self._tools or self._resources or self._prompts)
+        app.post("/mcp", self._http_handler(app), runtime="main", in_openapi=False)
+        app.on_startup(lambda: print(f"  MCP: {self._summary()} → POST /mcp", flush=True))
 
     # ------------------------------------------------------------------
     # Decorators
@@ -299,15 +388,13 @@ class MCPServer:
         description: str | None = None,
         input_schema: dict | None = None,
     ):
-        """Register a tool that AI models can invoke."""
+        """Register a tool that AI models can invoke. ``ValueError`` when a tool of that
+        name is already registered. The tool reports a failure to the model by raising
+        ``ToolError``."""
 
         def register(f: Callable) -> Callable:
             tool_name = name or f.__name__
-            if tool_name in self._tools:
-                _log.warning(
-                    "MCP tool %r is already registered; overwriting the "
-                    "previous handler", tool_name,
-                )
+            _refuse_repeat("tool", tool_name, self._tools)
             self._tools[tool_name] = _Tool(
                 name=tool_name,
                 description=description or f.__doc__ or "",
@@ -329,14 +416,11 @@ class MCPServer:
         description: str | None = None,
         mime_type: str = "application/json",
     ):
-        """Register a readable resource at an exact URI."""
+        """Register a readable resource at an exact URI. ``ValueError`` when one is already
+        registered there."""
 
         def register(fn: Callable) -> Callable:
-            if uri in self._resources:
-                _log.warning(
-                    "MCP resource %r is already registered; overwriting the "
-                    "previous handler", uri,
-                )
+            _refuse_repeat("resource", uri, self._resources)
             self._resources[uri] = _Resource(
                 uri=uri,
                 name=name or fn.__name__,
@@ -355,23 +439,18 @@ class MCPServer:
         description: str | None = None,
         arguments: list[dict] | None = None,
     ):
-        """Register a prompt template."""
+        """Register a prompt template. ``arguments``: what ``prompts/list`` announces, as
+        MCP's ``{"name", "description", "required"}`` objects (default: the handler's
+        parameters); an entry the handler could not be called with raises ``TypeError`` or
+        ``ValueError`` here. ``ValueError`` too when a prompt of that name is registered."""
 
         def register(fn: Callable) -> Callable:
-            if name in self._prompts:
-                _log.warning(
-                    "MCP prompt %r is already registered; overwriting the "
-                    "previous handler", name,
-                )
+            _refuse_repeat("prompt", name, self._prompts)
             params = _Params.of(fn)
             self._prompts[name] = _Prompt(
                 name=name,
                 description=description or fn.__doc__ or "",
-                arguments=arguments or [
-                    {"name": p, "required": p in params.required}
-                    for p in inspect.signature(fn).parameters
-                    if p in params.names and p not in ("self", "cls")
-                ],
+                arguments=_prompt_arguments(name, arguments, params),
                 params=params,
                 handler=fn,
             )
@@ -379,27 +458,24 @@ class MCPServer:
 
         return register
 
-    def summary(self) -> str:
-        """Return how many tools, resources and prompts this server has, for the startup line."""
+    def _summary(self) -> str:
         return f"{len(self._tools)} tools, {len(self._resources)} resources, {len(self._prompts)} prompts"
 
-    def http_handler(self, app: Mipyre) -> Callable:
-        """Return the route handler of ``POST /mcp``: it refuses a cross-site request or a
-        body that is not JSON (``app.trusted_origins`` as it is at that request), and
-        answers the rest with ``handle_request``."""
+    def _http_handler(self, app: Mipyre) -> Callable:
+        """Return the route handler of ``POST /mcp``: it refuses a body that is not JSON
+        (415), answers a body that does not decode with -32700, a notification with ``202``
+        and no body, and the rest with ``answer``. A request from another site's page has
+        already been refused by the engine."""
 
         def mcp_handler(req):
-            refused = _csrf.check(req, app._origin_policy, _BODY_TYPES)
-            if isinstance(refused, _csrf.Refused):
-                return Response(
-                    body=self.refusal(refused.reason),
-                    status_code=refused.status,
-                    content_type="application/json",
-                )
-            return Response(
-                body=self.handle_request(req.body, request_id=req.request_id),
-                content_type="application/json",
-            )
+            content_type = req.headers.get("content-type")
+            if media_type(content_type) not in _BODY_TYPES:
+                return _reply(_refusal(unsupported_media_type(content_type, _BODY_TYPES)), 415)
+            try:
+                message = req.json()
+            except HTTPException as e:
+                return _reply(_error_response(None, JsonRpcCode.PARSE_ERROR, f"Parse error: {e.detail}"))
+            return _then(self.answer(message, request_id=req.request_id), _reply)
 
         return mcp_handler
 
@@ -407,98 +483,81 @@ class MCPServer:
     # JSON-RPC 2.0 handler
     # ------------------------------------------------------------------
 
-    def handle_request(self, body: str | bytes, request_id: str | None = None) -> str:
-        """Process a JSON-RPC 2.0 request and return a response.
+    def answer(self, message: Any, request_id: str | None = None) -> Any:
+        """Return the reply to one decoded JSON-RPC 2.0 request, or ``None`` for a
+        notification, which gets none. When the tool, resource or prompt it calls is
+        ``async``, return a coroutine that resolves to the reply.
 
         ``request_id`` is the HTTP request's id: an internal error (-32603) reports it
         in ``error.data.request_id`` and logs it with the exception, so the two can be
         matched up. Without one (a direct call) the error has no ``data``.
         """
-        try:
-            req = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            return self._error_response(None, JsonRpcCode.PARSE_ERROR, f"Parse error: {e}")
-
         # A valid JSON-RPC 2.0 request is an Object; primitives and arrays
         # (the latter reserved for batch requests, which this server does
         # not support) must be rejected with -32600 per the spec.
-        if not isinstance(req, dict):
-            return self._error_response(None, JsonRpcCode.INVALID_REQUEST, "Invalid Request")
+        if not isinstance(message, dict):
+            return _error_response(None, JsonRpcCode.INVALID_REQUEST, "Invalid Request")
 
         # JSON-RPC 2.0 §4.2: the "jsonrpc" member MUST be exactly "2.0".
-        if req.get("jsonrpc") != "2.0":
-            return self._error_response(
-                req.get("id"), JsonRpcCode.INVALID_REQUEST, "Invalid Request: jsonrpc must be '2.0'"
+        if message.get("jsonrpc") != "2.0":
+            return _error_response(
+                message.get("id"), JsonRpcCode.INVALID_REQUEST, "Invalid Request: jsonrpc must be '2.0'"
             )
 
-        # JSON-RPC 2.0 §4: no "id" makes it a notification, which gets no reply: "" (an
-        # empty HTTP body).
-        is_notification = "id" not in req
-        req_id = req.get("id")
+        # JSON-RPC 2.0 §4: no "id" makes it a notification, which gets no reply.
+        is_notification = "id" not in message
+        req_id = message.get("id")
         # §4: an id is a String, Number or Null; echoed back as is.
         if not _is_json_rpc_id(req_id):
-            return self._error_response(
+            return _error_response(
                 None, JsonRpcCode.INVALID_REQUEST,
                 f"Invalid Request: id must be a string, number or null, got {_json_type_name(req_id)}",
             )
-        method = req.get("method")
+        method = message.get("method")
         if not isinstance(method, str):
-            return self._error_response(
+            return _error_response(
                 req_id, JsonRpcCode.INVALID_REQUEST,
                 "Invalid Request: method must be a string, got "
-                + ("nothing" if "method" not in req else _json_type_name(method)),
+                + ("nothing" if "method" not in message else _json_type_name(method)),
             )
         # JSON-RPC 2.0 §5.1: when present, `params` MUST be a Structured
         # value (Object or Array). Treat absent as empty dict.
-        params = req.get("params", {})
+        params = message.get("params", {})
         if not isinstance(params, (dict, list)):
-            return self._error_response(
+            return _error_response(
                 req_id, JsonRpcCode.INVALID_REQUEST, "Invalid Request: params must be Object or Array"
             )
         # Array (positional) params are structurally valid JSON-RPC, but every
         # method here takes named arguments.
         if isinstance(params, list):
-            return self._error_response(
+            return _error_response(
                 req_id, JsonRpcCode.INVALID_PARAMS,
                 "Invalid params: this server requires named parameters (Object), "
                 "positional Array params are not supported",
             )
 
-        handler_map = {
-            "initialize": self._handle_initialize,
-            "tools/list": self._handle_tools_list,
-            "tools/call": self._handle_tools_call,
-            "resources/list": self._handle_resources_list,
-            "resources/read": self._handle_resources_read,
-            "prompts/list": self._handle_prompts_list,
-            "prompts/get": self._handle_prompts_get,
-        }
-
-        handler = handler_map.get(method)
+        handler = _METHODS.get(method)
         if handler is None:
             if is_notification:
-                return ""
-            return self._error_response(req_id, JsonRpcCode.METHOD_NOT_FOUND, f"Method not found: {method}")
+                return None
+            return _error_response(req_id, JsonRpcCode.METHOD_NOT_FOUND, f"Method not found: {method}")
 
+        call = _Call(req_id, method, request_id, is_notification)
         try:
-            result = handler(params)
-        except JsonRpcError as e:
-            return "" if is_notification else self._error_response(req_id, e.code, e.message)
-        except Exception:  # noqa: BLE001 — logged with its traceback and request id; the caller gets INTERNAL_ERROR
-            log_server_error(_log, request_id, "MCP handler %r raised", method)
-            return "" if is_notification else self._error_response(
-                req_id, JsonRpcCode.INTERNAL_ERROR, "Internal error",
-                data=None if request_id is None else {"request_id": request_id},
-            )
-        if is_notification:
-            return ""
-        return json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result})
+            result = handler(self, params)
+        except Exception as e:  # noqa: BLE001 — reply_to_error logs what is not the client's, with its traceback
+            return call.reply_to_error(e)
+        if inspect.isawaitable(result):
+            return call.reply_later(result)
+        return call.reply(result)
 
     # ------------------------------------------------------------------
     # Method handlers
     # ------------------------------------------------------------------
 
     def _handle_initialize(self, params: dict) -> dict:
+        from mipyre import __version__
+
         return {
             "protocolVersion": "2024-11-05",
             "capabilities": {
@@ -506,7 +565,7 @@ class MCPServer:
                 "resources": {"subscribe": False, "listChanged": False},
                 "prompts": {"listChanged": False},
             },
-            "serverInfo": {"name": "mipyre-mcp", "version": getattr(__import__("mipyre"), "__version__", "dev")},
+            "serverInfo": {"name": "mipyre-mcp", "version": __version__},
         }
 
     def _handle_tools_list(self, params: dict) -> dict:
@@ -516,7 +575,7 @@ class MCPServer:
         ]
         return {"tools": tools}
 
-    def _handle_tools_call(self, params: dict) -> dict:
+    def _handle_tools_call(self, params: dict) -> Any:
         tool_name = _str_param(params, "name")
         tool = self._tools.get(tool_name)
         if tool is None:
@@ -528,8 +587,13 @@ class MCPServer:
         tool.params.check(arguments)
         _check_arguments(tool.input_schema, arguments)
 
-        result = _call(tool.handler, arguments)
-        return {"content": [{"type": "text", "text": _as_text(result)}], "isError": False}
+        try:
+            value = tool.handler(**arguments)
+        except ToolError as e:
+            return _tool_result(e.message, is_error=True)
+        if inspect.isawaitable(value):
+            return _tool_result_later(value)
+        return _tool_result(_as_text(value), is_error=False)
 
     def _handle_resources_list(self, params: dict) -> dict:
         resources = [
@@ -538,57 +602,132 @@ class MCPServer:
         ]
         return {"resources": resources}
 
-    def _handle_resources_read(self, params: dict) -> dict:
+    def _handle_resources_read(self, params: dict) -> Any:
         uri = _str_param(params, "uri")
         resource = self._resources.get(uri)
         if resource is None:
             raise JsonRpcError(JsonRpcCode.RESOURCE_NOT_FOUND, f"Resource not found: {uri}")
 
-        result = _call(resource.handler, {})
-        return {
-            "contents": [{"uri": uri, "mimeType": resource.mime_type, "text": _as_text(result)}]
-        }
+        return _then(resource.handler(), lambda value: {
+            "contents": [{"uri": uri, "mimeType": resource.mime_type, "text": _as_text(value)}]
+        })
 
     def _handle_prompts_list(self, params: dict) -> dict:
         prompts = [
-            {"name": p.name, "description": p.description, "arguments": p.arguments}
+            {"name": p.name, "description": p.description, "arguments": [a.as_json() for a in p.arguments]}
             for p in self._prompts.values()
         ]
         return {"prompts": prompts}
 
-    def _handle_prompts_get(self, params: dict) -> dict:
+    def _handle_prompts_get(self, params: dict) -> Any:
         prompt_name = _str_param(params, "name")
         prompt = self._prompts.get(prompt_name)
         if prompt is None:
             raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"Unknown prompt: {prompt_name}")
         arguments = _arguments_object(params)
-        missing = [a["name"] for a in prompt.arguments if a.get("required") and a["name"] not in arguments]
+        missing = [a.name for a in prompt.arguments if a.required and a.name not in arguments]
         if missing:
             raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"missing required argument(s): {missing}")
         prompt.params.check(arguments)
 
-        result = _call(prompt.handler, arguments)
-        return {
+        return _then(prompt.handler(**arguments), lambda value: {
             "description": prompt.description,
             "messages": [
-                {"role": "user", "content": {"type": "text", "text": _as_text(result)}}
+                {"role": "user", "content": {"type": "text", "text": _as_text(value)}}
             ],
-        }
+        })
 
-    @classmethod
-    def refusal(cls, reason: str) -> str:
-        """The body of an HTTP-level refusal (a body type or ``Origin`` ``/mcp`` does not
-        take): a JSON-RPC Invalid Request error carrying the reason."""
-        return cls._error_response(None, JsonRpcCode.INVALID_REQUEST, reason)
 
-    @staticmethod
-    def _error_response(
-        req_id: Any, code: JsonRpcCode, message: str, data: dict | None = None
-    ) -> str:
-        error: dict[str, Any] = {"code": int(code), "message": message}
-        if data is not None:
-            error["data"] = data
-        return json.dumps({"jsonrpc": "2.0", "id": req_id, "error": error})
+# The server's methods by JSON-RPC name, as functions of the class: bound methods kept on an
+# instance would make every server a reference cycle, freed only by the cyclic collector.
+_METHODS: dict[str, Callable[[MCPServer, dict], Any]] = {
+    "initialize": MCPServer._handle_initialize,
+    "tools/list": MCPServer._handle_tools_list,
+    "tools/call": MCPServer._handle_tools_call,
+    "resources/list": MCPServer._handle_resources_list,
+    "resources/read": MCPServer._handle_resources_read,
+    "prompts/list": MCPServer._handle_prompts_list,
+    "prompts/get": MCPServer._handle_prompts_get,
+}
+
+
+@dataclass(frozen=True)
+class _Call:
+    """One JSON-RPC call: its id, its method, whether it is a notification (which gets no
+    reply) and the id of the HTTP request it came in."""
+
+    req_id: Any
+    method: str
+    request_id: str | None
+    is_notification: bool
+
+    def reply(self, result: Any) -> dict | None:
+        if self.is_notification:
+            return None
+        return {"jsonrpc": "2.0", "id": self.req_id, "result": result}
+
+    def reply_to_error(self, error: Exception) -> dict | None:
+        """A ``JsonRpcError`` is the client's and goes back as it is; anything else is logged
+        with its traceback and the request id, and the client gets -32603 carrying that id."""
+        if isinstance(error, JsonRpcError):
+            code, message, data = error.code, error.message, None
+        else:
+            _log.error("MCP handler %r raised (request_id=%s)", self.method, self.request_id, exc_info=error)
+            code, message = JsonRpcCode.INTERNAL_ERROR, "Internal error"
+            data = None if self.request_id is None else {"request_id": self.request_id}
+        if self.is_notification:
+            return None
+        return _error_response(self.req_id, code, message, data=data)
+
+    async def reply_later(self, pending: Any) -> dict | None:
+        # gather hands the handler's exception back as a value, so reply_to_error stays the
+        # one place that decides what a failure is.
+        import asyncio
+
+        outcome: Any
+        (outcome,) = await asyncio.gather(pending, return_exceptions=True)
+        if isinstance(outcome, Exception):
+            return self.reply_to_error(outcome)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return self.reply(outcome)
+
+
+def _tool_result(text: str, *, is_error: bool) -> dict:
+    return {"content": [{"type": "text", "text": text}], "isError": is_error}
+
+
+async def _tool_result_later(pending: Any) -> dict:
+    try:
+        value = await pending
+    except ToolError as e:
+        return _tool_result(e.message, is_error=True)
+    return _tool_result(_as_text(value), is_error=False)
+
+
+def _refuse_repeat(kind: str, key: str, registered: dict) -> None:
+    if key in registered:
+        raise ValueError(f"MCP {kind} {key!r} is already registered")
+
+
+def _reply(reply: dict | None, status: int = 200) -> Response:
+    """The HTTP response carrying a JSON-RPC reply; ``202`` with no body for none."""
+    if reply is None:
+        return Response(body=b"", status_code=202)
+    return Response(body=encode_json(reply), status_code=status, content_type="application/json")
+
+
+def _refusal(reason: str) -> dict:
+    """The reply to an HTTP-level refusal (a body type ``/mcp`` does not take): a JSON-RPC
+    Invalid Request error carrying the reason."""
+    return _error_response(None, JsonRpcCode.INVALID_REQUEST, reason)
+
+
+def _error_response(req_id: Any, code: JsonRpcCode, message: str, data: dict | None = None) -> dict:
+    error: dict[str, Any] = {"code": int(code), "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": req_id, "error": error}
 
 
 def _is_json_rpc_id(value: object) -> bool:

@@ -4,6 +4,10 @@
 //! memory. The peer writes two counters: `published`, one past the last answer it published, and `taken`, `k + 1`
 //! once it began request `k`. Either is believed only once it fits the window. Sequences wrap at 2^32, so every
 //! comparison is a distance from `read`.
+//!
+//! The host reads `published` before `taken`, both with `Acquire`. A peer writes `taken = k + 1` before it publishes
+//! answer `k`, so whatever it does between the two reads, `published ≤ taken ≤ sent` holds for what the host read;
+//! `taken − published` is at most 1 only while the peer stands still, which is what a dead peer does.
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -101,6 +105,15 @@ impl Window {
     pub const fn has_room(&self, depth: RingDepth) -> bool {
         self.in_flight() < depth.get()
     }
+
+    /// Returns the requests that hold a slot, `[read, sent)`.
+    #[inline]
+    pub const fn outstanding(&self) -> SeqRange {
+        SeqRange {
+            start: self.read,
+            end: self.sent,
+        }
+    }
 }
 
 /// The requests from `start` up to, not including, `end`, across the wrap.
@@ -133,7 +146,7 @@ impl SeqRange {
 }
 
 /// How a dead peer left the requests the host had sent it: the ones it answered, the one it died running (if it
-/// was running one) and the ones it never took, which wait for the next peer. Together they are the window's
+/// was running one) and the ones it never took. Together they are the window's
 /// `[read, sent)`, each request in exactly one; only [`exit_split`] makes one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExitSplit {
@@ -155,7 +168,8 @@ impl ExitSplit {
         self.running
     }
 
-    /// The requests the peer never took, up to `sent`; the next peer starts at the first of them.
+    /// The requests the peer never took, up to `sent`. They are given up like the running one, never handed to
+    /// another peer: their bytes were in memory the dead peer could write.
     #[inline]
     pub const fn handed(&self) -> SeqRange {
         self.handed
@@ -168,13 +182,18 @@ impl ExitSplit {
 pub enum PeerCounterError {
     #[error("the peer says it answered up to {published}, but the host sent up to {sent} and has read up to {read}")]
     AnswersPastSent { read: Seq, sent: Seq, published: Seq },
-    /// A peer that published up to `published` has `taken` at `published` (it answered all it took) or one past it
-    /// (it is running `published`, which was sent), never anything else.
+    /// `taken` read after `published` lies between `published` and `sent`; a peer that stands still (a dead one)
+    /// has it at `published` (it answered all it took) or one past it (it died running `published`).
     #[error(
         "the peer says it took up to {taken} and answered up to {published}, but the host sent up to {sent} and \
          has read up to {read}"
     )]
-    TakenOutOfRange { read: Seq, sent: Seq, published: Seq, taken: Seq },
+    TakenOutOfRange {
+        read: Seq,
+        sent: Seq,
+        published: Seq,
+        taken: Seq,
+    },
 }
 
 /// Returns how many answers past `read` the peer published, given the `published` counter it wrote; a count past
@@ -183,32 +202,60 @@ pub enum PeerCounterError {
 pub fn count_ready_answers(w: &Window, published: Seq) -> Result<u32, PeerCounterError> {
     let ready = published.since(w.read);
     if ready > w.in_flight() {
-        return Err(PeerCounterError::AnswersPastSent { read: w.read, sent: w.sent, published });
+        return Err(PeerCounterError::AnswersPastSent {
+            read: w.read,
+            sent: w.sent,
+            published,
+        });
     }
     Ok(ready)
 }
 
-/// Returns the request the peer is running, from the `taken` counter it wrote beside the `published` one: none
-/// when `taken` is at `published`, request `published` when it is one past and that request was sent. This is the
-/// one place `taken` is read.
+/// Returns the oldest request the peer took and had not answered when `published` was read: none when `taken`,
+/// read after `published`, is at it, else request `published`. A live peer may have answered it since and moved on,
+/// so `taken` may run up to `sent`; past it, or behind `published`, is a fault. This is the one place `taken` is
+/// read.
 #[inline]
 pub fn running(w: &Window, published: Seq, taken: Seq) -> Result<Option<Seq>, PeerCounterError> {
     count_ready_answers(w, published)?;
-    match taken.since(published) {
-        0 => Ok(None),
-        1 if w.sent != published => Ok(Some(published)),
-        _ => Err(PeerCounterError::TakenOutOfRange { read: w.read, sent: w.sent, published, taken }),
+    if taken.since(published) > w.sent.since(published) {
+        return Err(PeerCounterError::TakenOutOfRange {
+            read: w.read,
+            sent: w.sent,
+            published,
+            taken,
+        });
     }
+    Ok((taken != published).then_some(published))
 }
 
-/// Splits the window by how a dead peer left it, from the two counters it wrote last.
+/// Splits the window by how a dead peer left it, from the two counters it wrote last. A dead peer stands still, so
+/// past [`running`]'s check it has taken at most one request it did not answer.
 pub fn exit_split(w: &Window, published: Seq, taken: Seq) -> Result<ExitSplit, PeerCounterError> {
     let running = running(w, published, taken)?;
-    let handed_from = if running.is_some() { published.after(1) } else { published };
+    if taken.since(published) > 1 {
+        return Err(PeerCounterError::TakenOutOfRange {
+            read: w.read,
+            sent: w.sent,
+            published,
+            taken,
+        });
+    }
+    let handed_from = if running.is_some() {
+        published.after(1)
+    } else {
+        published
+    };
     Ok(ExitSplit {
-        answered: SeqRange { start: w.read, end: published },
+        answered: SeqRange {
+            start: w.read,
+            end: published,
+        },
         running,
-        handed: SeqRange { start: handed_from, end: w.sent },
+        handed: SeqRange {
+            start: handed_from,
+            end: w.sent,
+        },
     })
 }
 
@@ -231,7 +278,11 @@ mod tests {
             [1, 2, 8, 1 << 31].map(|d| RingDepth::new(d).map(RingDepth::get)),
             [Some(1), Some(2), Some(8), Some(1 << 31)]
         );
-        assert_eq!(u32::MAX % 3, 0, "depth 3 would put request u32::MAX in request 0's slot");
+        assert_eq!(
+            u32::MAX % 3,
+            0,
+            "depth 3 would put request u32::MAX in request 0's slot"
+        );
         let eight = depth(8);
         assert_ne!(Seq(u32::MAX).slot_index(eight), Seq(0).slot_index(eight));
     }
@@ -248,14 +299,26 @@ mod tests {
     fn answers_up_to_what_was_sent_are_ready() {
         assert_eq!(count_ready_answers(&w(10, 15), Seq(10)), Ok(0));
         assert_eq!(count_ready_answers(&w(10, 15), Seq(11)), Ok(1));
-        assert_eq!(count_ready_answers(&w(10, 15), Seq(15)), Ok(5), "every request sent is answered");
+        assert_eq!(
+            count_ready_answers(&w(10, 15), Seq(15)),
+            Ok(5),
+            "every request sent is answered"
+        );
     }
 
     #[test]
     fn an_answer_past_what_was_sent_is_a_fault() {
-        let fault = |sent, published| PeerCounterError::AnswersPastSent { read: Seq(10), sent: Seq(sent), published: Seq(published) };
+        let fault = |sent, published| PeerCounterError::AnswersPastSent {
+            read: Seq(10),
+            sent: Seq(sent),
+            published: Seq(published),
+        };
         assert_eq!(count_ready_answers(&w(10, 15), Seq(16)), Err(fault(15, 16)));
-        assert_eq!(count_ready_answers(&w(10, 10), Seq(11)), Err(fault(10, 11)), "nothing was sent");
+        assert_eq!(
+            count_ready_answers(&w(10, 10), Seq(11)),
+            Err(fault(10, 11)),
+            "nothing was sent"
+        );
     }
 
     /// A peer that steps its counter back looks, unchecked, like 2^32 - 1 answers to read.
@@ -263,21 +326,37 @@ mod tests {
     fn an_answer_counter_moved_backwards_is_a_fault() {
         assert_eq!(
             count_ready_answers(&w(10, 15), Seq(9)),
-            Err(PeerCounterError::AnswersPastSent { read: Seq(10), sent: Seq(15), published: Seq(9) })
+            Err(PeerCounterError::AnswersPastSent {
+                read: Seq(10),
+                sent: Seq(15),
+                published: Seq(9)
+            })
         );
         assert_eq!(
             count_ready_answers(&w(0, 3), Seq(u32::MAX)),
-            Err(PeerCounterError::AnswersPastSent { read: Seq(0), sent: Seq(3), published: Seq(u32::MAX) })
+            Err(PeerCounterError::AnswersPastSent {
+                read: Seq(0),
+                sent: Seq(3),
+                published: Seq(u32::MAX)
+            })
         );
     }
 
     #[test]
     fn answers_are_counted_across_the_wrap() {
         let (read, sent) = (u32::MAX - 1, 2);
-        let fault = |published| PeerCounterError::AnswersPastSent { read: Seq(read), sent: Seq(sent), published: Seq(published) };
+        let fault = |published| PeerCounterError::AnswersPastSent {
+            read: Seq(read),
+            sent: Seq(sent),
+            published: Seq(published),
+        };
         assert_eq!(count_ready_answers(&w(read, sent), Seq(u32::MAX)), Ok(1));
         assert_eq!(count_ready_answers(&w(read, sent), Seq(0)), Ok(2));
-        assert_eq!(count_ready_answers(&w(read, sent), Seq(2)), Ok(4), "every request sent is answered");
+        assert_eq!(
+            count_ready_answers(&w(read, sent), Seq(2)),
+            Ok(4),
+            "every request sent is answered"
+        );
         assert_eq!(count_ready_answers(&w(read, sent), Seq(3)), Err(fault(3)));
         assert_eq!(count_ready_answers(&w(read, sent), Seq(read - 1)), Err(fault(read - 1)));
     }
@@ -298,7 +377,10 @@ mod tests {
         let split = exit_split(&w(10, 15), Seq(10), Seq(11)).unwrap();
         assert_eq!(split.running(), Some(Seq(10)));
         assert_eq!((split.handed().start(), split.handed().end()), (Seq(11), Seq(15)));
-        assert_eq!(exit_split(&w(10, 11), Seq(10), Seq(11)).unwrap().running(), Some(Seq(10)));
+        assert_eq!(
+            exit_split(&w(10, 11), Seq(10), Seq(11)).unwrap().running(),
+            Some(Seq(10))
+        );
         let wrapped = exit_split(&w(u32::MAX, 3), Seq(u32::MAX), Seq(0)).unwrap();
         assert_eq!(wrapped.running(), Some(Seq(u32::MAX)), "across the wrap");
     }
@@ -314,20 +396,93 @@ mod tests {
     #[test]
     fn a_dead_peers_taken_anywhere_else_is_a_fault() {
         let fault = |read, sent, published, taken| {
-            Err(PeerCounterError::TakenOutOfRange { read: Seq(read), sent: Seq(sent), published: Seq(published), taken: Seq(taken) })
+            Err(PeerCounterError::TakenOutOfRange {
+                read: Seq(read),
+                sent: Seq(sent),
+                published: Seq(published),
+                taken: Seq(taken),
+            })
         };
-        assert_eq!(exit_split(&w(10, 10), Seq(10), Seq(11)), fault(10, 10, 10, 11), "took a request never sent");
-        assert_eq!(exit_split(&w(10, 15), Seq(10), Seq(12)), fault(10, 15, 10, 12), "took two without answering one");
-        assert_eq!(exit_split(&w(10, 15), Seq(10), Seq(9)), fault(10, 15, 10, 9), "moved backwards");
-        assert_eq!(exit_split(&w(0, 3), Seq(0), Seq(u32::MAX)), fault(0, 3, 0, u32::MAX), "moved backwards across the wrap");
-        assert_eq!(exit_split(&w(10, 12), Seq(12), Seq(13)), fault(10, 12, 12, 13), "answered all, then took one never sent");
+        assert_eq!(
+            exit_split(&w(10, 10), Seq(10), Seq(11)),
+            fault(10, 10, 10, 11),
+            "took a request never sent"
+        );
+        assert_eq!(
+            exit_split(&w(10, 15), Seq(10), Seq(12)),
+            fault(10, 15, 10, 12),
+            "took two without answering one"
+        );
+        assert_eq!(
+            exit_split(&w(10, 15), Seq(10), Seq(9)),
+            fault(10, 15, 10, 9),
+            "moved backwards"
+        );
+        assert_eq!(
+            exit_split(&w(0, 3), Seq(0), Seq(u32::MAX)),
+            fault(0, 3, 0, u32::MAX),
+            "moved backwards across the wrap"
+        );
+        assert_eq!(
+            exit_split(&w(10, 12), Seq(12), Seq(13)),
+            fault(10, 12, 12, 13),
+            "answered all, then took one never sent"
+        );
+    }
+
+    /// Between the two reads a live peer may answer the request it ran and take more, up to what was sent.
+    #[test]
+    fn a_live_peer_that_took_up_to_what_was_sent_runs_the_oldest_unanswered() {
+        assert_eq!(running(&w(10, 15), Seq(12), Seq(12)), Ok(None));
+        assert_eq!(running(&w(10, 15), Seq(12), Seq(13)), Ok(Some(Seq(12))));
+        assert_eq!(
+            running(&w(10, 15), Seq(12), Seq(15)),
+            Ok(Some(Seq(12))),
+            "took every request sent"
+        );
+        assert_eq!(
+            running(&w(u32::MAX - 1, 2), Seq(u32::MAX), Seq(1)),
+            Ok(Some(Seq(u32::MAX))),
+            "across the wrap"
+        );
+    }
+
+    #[test]
+    fn a_live_peers_taken_past_what_was_sent_or_behind_published_is_a_fault() {
+        let fault = |published, taken| {
+            Err(PeerCounterError::TakenOutOfRange {
+                read: Seq(10),
+                sent: Seq(15),
+                published: Seq(published),
+                taken: Seq(taken),
+            })
+        };
+        assert_eq!(
+            running(&w(10, 15), Seq(12), Seq(16)),
+            fault(12, 16),
+            "took a request never sent"
+        );
+        assert_eq!(
+            running(&w(10, 15), Seq(12), Seq(11)),
+            fault(12, 11),
+            "behind what it answered"
+        );
+        assert_eq!(
+            running(&w(10, 15), Seq(15), Seq(16)),
+            fault(15, 16),
+            "answered all, then took one never sent"
+        );
     }
 
     #[test]
     fn a_dead_peers_answers_past_what_was_sent_are_a_fault() {
         assert_eq!(
             exit_split(&w(10, 15), Seq(16), Seq(16)),
-            Err(PeerCounterError::AnswersPastSent { read: Seq(10), sent: Seq(15), published: Seq(16) })
+            Err(PeerCounterError::AnswersPastSent {
+                read: Seq(10),
+                sent: Seq(15),
+                published: Seq(16)
+            })
         );
     }
 }
@@ -376,12 +531,29 @@ mod proofs {
             assert_eq!(s.handed().end(), w.sent);
             let ran = u32::from(s.running().is_some());
             assert_eq!(s.answered().end().after(ran), s.handed().start());
-            assert_eq!(u64::from(s.answered().len()) + u64::from(ran) + u64::from(s.handed().len()), u64::from(w.in_flight()));
+            assert_eq!(
+                u64::from(s.answered().len()) + u64::from(ran) + u64::from(s.handed().len()),
+                u64::from(w.in_flight())
+            );
             assert_eq!(s.running().is_some(), taken == published.after(1));
             if let Some(seq) = s.running() {
                 assert_eq!(seq, s.answered().end());
             }
         }
+    }
+
+    /// No counters a correct live peer leaves, read `published` first, are a fault, and the request running is the
+    /// oldest unanswered or none.
+    #[kani::proof]
+    fn a_live_peer_is_never_a_fault() {
+        let w = any_window(any_depth());
+        let (answered, took): (u32, u32) = (kani::any(), kani::any());
+        kani::assume(answered <= took && took <= w.in_flight());
+        let (published, taken) = (w.read.after(answered), w.read.after(took));
+        assert_eq!(
+            running(&w, published, taken),
+            Ok((took != answered).then_some(published))
+        );
     }
 
     /// Sending one more request when the window has room keeps at most `depth` in flight.

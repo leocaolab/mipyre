@@ -186,10 +186,7 @@ where
 
 /// Returns the failure of a serve that panicked, with the panic of the `after_serve` that
 /// followed it, if that panicked too.
-fn panicked<E>(
-    payload: Box<dyn std::any::Any + Send>,
-    after: Option<Box<dyn std::any::Any + Send>>,
-) -> ThreadError<E> {
+fn panicked<E>(payload: Box<dyn std::any::Any + Send>, after: Option<Box<dyn std::any::Any + Send>>) -> ThreadError<E> {
     let message = into_panic_message(payload);
     ThreadError::Panicked(match after {
         Some(after) => format!("{message}; after_serve panicked too: {}", into_panic_message(after)),
@@ -296,9 +293,13 @@ impl Cancellable for CancellationToken {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopCause<C> {
     /// A thread of the run failed while the run was still going.
-    ThreadFailed { thread: String },
+    ThreadFailed {
+        thread: String,
+    },
     /// The OS refused to start this thread of the run.
-    NotSpawned { thread: String },
+    NotSpawned {
+        thread: String,
+    },
     /// Every thread of the run ended, with nothing stopping it.
     ThreadsEnded,
     Caller(C),
@@ -488,7 +489,10 @@ fn in_run<T, E, C>(
     stop: &RunStop<C>,
     thread: String,
     body: impl FnOnce(&ThreadStop<C>) -> Result<T, ThreadError<E>> + Send + 'static,
-) -> (impl FnOnce() -> Result<T, ThreadError<E>> + Send + 'static, Arc<AtomicUsize>)
+) -> (
+    impl FnOnce() -> Result<T, ThreadError<E>> + Send + 'static,
+    Arc<AtomicUsize>,
+)
 where
     C: Send + 'static,
 {
@@ -545,9 +549,7 @@ where
         let slot = CoreSlot { index, core };
         let run = run.clone();
         let (body, pool_threads) = in_run(stop, thread.clone(), move |own| run(slot, payload, own));
-        let builder = std::thread::Builder::new()
-            .name(thread.clone())
-            .stack_size(stack_size);
+        let builder = std::thread::Builder::new().name(thread.clone()).stack_size(stack_size);
         match spawner.spawn(index, builder, body) {
             Ok(handle) => started.push(ThreadHandle {
                 thread: handle,
@@ -603,7 +605,9 @@ where
             pool_threads,
         }),
         Err(source) => {
-            stop.stop_for(StopCause::NotSpawned { thread: name.to_string() });
+            stop.stop_for(StopCause::NotSpawned {
+                thread: name.to_string(),
+            });
             Err(SpawnError {
                 thread: name.to_string(),
                 source,
@@ -937,7 +941,10 @@ mod tests {
 
     impl Drop for DropWitness {
         fn drop(&mut self) {
-            self.drops.lock().unwrap().push((self.value, std::thread::current().id()));
+            self.drops
+                .lock()
+                .unwrap()
+                .push((self.value, std::thread::current().id()));
         }
     }
 
@@ -945,7 +952,15 @@ mod tests {
         let drops = Arc::new(TestMutex::new(Vec::new()));
         let payloads = values
             .iter()
-            .map(|&value| (DropWitness { value, drops: Arc::clone(&drops) }, None))
+            .map(|&value| {
+                (
+                    DropWitness {
+                        value,
+                        drops: Arc::clone(&drops),
+                    },
+                    None,
+                )
+            })
             .collect();
         (payloads, drops)
     }
@@ -1057,20 +1072,45 @@ mod tests {
         }
     }
 
-    fn serve_test<H, Fut>(os: &impl ThreadOs, hooks: H, stop: &ThreadStop<()>, limit: Duration, serve: impl FnOnce() -> Fut) -> Result<(), ThreadError<BodyError>>
+    fn serve_test<H, Fut>(
+        os: &impl ThreadOs,
+        hooks: H,
+        stop: &ThreadStop<()>,
+        limit: Duration,
+        serve: impl FnOnce() -> Fut,
+    ) -> Result<(), ThreadError<BodyError>>
     where
         H: ThreadHooks + Clone,
         Fut: Future<Output = Result<(), BodyError>>,
     {
-        serve_with(os, place_with(os, None), BLOCKING_STACK, hooks, stop, move || limit, serve)
+        serve_with(
+            os,
+            place_with(os, None),
+            BLOCKING_STACK,
+            hooks,
+            stop,
+            move || limit,
+            serve,
+        )
     }
 
     /// Serves on this thread, unpinned, with the host's real calls.
-    fn serve_here<Fut>(stop: &ThreadStop<()>, limit: Duration, serve: impl FnOnce() -> Fut) -> Result<(), ThreadError<BodyError>>
+    fn serve_here<Fut>(
+        stop: &ThreadStop<()>,
+        limit: Duration,
+        serve: impl FnOnce() -> Fut,
+    ) -> Result<(), ThreadError<BodyError>>
     where
         Fut: Future<Output = Result<(), BodyError>>,
     {
-        serve_on_this_thread(pin_and_raise_qos(None), BLOCKING_STACK, HookRecorder::default(), stop, move || limit, serve)
+        serve_on_this_thread(
+            pin_and_raise_qos(None),
+            BLOCKING_STACK,
+            HookRecorder::default(),
+            stop,
+            move || limit,
+            serve,
+        )
     }
 
     /// The blocking call waits for the test, so a runtime dropped with no limit would never
@@ -1096,19 +1136,15 @@ mod tests {
                 Ok(())
             });
             assert!(served.is_ok(), "{:?}", served.err());
-            assert_eq!(left_on_pool(&stop), NonZeroUsize::new(1), "the one call is left on the pool");
             assert_eq!(
-                finished.load(Ordering::SeqCst),
-                0,
-                "the call is still running"
+                left_on_pool(&stop),
+                NonZeroUsize::new(1),
+                "the one call is left on the pool"
             );
+            assert_eq!(finished.load(Ordering::SeqCst), 0, "the call is still running");
             release.send(()).unwrap();
             call_ended.recv().unwrap();
-            assert_eq!(
-                finished.load(Ordering::SeqCst),
-                1,
-                "the call left running finished"
-            );
+            assert_eq!(finished.load(Ordering::SeqCst), 1, "the call left running finished");
         });
     }
 
@@ -1160,7 +1196,13 @@ mod tests {
             steps: Arc::clone(&steps),
             fail_build: false,
         };
-        let served = serve_test(&os, StepLog(Arc::clone(&steps)), &own_stop("t"), Duration::ZERO, || async { Ok(()) });
+        let served = serve_test(
+            &os,
+            StepLog(Arc::clone(&steps)),
+            &own_stop("t"),
+            Duration::ZERO,
+            || async { Ok(()) },
+        );
         assert!(served.is_ok());
         let steps = steps.lock().unwrap().clone();
         assert_eq!(steps, ["pin", "qos", "build", "before_serve", "after_serve"]);
@@ -1175,10 +1217,16 @@ mod tests {
         };
         let served = Arc::new(AtomicUsize::new(0));
         let ran = Arc::clone(&served);
-        let result = serve_test(&os, StepLog(Arc::clone(&steps)), &own_stop("t"), Duration::ZERO, || async move {
-            ran.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
+        let result = serve_test(
+            &os,
+            StepLog(Arc::clone(&steps)),
+            &own_stop("t"),
+            Duration::ZERO,
+            || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
         assert!(
             matches!(
                 result,
@@ -1199,14 +1247,22 @@ mod tests {
         within_10s(|| {
             let served = Arc::new(AtomicUsize::new(0));
             let ran = Arc::clone(&served);
-            let placement = pin_and_raise_qos(Some(CoreId { id: mipyre_cpu::MAX_CPUS }));
+            let placement = pin_and_raise_qos(Some(CoreId {
+                id: mipyre_cpu::MAX_CPUS,
+            }));
             let refused = placement.pin.as_ref().expect_err("no host has this CPU").to_string();
             assert!(refused.contains("CPU 8192"), "{refused}");
-            let outcome: Result<(), ThreadError<BodyError>> =
-                serve_on_this_thread(placement, BLOCKING_STACK, HookRecorder::default(), &own_stop("t"), || Duration::ZERO, || async move {
+            let outcome: Result<(), ThreadError<BodyError>> = serve_on_this_thread(
+                placement,
+                BLOCKING_STACK,
+                HookRecorder::default(),
+                &own_stop("t"),
+                || Duration::ZERO,
+                || async move {
                     ran.fetch_add(1, Ordering::SeqCst);
                     Ok(())
-                });
+                },
+            );
             assert!(outcome.is_ok());
             assert_eq!(served.load(Ordering::SeqCst), 1, "served unpinned");
         });
@@ -1360,7 +1416,13 @@ mod tests {
         });
         release.open();
         assert!(stopped_first, "the join returned before the stop");
-        assert_eq!(joined.left_running, [ThreadLeftover { thread: "serving-0".into(), what: Leftover::Thread }]);
+        assert_eq!(
+            joined.left_running,
+            [ThreadLeftover {
+                thread: "serving-0".into(),
+                what: Leftover::Thread
+            }]
+        );
     }
 
     #[test]
@@ -1372,7 +1434,11 @@ mod tests {
             deadline.fix(stopped + Duration::from_secs(60)),
             stopped + Duration::from_secs(5)
         );
-        assert_eq!(deadline.clone().fix(stopped + Duration::from_secs(60)), stopped + Duration::from_secs(5), "a clone shares it");
+        assert_eq!(
+            deadline.clone().fix(stopped + Duration::from_secs(60)),
+            stopped + Duration::from_secs(5),
+            "a clone shares it"
+        );
     }
 
     /// An earlier group of the same stop fixed the deadline and used it all, so a stuck thread of
@@ -1405,7 +1471,13 @@ mod tests {
         deadline.fix(stopped);
         let joined = within_10s(move || join_until(handles, deadline.fix(Instant::now())));
         release.open();
-        assert_eq!(joined.left_running, [ThreadLeftover { thread: "late-group-0".into(), what: Leftover::Thread }]);
+        assert_eq!(
+            joined.left_running,
+            [ThreadLeftover {
+                thread: "late-group-0".into(),
+                what: Leftover::Thread
+            }]
+        );
     }
 
     #[test]
@@ -1418,7 +1490,10 @@ mod tests {
             &run,
             &mut OsSpawner,
             |slot, payload, _stop| {
-                assert_eq!(std::thread::current().name(), Some(format!("j-{}", slot.index()).as_str()));
+                assert_eq!(
+                    std::thread::current().name(),
+                    Some(format!("j-{}", slot.index()).as_str())
+                );
                 if payload == 1 {
                     body(Err(BodyError::NotServed))
                 } else {
@@ -1431,7 +1506,10 @@ mod tests {
         let joined = join(handles, &run, Duration::from_secs(5));
         assert_eq!(joined.ended, vec![0, 20]);
         assert_eq!(joined.failures.len(), 1);
-        assert!(matches!(joined.failures[0].error, ThreadError::Returned(BodyError::NotServed)));
+        assert!(matches!(
+            joined.failures[0].error,
+            ThreadError::Returned(BodyError::NotServed)
+        ));
         assert_eq!(joined.failures[0].thread, "j-1");
         assert_eq!(run.cause(), failed("j-1"), "the failed thread stopped the others");
     }
@@ -1601,13 +1679,21 @@ mod tests {
         let another_run = RunStop::<&'static str>::default();
         another_run.stop("SIGINT");
         run_as(&another_run, "u-0", |_| body::<u8>(Err(BodyError::NotServed)));
-        assert_eq!(another_run.cause(), Some(StopCause::Caller("SIGINT")), "another run has its own cause");
+        assert_eq!(
+            another_run.cause(),
+            Some(StopCause::Caller("SIGINT")),
+            "another run has its own cause"
+        );
     }
 
     /// The fold that sorts a run's joins is fed values, with no thread started.
     #[test]
     fn the_tally_sorts_each_join_by_how_it_ended() {
-        fn joined(thread: &str, joined: Result<Result<u8, ThreadError<BodyError>>, ThreadJoinError>, pool: usize) -> JoinOutcome<u8, BodyError> {
+        fn joined(
+            thread: &str,
+            joined: Result<Result<u8, ThreadError<BodyError>>, ThreadJoinError>,
+            pool: usize,
+        ) -> JoinOutcome<u8, BodyError> {
             JoinOutcome {
                 thread: thread.into(),
                 joined,
@@ -1626,8 +1712,14 @@ mod tests {
         assert_eq!(
             results.left_running,
             [
-                ThreadLeftover { thread: "b".into(), what: Leftover::BlockingCalls(NonZeroUsize::new(3).unwrap()) },
-                ThreadLeftover { thread: "d".into(), what: Leftover::Thread },
+                ThreadLeftover {
+                    thread: "b".into(),
+                    what: Leftover::BlockingCalls(NonZeroUsize::new(3).unwrap())
+                },
+                ThreadLeftover {
+                    thread: "d".into(),
+                    what: Leftover::Thread
+                },
             ]
         );
         let failed: Vec<_> = results.failures.iter().map(|f| f.thread.as_str()).collect();
@@ -1664,7 +1756,11 @@ mod tests {
             Ok(_) => panic!("a stack of usize::MAX / 2 can't be had"),
             Err(failure) => failure,
         };
-        assert_eq!(run.cause(), Some(StopCause::NotSpawned { thread: "s-0".into() }), "the spawn's failure stopped the run");
+        assert_eq!(
+            run.cause(),
+            Some(StopCause::NotSpawned { thread: "s-0".into() }),
+            "the spawn's failure stopped the run"
+        );
         let here = std::thread::current().id();
         let mut dropped = drops.lock().unwrap().clone();
         dropped.sort_unstable_by_key(|(value, _)| *value);
@@ -1713,7 +1809,10 @@ mod tests {
             move |_stop, ()| async move { held.wait() },
         )
         .unwrap();
-        assert!(matches!(watcher.finish(Instant::now()), Err(ThreadJoinError::StillRunning)));
+        assert!(matches!(
+            watcher.finish(Instant::now()),
+            Err(ThreadJoinError::StillRunning)
+        ));
         release.open();
     }
 
@@ -1749,7 +1848,6 @@ mod tests {
         within_10s(move || block_until_cancelled(&watched));
         assert!(watcher.finish(Instant::now() + JOIN_TIMEOUT).is_ok());
     }
-
 
     #[test]
     fn a_spawn_failing_midway_stops_the_started_threads_and_drops_the_rest_here() {
@@ -1840,7 +1938,13 @@ mod tests {
         .unwrap();
         let joined = join(handles, &run, Duration::from_millis(10));
         release.open();
-        assert_eq!(joined.left_running, [ThreadLeftover { thread: "x-1".into(), what: Leftover::Thread }]);
+        assert_eq!(
+            joined.left_running,
+            [ThreadLeftover {
+                thread: "x-1".into(),
+                what: Leftover::Thread
+            }]
+        );
         assert_eq!(joined.failures[0].thread, "x-0");
         assert_eq!(run.cause(), failed("x-0"));
     }
@@ -1867,7 +1971,13 @@ mod tests {
         .unwrap();
         let joined = join(handles, &run, Duration::from_millis(10));
         release.open();
-        assert_eq!(joined.left_running, [ThreadLeftover { thread: "slow-0".into(), what: Leftover::Thread }]);
+        assert_eq!(
+            joined.left_running,
+            [ThreadLeftover {
+                thread: "slow-0".into(),
+                what: Leftover::Thread
+            }]
+        );
         assert!(joined.ended.is_empty());
         assert!(joined.failures.is_empty());
         assert!(!joined.is_clean(), "an abandoned thread is not a clean end");
@@ -1893,14 +2003,22 @@ mod tests {
                 })
             })
         });
-        assert!(matches!(finished.outcome, Err(ThreadError::Returned(BodyError::NotServed))));
+        assert!(matches!(
+            finished.outcome,
+            Err(ThreadError::Returned(BodyError::NotServed))
+        ));
         assert_eq!(run.cause(), failed("t-0"));
         assert_eq!(finished.left_on_pool, None, "the call returned within the limit");
     }
 
     /// Runs one thread whose serve leaves a call on the blocking pool, held until the test
     /// releases it, and serves it as `serve` ends.
-    fn stuck_serve(name: &str, run: &TestRun, release: &Gate, serve: fn() -> Result<(), BodyError>) -> Vec<ThreadHandle<(), BodyError>> {
+    fn stuck_serve(
+        name: &str,
+        run: &TestRun,
+        release: &Gate,
+        serve: fn() -> Result<(), BodyError>,
+    ) -> Vec<ThreadHandle<(), BodyError>> {
         let held = release.clone();
         spawn_per_core(
             name,
@@ -1933,10 +2051,22 @@ mod tests {
         let waited = run.clone();
         let joined = within_10s(move || join(handles, &waited, JOIN_TIMEOUT));
         release.open();
-        assert!(matches!(joined.failures[0].error, ThreadError::Returned(BodyError::NotServed)));
+        assert!(matches!(
+            joined.failures[0].error,
+            ThreadError::Returned(BodyError::NotServed)
+        ));
         assert_eq!(run.cause(), failed("stuck-0"));
-        assert_eq!(joined.left_running, [ThreadLeftover { thread: "stuck-0".into(), what: Leftover::BlockingCalls(NonZeroUsize::MIN) }]);
-        assert!(!joined.is_clean(), "a thread that left a call running is not a clean end");
+        assert_eq!(
+            joined.left_running,
+            [ThreadLeftover {
+                thread: "stuck-0".into(),
+                what: Leftover::BlockingCalls(NonZeroUsize::MIN)
+            }]
+        );
+        assert!(
+            !joined.is_clean(),
+            "a thread that left a call running is not a clean end"
+        );
     }
 
     #[test]
@@ -1950,7 +2080,13 @@ mod tests {
         release.open();
         assert_eq!(joined.ended, vec![()]);
         assert!(joined.failures.is_empty());
-        assert_eq!(joined.left_running, [ThreadLeftover { thread: "kept-0".into(), what: Leftover::BlockingCalls(NonZeroUsize::MIN) }]);
+        assert_eq!(
+            joined.left_running,
+            [ThreadLeftover {
+                thread: "kept-0".into(),
+                what: Leftover::BlockingCalls(NonZeroUsize::MIN)
+            }]
+        );
         assert!(!joined.is_clean(), "not a clean end");
     }
 
@@ -1961,19 +2097,23 @@ mod tests {
         let release = Gate::default();
         let held = release.clone();
         let finished = within_10s(move || {
-            run_as(&TestRun::default(), "t-0", |own| -> Result<(), ThreadError<BodyError>> {
-                let (entered, in_pool) = mpsc::channel::<()>();
-                let served = serve_here(own, Duration::ZERO, || async move {
-                    drop(tokio::task::spawn_blocking(move || {
-                        entered.send(()).expect("the serve waits for this");
-                        held.wait();
-                    }));
-                    in_pool.recv().expect("the call started");
-                    Ok(())
-                });
-                assert!(served.is_ok());
-                panic!("the body panicked after its serve");
-            })
+            run_as(
+                &TestRun::default(),
+                "t-0",
+                |own| -> Result<(), ThreadError<BodyError>> {
+                    let (entered, in_pool) = mpsc::channel::<()>();
+                    let served = serve_here(own, Duration::ZERO, || async move {
+                        drop(tokio::task::spawn_blocking(move || {
+                            entered.send(()).expect("the serve waits for this");
+                            held.wait();
+                        }));
+                        in_pool.recv().expect("the call started");
+                        Ok(())
+                    });
+                    assert!(served.is_ok());
+                    panic!("the body panicked after its serve");
+                },
+            )
         });
         release.open();
         assert_eq!(finished.left_on_pool, NonZeroUsize::new(1));
@@ -2031,7 +2171,13 @@ mod tests {
         release.open();
         assert_eq!(run.cause(), failed("panics-0"));
         assert!(matches!(&joined.failures[0].error, ThreadError::Panicked(payload) if payload == "serve panicked"));
-        assert_eq!(joined.left_running, [ThreadLeftover { thread: "panics-0".into(), what: Leftover::BlockingCalls(NonZeroUsize::MIN) }]);
+        assert_eq!(
+            joined.left_running,
+            [ThreadLeftover {
+                thread: "panics-0".into(),
+                what: Leftover::BlockingCalls(NonZeroUsize::MIN)
+            }]
+        );
     }
 
     #[derive(Clone, Default)]
@@ -2060,7 +2206,10 @@ mod tests {
             Ok(())
         });
         assert_eq!(
-            (hooks.before_serve.load(Ordering::SeqCst), hooks.after_serve.load(Ordering::SeqCst)),
+            (
+                hooks.before_serve.load(Ordering::SeqCst),
+                hooks.after_serve.load(Ordering::SeqCst)
+            ),
             (1, 1)
         );
         assert_eq!(served.load(Ordering::SeqCst), 0, "nothing served");
@@ -2087,14 +2236,21 @@ mod tests {
         let finished = within_10s(move || {
             run_as(&stopped, "t-0", |own| {
                 let (entered, in_pool) = mpsc::channel::<()>();
-                serve_on_this_thread(pin_and_raise_qos(None), BLOCKING_STACK, AfterServePanic, own, || Duration::ZERO, || async move {
-                    drop(tokio::task::spawn_blocking(move || {
-                        entered.send(()).expect("the serve waits for this");
-                        held.wait();
-                    }));
-                    in_pool.recv().expect("the call started");
-                    Ok::<(), BodyError>(())
-                })
+                serve_on_this_thread(
+                    pin_and_raise_qos(None),
+                    BLOCKING_STACK,
+                    AfterServePanic,
+                    own,
+                    || Duration::ZERO,
+                    || async move {
+                        drop(tokio::task::spawn_blocking(move || {
+                            entered.send(()).expect("the serve waits for this");
+                            held.wait();
+                        }));
+                        in_pool.recv().expect("the call started");
+                        Ok::<(), BodyError>(())
+                    },
+                )
             })
         });
         release.open();
@@ -2140,9 +2296,14 @@ mod tests {
     #[test]
     fn a_thread_started_in_a_run_is_joined_with_it() {
         let run = TestRun::default();
-        let handle = spawn_in_run("acceptor", 1 << 20, &run, |_own| -> Result<String, ThreadError<BodyError>> {
-            Ok(std::thread::current().name().unwrap_or_default().to_string())
-        })
+        let handle = spawn_in_run(
+            "acceptor",
+            1 << 20,
+            &run,
+            |_own| -> Result<String, ThreadError<BodyError>> {
+                Ok(std::thread::current().name().unwrap_or_default().to_string())
+            },
+        )
         .unwrap();
         assert_eq!(handle.name(), "acceptor");
         let waited = run.clone();
@@ -2150,6 +2311,4 @@ mod tests {
         assert_eq!(joined.ended, ["acceptor"], "it ran under its name");
         assert_eq!(run.cause(), Some(StopCause::ThreadsEnded), "and its end ended the run");
     }
-
-
 }

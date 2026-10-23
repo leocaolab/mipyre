@@ -22,7 +22,7 @@ import pytest
 from websockets.sync.client import connect
 
 from tests.conftest import fork_panic_lines
-from tests._helpers import answers, bound_port, read_file
+from tests._helpers import answers, bound_port, read_file, set_subinterpreters
 
 pytestmark = pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"), reason="own-GIL sub-interpreters"
@@ -77,6 +77,7 @@ def test_main_side_routes_survive_workers_executing_engine(tmp_path, tpc):
     LoopGuard thread-local destructors on Tokio blocking threads."""
     log_path = str(tmp_path / "server.log")
     env = dict(os.environ, L2_PORT="0", RUST_BACKTRACE="0", MIPYRE_TPC=tpc)
+    set_subinterpreters(env, "2")
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "_l2_main_side_app.py")],

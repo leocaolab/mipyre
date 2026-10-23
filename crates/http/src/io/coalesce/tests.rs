@@ -4,8 +4,15 @@
 use super::*;
 use crate::plan::coalesce::{COALESCE_LIMIT, H2_PREFACE};
 
+use mipyre_transport::stream::linger::{Close, LingerBounds};
 use mipyre_transport::stream::stall::WriteStall;
 use tokio::io::AsyncWriteExt;
+
+/// Bounds a lingering finish far past what a scripted read takes, so a test's reads end it.
+const BOUNDS: LingerBounds = LingerBounds {
+    idle: std::time::Duration::from_secs(2),
+    limit: std::time::Duration::from_secs(10),
+};
 
 fn run<F: std::future::Future<Output = ()>>(test: F) {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -25,21 +32,13 @@ struct ChokedIo {
 }
 
 impl AsyncRead for ChokedIo {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Poll::Pending
     }
 }
 
 impl AsyncWrite for ChokedIo {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         if self.refuse_next {
             self.refuse_next = false;
             cx.waker().wake_by_ref();
@@ -139,11 +138,7 @@ fn wire() -> (ScriptedIo, Arc<Mutex<Wire>>) {
 
 impl AsyncRead for ScriptedIo {
     /// Delivers the next scripted read, where `None` is EOF and an empty script is `Pending`.
-    fn poll_read(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         match self.0.lock().reads.pop_front() {
             Some(Some(bytes)) => {
                 buf.put_slice(&bytes);
@@ -156,18 +151,10 @@ impl AsyncRead for ScriptedIo {
 }
 
 impl AsyncWrite for ScriptedIo {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let mut wire = self.0.lock();
         wire.write_calls += 1;
-        match wire
-            .writes
-            .pop_front()
-            .unwrap_or(WriteStep::Take(usize::MAX))
-        {
+        match wire.writes.pop_front().unwrap_or(WriteStep::Take(usize::MAX)) {
             WriteStep::Take(max) => {
                 let n = buf.len().min(max);
                 if wire.buffers {
@@ -277,9 +264,7 @@ fn the_end_of_a_poll_writes_what_the_poll_kept_in_one_write() {
 #[test]
 fn a_flush_while_requests_are_unread_waits_and_a_pending_read_lets_the_next_flush_write() {
     let (io, wire) = wire();
-    wire.lock()
-        .reads
-        .push_back(Some(b"GET / HTTP/1.1\r\n\r\n".to_vec()));
+    wire.lock().reads.push_back(Some(b"GET / HTTP/1.1\r\n\r\n".to_vec()));
     let (mut io, flusher) = coalesce(io);
     let mut conn = Conn {
         io: &mut io,
@@ -292,22 +277,12 @@ fn a_flush_while_requests_are_unread_waits_and_a_pending_read_lets_the_next_flus
         flusher.enter();
         let polled = std::future::Future::poll(Pin::new(&mut conn), &mut cx);
         assert!(polled.is_pending());
-        assert_eq!(
-            wire.lock().write_calls,
-            0,
-            "kept while a request may be unread"
-        );
+        assert_eq!(wire.lock().write_calls, 0, "kept while a request may be unread");
         let mut space = [0u8; 8];
         let mut buf = ReadBuf::new(&mut space);
-        assert!(Pin::new(&mut *conn.io)
-            .poll_read(&mut cx, &mut buf)
-            .is_pending());
+        assert!(Pin::new(&mut *conn.io).poll_read(&mut cx, &mut buf).is_pending());
         assert!(Pin::new(&mut *conn.io).poll_flush(&mut cx).is_ready());
-        assert_eq!(
-            wire.lock().landed,
-            b"first;",
-            "written once nothing is queued"
-        );
+        assert_eq!(wire.lock().landed, b"first;", "written once nothing is queued");
         flusher.leave(&mut cx);
     }
 }
@@ -316,19 +291,13 @@ fn a_flush_while_requests_are_unread_waits_and_a_pending_read_lets_the_next_flus
 fn bytes_a_buffering_inner_holds_are_flushed_when_the_connection_ends() {
     let (io, wire) = wire();
     wire.lock().buffers = true;
-    wire.lock()
-        .reads
-        .push_back(Some(b"GET /ws HTTP/1.1\r\n\r\n".to_vec()));
+    wire.lock().reads.push_back(Some(b"GET /ws HTTP/1.1\r\n\r\n".to_vec()));
     let (mut io, flusher) = coalesce(io);
     let mut conn = Conn {
         io: &mut io,
         // The 101 is kept because a request was just read, and the connection future ends
         // without a shutdown.
-        polls: polls(&[&[
-            Call::Read,
-            Call::Write(b"HTTP/1.1 101\r\n\r\n"),
-            Call::Flush,
-        ]]),
+        polls: polls(&[&[Call::Read, Call::Write(b"HTTP/1.1 101\r\n\r\n"), Call::Flush]]),
         errors: Vec::new(),
     };
     assert!(bracket(&mut conn, &flusher).is_ready());
@@ -341,18 +310,13 @@ fn an_upgraded_stream_carries_on_a_write_out_the_connection_left_blocked() {
     {
         let mut w = wire.lock();
         w.buffers = true;
-        w.reads
-            .push_back(Some(b"GET /ws HTTP/1.1\r\n\r\n".to_vec()));
+        w.reads.push_back(Some(b"GET /ws HTTP/1.1\r\n\r\n".to_vec()));
         w.writes.push_back(WriteStep::Full);
     }
     let (mut io, flusher) = coalesce(io);
     let mut conn = Conn {
         io: &mut io,
-        polls: polls(&[&[
-            Call::Read,
-            Call::Write(b"HTTP/1.1 101\r\n\r\n"),
-            Call::Flush,
-        ]]),
+        polls: polls(&[&[Call::Read, Call::Write(b"HTTP/1.1 101\r\n\r\n"), Call::Flush]]),
         errors: Vec::new(),
     };
     assert!(bracket(&mut conn, &flusher).is_ready());
@@ -375,9 +339,7 @@ fn partial_writes_with_new_bytes_keep_the_buffer_bounded() {
     for _ in 0..20_000 {
         // The client reads exactly as fast as the server writes, so every flush gets out ten
         // bytes and the socket is full again.
-        wire.lock()
-            .writes
-            .extend([WriteStep::Take(10), WriteStep::Full]);
+        wire.lock().writes.extend([WriteStep::Take(10), WriteStep::Full]);
         if let Poll::Ready(Ok(n)) = Pin::new(&mut io).poll_write(&mut cx, b"0123456789") {
             want.extend_from_slice(&b"0123456789"[..n]);
         }
@@ -397,9 +359,7 @@ fn partial_writes_with_new_bytes_keep_the_buffer_bounded() {
 #[test]
 fn a_failed_write_is_tried_once_and_reported_once() {
     let (io, wire) = wire();
-    wire.lock()
-        .writes
-        .push_back(WriteStep::Fail(io::ErrorKind::BrokenPipe));
+    wire.lock().writes.push_back(WriteStep::Fail(io::ErrorKind::BrokenPipe));
     let (mut io, flusher) = coalesce(io);
     let mut conn = Conn {
         io: &mut io,
@@ -434,11 +394,7 @@ fn a_poll_whose_write_came_back_pending_does_not_write_again_at_its_end() {
     wire.lock().reads.push_back(Some(PIPELINED.to_vec()));
     wire.lock().writes.extend([WriteStep::Full; 8]);
     assert!(bracket(&mut conn, &flusher).is_pending());
-    assert_eq!(
-        wire.lock().write_calls,
-        1,
-        "the first poll's end tries once"
-    );
+    assert_eq!(wire.lock().write_calls, 1, "the first poll's end tries once");
     assert!(bracket(&mut conn, &flusher).is_pending());
     assert_eq!(
         wire.lock().write_calls,
@@ -462,9 +418,7 @@ fn a_switch_to_http2_writes_a_kept_tail_before_passing_through() {
     let mut space = [0u8; 64];
     let mut buf = ReadBuf::new(&mut space);
     assert!(Pin::new(&mut io).poll_read(&mut cx, &mut buf).is_ready());
-    assert!(Pin::new(&mut io)
-        .poll_write(&mut cx, b"SETTINGS")
-        .is_ready());
+    assert!(Pin::new(&mut io).poll_write(&mut cx, b"SETTINGS").is_ready());
     let mut buf = ReadBuf::new(&mut space);
     assert!(Pin::new(&mut io).poll_read(&mut cx, &mut buf).is_pending());
     assert!(Pin::new(&mut io).poll_flush(&mut cx).is_pending());
@@ -488,9 +442,7 @@ fn a_switch_to_http2_writes_a_kept_tail_before_passing_through() {
 #[test]
 fn a_write_out_a_poll_end_failed_is_reported_once_by_the_next_call() {
     let (io, wire) = wire();
-    wire.lock()
-        .writes
-        .push_back(WriteStep::Fail(io::ErrorKind::BrokenPipe));
+    wire.lock().writes.push_back(WriteStep::Fail(io::ErrorKind::BrokenPipe));
     wire.lock().reads.push_back(Some(PIPELINED.to_vec()));
     let (mut io, flusher) = coalesce(io);
     let mut conn = Conn {
@@ -504,11 +456,18 @@ fn a_write_out_a_poll_end_failed_is_reported_once_by_the_next_call() {
         errors: Vec::new(),
     };
     assert!(bracket(&mut conn, &flusher).is_pending());
-    assert!(conn.errors.is_empty(), "the poll's end met the error, not the connection");
+    assert!(
+        conn.errors.is_empty(),
+        "the poll's end met the error, not the connection"
+    );
     assert!(bracket(&mut conn, &flusher).is_pending());
     assert_eq!(wire.lock().write_calls, 1, "a poll with no call does not write again");
     assert!(bracket(&mut conn, &flusher).is_pending());
-    assert_eq!(conn.errors, [io::ErrorKind::BrokenPipe], "reported by the next call, once");
+    assert_eq!(
+        conn.errors,
+        [io::ErrorKind::BrokenPipe],
+        "reported by the next call, once"
+    );
     assert_eq!(wire.lock().write_calls, 1);
 }
 
@@ -527,11 +486,11 @@ fn finish_writes_what_a_connection_that_ended_without_a_shutdown_left_blocked() 
         assert!(bracket(&mut conn, &flusher).is_ready());
         drop(conn);
         drop(io);
-        assert!(
-            wire.lock().landed.is_empty(),
-            "the socket was full at the poll's end"
-        );
-        flusher.finish().await.unwrap();
+        assert!(wire.lock().landed.is_empty(), "the socket was full at the poll's end");
+        flusher
+            .finish(Close::Now, BOUNDS, std::future::pending())
+            .await
+            .unwrap();
         assert_eq!(wire.lock().landed, b"HTTP/1.1 200 OK\r\n\r\n");
     });
 }
@@ -557,9 +516,61 @@ fn finish_reports_a_write_out_the_last_poll_failed_and_nothing_else_does() {
         );
         drop(conn);
         drop(io);
-        let e = flusher.finish().await.unwrap_err();
+        let e = flusher
+            .finish(Close::Now, BOUNDS, std::future::pending())
+            .await
+            .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(wire.lock().write_calls, 1);
+    });
+}
+
+#[test]
+fn a_lingering_finish_reads_what_the_client_still_sends_until_it_closes() {
+    run(async {
+        let (io, wire) = wire();
+        wire.lock().reads.push_back(Some(PIPELINED.to_vec()));
+        let (mut io, flusher) = coalesce(io);
+        let mut conn = Conn {
+            io: &mut io,
+            polls: polls(&[&[Call::Read, Call::Write(b"HTTP/1.1 413\r\n\r\n")]]),
+            errors: Vec::new(),
+        };
+        assert!(bracket(&mut conn, &flusher).is_ready());
+        drop(conn);
+        drop(io);
+        wire.lock()
+            .reads
+            .extend([Some(b"the unread body".to_vec()), Some(b"more of it".to_vec()), None]);
+        flusher
+            .finish(Close::Lingering, BOUNDS, std::future::pending())
+            .await
+            .unwrap();
+        assert!(wire.lock().reads.is_empty(), "read up to the client's close");
+        assert_eq!(wire.lock().landed, b"HTTP/1.1 413\r\n\r\n");
+    });
+}
+
+#[test]
+fn a_lingering_finish_does_not_wait_for_a_client_that_has_closed() {
+    run(async {
+        let (io, wire) = wire();
+        wire.lock().reads.extend([Some(PIPELINED.to_vec()), None]);
+        let (mut io, flusher) = coalesce(io);
+        let mut conn = Conn {
+            io: &mut io,
+            polls: polls(&[&[Call::Read, Call::Write(b"HTTP/1.1 200 OK\r\n\r\n"), Call::Read]]),
+            errors: Vec::new(),
+        };
+        assert!(bracket(&mut conn, &flusher).is_ready());
+        drop(conn);
+        drop(io);
+        wire.lock().reads.push_back(Some(b"never read".to_vec()));
+        flusher
+            .finish(Close::Lingering, BOUNDS, std::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(wire.lock().reads.len(), 1, "nothing is read after the client's EOF");
     });
 }
 
@@ -578,7 +589,10 @@ fn finish_leaves_an_upgraded_stream_to_its_new_owner() {
         assert!(bracket(&mut conn, &flusher).is_ready());
         drop(conn);
         // The upgrade's owner still holds `io`, so finish does not wait on it.
-        flusher.finish().await.unwrap();
+        flusher
+            .finish(Close::Now, BOUNDS, std::future::pending())
+            .await
+            .unwrap();
         io.flush().await.unwrap();
         assert_eq!(wire.lock().landed, b"HTTP/1.1 101\r\n\r\n");
     });
@@ -603,21 +617,11 @@ fn a_keep_alive_connection_reuses_its_buffer_for_batches_up_to_the_limit() {
         ));
         let mut buf = ReadBuf::new(&mut space);
         assert!(Pin::new(&mut io).poll_read(&mut cx, &mut buf).is_pending());
-        assert!(matches!(
-            Pin::new(&mut io).poll_flush(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
+        assert!(matches!(Pin::new(&mut io).poll_flush(&mut cx), Poll::Ready(Ok(()))));
         flusher.leave(&mut cx);
         let kept = io.shared.state.lock().out.capacity();
-        assert!(
-            kept >= body.len(),
-            "the written-out buffer was freed (capacity {kept})"
-        );
-        assert_eq!(
-            *capacity.get_or_insert(kept),
-            kept,
-            "the buffer was reallocated"
-        );
+        assert!(kept >= body.len(), "the written-out buffer was freed (capacity {kept})");
+        assert_eq!(*capacity.get_or_insert(kept), kept, "the buffer was reallocated");
     }
 }
 
@@ -648,7 +652,10 @@ fn captured_log(f: impl FnOnce()) -> String {
 /// A second warning inside the throttle's period is held back.
 #[test]
 fn a_dropped_connections_failed_last_write_out_is_a_warning_with_the_error() {
-    let throttles = (LogThrottle::new(DROP_WARNING_PERIOD), LogThrottle::new(DROP_WARNING_PERIOD));
+    let throttles = (
+        LogThrottle::new(DROP_WARNING_PERIOD),
+        LogThrottle::new(DROP_WARNING_PERIOD),
+    );
     let now = std::time::Duration::from_secs(1);
     let failed = || Poll::Ready(Err(io::Error::new(io::ErrorKind::PermissionDenied, "egress refused")));
     let log = captured_log(|| say_dropped_write_out(failed(), 12, [&throttles.0, &throttles.1], now));
@@ -663,20 +670,49 @@ fn a_dropped_connections_failed_last_write_out_is_a_warning_with_the_error() {
 #[test]
 fn a_dropped_connections_full_socket_warns_and_a_gone_peer_does_not() {
     let now = std::time::Duration::from_secs(1);
-    let log = captured_log(|| say_dropped_write_out(Poll::Pending, 5, [&LogThrottle::new(DROP_WARNING_PERIOD), &LogThrottle::new(DROP_WARNING_PERIOD)], now));
-    assert!(log.lines().any(|l| l.contains("WARN") && l.contains("socket was full")), "{log}");
+    let log = captured_log(|| {
+        say_dropped_write_out(
+            Poll::Pending,
+            5,
+            [
+                &LogThrottle::new(DROP_WARNING_PERIOD),
+                &LogThrottle::new(DROP_WARNING_PERIOD),
+            ],
+            now,
+        )
+    });
+    assert!(
+        log.lines().any(|l| l.contains("WARN") && l.contains("socket was full")),
+        "{log}"
+    );
 
     let reset = Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)));
-    let log = captured_log(|| say_dropped_write_out(reset, 5, [&LogThrottle::new(DROP_WARNING_PERIOD), &LogThrottle::new(DROP_WARNING_PERIOD)], now));
+    let log = captured_log(|| {
+        say_dropped_write_out(
+            reset,
+            5,
+            [
+                &LogThrottle::new(DROP_WARNING_PERIOD),
+                &LogThrottle::new(DROP_WARNING_PERIOD),
+            ],
+            now,
+        )
+    });
     assert!(!log.contains("WARN"), "{log}");
 }
 
 #[test]
 fn a_full_sockets_warning_does_not_hold_back_a_failed_writes() {
-    let throttles = (LogThrottle::new(DROP_WARNING_PERIOD), LogThrottle::new(DROP_WARNING_PERIOD));
+    let throttles = (
+        LogThrottle::new(DROP_WARNING_PERIOD),
+        LogThrottle::new(DROP_WARNING_PERIOD),
+    );
     let now = std::time::Duration::from_secs(1);
     let log = captured_log(|| say_dropped_write_out(Poll::Pending, 5, [&throttles.0, &throttles.1], now));
-    assert!(log.lines().any(|l| l.contains("WARN") && l.contains("socket was full")), "{log}");
+    assert!(
+        log.lines().any(|l| l.contains("WARN") && l.contains("socket was full")),
+        "{log}"
+    );
 
     let failed = Poll::Ready(Err(io::Error::new(io::ErrorKind::PermissionDenied, "egress refused")));
     let log = captured_log(|| say_dropped_write_out(failed, 5, [&throttles.0, &throttles.1], now));
@@ -688,11 +724,7 @@ fn a_full_sockets_warning_does_not_hold_back_a_failed_writes() {
 struct NeverWrites;
 
 impl AsyncRead for NeverWrites {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Poll::Pending
     }
 }
@@ -749,7 +781,7 @@ async fn under_the_coalescing_layer_a_stall_is_reported_once_and_not_written_aga
     drop(conn);
     assert_eq!(*errors.borrow(), [io::ErrorKind::TimedOut]);
     flusher
-        .finish()
+        .finish(Close::Now, BOUNDS, std::future::pending())
         .await
         .expect("the stall was reported to the connection, not again");
 }

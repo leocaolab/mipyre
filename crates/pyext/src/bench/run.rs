@@ -17,10 +17,7 @@ use tokio_util::sync::CancellationToken;
 use super::client::{client_failures, drive_client, run_loopback_clients, ClientError, LOOPBACK_CLIENT};
 use super::measure::{measure, measure_profiled, Measurement, ProfileDepth, ProfileReport};
 use crate::runtime::{LiveWorkers, ServerRunStop, WorkerKind, WorkerRecipe};
-use crate::serve::{
-    serve_on_workers, tpc_accept_loop_inline, OffThreadRunners, ServeError, Site, TpcServer, TpcThread, TpcThreads,
-    Upgrades,
-};
+use crate::serve::{serve_on_workers, tpc_accept_loop_inline, ServeError, Site, TpcServer, TpcThread, TpcThreads};
 use crate::sync::{AtomicU64, Mutex};
 use crate::telemetry::RunCounters;
 use mipyre_cpu::CoreId;
@@ -107,7 +104,8 @@ impl BenchWorkers {
                 threads: sites.into_iter().zip(lives).collect(),
                 recipe,
             },
-            runners: OffThreadRunners::default(),
+            main_bridge: None,
+            async_pool: None,
             cpus: cpus.to_vec(),
             counters,
         }
@@ -188,11 +186,19 @@ fn serve_inmem_while<R>(
     let run = ServerRunStop::default();
     let deadline = workers.deadline();
     let threads = vec![(); workers.sites.len()];
-    let served = serve_on_workers(workers.into_server(core_ids, &run), threads, &run, &deadline, serve, || {
-        let measured = measure(&counter);
-        run.cancel();
-        measured
-    });
+    let served = serve_on_workers(
+        workers.into_server(core_ids, &run),
+        threads,
+        &run,
+        &deadline,
+        &mut mipyre_tpc::OsSpawner,
+        serve,
+        || {
+            let measured = measure(&counter);
+            run.cancel();
+            measured
+        },
+    );
     let failed = std::mem::take(&mut *failed.lock());
     settle(served, failed)
 }
@@ -216,8 +222,8 @@ pub(crate) fn run_loopback_bench(
         addr: (Ipv4Addr::LOCALHOST, 0).into(),
         tls: None,
     };
-    let listeners =
-        Endpoints::bind(&ListenerSet::one(spec), copies, crate::serve::bind_options()).map_err(BenchError::BindFailed)?;
+    let listeners = Endpoints::bind(&ListenerSet::one(spec), copies, crate::serve::bind_options())
+        .map_err(BenchError::BindFailed)?;
     let addr = listeners.bound()[0].addr;
     println!(
         "\n  Mipyre v{} [loopback bench] — {} workers, {client_conns} client conns, port {}, {}s",
@@ -243,16 +249,24 @@ pub(crate) fn run_loopback_bench(
     let run = ServerRunStop::default();
     let deadline = workers.deadline();
     let server = workers.into_server(core_ids, &run);
-    let served = serve_on_workers(server, listeners.into_loops(), &run, &deadline, serve, || {
-        // The clients finish first, because the servers must keep serving until every client has
-        // finished its batch.
-        let clients = measure_clients(
-            || measure(&counter, duration),
-            |stop| run_loopback_clients(addr, client_conns, Arc::clone(&counter), stop),
-        );
-        run.cancel();
-        clients
-    });
+    let served = serve_on_workers(
+        server,
+        listeners.into_loops(),
+        &run,
+        &deadline,
+        &mut mipyre_tpc::OsSpawner,
+        serve,
+        || {
+            // The clients finish first, because the servers must keep serving until every client has
+            // finished its batch.
+            let clients = measure_clients(
+                || measure(&counter, duration),
+                |stop| run_loopback_clients(addr, client_conns, Arc::clone(&counter), stop),
+            );
+            run.cancel();
+            clients
+        },
+    );
     let failed = std::mem::take(&mut *failed.lock());
     let (measured, client_failures) = settle(served, failed)??;
     fail_on(client_failures)?;
@@ -317,11 +331,11 @@ fn fail_on(failures: Vec<BenchPartError>) -> Result<(), BenchError> {
 
 /// Returns why `tpc_thread`'s worker retired, if it did, as a failure of the bench.
 fn retirement(tpc_thread: &TpcThread) -> Option<BenchPartError> {
-    let Err(why) = tpc_thread.slot.worker()?.serving() else {
+    let Err(why) = tpc_thread.worker.as_ref()?.serving() else {
         return None;
     };
     Some(BenchPartError::WorkerRetired {
-        worker: tpc_thread.slot.index().get(),
+        worker: tpc_thread.index.get(),
         why,
     })
 }
@@ -343,18 +357,15 @@ async fn serve_inmem(
             tokio::task::spawn_local(crate::serve::drive_conn(
                 server_io,
                 mipyre_transport::driver::Peer::InMemory,
-                Upgrades::Off,
+                None,
                 {
                     let tpc_thread = Rc::clone(&tpc_thread);
                     move |req, peer| crate::serve::handle_request_tpc_inline(req, Rc::clone(&tpc_thread), peer)
                 },
                 server_stop.stopped(),
             ));
-            let (counter, stop, request) =
-                (Arc::clone(&counter), stop.clone(), Arc::clone(&request));
-            tokio::task::spawn_local(async move {
-                drive_client(client_io, &counter, &stop, &request).await
-            })
+            let (counter, stop, request) = (Arc::clone(&counter), stop.clone(), Arc::clone(&request));
+            tokio::task::spawn_local(async move { drive_client(client_io, &counter, &stop, &request).await })
         })
         .collect();
     client_failures(clients).await
@@ -386,10 +397,13 @@ mod tests {
 
     #[test]
     fn a_panicking_client_thread_fails_the_bench_with_its_panic() {
-        let (_, failures) = measure_clients(nothing_measured, |_| panic!("client exploded"))
-            .expect("the client thread starts");
+        let (_, failures) =
+            measure_clients(nothing_measured, |_| panic!("client exploded")).expect("the client thread starts");
         let err = fail_on(failures).expect_err("a panicked client fails the bench");
-        assert_eq!(err.to_string(), "the bench failed: thread mipyre-lb-client panicked: client exploded");
+        assert_eq!(
+            err.to_string(),
+            "the bench failed: thread mipyre-lb-client panicked: client exploded"
+        );
     }
 
     #[test]

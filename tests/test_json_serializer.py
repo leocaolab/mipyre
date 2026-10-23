@@ -5,8 +5,13 @@ serializer stack is covered without mocking internals.
 """
 
 import collections
+import decimal
+import uuid
+
 import pytest
+
 from mipyre import Mipyre
+from mipyre.engine import encode_json
 from mipyre.testing import TestClient
 
 
@@ -33,13 +38,11 @@ def as_tuple(req):
 
 @app.get("/big-int-u64")
 def big_int_u64(req):
-    # u64::MAX — beyond i64::MAX; serialized as a JSON string to preserve precision
     return {"v": 18446744073709551615}
 
 
 @app.get("/big-int-huge")
 def big_int_huge(req):
-    # Beyond u64::MAX — serialized as a JSON string to preserve precision
     return {"v": 2**65}
 
 
@@ -124,6 +127,15 @@ def unicode_passthrough(req):
     return {"msg": "你好，世界！🔥"}
 
 
+@app.get("/db-row")
+def db_row(req):
+    return {
+        "id": uuid.UUID("12345678-1234-5678-1234-567812345678"),
+        "price": decimal.Decimal("1.10"),
+        "unknown": decimal.Decimal("NaN"),
+    }
+
+
 @pytest.fixture(scope="module")
 def client():
     c = TestClient(app)
@@ -156,16 +168,15 @@ def test_tuple_as_array(client):
 
 
 def test_big_int_u64_is_number(client):
-    """u64::MAX fits in orjson's unsigned 64-bit range — serialized as a JSON number."""
     r = client.get("/big-int-u64")
     assert r.status_code == 200
     assert r.json()["v"] == 18446744073709551615
 
 
-def test_big_int_huge_raises_error(client):
-    """Integers beyond u64::MAX — orjson raises TypeError → 500."""
+def test_big_int_beyond_u64_is_written_in_full(client):
     r = client.get("/big-int-huge")
-    assert r.status_code == 500
+    assert r.status_code == 200
+    assert r.body == b'{"v":36893488147419103232}'
 
 
 def test_float_key_raises_error(client):
@@ -273,3 +284,16 @@ def test_unicode_passthrough(client):
     assert r.json() == {"msg": "你好，世界！🔥"}
     # Characters must appear as UTF-8 bytes, not \uXXXX escapes
     assert "你好" in r.text
+
+
+def test_uuid_and_decimal_columns_answer_as_strings(client):
+    """A row read from Postgres holds `uuid.UUID` and `decimal.Decimal`; returning it is a 200,
+    with the digits a float would lose kept in the string."""
+    r = client.get("/db-row")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"id": "12345678-1234-5678-1234-567812345678", "price": "1.10", "unknown": "NaN"}
+
+
+def test_encode_json_gives_the_bytes_a_response_carries(client):
+    assert client.get("/db-row").body == encode_json(db_row(None))
+

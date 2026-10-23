@@ -6,7 +6,7 @@ client_ip, body) are correctly populated across different scenarios.
 
 import pytest
 from mipyre import Mipyre
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 
 
 # Module level: TestClient serves it through sub-interpreter workers, which rebuild
@@ -111,9 +111,8 @@ def unicode_param(req):
 
 @pytest.fixture(scope="module")
 def client():
-    c = TestClient(app, transport="tcp")
-    yield c
-    c.close()
+    with TestServer(app) as server, TestClient(server) as c:
+        yield c
 
 
 # --- Method tests ---

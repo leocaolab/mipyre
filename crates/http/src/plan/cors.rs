@@ -5,9 +5,11 @@ use bytes::Bytes;
 use http::header::{
     HeaderMap, HeaderName, HeaderValue, InvalidHeaderValue, ACCESS_CONTROL_ALLOW_CREDENTIALS,
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_METHOD, ORIGIN,
-    VARY,
+    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_METHOD, ORIGIN, VARY,
 };
+// `core::net`: the address is a value; `std::net` is the socket half the plan never names.
+use core::net::Ipv6Addr;
+
 use http::{Method, Response, StatusCode};
 
 use crate::plan::header::{own_header_name, own_header_value};
@@ -35,7 +37,6 @@ pub struct CorsOrigin(usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorsSetting {
-    Origin,
     Methods,
     Headers,
     ExposeHeaders,
@@ -44,7 +45,6 @@ pub enum CorsSetting {
 impl std::fmt::Display for CorsSetting {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            CorsSetting::Origin => "origin",
             CorsSetting::Methods => "methods",
             CorsSetting::Headers => "headers",
             CorsSetting::ExposeHeaders => "expose_headers",
@@ -63,48 +63,47 @@ pub enum CorsError {
     /// The Fetch standard has browsers refuse a credentialed request whose answer allows the
     /// origin `*`, so the app would fail in every browser while the server answers 200.
     #[error(
-        "CORS origin {origin:?} allows any origin (\"*\") with allow_credentials, which every browser \
+        "CORS origins {origins:?} allow any origin (\"*\") with allow_credentials, which every browser \
          refuses (W3C Fetch): name the origins, or turn allow_credentials off"
     )]
-    AnyOriginWithCredentials { origin: String },
-    /// An empty origin is a header value, but no browser's `Origin` is ever empty, so it would
-    /// allow nothing.
-    #[error("CORS origin {origin:?} names no origin, or lists an empty one")]
-    EmptyOrigin { origin: String },
+    AnyOriginWithCredentials { origins: Vec<String> },
+    #[error("CORS allow_origins names no origin: give \"*\" or the origins")]
+    EmptyOrigin,
+    /// A browser's `Origin` is `scheme://host[:port]` and nothing else, so an entry of another
+    /// shape would never match one.
+    #[error(
+        "CORS origin {origin:?} is not an origin: expected \"http[s]://host[:port]\" with no path, \
+         e.g. \"https://app.example.com\""
+    )]
+    NotAnOrigin { origin: String },
 }
 
 impl Cors {
-    /// Parses the app's CORS settings into headers. `origin` is one origin, `*`, or origins
-    /// separated by commas; one of them `*` allows any origin.
+    /// Parses the app's CORS settings into headers. Each of `origins` is an origin, or `*`, which
+    /// allows any; an origin is kept as a browser writes its `Origin` (lower-case, without the
+    /// scheme's default port), which is the form both the answer and [`Cors::trusts`] compare.
     ///
     /// # Errors
     ///
     /// Returns [`CorsError::InvalidValue`] when a setting is not a valid header value,
-    /// [`CorsError::EmptyOrigin`] when `origin` names no origin or has an empty one in its list,
-    /// and [`CorsError::AnyOriginWithCredentials`] when `origin` lists `*` with credentials
-    /// allowed.
+    /// [`CorsError::EmptyOrigin`] when `origins` is empty, [`CorsError::NotAnOrigin`] for an
+    /// entry that is not `http[s]://host[:port]`, and [`CorsError::AnyOriginWithCredentials`]
+    /// when `origins` lists `*` with credentials allowed.
     pub fn parse(
-        origin: &str,
+        origins: &[String],
         methods: &str,
         headers: &str,
         expose_headers: Option<&str>,
         allow_credentials: bool,
         max_age: Option<u32>,
     ) -> Result<Self, CorsError> {
-        // An HTTP list's separator is a comma with optional spaces and tabs around it (RFC 9110).
-        let listed: Vec<&str> = origin
-            .split(',')
-            .map(|o| o.trim_matches([' ', '\t']))
-            .collect();
-        if listed.iter().any(|o| o.is_empty()) {
-            return Err(CorsError::EmptyOrigin {
-                origin: origin.to_string(),
-            });
+        if origins.is_empty() {
+            return Err(CorsError::EmptyOrigin);
         }
-        let any = listed.contains(&"*");
+        let any = origins.iter().any(|o| o == "*");
         if allow_credentials && any {
             return Err(CorsError::AnyOriginWithCredentials {
-                origin: origin.to_string(),
+                origins: origins.to_vec(),
             });
         }
         let value = |setting: CorsSetting, value: &str| {
@@ -116,26 +115,21 @@ impl Cors {
         };
         let origins = match any {
             true => vec![HeaderValue::from_static("*")],
-            false => listed
+            false => origins
                 .iter()
-                .map(|o| value(CorsSetting::Origin, o))
+                .map(|o| {
+                    browser_origin(o)
+                        .and_then(|o| HeaderValue::try_from(o).ok())
+                        .ok_or_else(|| CorsError::NotAnOrigin { origin: o.clone() })
+                })
                 .collect::<Result<_, _>>()?,
         };
         let mut set = vec![
-            (
-                ACCESS_CONTROL_ALLOW_METHODS,
-                value(CorsSetting::Methods, methods)?,
-            ),
-            (
-                ACCESS_CONTROL_ALLOW_HEADERS,
-                value(CorsSetting::Headers, headers)?,
-            ),
+            (ACCESS_CONTROL_ALLOW_METHODS, value(CorsSetting::Methods, methods)?),
+            (ACCESS_CONTROL_ALLOW_HEADERS, value(CorsSetting::Headers, headers)?),
         ];
         if allow_credentials {
-            set.push((
-                ACCESS_CONTROL_ALLOW_CREDENTIALS,
-                HeaderValue::from_static("true"),
-            ));
+            set.push((ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true")));
         }
         if let Some(expose) = expose_headers {
             set.push((
@@ -148,6 +142,15 @@ impl Cors {
             headers: set,
             max_age: max_age.map(HeaderValue::from),
         })
+    }
+
+    /// Returns whether a page from `origin` may make this server act: any origin under `*`,
+    /// otherwise one of the origins, byte for byte as [`Cors::origin_of`] compares.
+    pub fn trusts(&self, origin: &HeaderValue) -> bool {
+        match self.origins.as_slice() {
+            [any] if any == "*" => true,
+            origins => origins.contains(origin),
+        }
     }
 
     /// Copies the headers into allocations of their own, so each serving thread applies its own.
@@ -202,19 +205,65 @@ impl Cors {
         let mut resp = Response::new(Bytes::new());
         *resp.status_mut() = StatusCode::NO_CONTENT;
         if let Some(max_age) = &self.max_age {
-            resp.headers_mut()
-                .insert(ACCESS_CONTROL_MAX_AGE, max_age.clone());
+            resp.headers_mut().insert(ACCESS_CONTROL_MAX_AGE, max_age.clone());
         }
         Some(resp)
     }
+}
+
+/// Returns `entry` as a browser serializes an origin (WHATWG URL): `scheme://host[:port]` with
+/// the scheme and host in lower case, an IPv6 host in its canonical form and the scheme's default
+/// port left out; `None` when `entry` is anything else (another scheme, a path, user info, `null`,
+/// a host that is not ASCII).
+fn browser_origin(entry: &str) -> Option<String> {
+    let (scheme, rest) = entry.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let (host, after) = match rest.strip_prefix('[') {
+        Some(v6) => {
+            let (addr, after) = v6.split_once(']')?;
+            let addr: Ipv6Addr = addr.parse().ok()?;
+            (format!("[{addr}]"), after)
+        }
+        None => {
+            let (host, after) = rest.split_at(rest.find(':').unwrap_or(rest.len()));
+            let is_name = !host.is_empty()
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+            if !is_name {
+                return None;
+            }
+            (host.to_ascii_lowercase(), after)
+        }
+    };
+    let port = match after {
+        "" => None,
+        _ => {
+            let digits = after
+                .strip_prefix(':')
+                .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))?;
+            Some(digits.parse::<u16>().ok()?)
+        }
+    };
+    Some(match port {
+        Some(port) if port != default_port => format!("{scheme}://{host}:{port}"),
+        _ => format!("{scheme}://{host}"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cors(origin: &str, allow_credentials: bool, max_age: Option<u32>) -> Result<Cors, CorsError> {
-        Cors::parse(origin, "GET, POST", "content-type", None, allow_credentials, max_age)
+    /// Parses `origins` written as one string, separated by `", "`.
+    fn cors(origins: &str, allow_credentials: bool, max_age: Option<u32>) -> Result<Cors, CorsError> {
+        let origins: Vec<String> = origins.split(", ").map(str::to_string).collect();
+        Cors::parse(&origins, "GET, POST", "content-type", None, allow_credentials, max_age)
     }
 
     fn preflight_headers() -> HeaderMap {
@@ -225,11 +274,14 @@ mod tests {
 
     #[test]
     fn any_origin_with_credentials_is_refused_wherever_it_is_listed() {
-        for origin in ["*", " * ", "https://a.example, *"] {
-            assert!(matches!(
-                cors(origin, true, None),
-                Err(CorsError::AnyOriginWithCredentials { .. })
-            ), "{origin:?}");
+        for origin in ["*", "https://a.example, *"] {
+            assert!(
+                matches!(
+                    cors(origin, true, None),
+                    Err(CorsError::AnyOriginWithCredentials { .. })
+                ),
+                "{origin:?}"
+            );
         }
         assert!(cors("*", false, None).is_ok());
         assert!(cors("https://a.example", true, None).is_ok());
@@ -238,8 +290,11 @@ mod tests {
     #[test]
     fn a_value_that_is_no_header_value_names_its_setting() {
         assert!(matches!(
-            cors("https://a.example\n", false, None),
-            Err(CorsError::InvalidValue { setting: CorsSetting::Origin, .. })
+            Cors::parse(&["*".into()], "GET\n", "content-type", None, false, None),
+            Err(CorsError::InvalidValue {
+                setting: CorsSetting::Methods,
+                ..
+            })
         ));
     }
 
@@ -341,21 +396,85 @@ mod tests {
     }
 
     #[test]
-    fn an_origin_list_with_an_empty_entry_or_none_is_refused() {
-        for origin in ["", " ", "https://a.example,", "https://a.example, , https://b.example"] {
-            assert!(
-                matches!(cors(origin, false, None), Err(CorsError::EmptyOrigin { .. })),
-                "{origin:?}"
+    fn no_origin_at_all_is_refused() {
+        assert!(matches!(
+            Cors::parse(&[], "GET", "*", None, false, None),
+            Err(CorsError::EmptyOrigin)
+        ));
+    }
+
+    #[test]
+    fn an_origin_entry_is_written_as_a_browser_sends_it() {
+        for (entry, sent) in [
+            ("https://A.example:443", "https://a.example"),
+            ("HTTP://a.example:80", "http://a.example"),
+            ("http://a.example:8080", "http://a.example:8080"),
+            ("https://a.example:80", "https://a.example:80"),
+            ("http://[0:0::1]:3000", "http://[::1]:3000"),
+            ("http://127.0.0.1:8000", "http://127.0.0.1:8000"),
+        ] {
+            let c = cors(entry, false, None).unwrap();
+            assert_eq!(
+                answer(&c, &HeaderMap::new())[ACCESS_CONTROL_ALLOW_ORIGIN],
+                sent,
+                "{entry}"
             );
         }
     }
 
     #[test]
-    fn a_listed_origin_that_is_no_header_value_names_its_setting() {
+    fn an_entry_that_is_no_origin_is_refused() {
+        for entry in [
+            "",
+            " ",
+            " https://a.example",
+            "a.example",
+            "https://a.example/",
+            "https://a.example/p",
+            "null",
+            "ftp://a",
+            "https://u@a",
+            "https://a?q",
+            "https://a#f",
+            "https://",
+            "https://a:",
+            "https://a:99999",
+            "https://a:8x",
+            "https://a:1:2",
+            "http://[::1",
+            "http://[nope]",
+            "http://[::1]x",
+            "https://bücher.example",
+            "https://a.example\n",
+            "javascript:alert(1)",
+        ] {
+            assert!(
+                matches!(cors(entry, false, None), Err(CorsError::NotAnOrigin { origin }) if origin == entry),
+                "{entry:?}"
+            );
+        }
         assert!(matches!(
             cors("https://a.example, https://b\x7f", false, None),
-            Err(CorsError::InvalidValue { setting: CorsSetting::Origin, .. })
+            Err(CorsError::NotAnOrigin { .. })
         ));
+    }
+
+    #[test]
+    fn trusts_is_byte_for_byte() {
+        let c = cors(AB, false, None).unwrap();
+        assert!(c.trusts(&HeaderValue::from_static("https://a.example")));
+        assert!(c.trusts(&HeaderValue::from_static("https://b.example")));
+        for origin in [
+            "https://A.example",
+            "https://a.example:443",
+            "http://a.example",
+            "https://a.example.evil",
+            "null",
+        ] {
+            assert!(!c.trusts(&HeaderValue::from_static(origin)), "{origin}");
+        }
+        let any = cors("*", false, None).unwrap();
+        assert!(any.trusts(&HeaderValue::from_static("https://evil.example")));
     }
 
     #[test]

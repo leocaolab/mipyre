@@ -18,10 +18,10 @@ use bytes::Bytes;
 use http_body_util::{Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::io::DuplexStream;
-use tokio::time::Instant;
 use proptest::strategy::Strategy as _;
+use tokio::io::DuplexStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::serve::conn::{drive_connection, drive_local_connection, ConnectionTimeouts, LocalExec};
@@ -62,21 +62,13 @@ impl CountingIo {
 }
 
 impl AsyncRead for CountingIo {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for CountingIo {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let r = Pin::new(&mut self.inner).poll_write(cx, buf);
         self.count(&r);
         r
@@ -119,13 +111,17 @@ fn big_body(n: usize) -> Vec<u8> {
 
 /// Answers `/slow/<ms>` after a sleep, sends `first` and then `second` 300 ms later on `/stream`,
 /// never finishes `/stalled`'s body, serves [`big_body`] on `/big/<n>`, switches protocols on
-/// `/upgrade` and then writes `after`, and echoes any other path.
-async fn answer(
-    mut req: hyper::Request<Incoming>,
-) -> Result<hyper::Response<ResponseBody>, hyper::Error> {
+/// `/upgrade` and then writes `after`, refuses `/refuse` with a 413 without reading its body, and
+/// echoes any other path.
+async fn answer(mut req: hyper::Request<Incoming>) -> Result<hyper::Response<ResponseBody>, hyper::Error> {
     let path = req.uri().path().to_owned();
     if let Some(n) = path.strip_prefix("/big/") {
         return Ok(full(big_body(n.parse().unwrap())));
+    }
+    if path == "/refuse" {
+        let mut resp = full("");
+        *resp.status_mut() = hyper::StatusCode::PAYLOAD_TOO_LARGE;
+        return Ok(resp);
     }
     if path == "/upgrade" {
         let upgrade = hyper::upgrade::on(&mut req);
@@ -136,8 +132,10 @@ async fn answer(
         });
         let mut resp = hyper::Response::new(ResponseBody::empty());
         *resp.status_mut() = hyper::StatusCode::SWITCHING_PROTOCOLS;
-        resp.headers_mut()
-            .insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("upgrade"));
+        resp.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("upgrade"),
+        );
         resp.headers_mut()
             .insert(hyper::header::UPGRADE, hyper::header::HeaderValue::from_static("test"));
         return Ok(resp);
@@ -147,7 +145,7 @@ async fn answer(
         return Ok(full(path));
     }
     if path == "/stalled" {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, hyper::Error>>(2);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::convert::Infallible>>(2);
         tokio::task::spawn_local(async move {
             // Far more than the pipe holds, so the server's write blocks.
             tx.send(Ok(Frame::data(Bytes::from(vec![b'x'; 64 << 20]))))
@@ -160,19 +158,15 @@ async fn answer(
         return Ok(hyper::Response::new(ResponseBody::boxed(body)));
     }
     if path == "/stream" {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, hyper::Error>>(2);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::convert::Infallible>>(2);
         tokio::task::spawn_local(async move {
-            tx.send(Ok(Frame::data(Bytes::from_static(b"first"))))
-                .await
-                .unwrap();
+            tx.send(Ok(Frame::data(Bytes::from_static(b"first")))).await.unwrap();
             tokio::time::sleep(Duration::from_millis(300)).await;
             #[expect(
                 clippy::let_underscore_must_use,
                 reason = "the client may have read what it needed and closed by now"
             )]
-            let _ = tx
-                .send(Ok(Frame::data(Bytes::from_static(b"second"))))
-                .await;
+            let _ = tx.send(Ok(Frame::data(Bytes::from_static(b"second")))).await;
         });
         let body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
         return Ok(hyper::Response::new(ResponseBody::boxed(body)));
@@ -248,7 +242,7 @@ async fn serve_over(writes_mode: Writes, vectored: bool) -> Server {
 }
 
 fn get(path: &str) -> String {
-    format!("GET {path} HTTP/1.1\r\nHost: t\r\n\r\n")
+    format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
 }
 
 /// Holds a response's body as the client read it, de-chunked.
@@ -285,9 +279,7 @@ fn parse_responses(buf: &mut Vec<u8>, out: &mut Vec<Got>) {
                 let Some(nl) = buf[at..].windows(2).position(|w| w == b"\r\n") else {
                     return;
                 };
-                let size =
-                    usize::from_str_radix(std::str::from_utf8(&buf[at..at + nl]).unwrap(), 16)
-                        .unwrap();
+                let size = usize::from_str_radix(std::str::from_utf8(&buf[at..at + nl]).unwrap(), 16).unwrap();
                 let data = at + nl + 2;
                 if buf.len() < data + size + 2 {
                     return;
@@ -313,12 +305,7 @@ async fn read_responses(client: &mut DuplexStream, n: usize, within: Duration) -
     while got.len() < n {
         let read = tokio::time::timeout_at(deadline, client.read(&mut chunk))
             .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "{} of {n} responses within {within:?}; buffered {buf:?}",
-                    got.len()
-                )
-            })
+            .unwrap_or_else(|_| panic!("{} of {n} responses within {within:?}; buffered {buf:?}", got.len()))
             .unwrap();
         assert!(read > 0, "EOF after {} of {n} responses", got.len());
         buf.extend_from_slice(&chunk[..read]);
@@ -344,10 +331,7 @@ fn a_client_that_never_reads_is_disconnected_after_the_write_timeout() {
     // the connection stays open for good.
     run(async {
         let mut s = serve_one(Writes::Coalesced).await;
-        s.client
-            .write_all(get("/stalled").as_bytes())
-            .await
-            .unwrap();
+        s.client.write_all(get("/stalled").as_bytes()).await.unwrap();
         // The budget restarts at each progress, so allow for the writes that got through first.
         tokio::time::timeout(2 * WRITE_TIMEOUT, &mut s.done)
             .await
@@ -369,10 +353,7 @@ fn a_response_followed_by_half_a_request_is_sent_at_once() {
         assert_eq!(got[0].body, b"/a");
         assert_eq!(sent.elapsed(), Duration::ZERO, "sent only once the clock moved");
         // The rest of the second request completes it.
-        s.client
-            .write_all(b"TP/1.1\r\nHost: t\r\n\r\n")
-            .await
-            .unwrap();
+        s.client.write_all(b"TP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await.unwrap();
         let got = read_responses(&mut s.client, 1, PATIENCE).await;
         assert_eq!(got[0].body, b"/b");
     });
@@ -386,10 +367,7 @@ fn sixteen_pipelined_requests_are_answered_in_order_in_one_write() {
             let batch: String = (0..16).map(|i| get(&format!("/{i}"))).collect();
             s.client.write_all(batch.as_bytes()).await.unwrap();
             let got = read_responses(&mut s.client, 16, PATIENCE).await;
-            let bodies: Vec<String> = got
-                .iter()
-                .map(|g| String::from_utf8(g.body.clone()).unwrap())
-                .collect();
+            let bodies: Vec<String> = got.iter().map(|g| String::from_utf8(g.body.clone()).unwrap()).collect();
             let want: Vec<String> = (0..16).map(|i| format!("/{i}")).collect();
             assert_eq!(bodies, want);
             assert_eq!(s.writes.load(Ordering::Relaxed), expected_writes);
@@ -416,7 +394,7 @@ fn connection_close_and_client_eof_lose_no_kept_response() {
         // The last request asks to close: hyper shuts the connection down after it.
         let mut s = serve_one(Writes::Coalesced).await;
         let batch = format!(
-            "{}{}GET /3 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+            "{}{}GET /3 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
             get("/1"),
             get("/2")
         );
@@ -603,7 +581,10 @@ fn a_write_that_finds_the_socket_full_is_not_tried_again_until_it_drains_and_los
             }
             assert_eq!(s.blocked.load(Ordering::Relaxed), 1, "{mode:?}, vectored: {vectored}");
             let got = read_responses(&mut s.client, 1, PATIENCE).await;
-            assert!(got[0].body == big_body(N), "{mode:?}, vectored: {vectored}: the body arrived changed");
+            assert!(
+                got[0].body == big_body(N),
+                "{mode:?}, vectored: {vectored}: the body arrived changed"
+            );
         });
     }
 }
@@ -616,7 +597,7 @@ fn a_response_still_blocked_when_the_connection_closes_arrives_whole() {
         run(async move {
             const N: usize = 3 * PIPE_BYTES + 7;
             let mut s = serve_over(mode, vectored).await;
-            let req = format!("GET /big/{N} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+            let req = format!("GET /big/{N} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
             s.client.write_all(req.as_bytes()).await.unwrap();
             for _ in 0..16 {
                 tokio::task::yield_now().await;
@@ -629,7 +610,10 @@ fn a_response_still_blocked_when_the_connection_closes_arrives_whole() {
             let mut got = Vec::new();
             parse_responses(&mut all, &mut got);
             assert_eq!(got.len(), 1, "{mode:?}, vectored: {vectored}");
-            assert!(got[0].body == big_body(N), "{mode:?}, vectored: {vectored}: the body arrived changed");
+            assert!(
+                got[0].body == big_body(N),
+                "{mode:?}, vectored: {vectored}: the body arrived changed"
+            );
             assert!(all.is_empty(), "nothing after the response");
             s.done.await.unwrap();
         });
@@ -644,7 +628,10 @@ fn a_client_gone_mid_response_ends_the_connection() {
         run(async move {
             let s = serve_over(mode, vectored).await;
             let Server { mut client, done, .. } = s;
-            client.write_all(get(&format!("/big/{}", 4 * PIPE_BYTES)).as_bytes()).await.unwrap();
+            client
+                .write_all(get(&format!("/big/{}", 4 * PIPE_BYTES)).as_bytes())
+                .await
+                .unwrap();
             for _ in 0..16 {
                 tokio::task::yield_now().await;
             }
@@ -664,7 +651,7 @@ fn an_upgrade_sends_the_whole_101_before_the_upgraded_streams_bytes() {
         run(async move {
             let mut s = serve_over(Writes::Coalesced, vectored).await;
             s.client
-                .write_all(b"GET /upgrade HTTP/1.1\r\nHost: t\r\nConnection: upgrade\r\nUpgrade: test\r\n\r\n")
+                .write_all(b"GET /upgrade HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: upgrade\r\nUpgrade: test\r\n\r\n")
                 .await
                 .unwrap();
             let mut seen = Vec::new();
@@ -713,9 +700,7 @@ const TICK: Duration = Duration::from_millis(1);
 /// client reading EOF, just after it.
 async fn closed_at(s: &mut Server, deadline: Instant) {
     assert!(
-        tokio::time::timeout_at(deadline - TICK, &mut s.done)
-            .await
-            .is_err(),
+        tokio::time::timeout_at(deadline - TICK, &mut s.done).await.is_err(),
         "the connection ended before {:?}",
         deadline - TICK
     );
@@ -735,7 +720,7 @@ fn a_request_head_never_finished_is_closed_at_the_header_read_timeout() {
         let mut s = serve_one(Writes::Coalesced).await;
         let started = Instant::now();
         s.client
-            .write_all(b"GET /slowloris HTTP/1.1\r\nHost: t\r\nX-A: ")
+            .write_all(b"GET /slowloris HTTP/1.1\r\nHost: 127.0.0.1\r\nX-A: ")
             .await
             .unwrap();
         closed_at(&mut s, started + HEADER_READ_TIMEOUT).await;
@@ -753,6 +738,47 @@ fn an_idle_keep_alive_connection_is_closed_at_the_header_read_timeout() {
         assert_eq!(got[0].body, b"/a");
         let answered = Instant::now();
         closed_at(&mut s, answered + HEADER_READ_TIMEOUT).await;
+    });
+}
+
+/// Checks that a stop coming while a connection lingers ends it at once: the 413 has gone out
+/// before, and the connection does not wait out the rest of a body its client is still sending.
+#[test]
+fn a_stop_ends_a_lingering_close_at_once_after_its_answer_went_out() {
+    run(async {
+        let mut s = serve_one(Writes::Coalesced).await;
+        s.client
+            .write_all(b"POST /refuse HTTP/1.1\r\nHost: t\r\nContent-Length: 1000000\r\n\r\nthe start of a body")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !answer.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = tokio::time::timeout(PATIENCE, s.client.read(&mut chunk))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(n > 0, "EOF before the answer; read {answer:?}");
+            answer.extend_from_slice(&chunk[..n]);
+        }
+        assert!(
+            answer.starts_with(b"HTTP/1.1 413"),
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
+        s.client.write_all(b"more of the body").await.unwrap();
+        assert!(
+            tokio::time::timeout(PATIENCE / 2, &mut s.done).await.is_err(),
+            "the connection closed without lingering"
+        );
+
+        s.token.cancel();
+        let stopped = Instant::now();
+        (&mut s.done).await.unwrap();
+        assert_eq!(Instant::now() - stopped, Duration::ZERO);
+        let mut rest = Vec::new();
+        s.client.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"", "nothing follows the 413");
     });
 }
 

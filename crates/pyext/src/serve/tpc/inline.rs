@@ -2,7 +2,6 @@
 //! handlers inline on it.
 
 use std::rc::Rc;
-use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
@@ -10,34 +9,34 @@ use mipyre_subinterp::gc::GcPolicy;
 use mipyre_tpc::{LocalStop, LocalTasks, ShutdownDeadline};
 use mipyre_transport::driver::{AcceptError, TransportDriver};
 
-use super::startup::log_startup;
-use super::threads::{drain_connections, serve_on_workers, with_stop_watcher};
-use super::{hybrid_mode, AcceptMode, ServeError, TpcServer};
 use super::conn::{serve_accepted, ThreadWorker, TpcThread};
+use super::threads::{drain_connections, serve_on_workers};
+use super::{topology_label, AcceptMode, ServeError, TpcServer};
 use crate::runtime::ServerRunStop;
 use crate::serve::on_tpc::handle_request_tpc_inline;
-use crate::serve::websocket::Upgrades;
+use crate::serve::websocket::upgrade_site;
 
 /// Serves `server` with one `SO_REUSEPORT` listener per TPC thread.
 pub(super) fn run_per_thread_listener<D: TransportDriver>(
     transport: D,
     server: TpcServer,
-    banner: &str,
+    announce: impl FnOnce(&'static str, &[String]),
     run: &ServerRunStop,
     deadline: &ShutdownDeadline,
+    spawner: &mut impl mipyre_tpc::Spawner,
 ) -> Result<(), ServeError> {
-    let (gc, counters) = (server.gc, Arc::clone(&server.counters));
-    with_stop_watcher(run, counters, deadline, || {
-        let listening = transport.listening();
-        serve_on_workers(
-            server,
-            transport.into_loops(),
-            run,
-            deadline,
-            move |tpc_thread, share, stop, deadline| tpc_accept_loop_inline(share, tpc_thread, stop, gc, deadline),
-            || log_startup(hybrid_mode(AcceptMode::PerThreadListener), &listening, banner),
-        )
-    })
+    let gc = server.gc;
+    let listening = transport.listening();
+    let label = topology_label(&server.threads, AcceptMode::PerThreadListener);
+    serve_on_workers(
+        server,
+        transport.into_loops(),
+        run,
+        deadline,
+        spawner,
+        move |tpc_thread, share, stop, deadline| tpc_accept_loop_inline(share, tpc_thread, stop, gc, deadline),
+        || announce(label, &listening),
+    )
 }
 
 /// Accepts on this thread's listeners and serves each connection inline on `tpc_thread`'s worker
@@ -61,32 +60,33 @@ pub(crate) async fn tpc_accept_loop_inline<D: TransportDriver>(
         // Nothing needs collecting before any request ran, so the first tick is one period out.
         tokio::time::interval_at(tokio::time::Instant::now() + tick, tick)
     });
-    let upgrades = Upgrades::of(&tpc_thread.site);
+    let ws_site = upgrade_site(&tpc_thread.site);
     let stop = LocalStop::follow(&shutdown);
     let stopped = stop.stopped();
     tokio::pin!(stopped);
     let (retiring, conn_stop) = connections_stop(&shutdown);
-    let worker = tpc_thread.slot.worker();
-    let thread = tpc_thread.slot.index().get();
-    let lane_host = crate::lane::host_tpc_thread(tpc_thread.site.process.as_ref(), &tpc_thread.site.rules, thread)
-        .map_err(ServeError::LaneHost)?;
+    let worker = tpc_thread.worker.as_ref();
+    let thread = tpc_thread.index.get();
+    let lane_host =
+        crate::runtime::process::host_tpc_thread(tpc_thread.site.process.as_ref(), &tpc_thread.site.rules, thread)
+            .map_err(ServeError::LaneHost)?;
     let tracker = LocalTasks::new();
     let ended = loop {
-        let wake = tokio::select! {
+        let event = tokio::select! {
             biased;
             () = &mut stopped => break Ok(()),
-            () = retired(worker), if source.is_some() => AcceptWake::Retired,
+            () = retired(worker), if source.is_some() => ThreadEvent::WorkerRetired,
             accepted = accept::<D>(&mut source) => match accepted {
-                Ok(accepted) => AcceptWake::Accepted(accepted),
+                Ok(accepted) => ThreadEvent::Connection(accepted),
                 Err(stopped_accepting) => break Err(stopped_accepting.into()),
             },
-            () = next_tick(&mut ticker) => AcceptWake::Tick,
+            () = next_tick(&mut ticker) => ThreadEvent::IdleTick,
         };
-        match wake {
-            AcceptWake::Accepted(accepted) => {
+        match event {
+            ThreadEvent::Connection(accepted) => {
                 tracker.spawn_local(serve_accepted::<D, _, _>(
                     accepted,
-                    upgrades.clone(),
+                    ws_site.clone(),
                     {
                         let tpc_thread = Rc::clone(&tpc_thread);
                         move |req, peer| handle_request_tpc_inline(req, Rc::clone(&tpc_thread), peer)
@@ -94,12 +94,12 @@ pub(crate) async fn tpc_accept_loop_inline<D: TransportDriver>(
                     conn_stop.stopped(),
                 ));
             }
-            AcceptWake::Tick => {
+            ThreadEvent::IdleTick => {
                 if let Some(worker) = worker {
                     idle_gc_tick(worker);
                 }
             }
-            AcceptWake::Retired => {
+            ThreadEvent::WorkerRetired => {
                 source = None;
                 ticker = None;
                 retiring.cancel();
@@ -114,10 +114,12 @@ pub(crate) async fn tpc_accept_loop_inline<D: TransportDriver>(
     ended
 }
 
-enum AcceptWake<C> {
-    Accepted(C),
-    Tick,
-    Retired,
+/// What woke this TPC thread's loop this round: a new connection, the idle GC tick, or its worker's
+/// retirement.
+enum ThreadEvent<C> {
+    Connection(C),
+    IdleTick,
+    WorkerRetired,
 }
 
 /// Returns a stop for a thread's connections that fires on shutdown or when the returned token is
@@ -148,7 +150,7 @@ pub(super) async fn retired(worker: Option<&ThreadWorker>) {
 pub(super) fn stopped_accepting(tpc_thread: &TpcThread) {
     tracing::warn!(
         target: "mipyre::server",
-        worker = tpc_thread.slot.index().get(),
+        worker = tpc_thread.index.get(),
         "this TPC thread's worker retired: the thread takes no more connections and closes \
          the ones it has; the other threads serve"
     );

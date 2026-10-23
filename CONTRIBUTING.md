@@ -4,7 +4,7 @@ Thanks for helping. Bug reports, feature requests and patches are all welcome.
 
 ## How this repository works
 
-This repository is a release snapshot: each mipyre version is one commit, exported from the tree where development happens. A pull request is therefore not merged here directly. A maintainer carries the change into the development tree, where it goes through the same tests, performance checks and review as every other change, and it ships in the next release. The CHANGELOG entry for that release credits you by your GitHub handle.
+This repository holds snapshots exported from the tree where development happens: each commit is one export, and its message says what changed. A pull request is therefore not merged here directly. A maintainer carries the change into the development tree, where it goes through the same tests, performance checks and review as every other change, and it ships in the next release. The CHANGELOG entry for that release credits you by your GitHub handle.
 
 ## Reporting a bug
 

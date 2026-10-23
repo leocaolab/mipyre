@@ -1,4 +1,4 @@
-"""Tests for `@app.post(..., stream=True)` upload streaming.
+"""Tests for `@app.post(..., body=BodyStream)` upload streaming.
 
 Scope (matches v1 impl in src/python/body_stream.rs):
   * runtime="main" + sync handler only (registration should reject async / non-gil)
@@ -14,8 +14,8 @@ import urllib.error
 
 import pytest
 
-from mipyre import Mipyre
-from mipyre.testing import TestClient
+from mipyre import BodyStream, Mipyre
+from mipyre.testing import TestClient, TestServer
 
 
 # ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@ from mipyre.testing import TestClient
 def test_stream_requires_gil():
     app = Mipyre()
     with pytest.raises(ValueError, match="runtime='main'"):
-        @app.post("/x", stream=True)  # gil defaults to False
+        @app.post("/x", body=BodyStream)  # runtime defaults to subinterp
         def handler(req):
             pass
 
@@ -33,7 +33,7 @@ def test_stream_requires_gil():
 def test_stream_rejects_async():
     app = Mipyre()
     with pytest.raises(ValueError, match="async def"):
-        @app.post("/x", runtime="main", stream=True)
+        @app.post("/x", runtime="main", body=BodyStream)
         async def handler(req):
             pass
 
@@ -52,7 +52,7 @@ def root(req):
     return {"ready": True}
 
 
-@app.post("/upload", runtime="main", stream=True)
+@app.post("/upload", runtime="main", body=BodyStream)
 def upload(req):
     total = 0
     count = 0
@@ -63,7 +63,7 @@ def upload(req):
     return {"bytes": total, "chunks": count}
 
 
-@app.post("/read_all", runtime="main", stream=True)
+@app.post("/read_all", runtime="main", body=BodyStream)
 def read_all(req):
     data = req.stream.read()
     return {"len": len(data), "echo": data.decode("utf-8", errors="replace")}
@@ -80,7 +80,7 @@ def buffered(req):
 
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         yield c
 
 
@@ -123,7 +123,7 @@ def test_max_body_size_enforced_on_stream(client):
     # Its own module: a worker serves one app per module.
     from tests.apps.upload_small_cap import app
 
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         # 2 KB body > 1 KB cap → feeder sends ChunkMsg::Err
         try:
             resp = c.post("/up", body=b"y" * 2048)
@@ -139,16 +139,16 @@ def test_max_body_size_enforced_on_stream(client):
 def test_a_streamed_route_gets_its_first_chunk_before_the_rest_is_sent():
     """The handler has the first chunk while the client still holds the rest of the body: the
     server does not collect the body first (15549c56: on the sub-interpreter server a
-    stream=True route buffered it all; the byte-count test above passes either way). If the
+    body=BodyStream route buffered it all; the byte-count test above passes either way). If the
     body were collected, the handler would not run until the rest is sent, and the wait below
     would run out."""
     from tests.apps.upload_first_chunk import app, first_chunk_seen
 
     first, rest = b"a" * 1000, b"b" * 3000
-    with TestClient(app, transport="tcp") as c:
-        with socket.create_connection((c.host, c.port), timeout=10) as sock:
+    with TestServer(app) as server:
+        with socket.create_connection((server.host, server.port), timeout=10) as sock:
             sock.sendall(
-                b"POST /first-then-rest HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+                b"POST /first-then-rest HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
                 b"Content-Length: %d\r\n\r\n" % (len(first) + len(rest)) + first
             )
             assert first_chunk_seen.wait(timeout=10), "the handler did not get the first chunk"

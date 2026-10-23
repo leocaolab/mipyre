@@ -6,8 +6,8 @@ docs/design/code-review-cced8c2-roadmap.md, M2 and "Carried into M2 from M1"), e
 the paths marked as regression coverage, which already behaved.
 
 Serving paths, as `app.run` picks them:
-  - "gil"       MIPYRE_RUNTIME=main, MIPYRE_TPC=0  → multi-thread runtime, handlers on main
-  - "tpc-gil"   MIPYRE_RUNTIME=main                  → TPC threads, handlers on main
+  - "gil"       MIPYRE_TEST_MODE=main, MIPYRE_TPC=0  → multi-thread runtime, handlers on main
+  - "tpc-gil"   MIPYRE_TEST_MODE=main                  → TPC threads, handlers on main
   - "tpc"       default runtime                        → TPC inline (sub-interp) + main bridge (runtime="main")
   - "pool"      default runtime, MIPYRE_TPC=0        → sub-interp pool + main (runtime="main")
 """
@@ -31,7 +31,7 @@ import urllib.request
 
 import pytest
 
-from tests._helpers import bound_port, read_file, settle
+from tests._helpers import bound_port, metric_count, read_file, set_subinterpreters, settle
 
 PYTHON = sys.executable
 HOST = "127.0.0.1"
@@ -57,7 +57,7 @@ PATHS: dict[str, dict[str, str | None]] = {
 
 class Server:
     """A Mipyre server running `script` on one serving path. `app.run` in the script
-    reads `port` from `M2_PORT`; the "gil" paths run with `MIPYRE_RUNTIME=main`."""
+    reads `port` from `M2_PORT`; the "gil" paths run with `MIPYRE_TEST_MODE=main`."""
 
     def __init__(self, script: str, path: str, workers: int = 2):
         self.port = 0  # the bound one once the server listens
@@ -66,14 +66,14 @@ class Server:
             f.write(textwrap.dedent(script))
         self.log_path = self.script_path + ".log"
         env = dict(os.environ)
-        env.pop("MIPYRE_RUNTIME", None)
+        env.pop("MIPYRE_TEST_MODE", None)
         if (runtime := PATHS[path]["runtime"]) is not None:
-            env["MIPYRE_RUNTIME"] = runtime
+            env["MIPYRE_TEST_MODE"] = runtime
         env["M2_PORT"] = "0"
-        env["M2_WORKERS"] = str(workers)
         env.pop("MIPYRE_TPC", None)
         if (tpc := PATHS[path]["tpc"]) is not None:
             env["MIPYRE_TPC"] = tpc
+        set_subinterpreters(env, str(workers))
         with open(self.log_path, "w") as log:
             self.proc = subprocess.Popen(
                 [PYTHON, self.script_path],
@@ -129,7 +129,7 @@ class Server:
 
 RUN = """
 import os
-app.run(host="127.0.0.1", port=int(os.environ["M2_PORT"]), workers=int(os.environ["M2_WORKERS"]))
+app.run(host="127.0.0.1", port=int(os.environ["M2_PORT"]))
 """
 
 
@@ -142,8 +142,9 @@ def _access_lines(log: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 FALLBACK_SCRIPT = """
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/")
 def index(req):
@@ -171,8 +172,9 @@ def test_fallback_serves_unmatched_paths(path):
 # ---------------------------------------------------------------------------
 
 BODY_SCRIPT = """
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.request_timeout = REQUEST_BUDGET
 
 @app.post("/echo")
@@ -188,7 +190,7 @@ def _stalled_post(port: int, wait: float) -> tuple[bytes | None, float]:
     start = time.time()
     with socket.create_connection((HOST, port), timeout=wait) as s:
         s.sendall(
-            b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n0123456789"
+            b"POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\n0123456789"
         )
         try:
             data = s.recv(4096)
@@ -198,18 +200,15 @@ def _stalled_post(port: int, wait: float) -> tuple[bytes | None, float]:
 
 
 ADMISSION_SCRIPT = """
+import os
 from mipyre import Mipyre
-from mipyre.engine import get_gil_metrics
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.enable_cors(allow_origins="https://app.example")
+app.enable_metrics()
 
 @app.post("/upload")
 def upload(req):
     return str(len(req.body))
-
-@app.get("/dropped", runtime="main")
-def dropped(req):
-    return {"dropped": get_gil_metrics().dropped_requests}
 """ + RUN
 
 
@@ -239,7 +238,7 @@ def test_pool_admission_rejects_large_bodies_past_the_permit_budget():
     try:
         for _ in range(129):
             s = socket.create_connection((HOST, srv.port), timeout=10)
-            s.sendall(b"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n")
+            s.sendall(b"POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 100000\r\n\r\n")
             conns.append(s)
         # The ones holding a permit wait for their body, so the refused one is the only
         # connection with a reply.
@@ -251,8 +250,9 @@ def test_pool_admission_rejects_large_bodies_past_the_permit_budget():
         status, headers = _reply_head(replied[0])
         assert status == 503
         assert headers.get("access-control-allow-origin") == "https://app.example"
-        status, body, _ = srv.request("/dropped")
-        assert json.loads(body)["dropped"] >= 1
+        status, body, _ = srv.request("/metrics")
+        # This server's own refusals: the one 503 above.
+        assert metric_count(body.decode(), "mipyre_http_requests_refused_total") == 1
     finally:
         for s in conns:
             s.close()
@@ -293,10 +293,11 @@ def test_the_body_time_settings_have_defaults_and_refuse_bad_values():
 
 SLOW_SCRIPT = """
 import time
+import os
 from mipyre import Mipyre
-from mipyre.engine import get_gil_metrics
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.request_timeout = REQUEST_BUDGET
+app.enable_metrics()
 
 @app.get("/slow")
 def slow(req):
@@ -307,10 +308,6 @@ def slow(req):
 def slow_gil(req):
     time.sleep(REQUEST_BUDGET + 0.5)
     return "late"
-
-@app.get("/dropped", runtime="main")
-def dropped(req):
-    return {"dropped": get_gil_metrics().dropped_requests}
 """.replace("REQUEST_BUDGET", str(SLOW_BUDGET_S)) + RUN
 
 # (serving path, route): every way a handler call is dispatched.
@@ -350,9 +347,11 @@ def test_handler_timeout_is_504_on_every_path():
 
         # A request the server gave up on is counted as dropped, on every path.
         for case, srv in servers.items():
-            status, body, _ = srv.request("/dropped")
+            status, body, _ = srv.request("/metrics")
             assert status == 200
-            assert json.loads(body)["dropped"] >= 1, f"{case}: DROPPED_REQUESTS not counted"
+            # This server's own refusals: its one request past the budget.
+            refused = metric_count(body.decode(), "mipyre_http_requests_refused_total")
+            assert refused == 1, f"{case}: {refused} refusals counted"
     finally:
         for srv in servers.values():
             srv.stop()
@@ -364,8 +363,9 @@ def test_handler_timeout_is_504_on_every_path():
 # ---------------------------------------------------------------------------
 
 LOG_SCRIPT = """
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.enable_access_log()
 app.add_fast_response("GET", "/fast", b"fast")
 
@@ -401,9 +401,10 @@ def test_every_response_writes_one_access_line(path):
 # ---------------------------------------------------------------------------
 
 CTX_SCRIPT = """
+import os
 from mipyre import Mipyre, Response
 from mipyre.context import ctx
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.before_request
 def tag(req):
@@ -452,8 +453,9 @@ def test_ctx_does_not_leak_into_the_next_request(path, route):
 # ---------------------------------------------------------------------------
 
 WS_SCRIPT = """
+import os
 from mipyre import Mipyre, Response
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.enable_cors(allow_origins="https://app.example")
 
 @app.before_request
@@ -516,8 +518,9 @@ def test_fast_response_rejects_invalid_status_and_headers_at_registration():
             "-c",
             textwrap.dedent(
                 """
+                import os
                 from mipyre import Mipyre
-                app = Mipyre()
+                app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
                 for kwargs in ({"status_code": 1000}, {"status_code": 42},
                                {"headers": {"x-bad": "line\\nbreak"}},
                                {"headers": {"bad header": "v"}},
@@ -542,8 +545,9 @@ def test_fast_response_rejects_invalid_status_and_headers_at_registration():
 
 
 STATUS_SCRIPT = """
+import os
 from mipyre import Mipyre, Response
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/bad-status")
 def bad_status(req):

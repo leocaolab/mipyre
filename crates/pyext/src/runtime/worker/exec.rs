@@ -60,7 +60,7 @@ pub(super) use bundled;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScriptFailure {
     RelativeImport,
-    /// It holds the explanation `mipyre._subinterp_import.explain` gave.
+    /// It holds the explanation `mipyre._worker.imports.explain` gave.
     NotForSubinterpreters(Box<str>),
     /// It holds each check that raised, with its error.
     NotDiagnosed(Box<str>),
@@ -86,6 +86,19 @@ impl std::fmt::Display for ScriptFailure {
     }
 }
 
+/// What loads C extensions in the worker running a source, which decides whether a failed
+/// import is explained as an extension that can't load in a sub-interpreter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExtensionLoader {
+    /// CPython, with its own check: an extension that can't load fails, and the engine says what
+    /// to do.
+    CPython,
+    /// The `runtime="isolated"` adapter, which copies such extensions per worker; when it can't,
+    /// its own `IsolationError` says why, and the engine's advice (which names
+    /// `runtime="isolated"`) would be wrong.
+    IsolationAdapter,
+}
+
 /// What a source raised, still on its interpreter, and what the engine could tell of why.
 #[derive(Debug)]
 pub(super) struct ExecFailure {
@@ -94,11 +107,7 @@ pub(super) struct ExecFailure {
 }
 
 /// Creates a module registered in `sys.modules`, with builtins and, for the script, `__file__`.
-pub(super) fn new_module<'py>(
-    py: Python<'py>,
-    name: &CStr,
-    file: Option<&Path>,
-) -> PyResult<Bound<'py, PyModule>> {
+pub(super) fn new_module<'py>(py: Python<'py>, name: &CStr, file: Option<&Path>) -> PyResult<Bound<'py, PyModule>> {
     let module = PyModule::new(py, &name.to_string_lossy())?;
     // SAFETY: The thread is attached (`py`), and `PyEval_GetBuiltins` returns a borrowed
     // reference to the current builtins dict that is never NULL.
@@ -119,16 +128,13 @@ pub(super) fn exec_in(
     py: Python<'_>,
     src: &PythonSource<'_>,
     module: &Bound<'_, PyModule>,
+    loader: ExtensionLoader,
 ) -> Result<(), ExecFailure> {
     // The path is spelled as `os.fsdecode` would, so a path that is not UTF-8 keeps its bytes.
-    let file = src
-        .file
-        .as_os_str()
-        .into_pyobject(py)
-        .map_err(|e| ExecFailure {
-            raised: PyErr::from(e),
-            failure: None,
-        })?;
+    let file = src.file.as_os_str().into_pyobject(py).map_err(|e| ExecFailure {
+        raised: PyErr::from(e),
+        failure: None,
+    })?;
     let dict = module.dict();
     // SAFETY: The thread is attached (`py`), `src.text` is NUL-terminated, and `file` and `dict`
     // are live; both calls return a new reference or NULL with an exception set.
@@ -144,38 +150,37 @@ pub(super) fn exec_in(
             ),
         )
         .and_then(|code| {
-            Bound::from_owned_ptr_or_err(
-                py,
-                ffi::PyEval_EvalCode(code.as_ptr(), dict.as_ptr(), dict.as_ptr()),
-            )
+            Bound::from_owned_ptr_or_err(py, ffi::PyEval_EvalCode(code.as_ptr(), dict.as_ptr(), dict.as_ptr()))
         })
     };
     ran.map(drop).map_err(|e| ExecFailure {
-        failure: script_failure(py, &e, &file, src),
+        failure: script_failure(py, &e, &file, src, loader),
         raised: e,
     })
 }
 
-/// Explains `err` when the engine can: an extension that cannot load in a sub-interpreter, or a
-/// relative import on the innermost traceback line in `filename`. A check that itself raises comes
-/// back as [`ScriptFailure::NotDiagnosed`], so the caller sees it.
+/// Explains `err` when the engine can: an extension that cannot load in a sub-interpreter (only
+/// under [`ExtensionLoader::CPython`]), or a relative import on the innermost traceback line in
+/// `filename`. A check that itself raises comes back as [`ScriptFailure::NotDiagnosed`], so the
+/// caller sees it.
 fn script_failure(
     py: Python<'_>,
     err: &PyErr,
     filename: &Bound<'_, PyString>,
     src: &PythonSource<'_>,
+    loader: ExtensionLoader,
 ) -> Option<ScriptFailure> {
     let mut undiagnosed: Vec<String> = Vec::new();
-    match py
-        .import("mipyre._subinterp_import")
-        .and_then(|m| m.call_method1("explain", (err.value(py),)))
-        .and_then(|text| text.extract::<Option<String>>())
-    {
-        Ok(Some(text)) => return Some(ScriptFailure::NotForSubinterpreters(text.into_boxed_str())),
-        Ok(None) => {}
-        Err(e) => undiagnosed.push(format!(
-            "the sub-interpreter check of {filename} raised {e}"
-        )),
+    if loader == ExtensionLoader::CPython {
+        match py
+            .import("mipyre._worker.imports")
+            .and_then(|m| m.call_method1("explain", (err.value(py),)))
+            .and_then(|text| text.extract::<Option<String>>())
+        {
+            Ok(Some(text)) => return Some(ScriptFailure::NotForSubinterpreters(text.into_boxed_str())),
+            Ok(None) => {}
+            Err(e) => undiagnosed.push(format!("the sub-interpreter check of {filename} raised {e}")),
+        }
     }
     if !err.is_instance_of::<PyImportError>(py) {
         return not_diagnosed(undiagnosed);
@@ -184,9 +189,7 @@ fn script_failure(
         Ok(true) => Some(ScriptFailure::RelativeImport),
         Ok(false) => not_diagnosed(undiagnosed),
         Err(e) => {
-            undiagnosed.push(format!(
-                "the relative-import check of {filename} raised {e}"
-            ));
+            undiagnosed.push(format!("the relative-import check of {filename} raised {e}"));
             not_diagnosed(undiagnosed)
         }
     }
@@ -197,18 +200,11 @@ fn not_diagnosed(undiagnosed: Vec<String>) -> Option<ScriptFailure> {
 }
 
 /// Returns the line of the innermost traceback frame in `filename`, if any.
-fn failing_line(
-    py: Python<'_>,
-    err: &PyErr,
-    filename: &Bound<'_, PyString>,
-) -> PyResult<Option<usize>> {
+fn failing_line(py: Python<'_>, err: &PyErr, filename: &Bound<'_, PyString>) -> PyResult<Option<usize>> {
     let mut line = None;
     let mut tb = err.traceback(py);
     while let Some(frame) = tb {
-        let code_file = frame
-            .getattr("tb_frame")?
-            .getattr("f_code")?
-            .getattr("co_filename")?;
+        let code_file = frame.getattr("tb_frame")?.getattr("f_code")?.getattr("co_filename")?;
         if code_file.eq(filename)? {
             line = Some(frame.getattr("tb_lineno")?.extract()?);
         }
@@ -219,11 +215,7 @@ fn failing_line(
 
 /// Tells whether `line` is inside a relative `from` import. `src` is parsed from its bytes, as it
 /// was compiled, so a coding cookie applies to both.
-fn relative_import_at(
-    py: Python<'_>,
-    src: &PythonSource<'_>,
-    line: Option<usize>,
-) -> PyResult<bool> {
+fn relative_import_at(py: Python<'_>, src: &PythonSource<'_>, line: Option<usize>) -> PyResult<bool> {
     let Some(line) = line else {
         return Ok(false);
     };

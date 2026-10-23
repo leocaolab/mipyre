@@ -13,11 +13,7 @@ use mipyre_tpc::panic_message;
 /// Runs `f` and raises a Rust panic in it as an unlogged [`EnginePanic`]; whoever catches it logs
 /// it once.
 #[inline]
-pub(super) fn no_panic<T>(
-    context: &'static str,
-    py: Python<'_>,
-    f: impl FnOnce() -> PyResult<T>,
-) -> PyResult<T> {
+pub(super) fn no_panic<T>(context: &'static str, py: Python<'_>, f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(result) => result,
         Err(payload) => Err(EnginePanic::raise(py, panicked(context, &*payload))),

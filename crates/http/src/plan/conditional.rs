@@ -16,10 +16,7 @@ impl EntityTag {
         reason = "quotes and hex digits are visible ASCII: the header-value parse cannot fail"
     )]
     pub fn of_digest(digest: u64) -> Self {
-        EntityTag(
-            HeaderValue::try_from(format!("\"{digest:016x}\""))
-                .expect("quotes and hex digits are visible ASCII"),
-        )
+        EntityTag(HeaderValue::try_from(format!("\"{digest:016x}\"")).expect("quotes and hex digits are visible ASCII"))
     }
 
     pub fn header_value(&self) -> HeaderValue {
@@ -47,7 +44,10 @@ pub fn not_modified(request: &HeaderMap, etag: &EntityTag, modified: Option<Http
     };
     let (Some(modified), Ok(since)) = (
         modified,
-        since.to_str().map_err(drop).and_then(|s| HttpDate::from_str(s).map_err(drop)),
+        since
+            .to_str()
+            .map_err(drop)
+            .and_then(|s| HttpDate::from_str(s).map_err(drop)),
     ) else {
         return false;
     };
@@ -133,7 +133,10 @@ mod tests {
 
     #[test]
     fn if_none_match_lists_and_lines() {
-        assert!(not_modified(&[(IF_NONE_MATCH, "\"a\", W/\"b,c\" ,\"0123456789abcdef\"")], None));
+        assert!(not_modified(
+            &[(IF_NONE_MATCH, "\"a\", W/\"b,c\" ,\"0123456789abcdef\"")],
+            None
+        ));
         assert!(!not_modified(&[(IF_NONE_MATCH, "\"a\", W/\"b,c\"")], None));
         assert!(not_modified(
             &[(IF_NONE_MATCH, "\"a\""), (IF_NONE_MATCH, "\"0123456789abcdef\"")],
@@ -161,24 +164,42 @@ mod tests {
     fn if_none_match_overrides_if_modified_since() {
         let modified = Some(date("Sun, 06 Nov 1994 08:49:37 GMT"));
         let later = "Mon, 07 Nov 1994 08:49:37 GMT";
-        assert!(!not_modified(&[(IF_NONE_MATCH, "\"other\""), (IF_MODIFIED_SINCE, later)], modified));
+        assert!(!not_modified(
+            &[(IF_NONE_MATCH, "\"other\""), (IF_MODIFIED_SINCE, later)],
+            modified
+        ));
         assert!(not_modified(&[(IF_MODIFIED_SINCE, later)], modified));
     }
 
     #[test]
     fn if_modified_since_on_either_side_of_the_change() {
         let modified = Some(date("Sun, 06 Nov 1994 08:49:37 GMT"));
-        assert!(not_modified(&[(IF_MODIFIED_SINCE, "Sun, 06 Nov 1994 08:49:37 GMT")], modified));
-        assert!(!not_modified(&[(IF_MODIFIED_SINCE, "Sun, 06 Nov 1994 08:49:36 GMT")], modified));
+        assert!(not_modified(
+            &[(IF_MODIFIED_SINCE, "Sun, 06 Nov 1994 08:49:37 GMT")],
+            modified
+        ));
+        assert!(!not_modified(
+            &[(IF_MODIFIED_SINCE, "Sun, 06 Nov 1994 08:49:36 GMT")],
+            modified
+        ));
         // The obsolete formats a recipient must accept.
-        assert!(not_modified(&[(IF_MODIFIED_SINCE, "Sunday, 06-Nov-94 08:49:37 GMT")], modified));
-        assert!(not_modified(&[(IF_MODIFIED_SINCE, "Sun Nov  6 08:49:37 1994")], modified));
+        assert!(not_modified(
+            &[(IF_MODIFIED_SINCE, "Sunday, 06-Nov-94 08:49:37 GMT")],
+            modified
+        ));
+        assert!(not_modified(
+            &[(IF_MODIFIED_SINCE, "Sun Nov  6 08:49:37 1994")],
+            modified
+        ));
     }
 
     #[test]
     fn an_unusable_if_modified_since_is_ignored() {
         let modified = Some(date("Sun, 06 Nov 1994 08:49:37 GMT"));
         assert!(!not_modified(&[(IF_MODIFIED_SINCE, "yesterday")], modified));
-        assert!(!not_modified(&[(IF_MODIFIED_SINCE, "Mon, 07 Nov 1994 08:49:37 GMT")], None));
+        assert!(!not_modified(
+            &[(IF_MODIFIED_SINCE, "Mon, 07 Nov 1994 08:49:37 GMT")],
+            None
+        ));
     }
 }

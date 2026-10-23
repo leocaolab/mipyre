@@ -3,7 +3,7 @@
 A failure is carried as a typed error holding the raw exception text and traceback,
 logged once where it happens with the request's id, and rendered once at the edge:
 
-- a 5xx body is generic plus that request id: ``{"error": "Internal Server Error",
+- a 5xx body is generic plus that request id: ``{"detail": "Internal Server Error",
   "request_id": "..."}``; the exception text never reaches the client;
 - a 4xx body carries the reason;
 - the log line that holds the exception holds the same request id.
@@ -13,7 +13,7 @@ docs/design/code-review-cced8c2-roadmap.md, M4), except the cases marked as regr
 coverage.
 
 Serving paths, as `app.run` picks them:
-  - "gil"   MIPYRE_RUNTIME=main, MIPYRE_TPC=0  → handlers on main
+  - "gil"   MIPYRE_TEST_MODE=main, MIPYRE_TPC=0  → handlers on main
   - "tpc"   default runtime                        → TPC inline sub-interpreters (+ bridge)
   - "pool"  default runtime, MIPYRE_TPC=0        → sub-interp pool (sync + async workers)
 """
@@ -33,7 +33,7 @@ import uuid
 
 import pytest
 
-from tests._helpers import lines_with, bound_port, read_file
+from tests._helpers import lines_with, bound_port, read_file, set_subinterpreters
 
 from mipyre import SharedState
 from mipyre.engine import Request
@@ -77,18 +77,18 @@ class Server:
             f.write(textwrap.dedent(script))
         self.log_path = self.script_path + ".log"
         env = dict(os.environ)
-        env.pop("MIPYRE_RUNTIME", None)
+        env.pop("MIPYRE_TEST_MODE", None)
         if (runtime := PATHS[path]["runtime"]) is not None:
-            env["MIPYRE_RUNTIME"] = runtime
+            env["MIPYRE_TEST_MODE"] = runtime
         elif subinterp_runtime is not None:
             # The sub-interpreter paths of an app that needs runtime="isolated" (pydantic).
-            env["MIPYRE_RUNTIME"] = subinterp_runtime
+            env["MIPYRE_TEST_MODE"] = subinterp_runtime
         env["M4_PORT"] = "0"
-        env["M4_WORKERS"] = str(workers)
         env.pop("MIPYRE_TPC", None)
         env.pop("MIPYRE_LOG", None)
         if (tpc := PATHS[path]["tpc"]) is not None:
             env["MIPYRE_TPC"] = tpc
+        set_subinterpreters(env, str(workers))
         with open(self.log_path, "w") as log:
             self.proc = subprocess.Popen(
                 [PYTHON, self.script_path],
@@ -158,7 +158,7 @@ class Server:
 
 RUN = """
 import os
-app.run(host="127.0.0.1", port=int(os.environ["M4_PORT"]), workers=int(os.environ["M4_WORKERS"]))
+app.run(host="127.0.0.1", port=int(os.environ["M4_PORT"]))
 """
 
 SCRIPT = """
@@ -166,9 +166,10 @@ import logging
 
 from pydantic import BaseModel
 
-from mipyre import Mipyre
+import os
+from mipyre import Mipyre, rpc
 
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/sync-raise")
 def sync_raise(req):
@@ -223,45 +224,50 @@ class Item(BaseModel):
     name: str
     qty: int
 
-@app.post("/model", model=Item)
+@app.post("/model", body=Item)
 def model(body):
     return {"name": body.name}
 
 # -- rpc ---------------------------------------------------------------------
 
-@app.rpc("/rpc/echo")
+@rpc(app)
 def echo(data):
     return data
 
-@app.rpc("/rpc/boom")
+@rpc(app, "boom")
 def rpc_boom(data):
     raise RuntimeError("m4-secret-rpc")
 
 # -- health ------------------------------------------------------------------
 
-app.enable_health_probes()
+from mipyre import HealthProbes
+probes = HealthProbes(app)
 
-@app.readiness_check("db")
+@probes.check("db")
 def db_ready():
     raise ConnectionError("m4-secret-health dsn=postgres://admin:hunter2@db")
 
 # -- mcp ---------------------------------------------------------------------
 
-@app.mcp.tool(description="raises")
+from mipyre.mcp import MCPServer
+mcp = MCPServer(app)
+
+@mcp.tool(description="raises")
 def explode() -> str:
     raise RuntimeError("m4-secret-mcp")
 
-@app.mcp.tool(description="adds")
+@mcp.tool(description="adds")
 def add(a: int, b: int) -> int:
     return a + b
 """ + RUN
 
 
 RID_SCRIPT = """
+import os
 from mipyre import Mipyre
 
-app = Mipyre()
-app.enable_request_id()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
+app.enable_request_id_header()
 
 @app.get("/sync-raise")
 def sync_raise(req):
@@ -275,7 +281,7 @@ def rid(req):
 
 @pytest.fixture(scope="module", params=ALL_PATHS)
 def srv(request):
-    # SCRIPT validates with pydantic (model=), whose core can't load in a plain
+    # SCRIPT validates with pydantic (body=), whose core can't load in a plain
     # sub-interpreter: its sub-interpreter paths run as runtime="isolated".
     s = Server(SCRIPT, request.param, subinterp_runtime="isolated")
     yield s
@@ -296,7 +302,7 @@ def _assert_generic_500(r: Reply, secret: str) -> str:
     body = r.json()
     rid = body.get("request_id")
     assert isinstance(rid, str) and rid, body
-    assert body == {"error": GENERIC_500, "request_id": rid}, body
+    assert body == {"detail": GENERIC_500, "request_id": rid}, body
     return rid
 
 
@@ -353,7 +359,7 @@ def test_request_id_is_readable_by_the_handler(srv):
 
 
 # ---------------------------------------------------------------------------
-# D4 request id: one writer. `enable_request_id` reuses it, the client's id wins.
+# D4 request id: one writer. `enable_request_id_header` reuses it, the client's id wins.
 # ---------------------------------------------------------------------------
 
 
@@ -387,13 +393,12 @@ def test_rpc_malformed_body_is_a_400_with_the_reason(srv):
     )
     assert r.status == 400, (r.status, r.body)
     body = r.json()
-    assert body["ok"] is False
     # The decoder's reason, with where the body stops being JSON.
-    assert "line 1 column 2" in body["error"], body
+    assert "line 1 column 2" in body["detail"], body
 
 
 def test_validation_error_is_a_422_with_the_detail(srv):
-    # Regression coverage: model= validation already answered 422 with pydantic's detail.
+    # Regression coverage: body= validation already answered 422 with pydantic's detail.
     r = srv.request(
         "POST", "/model", body=b'{"name": "x"}', headers={"Content-Type": "application/json"}
     )
@@ -405,7 +410,7 @@ def test_not_found_is_a_404_with_the_reason(srv):
     # Regression coverage.
     r = srv.request("GET", "/nope")
     assert r.status == 404
-    assert r.json() == {"error": "not found"}
+    assert r.json() == {"detail": "not found"}
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +424,7 @@ def test_rpc_handler_error_is_generic_with_request_id(srv):
     assert b"m4-secret-rpc" not in r.body and b"RuntimeError" not in r.body
     body = r.json()
     rid = body["request_id"]
-    assert body == {"ok": False, "error": GENERIC_500, "request_id": rid}
+    assert body == {"detail": GENERIC_500, "request_id": rid}
     _assert_logged_once(srv, "m4-secret-rpc", rid)
 
 
@@ -493,8 +498,9 @@ def test_worker_script_error_keeps_its_text():
     # The text of an exception message that is not valid UTF-8 (a lone surrogate) was
     # replaced by "" ("failed to extract string").
     script = """
+    import os
     from mipyre import Mipyre
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def index(req):
@@ -519,8 +525,9 @@ def test_worker_asyncio_setup_failure_is_a_startup_error():
     # must still fail.
     script = """
     import sys
+    import os
     from mipyre import Mipyre
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def index(req):
@@ -542,9 +549,10 @@ def test_missing_isojson_fails_at_startup():
     # to every dict.
     script = """
     import sys
+    import os
     from mipyre import Mipyre
     sys.modules["isojson"] = None
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def index(req):

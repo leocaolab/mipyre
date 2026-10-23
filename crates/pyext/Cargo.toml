@@ -37,12 +37,12 @@ leak_detect = ["dep:metrics", "dep:metrics-util"]
 bench = ["dep:httparse", "dep:backtrace"]
 
 # Start-phase timestamps: where a server's startup spends its time (the sub-interpreters'
-# creation, their setup, the start gate). Each stamp goes to stderr when
-# `MIPYRE_B183_TRACE=1` is set in the environment; off in every other build.
+# creation, their setup, the start gate). Each stamp goes to stderr in a build with this
+# feature; off in every other build.
 #
 # Build with:
 #   maturin develop --release --features startup_trace
-# and run a server with MIPYRE_B183_TRACE=1; `benchmarks/bench_startup.py` measures the total.
+# and run a server; `benchmarks/bench_startup.py` measures the total.
 startup_trace = ["mipyre_subinterp/startup_trace"]
 
 # Test-only fault injection: `mipyre.engine._fault_panic(message)` panics in Rust, so a
@@ -86,6 +86,10 @@ http-body-util = "0.1"
 bytes = "1"
 matchit = "0.8"
 serde_json = "1"
+# pyproject.toml's [tool.mipyre] tables, with the line of every key for the errors (b/335 D11); parsing only.
+toml = { version = "0.9", default-features = false, features = ["std", "parse"] }
+# A cookie's `Expires` as an HTTP-date (exchange/cookie.rs).
+httpdate = "1"
 # The access log's numbers, as serde_json writes them (telemetry/access_line.rs).
 itoa = "1"
 parking_lot = "0.12"
@@ -107,6 +111,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
+# Times answers by the CPU's counter (`serve/site.rs`).
+quanta = { version = "0.12", default-features = false }
 # The system calls it has safe calls for (process lanes, telemetry); libc keeps the rest, in
 # `lane/os.rs` and `telemetry/monitor.rs`.
 rustix = { version = "1.1.5", default-features = false, features = ["std", "event", "fs", "net", "param", "pipe", "process", "shm", "thread", "time"] }
@@ -135,13 +141,23 @@ backtrace = { version = "0.3", optional = true }
 
 [dev-dependencies]
 proptest = "1"
+# The fuzz target of the lane's answer decoder (src/lane/wire_fuzz.rs): `cargo test` replays its committed corpus,
+# `cargo bolero test` mutates it under libFuzzer.
+# Exactly 0.13.4: from 0.13.5 on its derive crate pins indexmap to =2.11.2, which would move the workspace's
+# shipping indexmap (h2, sqlx) back from 2.14.
+bolero = "=0.13.4"
 tokio = { version = "1", features = ["test-util"] }
 
 # The Loom models (`src/runtime/live_workers/loom_model.rs`), built only under `--cfg sync_model`, which swaps `src/sync.rs`'s names
 # for Loom's in this crate and in every package built with it, so Loom is a dependency under that cfg only:
-# `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_pyext --lib --release --target-dir target/loom loom`.
-[target.'cfg(sync_model)'.dependencies]
+# `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_pyext --lib --profile model --target-dir target/loom loom`.
+[target.'cfg(all(sync_model, not(sync_shuttle)))'.dependencies]
 loom = "0.7"
+
+# The Shuttle models (`src/runtime/job_queue/shuttle_model.rs`, b/744), built only under `--cfg sync_model --cfg
+# sync_shuttle`, which swaps `src/sync.rs`'s names for Shuttle's instead.
+[target.'cfg(all(sync_model, sync_shuttle))'.dependencies]
+shuttle = "0.9.8"
 
 [lints]
 workspace = true

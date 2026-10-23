@@ -9,6 +9,11 @@ use std::time::Duration;
 /// kernel's request socket, not an fd or a task.
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounds the gap between a client's bytes while the engine reads off what the client still sends
+/// after a connection's last answer: a client that has finished sending and is reading the answer
+/// sends nothing more, so the close waits this long after its last bytes.
+pub const LINGER_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
 const DEFAULT_MAX_BODY_BYTES: u64 = 10 * 1024 * 1024;
 /// The default matches the `websockets` library's 1 MiB rather than tungstenite's 64 MiB.
 const DEFAULT_MAX_MESSAGE_BYTES: MessageByteLimit = MessageByteLimit(1024 * 1024);
@@ -114,9 +119,7 @@ impl RequestBudget {
 const MAX_SETTING_SECS: u64 = 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
-#[error(
-    "{setting} must be a finite number of seconds above 0 and at most {MAX_SETTING_SECS} (365 days), got {got}"
-)]
+#[error("{setting} must be a finite number of seconds above 0 and at most {MAX_SETTING_SECS} (365 days), got {got}")]
 pub struct SecondsError {
     pub setting: &'static str,
     pub got: f64,
@@ -357,9 +360,7 @@ impl WsLimits {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WsLimitError {
-    #[error(
-        "max_websocket_message_size must be between 1 and {MAX_MESSAGE_BYTES_LIMIT} bytes, got {0}"
-    )]
+    #[error("max_websocket_message_size must be between 1 and {MAX_MESSAGE_BYTES_LIMIT} bytes, got {0}")]
     MessageSizeOutOfRange(i64),
     #[error("max_websocket_connections must be at least 1, got {0}")]
     ConnectionLimitOutOfRange(i64),
@@ -471,13 +472,14 @@ mod tests {
         for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e30] {
             assert_eq!(
                 RequestBudget::from_secs(seconds).map_err(|e| e.to_string()),
-                Err(SecondsError { setting: "request_timeout", got: seconds }.to_string()),
+                Err(SecondsError {
+                    setting: "request_timeout",
+                    got: seconds
+                }
+                .to_string()),
             );
         }
-        assert_eq!(
-            RequestBudget::from_secs(0.5).unwrap().get(),
-            Duration::from_millis(500)
-        );
+        assert_eq!(RequestBudget::from_secs(0.5).unwrap().get(), Duration::from_millis(500));
     }
 
     #[test]
@@ -511,10 +513,18 @@ mod tests {
         let year = MAX_SETTING_SECS as f64;
         type FromSecs = fn(f64) -> Result<Duration, SecondsError>;
         let settings: [(&str, FromSecs); 4] = [
-            ("request_timeout", |s| RequestBudget::from_secs(s).map(RequestBudget::get)),
-            ("body_time_limit", |s| BodyTimeLimit::from_secs(s).map(BodyTimeLimit::get)),
-            ("interrupt_grace", |s| InterruptGrace::from_secs(s).map(InterruptGrace::get)),
-            ("shutdown_timeout", |s| ShutdownTimeout::from_secs(s).map(ShutdownTimeout::get)),
+            ("request_timeout", |s| {
+                RequestBudget::from_secs(s).map(RequestBudget::get)
+            }),
+            ("body_time_limit", |s| {
+                BodyTimeLimit::from_secs(s).map(BodyTimeLimit::get)
+            }),
+            ("interrupt_grace", |s| {
+                InterruptGrace::from_secs(s).map(InterruptGrace::get)
+            }),
+            ("shutdown_timeout", |s| {
+                ShutdownTimeout::from_secs(s).map(ShutdownTimeout::get)
+            }),
         ];
         for (setting, from_secs) in settings {
             assert_eq!(from_secs(year), Ok(Duration::from_secs(MAX_SETTING_SECS)), "{setting}");
@@ -537,10 +547,7 @@ mod tests {
 
     #[test]
     fn the_default_request_budget_is_30_s() {
-        assert_eq!(
-            Limits::DEFAULT.request_budget.get(),
-            Duration::from_secs(30)
-        );
+        assert_eq!(Limits::DEFAULT.request_budget.get(), Duration::from_secs(30));
     }
 
     #[test]
@@ -554,7 +561,10 @@ mod tests {
         for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e30] {
             assert!(BodyTimeLimit::from_secs(seconds).is_err());
         }
-        assert_eq!(BodyTimeLimit::from_secs(1.5).unwrap().get(), Duration::from_millis(1500));
+        assert_eq!(
+            BodyTimeLimit::from_secs(1.5).unwrap().get(),
+            Duration::from_millis(1500)
+        );
     }
 }
 

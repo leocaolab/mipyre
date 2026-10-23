@@ -1,10 +1,10 @@
 //! Turns listener and accept failures into the Python exceptions `start()` and `serve()` raise,
 //! and prints where a server listens.
 
-use mipyre_transport::tcp::listener::{BindOptions, ListenerError, DEFAULT_BACKLOG};
 use mipyre_http::plan::limits::HEADER_READ_TIMEOUT;
 use mipyre_transport::driver::AcceptError;
 use mipyre_transport::endpoint::Endpoints;
+use mipyre_transport::tcp::listener::{BindOptions, ListenerError, DEFAULT_BACKLOG};
 
 pub(crate) fn print_listening(listening: &[String]) {
     for line in listening {

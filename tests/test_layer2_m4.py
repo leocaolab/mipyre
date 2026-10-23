@@ -95,7 +95,9 @@ def _no_panics(server: Server) -> None:
 
 RUN = """
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ["L2_PORT"]), workers={workers})
+    # The sub-interpreter count: one per TPC thread, or the pool's with MIPYRE_TPC=0.
+    size = "subinterpreters" if os.environ.get("MIPYRE_TPC") == "0" else "threads"
+    app.run(host="127.0.0.1", port=int(os.environ["L2_PORT"]), **{{size: {workers}}})
 """
 
 
@@ -309,7 +311,7 @@ def test_async_pool_request_ids_do_not_cross(tmp_path):
     s = Server(tmp_path, _app("""
         import asyncio
         app = Mipyre()
-        app.enable_request_id()
+        app.enable_request_id_header()
         RENDEZVOUS = os.environ["RID_RENDEZVOUS"]
 
         @app.get("/ping")
@@ -355,7 +357,6 @@ _ENGINE_NAMES = [
     "MipyreApp", "Request", "Response", "WebSocket", "SharedState", "Stream",
     "PgPool", "PgCursor", "get_gil_metrics", "init_logger", "emit_python_log", "_in_worker",
     "_worker_recv", "_worker_send", "_worker_to_response",
-    "_worker_app_handlers", "_worker_app_hooks",
 ]
 
 
@@ -468,7 +469,7 @@ def test_worker_logs_carry_worker_id(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E2E-13 two apps, E2E-14 isolate() removed, E2E-14b mipyre never re-executed
+# E2E-13 two apps, E2E-14b mipyre never re-executed
 # ---------------------------------------------------------------------------
 
 
@@ -492,30 +493,12 @@ def test_second_app_in_worker_fails_startup(tmp_path):
     assert fork_panic_lines(log) == []
 
 
-def test_isolate_fails_on_main_naming_the_new_way(tmp_path):
-    s = Server(tmp_path, _app("""
-        app = Mipyre()
-        app.isolate("mipyre")
-
-        @app.get("/ping")
-        def ping(req):
-            return "ok"
-    """))
-    rc = s.wait_exit()
-    log = s.log()
-    assert rc != 0, log
-    assert "app.isolate('mipyre') was removed" in log and "runtime='isolated'" in log, log[-3000:]
-    # Refused on main, before any worker exists.
-    assert "Listening on" not in log
-
-
-def test_reactive_isolation_never_reexecutes_mipyre(tmp_path):
+def test_isolation_never_reexecutes_mipyre(tmp_path):
     pytest.importorskip("pydantic_settings")
     s = Server(tmp_path, _app("""
         import sys
-        from mipyre.context import ctx
         app = Mipyre(runtime="isolated")
-        app.enable_request_id()
+        app.enable_request_id_header()
         ENGINE = sys.modules["mipyre.engine"]
 
         @app.get("/ping")
@@ -527,7 +510,7 @@ def test_reactive_isolation_never_reexecutes_mipyre(tmp_path):
             from mipyre.config import Settings  # pydantic_settings -> pydantic_core
             return {
                 "same_engine": sys.modules["mipyre.engine"] is ENGINE,
-                "rid": ctx.request_id(),
+                "rid": req.request_id,
                 "settings": Settings.__name__,
             }
     """))
@@ -546,71 +529,8 @@ def test_reactive_isolation_never_reexecutes_mipyre(tmp_path):
     _no_panics(s)
 
 
-def test_isolation_error_under_mipyre_import_keeps_the_package(tmp_path):
-    """E2E-14b, the exact path of M4 review B5: an isolation-class ImportError raised
-    inside an `import mipyre.<sub>` statement makes the reactive hook clone the failing
-    package and retry the statement. Before FR-11 it also evicted the statement's
-    package, `mipyre`, and the retry re-executed it (a second `mipyre.engine` module
-    object, duplicate ContextVars). A meta-path finder that fails once stands in for a
-    mipyre submodule that imports a non-shareable extension."""
-    pkg = tmp_path / "e2efakepkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("")
-    s = Server(tmp_path, _app("""
-        import sys
-        import mipyre.engine
-        app = Mipyre(runtime="isolated")
-        ENGINE = sys.modules["mipyre.engine"]
-        PACKAGE = sys.modules["mipyre"]
-
-        class _FailOnce:
-            fired = False
-
-            def find_spec(self, name, path=None, target=None):
-                if name == "mipyre._e2e_trigger" and not _FailOnce.fired:
-                    _FailOnce.fired = True
-                    raise ImportError(
-                        "e2efakepkg._ext does not support loading in subinterpreters",
-                        name="e2efakepkg",
-                    )
-                return None
-
-        if mipyre.engine._in_worker():
-            sys.meta_path.insert(0, _FailOnce())
-
-        @app.get("/ping")
-        def ping(req):
-            return "ok"
-
-        @app.get("/trigger")
-        def trigger(req):
-            try:
-                import mipyre._e2e_trigger  # noqa: F401 — whether the import succeeds is what is under test
-            except ImportError as e:
-                outcome = type(e).__name__
-            else:
-                outcome = "imported"
-            return {
-                "fired": _FailOnce.fired,
-                "outcome": outcome,
-                "same_engine": sys.modules["mipyre.engine"] is ENGINE,
-                "same_package": sys.modules["mipyre"] is PACKAGE,
-            }
-    """), {"PYTHONPATH": str(tmp_path)})
-    try:
-        s.wait_up()
-        r = httpx.get(s.base + "/trigger", timeout=60).json()
-    finally:
-        rc = s.stop()
-    assert r["fired"] is True, r
-    assert r["outcome"] == "ModuleNotFoundError", r
-    assert r["same_engine"] is True and r["same_package"] is True, r
-    assert rc == 0, s.log()[-3000:]
-    _no_panics(s)
-
-
 # ---------------------------------------------------------------------------
-# E2E-15: pydantic only for model= apps, and model= validates in workers
+# E2E-15: pydantic only for body= apps, and body= validates in workers
 # ---------------------------------------------------------------------------
 
 
@@ -640,7 +560,7 @@ def test_pydantic_not_imported_without_model(tmp_path):
 
 
 @pytest.mark.parametrize("tpc", ["1", "0"])
-def test_model_validates_in_workers_through_reactive_isolation(tmp_path, tpc):
+def test_model_validates_in_workers_through_isolation(tmp_path, tpc):
     pytest.importorskip("pydantic")
     s = Server(tmp_path, _app("""
         from pydantic import BaseModel
@@ -655,7 +575,7 @@ def test_model_validates_in_workers_through_reactive_isolation(tmp_path, tpc):
         def ping(req):
             return "ok"
 
-        @app.post("/items", model=Item)
+        @app.post("/items", body=Item)
         def create(req, item):
             return {"name": item.name, "qty": item.qty,
                     "worker": mipyre.engine._in_worker()}
@@ -804,7 +724,7 @@ def test_cli_run_serves_worker_routes(tmp_path):
     """))
     s = Server(tmp_path, "", argv=[
         sys.executable, "-m", "mipyre.cli", "run", "cliapp:app",
-        "--port", "0", "--workers", "2",
+        "--port", "0", "--threads", "2",
     ])
     try:
         s.wait_up()
@@ -819,7 +739,7 @@ def test_cli_run_serves_worker_routes(tmp_path):
 def test_raw_engine_script_serves_unchanged(tmp_path):
     s = Server(tmp_path, """
         import os
-        from mipyre.engine import MipyreApp
+        from mipyre.engine import MipyreApp, RuntimeChoice
 
         app = MipyreApp()
 
@@ -829,12 +749,12 @@ def test_raw_engine_script_serves_unchanged(tmp_path):
         def ping(req):
             return "ok"
 
-        app.get("/", hello)
-        app.get("/ping", ping)
+        app.route("GET", "/", hello, RuntimeChoice.Worker)
+        app.route("GET", "/ping", ping, RuntimeChoice.Worker)
 
         if __name__ == "__main__":
             app.run(host="127.0.0.1", port=int(os.environ["L2_PORT"]),
-                    workers=2)
+                    threads=2)
     """)
     try:
         s.wait_up()

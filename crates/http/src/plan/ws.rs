@@ -105,9 +105,7 @@ impl UpgradeError {
 mod tests {
     use super::*;
 
-    fn handshake_parts(
-        edit: impl FnOnce(http::request::Builder) -> http::request::Builder,
-    ) -> Parts {
+    fn handshake_parts(edit: impl FnOnce(http::request::Builder) -> http::request::Builder) -> Parts {
         let valid = http::Request::builder()
             .method("GET")
             .uri("/ws")
@@ -130,10 +128,7 @@ mod tests {
         let refused = |edit: fn(http::request::Builder) -> http::request::Builder| {
             WsHandshake::parse(&handshake_parts(edit)).err().unwrap()
         };
-        assert_eq!(
-            refused(|b| b.method("POST")),
-            UpgradeError::NotGet(Method::POST)
-        );
+        assert_eq!(refused(|b| b.method("POST")), UpgradeError::NotGet(Method::POST));
         assert_eq!(
             refused(|b| b.version(Version::HTTP_10)),
             UpgradeError::NotHttp11(Version::HTTP_10)
@@ -154,19 +149,14 @@ mod tests {
             .insert("sec-websocket-version", HeaderValue::from_static("8"));
         assert_eq!(
             WsHandshake::parse(&old_version).err(),
-            Some(UpgradeError::UnsupportedVersion(Some(
-                HeaderValue::from_static("8")
-            )))
+            Some(UpgradeError::UnsupportedVersion(Some(HeaderValue::from_static("8"))))
         );
         let mut h2c = handshake_parts(|b| b);
         h2c.headers.insert("upgrade", HeaderValue::from_static("h2c"));
         assert_eq!(WsHandshake::parse(&h2c).err(), Some(UpgradeError::NotWebsocket));
         let mut no_key = handshake_parts(|b| b);
         no_key.headers.remove("sec-websocket-key");
-        assert_eq!(
-            WsHandshake::parse(&no_key).err(),
-            Some(UpgradeError::MissingKey)
-        );
+        assert_eq!(WsHandshake::parse(&no_key).err(), Some(UpgradeError::MissingKey));
     }
 
     #[test]

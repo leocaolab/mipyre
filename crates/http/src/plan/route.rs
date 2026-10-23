@@ -12,6 +12,7 @@ use http::{Method, Response, StatusCode};
 use matchit::Router;
 
 use crate::plan::header::{own_header_name, own_header_value};
+use crate::plan::response::MAX_HANDLER_LINES;
 
 /// A response built in full at registration, served for an exact `(method, path)` without
 /// calling Python.
@@ -40,6 +41,8 @@ pub enum FastResponseError {
         name: String,
         source: http::header::InvalidHeaderValue,
     },
+    #[error("{given} headers, past the {MAX_HANDLER_LINES} lines a response carries")]
+    TooManyHeaderLines { given: usize },
 }
 
 impl FastResponse {
@@ -52,21 +55,19 @@ impl FastResponse {
         status: u16,
         headers: &HashMap<String, String>,
     ) -> Result<Self, FastResponseError> {
-        let status =
-            StatusCode::from_u16(status).map_err(|_| FastResponseError::InvalidStatus(status))?;
+        let status = StatusCode::from_u16(status).map_err(|_| FastResponseError::InvalidStatus(status))?;
+        if headers.len() > MAX_HANDLER_LINES {
+            return Err(FastResponseError::TooManyHeaderLines { given: headers.len() });
+        }
         let mut map = HeaderMap::with_capacity(headers.len() + 2);
         map.insert(CONTENT_TYPE, header_value("content-type", content_type)?);
-        map.insert(
-            SERVER,
-            HeaderValue::from_static(crate::plan::response::SERVER_HEADER),
-        );
+        map.insert(SERVER, HeaderValue::from_static(crate::plan::response::SERVER_HEADER));
         for (name, value) in headers {
-            let header = HeaderName::from_bytes(name.as_bytes()).map_err(|source| {
-                FastResponseError::InvalidHeaderName {
+            let header =
+                HeaderName::from_bytes(name.as_bytes()).map_err(|source| FastResponseError::InvalidHeaderName {
                     name: name.clone(),
                     source,
-                }
-            })?;
+                })?;
             map.append(header, header_value(name, value)?);
         }
         Ok(FastResponse {
@@ -147,9 +148,7 @@ pub enum TemplateError {
 /// Returns an error when a segment starts with `:name`.
 pub fn template_params(path: &str) -> Result<Vec<&str>, TemplateError> {
     if let Some(name) = path.split('/').find_map(colon_param) {
-        return Err(TemplateError::ColonParam {
-            name: name.to_string(),
-        });
+        return Err(TemplateError::ColonParam { name: name.to_string() });
     }
     let mut names = Vec::new();
     let mut rest = path;
@@ -171,10 +170,7 @@ pub fn template_params(path: &str) -> Result<Vec<&str>, TemplateError> {
 
 fn colon_param(segment: &str) -> Option<&str> {
     let name = segment.strip_prefix(':')?;
-    let starts_ident = name
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let starts_ident = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
     starts_ident.then_some(name)
 }
 
@@ -218,12 +214,38 @@ impl RouteId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HandlerTarget(usize);
 
+impl HandlerTarget {
+    /// Returns the handler's position among the table's route and fallback handlers.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// Where a route's handler runs; Python's `runtime="process"` is [`HandlerPlace::Lane`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandlerPlace {
     Worker(HandlerKind),
-    Main(BodyMode),
+    Main(MainHandler),
     Lane,
+}
+
+/// How a handler on the main interpreter runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MainHandler {
+    /// A `def` handler, reading its body as the mode says.
+    Sync(BodyMode),
+    /// An `async def` handler, which always reads a buffered body.
+    Async,
+}
+
+impl MainHandler {
+    /// Returns how the handler reads its body.
+    pub fn body(self) -> BodyMode {
+        match self {
+            MainHandler::Sync(body) => body,
+            MainHandler::Async => BodyMode::Buffered,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,18 +277,21 @@ pub struct RouteRegistration {
     pub kind: HandlerKind,
 }
 
-/// A combination of `runtime=`, `stream=` and handler kind that no serving path runs.
+/// A combination of `runtime=`, a streamed body (`body=BodyStream`) and handler kind that no serving path runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RouteRegistrationError {
-    #[error("stream=True needs runtime='main': a streamed request body is only fed to handlers on the main interpreter")]
-    StreamOffMain,
-    #[error("stream=True is not supported on `async def` handlers; use a `def` handler")]
-    StreamAsync,
-    #[error("runtime='process' does not take stream=True (process lanes v1 buffer the body)")]
-    LaneStream,
     #[error(
-        "runtime='process' does not run `async def` handlers (process lanes v1); use a `def` handler"
+        "body=BodyStream needs runtime='main': a streamed request body is only fed to handlers on the main interpreter"
     )]
+    StreamOffMain,
+    #[error("body=BodyStream is not supported on `async def` handlers; use a `def` handler")]
+    StreamAsync,
+    #[error(
+        "runtime='process' does not take body=BodyStream: a process route gets the whole body at \
+         once; use runtime='main' for a streamed body"
+    )]
+    LaneStream,
+    #[error("runtime='process' does not run `async def` handlers; use a `def` handler")]
     LaneAsync,
 }
 
@@ -274,25 +299,20 @@ impl TryFrom<RouteRegistration> for HandlerPlace {
     type Error = RouteRegistrationError;
 
     fn try_from(registration: RouteRegistration) -> Result<Self, RouteRegistrationError> {
-        let RouteRegistration {
-            runtime,
-            stream,
-            kind,
-        } = registration;
+        let RouteRegistration { runtime, stream, kind } = registration;
         match (runtime, stream, kind) {
             (RuntimeChoice::Lane, true, _) => Err(RouteRegistrationError::LaneStream),
-            (RuntimeChoice::Lane, false, HandlerKind::Async) => {
-                Err(RouteRegistrationError::LaneAsync)
-            }
+            (RuntimeChoice::Lane, false, HandlerKind::Async) => Err(RouteRegistrationError::LaneAsync),
             (RuntimeChoice::Lane, false, HandlerKind::Sync) => Ok(HandlerPlace::Lane),
             (_, true, HandlerKind::Async) => Err(RouteRegistrationError::StreamAsync),
-            (RuntimeChoice::Worker, true, HandlerKind::Sync) => {
-                Err(RouteRegistrationError::StreamOffMain)
-            }
+            (RuntimeChoice::Worker, true, HandlerKind::Sync) => Err(RouteRegistrationError::StreamOffMain),
             (RuntimeChoice::Main, true, HandlerKind::Sync) => {
-                Ok(HandlerPlace::Main(BodyMode::Streamed))
+                Ok(HandlerPlace::Main(MainHandler::Sync(BodyMode::Streamed)))
             }
-            (RuntimeChoice::Main, false, _) => Ok(HandlerPlace::Main(BodyMode::Buffered)),
+            (RuntimeChoice::Main, false, HandlerKind::Sync) => {
+                Ok(HandlerPlace::Main(MainHandler::Sync(BodyMode::Buffered)))
+            }
+            (RuntimeChoice::Main, false, HandlerKind::Async) => Ok(HandlerPlace::Main(MainHandler::Async)),
             (RuntimeChoice::Worker, false, kind) => Ok(HandlerPlace::Worker(kind)),
         }
     }
@@ -302,8 +322,9 @@ impl TryFrom<RouteRegistration> for HandlerPlace {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandlerCall {
     Worker(RouteId, HandlerKind),
-    /// A `runtime="main"` route, or the fallback handler, which always reads a buffered body.
-    Main(HandlerTarget, BodyMode),
+    /// A `runtime="main"` route, or the fallback handler, which is a `def` handler reading a
+    /// buffered body.
+    Main(HandlerTarget, MainHandler),
     Lane(RouteId),
 }
 
@@ -329,6 +350,9 @@ impl std::fmt::Display for RouteKey {
 /// The path parameters of a matched route, percent-decoded.
 pub type Params = Vec<(String, String)>;
 
+const GET_SLOT: usize = 0;
+const HEAD_SLOT: usize = 5;
+
 static STANDARD_METHODS: [Method; 9] = [
     Method::GET,
     Method::POST,
@@ -340,45 +364,6 @@ static STANDARD_METHODS: [Method; 9] = [
     Method::CONNECT,
     Method::TRACE,
 ];
-
-/// Where the table looks a request's method up, matching it without case because
-/// registration stores the uppercase spelling. Every request method has a slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MethodSlot<'a> {
-    /// The index into [`STANDARD_METHODS`].
-    Standard(usize),
-    Extension(&'a str),
-}
-
-impl<'a> MethodSlot<'a> {
-    // The engine's request pipeline is one large async fn, where the inliner otherwise leaves
-    // this a call per request.
-    #[inline(always)]
-    fn of(method: &'a Method) -> Self {
-        match standard_slot(method) {
-            Some(i) => MethodSlot::Standard(i),
-            None => Self::of_extension(method.as_str()),
-        }
-    }
-
-    #[inline]
-    fn is(self, standard: &Method) -> bool {
-        matches!(self, MethodSlot::Standard(i) if STANDARD_METHODS[i] == *standard)
-    }
-
-    /// Finds the slot of a method the `http` crate did not parse as standard, which may still be
-    /// a standard name in another case.
-    #[cold]
-    fn of_extension(name: &'a str) -> Self {
-        match STANDARD_METHODS
-            .iter()
-            .position(|m| m.as_str().eq_ignore_ascii_case(name))
-        {
-            Some(i) => MethodSlot::Standard(i),
-            None => MethodSlot::Extension(name),
-        }
-    }
-}
 
 /// Holds values keyed by method: a standard method in a fixed slot, without hashing, and any
 /// other in a short list.
@@ -403,27 +388,22 @@ fn standard_slot(method: &Method) -> Option<usize> {
 }
 
 impl<T> ByMethod<T> {
-
-    #[inline]
-    fn get(&self, method: &Method) -> Option<&T> {
-        match standard_slot(method) {
-            Some(i) => self.standard[i].as_ref(),
-            None => self.other.iter().find(|(m, _)| m == method).map(|(_, v)| v),
+    /// Finds what `at` finds under `method` spelled exactly as registered, since a method is
+    /// case-sensitive (RFC 9110 §9.1); a `HEAD` it finds nothing for takes the `GET` one, whose
+    /// body the pipeline drops (RFC 9110 §9.3.2).
+    // The engine's request pipeline is one large async fn, where the inliner otherwise leaves
+    // this a call per request.
+    #[inline(always)]
+    fn serving<'s, R>(&'s self, method: &Method, at: impl Fn(&'s T) -> Option<R>) -> Option<R> {
+        let Some(slot) = standard_slot(method) else {
+            let (_, value) = self.other.iter().find(|(m, _)| m == method)?;
+            return at(value);
+        };
+        let found = self.standard[slot].as_ref().and_then(&at);
+        if found.is_none() && slot == HEAD_SLOT {
+            return self.standard[GET_SLOT].as_ref().and_then(at);
         }
-    }
-
-    #[inline]
-    fn get_slot(&self, slot: MethodSlot<'_>) -> Option<&T> {
-        match slot {
-            MethodSlot::Standard(i) => self.standard[i].as_ref(),
-            // Registration stores an uppercase token, so this compares the request's uppercase
-            // spelling.
-            MethodSlot::Extension(name) => self
-                .other
-                .iter()
-                .find(|(m, _)| m.as_str().eq_ignore_ascii_case(name))
-                .map(|(_, v)| v),
-        }
+        found
     }
 
     fn get_or_default(&mut self, method: &Method) -> &mut T
@@ -467,12 +447,7 @@ struct FastPaths(Vec<(Box<str>, FastResponse)>);
 
 impl FastPaths {
     fn own_copy(&self) -> Self {
-        FastPaths(
-            self.0
-                .iter()
-                .map(|(p, r)| (p.clone(), r.own_copy()))
-                .collect(),
-        )
+        FastPaths(self.0.iter().map(|(p, r)| (p.clone(), r.own_copy())).collect())
     }
 
     #[inline]
@@ -575,10 +550,7 @@ impl RouteManifest {
     pub fn of<H, D>(table: &RouteTable<H, D>) -> Self {
         let sealed = table.sealed.unwrap_or_else(|| table.counts());
         RouteManifest {
-            routes: table.routes[..sealed.routes]
-                .iter()
-                .map(ExpectedRoute::of)
-                .collect(),
+            routes: table.routes[..sealed.routes].iter().map(ExpectedRoute::of).collect(),
             before_hooks: sealed.before_hooks,
             after_hooks: sealed.after_hooks,
         }
@@ -600,16 +572,8 @@ impl RouteManifest {
             let mut out = String::new();
             for (i, route) in s.routes.iter().enumerate() {
                 let ExpectedRoute { key, on_worker } = route;
-                let mark = if i == first_diff {
-                    "  <-- first difference"
-                } else {
-                    ""
-                };
-                let place = if *on_worker {
-                    ""
-                } else {
-                    " (not on a sub-interpreter)"
-                };
+                let mark = if i == first_diff { "  <-- first difference" } else { "" };
+                let place = if *on_worker { "" } else { " (not on a sub-interpreter)" };
                 out.push_str(&format!("    [{i}] {key}{place}{mark}\n"));
             }
             out.push_str(&format!(
@@ -777,12 +741,10 @@ impl<H, D> RouteTable<H, D> {
             source,
         })?;
         let router = self.routers.get_or_default(&key.method);
-        router
-            .insert(path, id)
-            .map_err(|source| RouteError::RouterRefused {
-                route: key.clone(),
-                source,
-            })?;
+        router.insert(path, id).map_err(|source| RouteError::RouterRefused {
+            route: key.clone(),
+            source,
+        })?;
         let target = HandlerTarget(self.handlers.len());
         self.handlers.push(handler);
         self.routes.push(Route {
@@ -800,17 +762,9 @@ impl<H, D> RouteTable<H, D> {
     /// # Errors
     ///
     /// Returns an error when `method` is not an HTTP token.
-    pub fn add_fast_response(
-        &mut self,
-        method: &str,
-        path: &str,
-        response: FastResponse,
-    ) -> Result<bool, RouteError> {
+    pub fn add_fast_response(&mut self, method: &str, path: &str, response: FastResponse) -> Result<bool, RouteError> {
         let method = parse_method(method, path)?;
-        Ok(self
-            .fast_responses
-            .get_or_default(&method)
-            .insert(path, response))
+        Ok(self.fast_responses.get_or_default(&method).insert(path, response))
     }
 
     /// Registers the WebSocket handler for `path`.
@@ -878,10 +832,7 @@ impl<H, D> RouteTable<H, D> {
     ///
     /// Panics when `index` is out of range.
     pub fn route_id(&self, index: usize) -> RouteId {
-        assert!(
-            index < self.routes.len(),
-            "route index {index} out of range"
-        );
+        assert!(index < self.routes.len(), "route index {index} out of range");
         RouteId(index)
     }
 
@@ -892,9 +843,7 @@ impl<H, D> RouteTable<H, D> {
     /// Returns whether any route runs on a sub-interpreter worker; only then does a server build
     /// sub-interpreters.
     pub fn uses_workers(&self) -> bool {
-        self.routes
-            .iter()
-            .any(|r| matches!(r.runtime, HandlerPlace::Worker(_)))
+        self.routes.iter().any(|r| matches!(r.runtime, HandlerPlace::Worker(_)))
     }
 
     pub fn uses_lane(&self) -> bool {
@@ -903,11 +852,7 @@ impl<H, D> RouteTable<H, D> {
 
     /// Returns whether any request can run on the main interpreter, counting the fallback.
     pub fn uses_main(&self) -> bool {
-        self.fallback.is_some()
-            || self
-                .routes
-                .iter()
-                .any(|r| matches!(r.runtime, HandlerPlace::Main(_)))
+        self.fallback.is_some() || self.routes.iter().any(|r| matches!(r.runtime, HandlerPlace::Main(_)))
     }
 
     #[inline]
@@ -919,16 +864,11 @@ impl<H, D> RouteTable<H, D> {
     /// route runs the `GET` route (RFC 9110 §9.3.2), and the pipeline drops the body.
     #[inline]
     pub fn resolve(&self, method: &Method, path: &str) -> Option<(HandlerCall, Params)> {
-        let slot = MethodSlot::of(method);
-        let (id, params) = match self.lookup(slot, path) {
-            Some(found) => found,
-            None if slot.is(&Method::HEAD) => self.lookup(MethodSlot::of(&Method::GET), path)?,
-            None => return None,
-        };
+        let (id, params) = self.routers.serving(method, |router| matched_route(router, path))?;
         let route = self.route(id);
         let call = match route.runtime {
             HandlerPlace::Worker(kind) => HandlerCall::Worker(id, kind),
-            HandlerPlace::Main(body) => HandlerCall::Main(route.handler, body),
+            HandlerPlace::Main(handler) => HandlerCall::Main(route.handler, handler),
             HandlerPlace::Lane => HandlerCall::Lane(id),
         };
         Some((call, params))
@@ -952,29 +892,26 @@ impl<H, D> RouteTable<H, D> {
 
     pub fn fallback_call(&self) -> Option<HandlerCall> {
         self.fallback
-            .map(|target| HandlerCall::Main(target, BodyMode::Buffered))
+            .map(|target| HandlerCall::Main(target, MainHandler::Sync(BodyMode::Buffered)))
     }
 
     /// Returns the pre-built response for exactly `(method, path)`; a `HEAD` with none gets the
     /// `GET` one, and the pipeline drops the body.
     #[inline]
     pub fn fast_response(&self, method: &Method, path: &str) -> Option<&FastResponse> {
-        let registered = |method: &Method| self.fast_responses.get(method)?.get(path);
-        registered(method)
-            .or_else(|| (*method == Method::HEAD).then(|| registered(&Method::GET))?)
+        self.fast_responses.serving(method, |paths| paths.get(path))
     }
+}
 
-    #[inline]
-    fn lookup(&self, slot: MethodSlot<'_>, path: &str) -> Option<(RouteId, Params)> {
-        let router = self.routers.get_slot(slot)?;
-        // The match is exhaustive, so a new matchit error variant fails to compile instead of
-        // being read as no route.
-        let matched = match router.at(path) {
-            Ok(matched) => matched,
-            Err(matchit::MatchError::NotFound) => return None,
-        };
-        Some((*matched.value, decode_params(&matched.params)))
-    }
+#[inline]
+fn matched_route(router: &Router<RouteId>, path: &str) -> Option<(RouteId, Params)> {
+    // The match is exhaustive, so a new matchit error variant fails to compile instead of
+    // being read as no route.
+    let matched = match router.at(path) {
+        Ok(matched) => matched,
+        Err(matchit::MatchError::NotFound) => return None,
+    };
+    Some((*matched.value, decode_params(&matched.params)))
 }
 
 /// Parses `method` from its uppercase spelling, so a lowercase registration names the standard
@@ -994,9 +931,7 @@ fn decode_params(params: &matchit::Params<'_, '_>) -> Params {
     params
         .iter()
         .map(|(k, v)| {
-            let decoded = percent_encoding::percent_decode_str(v)
-                .decode_utf8_lossy()
-                .into_owned();
+            let decoded = percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned();
             (k.to_string(), decoded)
         })
         .collect()
@@ -1018,10 +953,7 @@ fn allow_value<'a>(methods: impl Iterator<Item = &'a str>) -> Option<HeaderValue
     }
     methods.sort_unstable();
     methods.dedup();
-    Some(
-        HeaderValue::from_str(&methods.join(", "))
-            .expect("HTTP method names are tokens, valid in a header value"),
-    )
+    Some(HeaderValue::from_str(&methods.join(", ")).expect("HTTP method names are tokens, valid in a header value"))
 }
 
 /// How many of a table's routes run in each place.
@@ -1031,6 +963,7 @@ pub struct PlaceCounts {
     pub worker_async: usize,
     pub main_buffered: usize,
     pub main_streamed: usize,
+    pub main_async: usize,
     pub lane: usize,
 }
 
@@ -1041,8 +974,9 @@ impl PlaceCounts {
             let count = match route.runtime {
                 HandlerPlace::Worker(HandlerKind::Sync) => &mut counts.worker_sync,
                 HandlerPlace::Worker(HandlerKind::Async) => &mut counts.worker_async,
-                HandlerPlace::Main(BodyMode::Buffered) => &mut counts.main_buffered,
-                HandlerPlace::Main(BodyMode::Streamed) => &mut counts.main_streamed,
+                HandlerPlace::Main(MainHandler::Sync(BodyMode::Buffered)) => &mut counts.main_buffered,
+                HandlerPlace::Main(MainHandler::Sync(BodyMode::Streamed)) => &mut counts.main_streamed,
+                HandlerPlace::Main(MainHandler::Async) => &mut counts.main_async,
                 HandlerPlace::Lane => &mut counts.lane,
             };
             *count += 1;
@@ -1051,7 +985,7 @@ impl PlaceCounts {
     }
 
     pub fn main(&self) -> usize {
-        self.main_buffered + self.main_streamed
+        self.main_buffered + self.main_streamed + self.main_async
     }
 
     pub fn total(&self) -> usize {
@@ -1065,62 +999,45 @@ impl PlaceCounts {
 }
 
 #[cfg(test)]
+mod route_model;
+
+#[cfg(test)]
 mod runtime_tests {
     use super::*;
 
-    fn runtime(
-        gil: bool,
-        stream: bool,
-        is_async: bool,
-        process: bool,
-    ) -> Result<HandlerPlace, RouteRegistrationError> {
-        let kind = if is_async {
-            HandlerKind::Async
-        } else {
-            HandlerKind::Sync
-        };
-        let runtime = match (gil, process) {
-            (false, false) => RuntimeChoice::Worker,
-            (true, false) => RuntimeChoice::Main,
-            (false, true) => RuntimeChoice::Lane,
-            (true, true) => unreachable!("a registration names one runtime"),
-        };
-        HandlerPlace::try_from(RouteRegistration {
-            runtime,
-            stream,
-            kind,
-        })
+    fn place(runtime: RuntimeChoice, stream: bool, kind: HandlerKind) -> Result<HandlerPlace, RouteRegistrationError> {
+        HandlerPlace::try_from(RouteRegistration { runtime, stream, kind })
     }
 
     #[test]
     fn a_streamed_body_needs_a_sync_main_interpreter_handler() {
         use HandlerPlace::{Main, Worker};
         assert_eq!(
-            runtime(true, true, false, false),
-            Ok(Main(BodyMode::Streamed))
+            place(RuntimeChoice::Main, true, HandlerKind::Sync),
+            Ok(Main(MainHandler::Sync(BodyMode::Streamed)))
         );
         assert_eq!(
-            runtime(false, true, false, false),
+            place(RuntimeChoice::Worker, true, HandlerKind::Sync),
             Err(RouteRegistrationError::StreamOffMain)
         );
         assert_eq!(
-            runtime(false, true, true, false),
+            place(RuntimeChoice::Worker, true, HandlerKind::Async),
             Err(RouteRegistrationError::StreamAsync)
         );
         assert_eq!(
-            runtime(true, true, true, false),
+            place(RuntimeChoice::Main, true, HandlerKind::Async),
             Err(RouteRegistrationError::StreamAsync)
         );
         assert_eq!(
-            runtime(true, false, true, false),
-            Ok(Main(BodyMode::Buffered))
+            place(RuntimeChoice::Main, false, HandlerKind::Async),
+            Ok(Main(MainHandler::Async))
         );
         assert_eq!(
-            runtime(false, false, false, false),
+            place(RuntimeChoice::Worker, false, HandlerKind::Sync),
             Ok(Worker(HandlerKind::Sync))
         );
         assert_eq!(
-            runtime(false, false, true, false),
+            place(RuntimeChoice::Worker, false, HandlerKind::Async),
             Ok(Worker(HandlerKind::Async))
         );
     }
@@ -1162,12 +1079,7 @@ mod template_tests {
     #[test]
     fn a_colon_segment_names_the_brace_form() {
         let err = template_params("/items/:item_id").unwrap_err();
-        assert_eq!(
-            err,
-            TemplateError::ColonParam {
-                name: "item_id".into()
-            }
-        );
+        assert_eq!(err, TemplateError::ColonParam { name: "item_id".into() });
         assert_eq!(
             err.to_string(),
             "`:item_id` is not a path parameter; write it as `{item_id}`"
@@ -1234,13 +1146,15 @@ mod template_proptests {
             kinds
                 .into_iter()
                 .enumerate()
-                .map(|(i, is_param)| {
-                    if is_param {
-                        param(i).boxed()
-                    } else {
-                        literal().boxed()
-                    }
-                })
+                .map(
+                    |(i, is_param)| {
+                        if is_param {
+                            param(i).boxed()
+                        } else {
+                            literal().boxed()
+                        }
+                    },
+                )
                 .collect::<Vec<_>>()
         });
         let catch_all = proptest::option::of(("[a-z]{1,6}", "[a-z0-9]{1,5}(/[a-z0-9]{1,5}){0,3}"));
@@ -1311,10 +1225,25 @@ mod template_proptests {
 mod fast_response_tests {
     use super::*;
 
+    fn with_headers(n: usize) -> Result<FastResponse, FastResponseError> {
+        let headers = (0..n).map(|i| (format!("x-{i}"), String::new())).collect();
+        FastResponse::parse(Bytes::from_static(b"ok"), "text/plain", 200, &headers)
+    }
+
+    /// One header past what a handler's response carries is refused at registration rather than
+    /// panicking there or when the server adds its own lines.
+    #[test]
+    fn a_fast_response_carries_at_most_max_handler_lines() {
+        assert!(with_headers(MAX_HANDLER_LINES).is_ok());
+        assert!(matches!(
+            with_headers(MAX_HANDLER_LINES + 1),
+            Err(FastResponseError::TooManyHeaderLines { given }) if given == MAX_HANDLER_LINES + 1
+        ));
+    }
+
     fn health() -> FastResponse {
         let headers = HashMap::from([("X-Probe".to_string(), "yes".to_string())]);
-        FastResponse::parse(Bytes::from(b"ok".to_vec()), "text/plain", 200, &headers)
-            .expect("a valid response")
+        FastResponse::parse(Bytes::from(b"ok".to_vec()), "text/plain", 200, &headers).expect("a valid response")
     }
 
     /// A leaked `from_static` body is never unique, so this proves the registration owns its
@@ -1337,18 +1266,10 @@ mod fast_response_tests {
     fn a_copy_shares_nothing_with_the_original() {
         let original = health();
         let copy = original.own_copy();
-        assert_ne!(
-            copy.body.as_ptr(),
-            original.body.as_ptr(),
-            "the body is shared"
-        );
+        assert_ne!(copy.body.as_ptr(), original.body.as_ptr(), "the body is shared");
         let custom = HeaderName::from_static("x-probe");
         let (a, b) = (&original.headers[&custom], &copy.headers[&custom]);
-        assert_ne!(
-            a.as_bytes().as_ptr(),
-            b.as_bytes().as_ptr(),
-            "a header value is shared"
-        );
+        assert_ne!(a.as_bytes().as_ptr(), b.as_bytes().as_ptr(), "a header value is shared");
         let (a, b) = (&original.headers[CONTENT_TYPE], &copy.headers[CONTENT_TYPE]);
         assert_ne!(
             a.as_bytes().as_ptr(),
@@ -1399,23 +1320,14 @@ mod fast_response_tests {
         for i in 0..REGISTERED {
             let body = Bytes::from_owner(DropCounter(drops.clone()));
             keep(&body);
-            let fast = FastResponse::parse(body, "text/plain", 200, &HashMap::new())
-                .expect("a valid response");
+            let fast = FastResponse::parse(body, "text/plain", 200, &HashMap::new()).expect("a valid response");
             let path = format!("/c{i}");
-            assert!(table
-                .add_fast_response("GET", &path, fast)
-                .expect("GET is a method"));
-            let served = table
-                .fast_response(&Method::GET, &path)
-                .expect("registered");
+            assert!(table.add_fast_response("GET", &path, fast).expect("GET is a method"));
+            let served = table.fast_response(&Method::GET, &path).expect("registered");
             drop(served.to_response());
         }
         let copy = table.copy_with(|h| *h);
-        drop(
-            copy.fast_response(&Method::GET, "/c0")
-                .expect("copied")
-                .to_response(),
-        );
+        drop(copy.fast_response(&Method::GET, "/c0").expect("copied").to_response());
         drop(copy);
         table
     }
@@ -1480,10 +1392,7 @@ mod insert_tests {
         );
         assert!(table.fast_response(&Method::GET, "/x").is_none());
 
-        assert_eq!(
-            table.add_fast_response("get", "/x", response()).ok(),
-            Some(true)
-        );
+        assert_eq!(table.add_fast_response("get", "/x", response()).ok(), Some(true));
         assert!(table.fast_response(&Method::GET, "/x").is_some());
     }
 }
@@ -1540,7 +1449,7 @@ mod ws_route_tests {
             "/ws",
             1,
             "page".into(),
-            HandlerPlace::Main(BodyMode::Buffered),
+            HandlerPlace::Main(MainHandler::Sync(BodyMode::Buffered)),
         )
         .unwrap();
         t.add_websocket("/ws", 2).unwrap();
@@ -1570,14 +1479,14 @@ mod fallback_tests {
             path,
             handler,
             path.into(),
-            HandlerPlace::Main(BodyMode::Buffered),
+            HandlerPlace::Main(MainHandler::Sync(BodyMode::Buffered)),
         )
         .unwrap();
     }
 
     fn main_target(call: HandlerCall) -> HandlerTarget {
         match call {
-            HandlerCall::Main(target, BodyMode::Buffered) => target,
+            HandlerCall::Main(target, MainHandler::Sync(BodyMode::Buffered)) => target,
             other => panic!("expected a buffered call on main: {other:?}"),
         }
     }
@@ -1610,10 +1519,7 @@ mod fallback_tests {
         let fallback = main_target(t.fallback_call().unwrap());
         let a = main_target(t.resolve(&Method::GET, "/a").unwrap().0);
         let b = main_target(t.resolve(&Method::GET, "/b").unwrap().0);
-        assert_eq!(
-            (*t.handler(fallback), *t.handler(a), *t.handler(b)),
-            (9, 1, 2)
-        );
+        assert_eq!((*t.handler(fallback), *t.handler(a), *t.handler(b)), (9, 1, 2));
         assert!(fallback != a && fallback != b && a != b);
         // Workers index by route id, so the ids stay in the routes' registration order.
         assert_eq!(t.route(t.route_id(0)).key.path, "/a");
@@ -1659,41 +1565,30 @@ mod fallback_tests {
 }
 
 #[cfg(test)]
-mod method_slot_tests {
+mod method_tests {
     use super::*;
 
     fn method(name: &str) -> Method {
         Method::from_bytes(name.as_bytes()).expect("a token is a method")
     }
 
-    /// This freezes today's behaviour; whether a lowercase method should match at all is still
-    /// open.
     #[test]
-    fn a_method_finds_its_slot_by_its_uppercase_spelling() {
-        let get = MethodSlot::of(&Method::GET);
-        assert_eq!(get, MethodSlot::Standard(0));
-        assert!(get.is(&Method::GET) && !get.is(&Method::HEAD));
-        for spelling in ["get", "Get", "gET"] {
-            let m = method(spelling);
-            assert_eq!(MethodSlot::of(&m), get, "{spelling}");
-        }
-        for spelling in ["HEAD", "head", "Head"] {
-            let m = method(spelling);
-            assert!(MethodSlot::of(&m).is(&Method::HEAD), "{spelling}");
-        }
-        let purge = method("purge");
-        assert_eq!(MethodSlot::of(&purge), MethodSlot::Extension("purge"));
-        assert!(!MethodSlot::of(&purge).is(&Method::HEAD));
-        // A name one letter off a standard one is not that method.
-        let geth = method("GETH");
-        assert_eq!(MethodSlot::of(&geth), MethodSlot::Extension("GETH"));
+    fn the_get_and_head_slots_hold_their_methods() {
+        assert_eq!(STANDARD_METHODS[GET_SLOT], Method::GET);
+        assert_eq!(STANDARD_METHODS[HEAD_SLOT], Method::HEAD);
     }
 
     fn table() -> RouteTable<u32, ()> {
         let mut t = RouteTable::new();
         for (m, path, h) in [("GET", "/a", 1), ("PURGE", "/a", 2), ("POST", "/p", 3)] {
-            t.insert(m, path, h, "h".into(), HandlerPlace::Main(BodyMode::Buffered))
-                .unwrap();
+            t.insert(
+                m,
+                path,
+                h,
+                "h".into(),
+                HandlerPlace::Main(MainHandler::Sync(BodyMode::Buffered)),
+            )
+            .unwrap();
         }
         t
     }
@@ -1706,12 +1601,12 @@ mod method_slot_tests {
     }
 
     #[test]
-    fn a_request_method_matches_its_route_in_any_case() {
+    fn a_request_method_matches_its_route_only_in_the_spelling_registered() {
         let t = table();
         assert_eq!(handler_of(&t, &Method::GET, "/a"), Some(1));
-        assert_eq!(handler_of(&t, &method("get"), "/a"), Some(1));
+        assert_eq!(handler_of(&t, &method("get"), "/a"), None);
         assert_eq!(handler_of(&t, &method("PURGE"), "/a"), Some(2));
-        assert_eq!(handler_of(&t, &method("Purge"), "/a"), Some(2));
+        assert_eq!(handler_of(&t, &method("Purge"), "/a"), None);
         assert_eq!(handler_of(&t, &method("PURGEX"), "/a"), None);
         assert_eq!(handler_of(&t, &Method::POST, "/a"), None);
     }
@@ -1720,12 +1615,54 @@ mod method_slot_tests {
     fn only_head_falls_back_to_get() {
         let mut t = table();
         assert_eq!(handler_of(&t, &Method::HEAD, "/a"), Some(1));
-        assert_eq!(handler_of(&t, &method("head"), "/a"), Some(1));
+        assert_eq!(handler_of(&t, &method("head"), "/a"), None);
         assert_eq!(handler_of(&t, &Method::OPTIONS, "/a"), None);
         assert_eq!(handler_of(&t, &Method::HEAD, "/p"), None);
         // A `HEAD` route of its own wins.
-        t.insert("HEAD", "/a", 4, "h".into(), HandlerPlace::Main(BodyMode::Buffered))
-            .unwrap();
+        t.insert(
+            "HEAD",
+            "/a",
+            4,
+            "h".into(),
+            HandlerPlace::Main(MainHandler::Sync(BodyMode::Buffered)),
+        )
+        .unwrap();
         assert_eq!(handler_of(&t, &Method::HEAD, "/a"), Some(4));
+    }
+
+    /// The route and the fast response registered under one spelling at two paths answer every
+    /// request spelling alike, so a request a fast response misses is never told its method is
+    /// allowed.
+    #[test]
+    fn a_fast_response_matches_a_request_method_as_a_route_does() {
+        let mut t: RouteTable<u32, ()> = RouteTable::new();
+        for registered in ["GET", "PURGE"] {
+            t.insert(
+                registered,
+                "/route",
+                1,
+                "h".into(),
+                HandlerPlace::Main(MainHandler::Sync(BodyMode::Buffered)),
+            )
+            .unwrap();
+            let fast = FastResponse::parse(
+                Bytes::from_static(b"ok"),
+                "text/plain",
+                200,
+                &std::collections::HashMap::new(),
+            )
+            .expect("a plain response parses");
+            assert_eq!(t.add_fast_response(registered, "/fast", fast).ok(), Some(true));
+        }
+        for requested in ["GET", "get", "HEAD", "head", "PURGE", "purge", "Purge", "POST"] {
+            let m = method(requested);
+            assert_eq!(
+                t.fast_response(&m, "/fast").is_some(),
+                t.resolve(&m, "/route").is_some(),
+                "{requested}"
+            );
+        }
+        assert!(t.fast_response(&method("PURGE"), "/fast").is_some());
+        assert!(t.fast_response(&method("purge"), "/fast").is_none());
     }
 }

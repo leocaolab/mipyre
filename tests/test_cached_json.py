@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from mipyre import Mipyre, Response, cached_json
-from mipyre.cache import _Entries, _Failure, _Failures
+from mipyre.cache import _Entries
 from mipyre.testing import TestClient
 
 # Module level: TestClient serves it through sub-interpreter workers, which rebuild
@@ -37,7 +39,7 @@ def test_first_call_runs_handler_and_caches():
         return {"n": counter["n"]}
 
     # The handler's counter lives in the test: only the main interpreter shares it.
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         r1 = c.get("/h")
         r2 = c.get("/h")
         r3 = c.get("/h")
@@ -90,7 +92,7 @@ def test_response_object_passthrough_not_cached():
                         status_code=202, content_type="application/json")
 
     # The handler's counter lives in the test: only the main interpreter shares it.
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         r1 = c.get("/h")
         r2 = c.get("/h")
 
@@ -100,15 +102,16 @@ def test_response_object_passthrough_not_cached():
     assert counter["n"] == 2
 
 
-def test_string_return_cached_as_bytes():
-    with TestClient(app, port=None) as c:
+def test_a_string_return_goes_out_as_the_engine_sends_it():
+    with TestClient(app) as c:
         r = c.get("/s")
     assert r.status_code == 200
     assert r.text == "hello world"
+    assert r.headers["content-type"].startswith("text/plain")
 
 
-def test_bytes_return_cached_verbatim():
-    with TestClient(app, port=None) as c:
+def test_a_bytes_return_goes_out_verbatim():
+    with TestClient(app) as c:
         r = c.get("/b")
     assert r.json() == {"raw": True}
 
@@ -124,7 +127,7 @@ def test_custom_key_function():
         return {"n": counter["n"], "q": req.query}
 
     # The handler's counter lives in the test: only the main interpreter shares it.
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         r1 = c.get("/k?x=1")
         r2 = c.get("/k?x=1")  # same key → hit
         r3 = c.get("/k?x=2")  # different key → miss
@@ -142,57 +145,93 @@ def test_invalid_ttl_rejected():
         cached_json(ttl=-1)
 
 
-# b/422: a handler that fails on every request counts each failure and logs one line per kind
-# a period, not one traceback per request.
+def test_the_default_key_does_not_serve_one_query_to_another():
+    app = Mipyre(runtime="main")
+
+    @app.get("/search")
+    @cached_json(ttl=60.0)
+    def search(req):
+        return {"q": req.query_params.get("q")}
+
+    with TestClient(app) as c:
+        a = c.get("/search", params={"q": "a"}).json()
+        b = c.get("/search", params={"q": "b"}).json()
+    assert (a, b) == ({"q": "a"}, {"q": "b"})
 
 
-def test_a_failure_kind_logs_once_a_period_and_says_how_many_it_held_back():
-    failures = _Failures(period=60.0)
-    assert failures.failed(_Failure.KEY_RAISED, now=100.0) == 0
-    assert failures.failed(_Failure.KEY_RAISED, now=100.5) is None
-    assert failures.failed(_Failure.KEY_RAISED, now=159.999) is None
-    # Another kind has its own line.
-    assert failures.failed(_Failure.NOT_SERIALIZABLE, now=101.0) == 0
-    # The period is over: the line goes out, standing in for the two held back.
-    assert failures.failed(_Failure.KEY_RAISED, now=160.0) == 2
-    assert failures.failed(_Failure.KEY_RAISED, now=160.0) is None
-    assert failures.count(_Failure.KEY_RAISED) == 5
-    assert failures.count(_Failure.NOT_SERIALIZABLE) == 1
+@pytest.mark.parametrize("header", ["Authorization", "Cookie"])
+def test_the_default_key_does_not_serve_one_user_to_another(header):
+    app = Mipyre(runtime="main")
+
+    @app.get("/me")
+    @cached_json(ttl=60.0)
+    def me(req):
+        return {"user": req.headers.get(header)}
+
+    with TestClient(app) as c:
+        alice = c.get("/me", headers={header: "alice"}).json()
+        bob = c.get("/me", headers={header: "bob"}).json()
+    assert (alice, bob) == ({"user": "alice"}, {"user": "bob"})
+
+
+def test_cached_json_does_not_label_plain_text_as_json():
+    app = Mipyre(runtime="main")
+
+    @app.get("/s")
+    @cached_json(ttl=60.0)
+    def s(req):
+        return "hello"
+
+    with TestClient(app) as c:
+        r = c.get("/s")
+    if r.headers["content-type"].startswith("application/json"):
+        json.loads(r.body)
+
+
+def test_a_key_of_none_serves_the_request_uncached():
+    calls = []
+
+    @cached_json(ttl=10.0, key=lambda req: None)
+    def handler(req):
+        calls.append(1)
+        return {"n": len(calls)}
+
+    assert [handler(_Req()) for _ in range(3)] == [{"n": 1}, {"n": 2}, {"n": 3}]
+
+
+def test_unique_keys_never_hold_more_than_the_byte_limit():
+    entries = _Entries(ttl=60.0, max_bytes=64 * 1024)
+    for i in range(1_000):
+        entries.put(f"/k{i}", b"x" * 1000, now=0.0)
+        held = sum(len(k) + len(body) for k, (body, _) in entries._entries.items())
+        assert held == entries._size <= 64 * 1024
+
+
+def test_a_body_past_the_byte_limit_is_not_stored_and_drops_nothing():
+    entries = _Entries(ttl=60.0, max_bytes=100)
+    entries.put("/a", b"a" * 50, now=0.0)
+    entries.put("/big", b"b" * 101, now=0.0)
+    assert (entries.get("/a", now=1.0), entries.get("/big", now=1.0)) == (b"a" * 50, None)
+    entries.put("/c", b"c" * 50, now=0.0)
+    assert (entries.get("/a", now=1.0), entries.get("/c", now=1.0)) == (None, b"c" * 50)
 
 
 class _Req:
     path = "/r"
+    query = ""
+    headers: dict[str, str] = {}
 
 
-def test_a_handler_that_fails_on_every_request_logs_one_line_with_its_type(caplog):
+def test_what_the_key_function_raises_fails_the_request():
     def key_that_raises(req):
         raise KeyError("no tenant")
 
-    def report(req):
-        return {"ok": True}
+    keyed = cached_json(ttl=10.0, key=key_that_raises)(lambda req: {"ok": True})
+    with pytest.raises(KeyError, match="no tenant"):
+        keyed(_Req())
 
-    def not_json(req):
-        return {"at": object()}
 
-    keyed = cached_json(ttl=10.0, key=key_that_raises)(report)
-    unserializable = cached_json(ttl=10.0)(not_json)
-    with caplog.at_level("ERROR", logger="mipyre.cache"):
-        answers = [keyed(_Req()) for _ in range(5)]
-        unserialized = [unserializable(_Req()) for _ in range(5)]
-    # Every request is still served, uncached.
-    assert [a.body for a in answers] == [b'{"ok":true}'] * 5
-    assert all(set(r) == {"at"} for r in unserialized)
-    records = [r for r in caplog.records if r.name == "mipyre.cache"]
-    assert [(r.error_type, r.getMessage()) for r in records] == [
-        (
-            "KeyError",
-            "cached_json test_a_handler_that_fails_on_every_request_logs_one_line_with_its_type.<locals>.report: "
-            "key function raised; bypassing cache (0 more since the last such line, 1 in all)",
-        ),
-        (
-            "TypeError",
-            "cached_json test_a_handler_that_fails_on_every_request_logs_one_line_with_its_type.<locals>.not_json: "
-            "could not serialize result; returning uncached (0 more since the last such line, 1 in all)",
-        ),
-    ]
-    assert all(r.exc_info is not None for r in records), "logged without its traceback"
+def test_a_result_the_engine_cannot_encode_fails_the_request():
+    unserializable = cached_json(ttl=10.0)(lambda req: {"at": object()})
+    with pytest.raises(TypeError):
+        unserializable(_Req())

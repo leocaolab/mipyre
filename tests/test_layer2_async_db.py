@@ -22,7 +22,7 @@ import httpx
 import pytest
 
 from tests.conftest import fork_panic_lines
-from tests._helpers import answers, bound_port, read_file
+from tests._helpers import answers, bound_port, read_file, set_subinterpreters
 
 PG_DSN = os.environ.get("MIPYRE_TEST_PG_DSN")
 
@@ -70,6 +70,7 @@ def _hammer(base: str) -> collections.Counter:
 def test_async_db_on_main_while_workers_execute_engine(tmp_path, tpc):
     log_path = str(tmp_path / "server.log")
     env = dict(os.environ, L2_PORT="0", RUST_BACKTRACE="0", MIPYRE_TPC=tpc)
+    set_subinterpreters(env, "2")
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "_l2_async_db_app.py")],

@@ -20,11 +20,7 @@ fn socket(script: &[Option<usize>]) -> Socket {
 }
 
 impl AsyncWrite for Socket {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.calls += 1;
         match self.script.pop_front().flatten() {
             Some(n) => Poll::Ready(Ok(n.min(buf.len()))),
@@ -66,10 +62,7 @@ async fn progress_restarts_the_budget() {
     assert!(write(&mut io).is_pending());
     tokio::time::advance(LIMIT - TICK).await;
     assert!(write(&mut io).is_pending());
-    assert!(
-        matches!(write(&mut io), Poll::Ready(Ok(3))),
-        "the client read a little"
-    );
+    assert!(matches!(write(&mut io), Poll::Ready(Ok(3))), "the client read a little");
     assert!(write(&mut io).is_pending());
     tokio::time::advance(LIMIT - TICK).await;
     assert!(
@@ -113,11 +106,7 @@ async fn after_a_stall_the_stream_fails_every_write_without_trying_the_socket() 
     match write(&mut io) {
         Poll::Ready(Err(e)) => {
             let why = e.get_ref().and_then(|s| s.downcast_ref::<WriteStallError>());
-            assert_eq!(
-                why.map(|w| w.limit),
-                Some(LIMIT),
-                "the error says it was a stall"
-            );
+            assert_eq!(why.map(|w| w.limit), Some(LIMIT), "the error says it was a stall");
         }
         other => panic!("expected the stall, got {other:?}"),
     }
@@ -128,18 +117,11 @@ async fn after_a_stall_the_stream_fails_every_write_without_trying_the_socket() 
         Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
         other => panic!("expected TimedOut again, got {other:?}"),
     }
-    assert_eq!(
-        io.inner.calls, calls,
-        "a stalled stream is not written to again"
-    );
+    assert_eq!(io.inner.calls, calls, "a stalled stream is not written to again");
 }
 
 impl AsyncRead for Socket {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Poll::Pending
     }
 }

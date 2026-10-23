@@ -68,9 +68,7 @@ impl ClientRequestId {
 impl fmt::Display for ClientRequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Every byte is ASCII, so each is its own char.
-        self.as_bytes()
-            .iter()
-            .try_for_each(|&b| f.write_char(char::from(b)))
+        self.as_bytes().iter().try_for_each(|&b| f.write_char(char::from(b)))
     }
 }
 
@@ -109,6 +107,35 @@ impl RequestId {
         })
     }
 
+    /// Hands `f` the id as text, as the header and a log line write it, without allocating: a
+    /// client's is its own bytes, a minted one its 32 hex digits on the stack.
+    #[expect(
+        clippy::expect_used,
+        reason = "a client's id passed `usable`, so it is ASCII, and a minted one is hex digits: \
+                  both are UTF-8"
+    )]
+    #[inline]
+    pub fn with_text<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        match self {
+            RequestId::Client(id) => f(std::str::from_utf8(id.as_bytes()).expect("an ASCII id")),
+            RequestId::Server(id) => f(std::str::from_utf8(&id.hex()).expect("hex digits")),
+        }
+    }
+
+    /// Returns the id as a response header's value: a client's shares its bytes, and a minted
+    /// one is written into an allocation of its own.
+    #[expect(
+        clippy::expect_used,
+        reason = "a client's id is a header value already, and a minted one is 32 lower-case hex \
+                  digits, which are a valid header value: the parse cannot fail"
+    )]
+    pub fn header_value(&self) -> HeaderValue {
+        match self {
+            RequestId::Client(id) => id.0.clone(),
+            RequestId::Server(id) => HeaderValue::from_bytes(&id.hex()).expect("hex digits are a valid header value"),
+        }
+    }
+
     /// Takes the client's id from `header` when the app named one and the value is usable, and
     /// mints one otherwise.
     #[inline]
@@ -117,6 +144,20 @@ impl RequestId {
             .and_then(|name| headers.get(name))
             .and_then(ClientRequestId::from_header)
             .map_or_else(RequestId::mint, RequestId::Client)
+    }
+}
+
+impl ServerRequestId {
+    /// Returns the id as its 32 lower-case hex digits, the process's seed first.
+    fn hex(&self) -> [u8; 32] {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let bytes = [self.process.to_be_bytes(), self.number.to_be_bytes()];
+        let mut out = [0; 32];
+        for (pair, byte) in out.as_chunks_mut::<2>().0.iter_mut().zip(bytes.iter().flatten()) {
+            pair[0] = DIGITS[usize::from(byte >> 4)];
+            pair[1] = DIGITS[usize::from(byte & 0xf)];
+        }
+        out
     }
 }
 
@@ -140,6 +181,31 @@ mod tests {
         let mut map = HeaderMap::new();
         map.insert(HEADER, HeaderValue::from_bytes(value).unwrap());
         map
+    }
+
+    #[test]
+    fn the_header_value_is_the_id_as_written() {
+        let minted = RequestId::Server(ServerRequestId {
+            process: 0x0123_4567_89ab_cdef,
+            number: 42,
+        });
+        assert_eq!(minted.header_value(), "0123456789abcdef000000000000002a");
+        assert_eq!(minted.header_value(), minted.to_string().as_str());
+        let fresh = RequestId::mint();
+        assert_eq!(fresh.header_value(), fresh.to_string().as_str());
+        let client = RequestId::of(&headers(b"trace-7f"), Some(&HEADER));
+        assert_eq!(client.header_value(), "trace-7f");
+    }
+
+    #[test]
+    fn the_text_is_the_id_as_displayed() {
+        let minted = RequestId::Server(ServerRequestId {
+            process: 0x0123_4567_89ab_cdef,
+            number: 42,
+        });
+        assert_eq!(minted.with_text(str::to_owned), minted.to_string());
+        let client = RequestId::of(&headers(b"Root=1-67891233;Sampled=1"), Some(&HEADER));
+        assert_eq!(client.with_text(str::to_owned), "Root=1-67891233;Sampled=1");
     }
 
     #[test]
@@ -180,10 +246,7 @@ mod tests {
             );
         }
         let absent = HeaderMap::new();
-        assert!(matches!(
-            RequestId::of(&absent, Some(&HEADER)),
-            RequestId::Server(_)
-        ));
+        assert!(matches!(RequestId::of(&absent, Some(&HEADER)), RequestId::Server(_)));
     }
 
     #[test]

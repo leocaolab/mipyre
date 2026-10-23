@@ -16,6 +16,9 @@ pub enum StreamEvent {
     /// An accepted connection could not be registered with the runtime of the thread that serves
     /// it, so it is dropped.
     RegisterFailed,
+    /// The peer kept sending through a lingering close's whole limit, so the stream was closed
+    /// while it still sent.
+    LingerCutShort,
 }
 
 const LOG_PERIOD: Duration = Duration::from_secs(60);
@@ -33,6 +36,7 @@ struct StreamEventTable<T> {
     peer_gone: T,
     write_stalled: T,
     register_failed: T,
+    linger_cut_short: T,
 }
 
 impl<T> StreamEventTable<T> {
@@ -41,6 +45,7 @@ impl<T> StreamEventTable<T> {
             StreamEvent::PeerGone => &self.peer_gone,
             StreamEvent::WriteStalled => &self.write_stalled,
             StreamEvent::RegisterFailed => &self.register_failed,
+            StreamEvent::LingerCutShort => &self.linger_cut_short,
         }
     }
 }
@@ -51,6 +56,7 @@ impl StreamEventTable<OwnLine<AtomicU64>> {
             peer_gone: OwnLine(AtomicU64::new(0)),
             write_stalled: OwnLine(AtomicU64::new(0)),
             register_failed: OwnLine(AtomicU64::new(0)),
+            linger_cut_short: OwnLine(AtomicU64::new(0)),
         }
     }
 }
@@ -61,6 +67,7 @@ impl StreamEventTable<OwnLine<LogThrottle>> {
             peer_gone: OwnLine(LogThrottle::new(LOG_PERIOD)),
             write_stalled: OwnLine(LogThrottle::new(LOG_PERIOD)),
             register_failed: OwnLine(LogThrottle::new(LOG_PERIOD)),
+            linger_cut_short: OwnLine(LogThrottle::new(LOG_PERIOD)),
         }
     }
 }

@@ -15,26 +15,30 @@ import textwrap
 import pytest
 
 from mipyre import Mipyre
+
+
+def _serve_in_own_process(module: str, requests: int) -> None:
+    """Serves ``module``'s app in its own process: it turns the access log on, and a process has
+    one log configuration (b/335 D14), which another test's app in this one may have set."""
+    script = f"""
+from tests.{module} import app
 from mipyre.testing import TestClient
+with TestClient(app) as c:
+    for _ in range({requests}):
+        assert c.get("/h").status_code == 200
+"""
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-2000:]
 
 
 def test_enable_access_log_with_sample_arg():
     # Its own module: a worker serves one app per module.
-    from tests.apps.log_sampling_sample_arg import app
-
-    with TestClient(app, port=None) as c:
-        for _ in range(5):
-            r = c.get("/h")
-            assert r.status_code == 200
+    _serve_in_own_process("apps.log_sampling_sample_arg", 5)
 
 
 def test_set_request_log_sampling_directly():
     # Its own module: a worker serves one app per module.
-    from tests.apps.log_sampling_direct_setter import app
-
-    with TestClient(app, port=None) as c:
-        r = c.get("/h")
-        assert r.status_code == 200
+    _serve_in_own_process("apps.log_sampling_direct_setter", 1)
 
 
 def test_sample_zero_is_rejected():

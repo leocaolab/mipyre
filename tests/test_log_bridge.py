@@ -1,4 +1,4 @@
-"""``mipyre._log_bridge``: a sink that fails is handed to ``logging``'s own ``handleError``,
+"""``mipyre._log.bridge``: a sink that fails is handed to ``logging``'s own ``handleError``,
 and the code that logged goes on (b/393; the bridge once swallowed it with ``except: pass``);
 the level gate is the handler's, and the user's root logger is only ever lowered."""
 
@@ -12,11 +12,11 @@ import textwrap
 
 import pytest
 
-from mipyre._log_bridge import RustLogHandler, handler_level, root_level
+from mipyre._log.bridge import RustLogHandler, handler_level, root_level
 
 
 def test_a_sink_that_raises_goes_to_handle_error_and_the_caller_goes_on(capsys, monkeypatch):
-    def sink(levelno, name, message, pathname, lineno, worker_id):
+    def sink(levelno, name, message, pathname, lineno, worker_id, lane):
         raise RuntimeError("the sink is gone")
 
     # `handleError` reports only while `raiseExceptions` is on (logging's default).

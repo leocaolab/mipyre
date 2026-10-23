@@ -15,7 +15,7 @@ build. The bench tests below run only in such a build (they are skipped otherwis
 suite and CI install.
 
 Serving paths, as `app.run` picks them:
-  - "gil"   MIPYRE_RUNTIME=main, MIPYRE_TPC=0  → multi-thread runtime, handlers on main
+  - "gil"   MIPYRE_TEST_MODE=main, MIPYRE_TPC=0  → multi-thread runtime, handlers on main
   - "tpc"   default runtime                        → TPC inline (sub-interp)
   - "pool"  default runtime, MIPYRE_TPC=0        → sub-interp pool
 """
@@ -33,7 +33,7 @@ import urllib.request
 
 import pytest
 
-from tests._helpers import bound_port, read_file
+from tests._helpers import bound_port, read_file, set_subinterpreters
 
 from mipyre.engine import MipyreApp
 
@@ -63,21 +63,21 @@ def _write_script(script: str) -> str:
 
 class Server:
     """A Mipyre server running `script` on one serving path. `app.run` in the script
-    reads `port` from `M6_PORT`; the "gil" path runs with `MIPYRE_RUNTIME=main`."""
+    reads `port` from `M6_PORT`; the "gil" path runs with `MIPYRE_TEST_MODE=main`."""
 
     def __init__(self, script: str, path: str, workers: int = 2):
         self.port = 0  # the bound one once the server listens
         self.script_path = _write_script(script)
         self.log_path = self.script_path + ".log"
         env = dict(os.environ)
-        env.pop("MIPYRE_RUNTIME", None)
+        env.pop("MIPYRE_TEST_MODE", None)
         if (runtime := PATHS[path]["runtime"]) is not None:
-            env["MIPYRE_RUNTIME"] = runtime
+            env["MIPYRE_TEST_MODE"] = runtime
         env["M6_PORT"] = "0"
-        env["M6_WORKERS"] = str(workers)
         env.pop("MIPYRE_TPC", None)
         if (tpc := PATHS[path]["tpc"]) is not None:
             env["MIPYRE_TPC"] = tpc
+        set_subinterpreters(env, str(workers))
         with open(self.log_path, "w") as log:
             self.proc = subprocess.Popen(
                 [PYTHON, self.script_path],
@@ -125,7 +125,7 @@ class Server:
 
 RUN = """
 import os
-app.run(host="127.0.0.1", port=int(os.environ["M6_PORT"]), workers=int(os.environ["M6_WORKERS"]))
+app.run(host="127.0.0.1", port=int(os.environ["M6_PORT"]))
 """
 
 
@@ -145,8 +145,9 @@ def _sum_reply(result: int) -> bytes:
 # ---------------------------------------------------------------------------
 
 GRPC_USER_ROUTE = """
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.post("/rpc")
 def rpc(req):
@@ -213,7 +214,7 @@ if _n == int(os.environ["M6_FAIL_AT"]):
     raise RuntimeError(f"m6 injected failure at execution {_n}")
 
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/")
 def index(req):
@@ -265,7 +266,7 @@ def test_tpc_worker_build_failure_ends_the_built_workers(tmp_path):
     counter = tmp_path / "counter"
     script = FAILING_WORKER + """
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, workers=2)
+    app.run(host="127.0.0.1", port=0, threads=2)
 """
     r = _run_script(script, {"M6_COUNTER": str(counter), "M6_FAIL_AT": "3"})
     out = r.stdout + r.stderr
@@ -277,8 +278,9 @@ if __name__ == "__main__":
 
 
 NO_ROOT_ROUTE = """
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/elsewhere")
 def elsewhere(req):
@@ -304,8 +306,9 @@ def test_bench_reports_non_200_responses_instead_of_counting_them(call):
 
 
 ROOT_ROUTE = """
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/")
 def index(req):

@@ -1,5 +1,5 @@
-//! Converts the engine's configuration values to and from Python: `Mode`, `LogLevel`,
-//! `GivenSize`, `Compression` and the `Metrics` snapshot.
+//! Converts the engine's configuration values to and from Python: `LogLevel`, `Compression`,
+//! the `Metrics` snapshot, and the flags (`Flag`, `Deployment`, `ServerFlags`).
 //!
 //! Each value belongs to the layer that uses it. A Python class with the owner's exact shape is
 //! the owner's type with its Python methods here; one with a shape of its own is a separate type
@@ -11,7 +11,7 @@ use mipyre_http::plan::compression::{
     BrotliQuality, CompressionSettings, CompressionSettingsError, EnabledCodecs, GzipLevel,
 };
 
-use crate::boot;
+use crate::boot::{CodeCall, Deployment, EntryPoint, Flag, FlagScope, ServerFlags, FLAGS};
 use crate::telemetry;
 
 /// Returns the name of `arg`'s type for a `TypeError`, or what reading it raised.
@@ -22,70 +22,8 @@ fn type_name(arg: &Bound<'_, PyAny>) -> String {
     )
 }
 
-/// A count `start()` is given, with where it came from.
-///
-/// The value stays signed and unchecked so that `start()` raises the same `ValueError` for
-/// `-1` as for `0`, instead of pyo3's `OverflowError`.
-#[pyclass(module = "mipyre.engine", name = "GivenSize", frozen, from_py_object)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PyGivenSize {
-    #[pyo3(get)]
-    pub(crate) value: i64,
-    #[pyo3(get)]
-    pub(crate) origin: boot::SizeOrigin,
-}
-
-#[pymethods]
-impl PyGivenSize {
-    #[new]
-    fn new(value: i64, origin: boot::SizeOrigin) -> Self {
-        Self { value, origin }
-    }
-}
-
-#[pymethods]
-impl boot::InterpreterMode {
-    /// Return the mode `name` spells: `"gil"` or `"default"`, `"subinterp"` or `"auto"`;
-    /// anything else raises `ValueError`.
-    #[staticmethod]
-    fn parse(name: &str) -> PyResult<Self> {
-        Ok(name.parse::<boot::InterpreterMode>()?)
-    }
-
-    /// Return whether this mode runs handlers in sub-interpreter workers.
-    #[getter]
-    fn uses_workers(&self) -> bool {
-        *self == boot::InterpreterMode::Subinterp
-    }
-
-    fn __str__(&self) -> &'static str {
-        self.as_str()
-    }
-}
-
-/// Parses a `mode=` argument, which is a `Mode` or its name.
-pub(crate) fn mode_from_arg(arg: &Bound<'_, PyAny>) -> PyResult<boot::InterpreterMode> {
-    if let Ok(mode) = arg.cast::<boot::InterpreterMode>() {
-        return Ok(*mode.get());
-    }
-    let name: &str = arg.extract().map_err(|_| {
-        pyo3::exceptions::PyTypeError::new_err(format!(
-            "mode must be a mipyre.engine.Mode or a str, got {}",
-            type_name(arg)
-        ))
-    })?;
-    Ok(name.parse::<boot::InterpreterMode>()?)
-}
-
 /// The minimum level that is logged.
-#[pyclass(
-    module = "mipyre.engine",
-    name = "LogLevel",
-    eq,
-    eq_int,
-    frozen,
-    hash
-)]
+#[pyclass(module = "mipyre.engine", name = "LogLevel", eq, eq_int, frozen, hash)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PyLogLevel {
     Off,
@@ -164,16 +102,8 @@ fn level_from_arg(arg: &Bound<'_, PyAny>) -> PyResult<telemetry::LogLevel> {
 /// `RuntimeError` when another global subscriber is already installed.
 #[pyfunction]
 #[pyo3(signature = (level, access_log, format))]
-pub(crate) fn init_logger(
-    level: &Bound<'_, PyAny>,
-    access_log: bool,
-    format: &str,
-) -> PyResult<()> {
-    Ok(telemetry::init_logger(
-        level_from_arg(level)?,
-        access_log,
-        format,
-    )?)
+pub(crate) fn init_logger(level: &Bound<'_, PyAny>, access_log: bool, format: &str) -> PyResult<()> {
+    Ok(telemetry::init_logger(level_from_arg(level)?, access_log, format)?)
 }
 
 /// Block until every line logged before the call is on stderr; return at once when no logger
@@ -182,9 +112,37 @@ pub(crate) fn init_logger(
 /// The logger writes from a background thread that process exit does not wait for, so
 /// `Mipyre.run()` calls this as it ends. Raises `RuntimeError` when the writer thread has
 /// stopped and the lines may never be written.
+/// The user's cache directory by the OS's convention (`~/Library/Caches` on macOS; elsewhere an
+/// absolute `$XDG_CACHE_HOME`, else `~/.cache`), or `None` when this user has no home directory.
+#[pyfunction]
+pub(crate) fn _user_cache_dir() -> Option<std::path::PathBuf> {
+    crate::boot::user_cache_dir()
+}
+
 #[pyfunction]
 pub(crate) fn flush_logs(py: Python<'_>) -> PyResult<()> {
     Ok(telemetry::flush_logs(py)?)
+}
+
+/// Stop the log's writer thread, so this process runs no thread of the logger's (it is about to
+/// fork), and return whether one was running. Until `_start_log_writer()` each thread that logs
+/// writes its lines itself; the lines logged before are written out first.
+#[pyfunction]
+pub(crate) fn _stop_log_writer(py: Python<'_>) -> PyResult<bool> {
+    Ok(telemetry::stop_log_writer(py)?)
+}
+
+/// Start the log's writer thread again after `_stop_log_writer()`; a no-op with no logger
+/// installed or its thread running.
+#[pyfunction]
+pub(crate) fn _start_log_writer() -> PyResult<()> {
+    Ok(telemetry::start_log_writer()?)
+}
+
+/// The name of the log's writer thread, as a process's thread list shows it.
+#[pyfunction]
+pub(crate) fn _log_writer_thread() -> &'static str {
+    telemetry::WRITER_THREAD
 }
 
 /// Bodies smaller than this many bytes cost more to compress than the bytes they save.
@@ -261,13 +219,7 @@ impl Compression {
         gzip_level = DEFAULT_GZIP_LEVEL,
         brotli_quality = DEFAULT_BROTLI_QUALITY,
     ))]
-    fn py_new(
-        min_size: i64,
-        gzip: bool,
-        brotli: bool,
-        gzip_level: i64,
-        brotli_quality: i64,
-    ) -> PyResult<Self> {
+    fn py_new(min_size: i64, gzip: bool, brotli: bool, gzip_level: i64, brotli_quality: i64) -> PyResult<Self> {
         CompressionSettings::parse(min_size, gzip, brotli, gzip_level, brotli_quality)
             .and_then(|settings| {
                 Ok(Self {
@@ -382,50 +334,6 @@ impl Metrics {
         self.0.degraded.clone()
     }
 
-    /// Return how many requests the server answered itself because Python could not: 503
-    /// overloaded or shutting down, 504 past the budget, 502 a dead process-lane worker, 500 a
-    /// dropped request.
-    #[getter]
-    fn dropped_requests(&self) -> u64 {
-        self.0.dropped_requests
-    }
-
-    /// Return how many requests were served, or `None` while `MIPYRE_METRICS` is unset.
-    #[getter]
-    fn total_requests(&self) -> Option<u64> {
-        self.0.total_requests
-    }
-
-    /// Return how many workers are serving now.
-    #[getter]
-    fn workers_serving(&self) -> i64 {
-        self.0.workers_serving
-    }
-
-    /// Return how many workers stopped serving on their own while the server ran.
-    #[getter]
-    fn workers_died(&self) -> u64 {
-        self.0.workers_died
-    }
-
-    /// Return how many `gc.collect()` calls raised or panicked; each retired its worker.
-    #[getter]
-    fn gc_failures(&self) -> u64 {
-        self.0.gc_failures
-    }
-
-    /// Return how many workers were retired because their `gc.collect()` failed.
-    #[getter]
-    fn workers_retired(&self) -> u64 {
-        self.0.workers_retired
-    }
-
-    /// Return why the last worker retired, in its own words, or `None` while none has.
-    #[getter]
-    fn last_worker_retirement(&self) -> Option<String> {
-        self.0.last_worker_retirement.clone()
-    }
-
     /// Return how many pre-compressed static files could not be read, so the original was
     /// served.
     #[getter]
@@ -439,6 +347,19 @@ impl Metrics {
         self.0.static_unwatched_mounts
     }
 
+    /// Return how many static answers sent from disk were cut off because the file changed or
+    /// failed while it was sent.
+    #[getter]
+    fn static_answers_cut(&self) -> u64 {
+        self.0.static_answers_cut
+    }
+
+    /// Return how many bytes static answers sent from disk hold now, read and not yet written out.
+    #[getter]
+    fn static_bytes_in_flight(&self) -> u64 {
+        self.0.static_bytes_in_flight
+    }
+
     /// Return how many async database results were dropped because their asyncio loop had
     /// closed.
     #[getter]
@@ -450,13 +371,6 @@ impl Metrics {
     #[getter]
     fn gil_congested_waits(&self) -> u64 {
         self.0.gil_congested_waits
-    }
-
-    /// Return why the server is sized from a fallback CPU count, or `None` when the OS gave
-    /// the counts.
-    #[getter]
-    fn cpu_sizing_fallback(&self) -> Option<String> {
-        self.0.cpu_sizing_fallback.clone()
     }
 
     /// Return how many times a client reset or closed its connection mid-IO; one connection
@@ -514,6 +428,13 @@ impl Metrics {
         self.0.request_head_timeouts
     }
 
+    /// Return how many trusted proxies' `X-Forwarded-For` headers were ignored because the entry
+    /// where the client was looked for is no IP address.
+    #[getter]
+    fn forwarded_for_unreadable(&self) -> u64 {
+        self.0.forwarded_for_unreadable
+    }
+
     /// Return how many connections could not set TCP_QUICKACK and keep delayed ACKs.
     #[getter]
     fn quickack_failures(&self) -> u64 {
@@ -532,72 +453,389 @@ impl Metrics {
         self.0.nodelay_failures
     }
 
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.0).replacen("Counters", "Metrics", 1)
+    }
+}
+
+/// One server run's counts, read at one moment (`Server.metrics()`): what this server did,
+/// apart from any other server of the process.
+#[pyclass(frozen, name = "RunMetrics", module = "mipyre.engine")]
+#[derive(Debug, Clone)]
+pub(crate) struct RunMetrics {
+    pub(crate) counts: telemetry::RunCounts,
+    /// What the run runs without, as `component: reason`, from each part that holds it.
+    pub(crate) degraded: Vec<String>,
+}
+
+#[pymethods]
+impl RunMetrics {
+    /// Return how many requests the server answered itself because Python could not: 503
+    /// overloaded or shutting down, 504 past the budget, 502 a dead process-lane worker, 500 a
+    /// dropped request.
+    #[getter]
+    fn dropped_requests(&self) -> u64 {
+        self.counts.refused
+    }
+
+    /// Return why the server was sized from a fallback CPU count, or `None` when the OS gave
+    /// the counts.
+    #[getter]
+    fn cpu_sizing_fallback(&self) -> Option<String> {
+        self.counts.cpu_sizing_fallback.clone()
+    }
+
+    /// Return how many requests were served, or `None` while the run does not count its answers (its `metrics` flag is off).
+    #[getter]
+    fn total_requests(&self) -> Option<u64> {
+        self.counts.answers.as_ref().map(telemetry::AnswerCounts::total)
+    }
+
+    /// Return how many workers are serving now.
+    #[getter]
+    fn workers_serving(&self) -> i64 {
+        self.counts.workers_serving
+    }
+
+    /// Return how many workers stopped serving on their own while the server ran.
+    #[getter]
+    fn workers_died(&self) -> u64 {
+        self.counts.workers_died
+    }
+
+    /// Return how many `runtime="process"` worker processes died (crashed, were killed, timed
+    /// out) and were replaced while the server ran.
+    #[getter]
+    fn process_workers_died(&self) -> u64 {
+        self.counts.process_workers_died
+    }
+
+    /// Return how many `gc.collect()` calls raised or panicked; each retired its worker.
+    #[getter]
+    fn gc_failures(&self) -> u64 {
+        self.counts.gc_failures
+    }
+
+    /// Return how many workers were retired because their `gc.collect()` failed.
+    #[getter]
+    fn workers_retired(&self) -> u64 {
+        self.counts.workers_retired
+    }
+
+    /// Return why the last worker retired, in its own words, or `None` while none has.
+    #[getter]
+    fn last_worker_retirement(&self) -> Option<String> {
+        self.counts.last_worker_retirement.clone()
+    }
+
+    /// Return how many requests were answered 422 because their `body=` model or `query=`
+    /// string failed validation.
+    #[getter]
+    fn validation_failures(&self) -> u64 {
+        self.counts.validation_failures
+    }
+
     /// Return how many threads could not be pinned to their core and run unpinned.
     #[getter]
     fn cpu_pin_failures(&self) -> u64 {
-        self.0.cpu_pin_failures
+        self.counts.cpu_pin_failures
     }
 
     /// Return how many macOS threads could not raise their QoS class and may run on
     /// efficiency cores.
     #[getter]
     fn cpu_qos_failures(&self) -> u64 {
-        self.0.cpu_qos_failures
+        self.counts.cpu_qos_failures
     }
 
     /// Return how many reads of the process's CPU affinity failed, leaving threads unpinned.
     #[getter]
     fn cpu_affinity_unreadable(&self) -> u64 {
-        self.0.cpu_affinity_unreadable
+        self.counts.cpu_affinity_unreadable
     }
 
     /// Return how many reads of the physical core topology failed, leaving threads unpinned.
     #[getter]
     fn cpu_topology_unreadable(&self) -> u64 {
-        self.0.cpu_topology_unreadable
+        self.counts.cpu_topology_unreadable
     }
 
     /// Return how many starts had more TPC threads than CPUs, leaving the extra threads
     /// unpinned.
     #[getter]
     fn cpu_threads_beyond_cpus(&self) -> u64 {
-        self.0.cpu_threads_beyond_cpus
+        self.counts.cpu_threads_beyond_cpus
     }
 
     /// Return how many drains of stopped accept loops ran out of time.
     #[getter]
     fn drain_timeouts(&self) -> u64 {
-        self.0.drain_timeouts
+        self.counts.drain_timeouts
     }
 
     /// Return how many connections were still open, and were closed, when such a drain gave
     /// up.
     #[getter]
     fn drain_closed_connections(&self) -> u64 {
-        self.0.drain_closed_connections
+        self.counts.drain_closed_connections
     }
 
-    /// Return how many stop watchers, the threads that stop a TPC run on SIGINT or SIGTERM,
+    /// Return how many stop watchers, the threads that stop a server run on SIGINT or SIGTERM,
     /// panicked or were still running when their run ended.
     #[getter]
     fn stop_watcher_failures(&self) -> u64 {
-        self.0.stop_watcher_failures
+        self.counts.stop_watcher_failures
     }
 
     /// Return how many main-interpreter handlers were still running when their TPC thread's
     /// runtime shut down, and were left running.
     #[getter]
     fn blocking_calls_left(&self) -> u64 {
-        self.0.blocking_calls_left
+        self.counts.blocking_calls_left
     }
 
     fn __repr__(&self) -> String {
-        format!("{:?}", self.0).replacen("Counters", "Metrics", 1)
+        format!("{self:?}")
+    }
+
+    /// Return what this server runs without, as ``component: reason`` lines: CPU pinning, a
+    /// crash-looping process lane, a static mount served uncached; empty while it runs as
+    /// configured.
+    #[getter]
+    fn degraded(&self) -> Vec<String> {
+        self.degraded.clone()
     }
 }
 
-/// Return a snapshot of every counter without resetting any.
+/// Return a snapshot of the process's counters without resetting any: the main GIL, RSS, the
+/// connection-level events and what runs degraded. A server's own counts are its
+/// `Server.metrics()`.
 #[pyfunction]
 pub(crate) fn get_gil_metrics() -> Metrics {
     Metrics(telemetry::read_counters())
+}
+
+/// The face Python reads of one setting of the declaration table (`boot/settings.rs`).
+#[pymethods]
+impl Flag {
+    #[getter]
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The `mipyre run` option, `--threads`.
+    #[getter]
+    fn cli(&self) -> &'static str {
+        self.cli
+    }
+
+    /// The environment variable, `MIPYRE_THREADS`.
+    #[getter]
+    fn env(&self) -> &'static str {
+        self.env
+    }
+
+    /// The `pyproject.toml` key in its table, `[tool.mipyre] threads`.
+    #[getter]
+    fn file(&self) -> String {
+        self.file.to_string()
+    }
+
+    /// Every place app code gives it, `run(threads=)`.
+    #[getter]
+    fn code(&self) -> Vec<String> {
+        self.code.iter().map(ToString::to_string).collect()
+    }
+
+    /// The shape of its value in one word: `bool`, `count`, `positive`, `duration`,
+    /// `positive_duration`, `port`, `ports`, `host`, `hosts`, `path`, `slot_bytes`, `choice`.
+    #[getter]
+    fn shape(&self) -> &'static str {
+        self.shape.word()
+    }
+
+    /// What its value must be, as an error says it.
+    #[getter]
+    fn expected(&self) -> String {
+        self.shape.expected()
+    }
+
+    #[getter]
+    fn default(&self) -> &'static str {
+        self.default
+    }
+
+    /// Whether it is about the whole process (`reload`, `log`) rather than one server.
+    #[getter]
+    fn process_wide(&self) -> bool {
+        self.scope == FlagScope::Process
+    }
+
+    #[getter]
+    fn doc(&self) -> &'static str {
+        self.doc
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Flag({:?}, {}, {})", self.name, self.cli, self.env)
+    }
+}
+
+/// Every mipyre setting, in the order `--help` and the docs list them.
+#[pyfunction]
+pub(crate) fn _flags() -> Vec<Flag> {
+    FLAGS.to_vec()
+}
+
+/// What the deployment gave, resolved once at an entry point; Python makes it and hands it to the
+/// server it starts.
+#[pymethods]
+impl Deployment {
+    /// No deployment at all: what an embedded engine (`TestClient`, a raw `start()`) uses.
+    #[new]
+    fn new() -> Self {
+        Deployment::default()
+    }
+
+    /// Reads this process's environment and the `pyproject.toml` in its working directory, once,
+    /// with `flags`: the command line's values by flag name, as typed.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ConfigError` with every value that cannot be used, and `ValueError` for a name in
+    /// `flags` that is no flag.
+    #[staticmethod]
+    #[pyo3(name = "from_process")]
+    fn from_process_py(flags: std::collections::BTreeMap<String, String>, entry: EntryPoint) -> PyResult<Self> {
+        let flags = flags
+            .into_iter()
+            .map(|(name, raw)| match FLAGS.iter().find(|flag| flag.name == name) {
+                Some(flag) => Ok((flag.name, raw)),
+                None => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{name:?} is not a mipyre flag"
+                ))),
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Deployment::from_process(&flags, entry)?)
+    }
+
+    #[getter]
+    fn entry(&self) -> EntryPoint {
+        self.entry
+    }
+
+    /// One line per value the deployment gave: the flag, the value and where it came from.
+    #[pyo3(name = "summary")]
+    fn summary_lines(&self) -> Vec<String> {
+        self.summary()
+    }
+
+    /// Whether Python logging is on: the deployment's `log`, else the app's `debug=` (`code`),
+    /// else `default` (on under `mipyre dev`).
+    #[pyo3(name = "log", signature = (code, default))]
+    fn log_on(&self, code: Option<bool>, default: bool) -> bool {
+        self.log.as_ref().map_or(code.unwrap_or(default), |given| given.value)
+    }
+
+    /// The app's process lanes: this deployment laid over `config` (with the code's
+    /// `ProcessLanes`), workers defaulting to `physical_cores`.
+    #[pyo3(name = "lanes")]
+    fn lanes_py(
+        &self,
+        config: PyRef<'_, ServerFlags>,
+        physical_cores: usize,
+    ) -> PyResult<crate::runtime::process::LaneRecipe> {
+        let cores = std::num::NonZeroUsize::new(physical_cores)
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("physical_cores must be at least 1"))?;
+        Ok(Deployment::lanes(self, &config, cores))
+    }
+
+    /// Whether to reload on file changes: the deployment's `reload`, else `run(reload=)`.
+    #[pyo3(name = "reload", signature = (code))]
+    fn reload_on(&self, code: Option<bool>) -> bool {
+        self.reload.as_ref().map_or(code.unwrap_or(false), |given| given.value)
+    }
+}
+
+/// Writes a value Python code gave a flag as the text a flag of its shape is written in: a
+/// bool as `true` / `false`, a list or tuple as its items joined by commas, a path as its
+/// `os.fspath`, anything else as its `str`.
+fn flag_text(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    use pyo3::types::{PyBool, PyList, PyTuple};
+    if let Ok(b) = value.cast::<PyBool>() {
+        return Ok(if b.is_true() { "true" } else { "false" }.to_string());
+    }
+    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+        let items: PyResult<Vec<String>> = value.try_iter()?.map(|item| flag_text(&item?)).collect();
+        return Ok(items?.join(","));
+    }
+    let os = value.py().import("os")?;
+    if value.is_instance(&os.getattr("PathLike")?)? {
+        return os.call_method1("fspath", (value,))?.str()?.extract();
+    }
+    value.str()?.extract()
+}
+
+/// Reads the keywords Python code passed `call` into its flags; a keyword given `None` is a
+/// keyword not given.
+fn flags_of(call: CodeCall, given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<ServerFlags> {
+    let mut flags = ServerFlags::default();
+    give_all(&mut flags, call, given)?;
+    Ok(flags)
+}
+
+fn give_all(flags: &mut ServerFlags, call: CodeCall, given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<()> {
+    for (keyword, value) in given.into_iter().flatten() {
+        if value.is_none() {
+            continue;
+        }
+        let keyword: String = keyword.extract()?;
+        flags.give(call, &keyword, &flag_text(&value)?)?;
+    }
+    Ok(())
+}
+
+/// The flags `run()`'s keywords give, each named as `run(name=)`.
+pub(crate) fn run_flags(given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<ServerFlags> {
+    flags_of(CodeCall::Run, given)
+}
+
+/// The flag values app code gives one server: `ServerFlags(threads=2)` is the programmatic
+/// way (`TestClient(config=)`, `start(config=)`); `run()`'s keywords come in as `_from_run`.
+#[pymethods]
+impl ServerFlags {
+    /// # Errors
+    ///
+    /// Raises `ConfigError` for a value of the wrong shape and `TypeError` for a keyword that
+    /// is no flag.
+    #[new]
+    #[pyo3(signature = (**given))]
+    fn new(given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<Self> {
+        flags_of(CodeCall::ServerFlags, given)
+    }
+
+    /// These flags with `given` set as well, each named as `ServerFlags(name=)`: what a
+    /// `TestServer` adds its host and port with.
+    #[pyo3(signature = (**given))]
+    fn _with(&self, given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<Self> {
+        let mut flags = self.clone();
+        give_all(&mut flags, CodeCall::ServerFlags, given)?;
+        Ok(flags)
+    }
+
+    /// These flags with the app's `ProcessLanes` fields (`given`), each named as
+    /// `ProcessLanes(name=)`.
+    #[pyo3(signature = (**given))]
+    fn _with_lanes(&self, given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<Self> {
+        let mut flags = self.clone();
+        give_all(&mut flags, CodeCall::ProcessLanes, given)?;
+        Ok(flags)
+    }
+
+    /// The values `run()` was given, each named as `run(name=)` in summaries and errors.
+    #[staticmethod]
+    #[pyo3(signature = (**given))]
+    fn _from_run(given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<Self> {
+        flags_of(CodeCall::Run, given)
+    }
 }

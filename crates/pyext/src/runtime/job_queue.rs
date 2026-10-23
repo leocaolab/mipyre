@@ -200,8 +200,12 @@ impl<T> Drop for JobReceiver<T> {
 }
 
 #[cfg(test)]
-#[cfg(sync_model)]
+#[cfg(all(sync_model, not(sync_shuttle)))]
 mod loom_model;
+
+#[cfg(test)]
+#[cfg(all(sync_model, sync_shuttle))]
+mod shuttle_model;
 
 #[cfg(test)]
 mod tests {
@@ -330,7 +334,10 @@ mod tests {
             })
             .collect();
         drop(rx);
-        let sent: usize = senders.into_iter().map(|t| t.join().expect("a sender does not panic")).sum();
+        let sent: usize = senders
+            .into_iter()
+            .map(|t| t.join().expect("a sender does not panic"))
+            .sum();
         let (mut count, mut sum) = (0, 0);
         for t in receivers {
             let (c, s) = t.join().expect("a receiver does not panic");

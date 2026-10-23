@@ -3,7 +3,7 @@ tests/test_upload_streaming.py, which sends the rest of the body only after that
 
 import threading
 
-from mipyre import Mipyre
+from mipyre import BodyStream, Mipyre
 
 app = Mipyre()
 
@@ -17,7 +17,7 @@ def root(req):
     return "ok"
 
 
-@app.post("/first-then-rest", runtime="main", stream=True)
+@app.post("/first-then-rest", runtime="main", body=BodyStream)
 def first_then_rest(req):
     chunks = iter(req.stream)
     first = next(chunks)

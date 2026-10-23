@@ -22,7 +22,7 @@ import sys
 import httpx
 import pytest
 
-from tests._helpers import bound_port, read_file
+from tests._helpers import bound_port, read_file, set_subinterpreters
 
 SCRIPT = r'''
 import os
@@ -36,7 +36,7 @@ if __name__ == "__main__":
     with open(os.environ["B252_MAIN_THREAD_FILE"], "w") as f:
         f.write(str(CREATED_ON))
 
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 
 @app.get("/")
@@ -45,7 +45,7 @@ def index(req):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, workers=3)
+    app.run(host="127.0.0.1", port=0)
 '''
 
 POOL = {"MIPYRE_TPC": "0"}
@@ -60,7 +60,8 @@ def test_each_worker_is_created_on_the_thread_that_serves_it(tmp_path, runtime):
     main_thread_file = tmp_path / "main_thread"
     log_path = tmp_path / "app.log"
     env = {**os.environ, **runtime, "B252_MAIN_THREAD_FILE": str(main_thread_file)}
-    env.pop("MIPYRE_RUNTIME", None)
+    env.pop("MIPYRE_TEST_MODE", None)
+    set_subinterpreters(env, "3")
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
             [sys.executable, str(script)], stdout=log, stderr=subprocess.STDOUT,

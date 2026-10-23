@@ -156,8 +156,7 @@ pub fn acceptor_from(
     // resumes on whichever accept loop the reconnect lands on. The key lives only in this
     // process's memory and rotates every 6 h. A TLS 1.2 ticket carries the master secret, so the
     // key opens the TLS 1.2 sessions it sealed until it rotates out; TLS 1.3 tickets do not.
-    cfg.ticketer =
-        rustls::crypto::ring::Ticketer::new().map_err(TlsError::TicketKeyNotGenerated)?;
+    cfg.ticketer = rustls::crypto::ring::Ticketer::new().map_err(TlsError::TicketKeyNotGenerated)?;
     cfg.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
 
     Ok(Arc::new(TlsAcceptor::from(Arc::new(cfg))))
@@ -213,13 +212,9 @@ mod tests {
 
     #[test]
     fn a_missing_cert_is_a_typed_open_error_naming_the_file() {
-        let err = build_acceptor(
-            "/nonexistent/missing-cert.pem",
-            "/nonexistent/missing-key.pem",
-            HTTP1,
-        )
-        .err()
-        .expect("no such file");
+        let err = build_acceptor("/nonexistent/missing-cert.pem", "/nonexistent/missing-key.pem", HTTP1)
+            .err()
+            .expect("no such file");
         match &err {
             TlsError::Unreadable { what, path, source } => {
                 assert_eq!(*what, PemFile::Certificate);
@@ -237,17 +232,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cert = dir.join("empty.pem");
         std::fs::write(&cert, b"").unwrap();
-        let err = build_acceptor(
-            cert.to_str().unwrap(),
-            "/nonexistent/key.pem",
-            HTTP1,
-        )
-        .err()
-        .expect("no certificate");
-        assert!(
-            matches!(err, TlsError::NoCertificate(ref p) if p == &cert),
-            "{err:?}"
-        );
+        let err = build_acceptor(cert.to_str().unwrap(), "/nonexistent/key.pem", HTTP1)
+            .err()
+            .expect("no certificate");
+        assert!(matches!(err, TlsError::NoCertificate(ref p) if p == &cert), "{err:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -288,10 +276,8 @@ mod tests {
     impl TestCert {
         fn new(test: &str) -> Self {
             let rcgen::CertifiedKey { cert, key_pair } =
-                rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                    .expect("generate a certificate");
-            let dir = std::env::temp_dir()
-                .join(format!("infra-http-tls-{test}-{}", std::process::id()));
+                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("generate a certificate");
+            let dir = std::env::temp_dir().join(format!("infra-http-tls-{test}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("cert.pem"), cert.pem()).unwrap();
             std::fs::write(dir.join("key.pem"), key_pair.serialize_pem()).unwrap();
@@ -303,20 +289,18 @@ mod tests {
 
         fn acceptor(&self, alpn: &[&[u8]]) -> Arc<TlsAcceptor> {
             let path = |name: &str| self.dir.join(name).to_str().unwrap().to_string();
-            build_acceptor(&path("cert.pem"), &path("key.pem"), alpn)
-                .expect("a valid certificate builds an acceptor")
+            build_acceptor(&path("cert.pem"), &path("key.pem"), alpn).expect("a valid certificate builds an acceptor")
         }
 
         fn connector(&self, alpn: &[&[u8]]) -> tokio_rustls::TlsConnector {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(self.der.clone()).unwrap();
-            let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+            let mut config =
+                rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
             config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
             tokio_rustls::TlsConnector::from(Arc::new(config))
         }
@@ -451,10 +435,7 @@ mod tests {
 
     /// Drives both ends through memory past the handshake and the session tickets TLS 1.3 sends
     /// right after it.
-    fn handshake_in_memory(
-        client: &mut rustls::ClientConnection,
-        server: &mut rustls::ServerConnection,
-    ) {
+    fn handshake_in_memory(client: &mut rustls::ClientConnection, server: &mut rustls::ServerConnection) {
         let mut wire = Vec::new();
         while client.is_handshaking() || server.is_handshaking() || server.wants_write() {
             while client.wants_write() {
@@ -545,10 +526,7 @@ mod tests {
             ids.sort_unstable();
             ids
         };
-        assert_eq!(
-            suites(CIPHER_SUITES),
-            suites(rustls::crypto::ring::ALL_CIPHER_SUITES)
-        );
+        assert_eq!(suites(CIPHER_SUITES), suites(rustls::crypto::ring::ALL_CIPHER_SUITES));
     }
 
     /// It uses more clients than rustls' default session cache holds sessions.

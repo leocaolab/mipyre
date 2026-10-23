@@ -10,11 +10,7 @@ use mipyre_transport::memory::{MemoryConnectError, MemoryConnector, MemorySource
 use pyo3::prelude::*;
 use tokio_util::sync::CancellationToken;
 
-use crate::boot::{GivenSize, ServerRun};
-use crate::pyapi::config::PyGivenSize;
-
-const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_PORT: u16 = 8000;
+use crate::boot::{ReadinessCallback, ServerFlagValues, ServerRun, DEFAULT_HOST, DEFAULT_PORT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Transport {
@@ -34,38 +30,27 @@ pub(super) fn transport(given: Option<&str>) -> PyResult<Transport> {
     }
 }
 
-fn socket_args_given(
-    host: Option<&str>,
-    port: Option<u16>,
-    tls_cert: Option<&str>,
-    tls_key: Option<&str>,
-    extra_tls_ports: Option<&[u16]>,
-    extra_plain_ports: Option<&[u16]>,
-) -> Vec<&'static str> {
+/// Names the socket flags a server was given (by its deployment or its code).
+fn socket_flags_given(values: &ServerFlagValues) -> Vec<&'static str> {
     [
-        ("host", host.is_some()),
-        ("port", port.is_some()),
-        ("tls_cert", tls_cert.is_some()),
-        ("tls_key", tls_key.is_some()),
-        ("extra_tls_ports", extra_tls_ports.is_some()),
-        ("extra_plain_ports", extra_plain_ports.is_some()),
+        ("host", values.host.is_some()),
+        ("port", values.port.is_some()),
+        ("tls_cert", values.tls_cert.is_some()),
+        ("tls_key", values.tls_key.is_some()),
+        ("extra_tls_ports", values.extra_tls_ports.is_some()),
+        ("extra_plain_ports", values.extra_plain_ports.is_some()),
+        ("allowed_hosts", values.allowed_hosts.is_some()),
+        ("trusted_proxies", values.trusted_proxies.is_some()),
     ]
     .into_iter()
     .filter_map(|(name, given)| given.then_some(name))
     .collect()
 }
 
-/// Refuses socket arguments for a memory server with a `ValueError` naming them, rather than
+/// Refuses socket flags for a memory server with a `ValueError` naming them, rather than
 /// silently dropping them.
-pub(super) fn refuse_socket_args(
-    host: Option<&str>,
-    port: Option<u16>,
-    tls_cert: Option<&str>,
-    tls_key: Option<&str>,
-    extra_tls_ports: Option<&[u16]>,
-    extra_plain_ports: Option<&[u16]>,
-) -> PyResult<()> {
-    let given = socket_args_given(host, port, tls_cert, tls_key, extra_tls_ports, extra_plain_ports);
+pub(super) fn refuse_socket_flags(values: &ServerFlagValues) -> PyResult<()> {
+    let given = socket_flags_given(values);
     if given.is_empty() {
         return Ok(());
     }
@@ -75,92 +60,93 @@ pub(super) fn refuse_socket_args(
     )))
 }
 
-/// Builds the listener set `start()`'s socket arguments name.
-///
-/// Extra TLS ports without a certificate are refused, because the operator would believe them
-/// protected.
-pub(super) fn listener_set(
-    host: Option<&str>,
-    port: Option<u16>,
-    tls_cert: Option<&str>,
-    tls_key: Option<&str>,
-    extra_tls_ports: Option<Vec<u16>>,
-    extra_plain_ports: Option<Vec<u16>>,
-) -> PyResult<ListenerSet> {
-    let addr = socket_addr(host.unwrap_or(DEFAULT_HOST), port.unwrap_or(DEFAULT_PORT))?;
-    let tls = match (tls_cert, tls_key) {
+/// Builds the listener set a server's socket flags name. The certificate and key come in pairs
+/// (the recipe checked that); extra TLS ports without them are refused, because the operator
+/// would believe them protected.
+pub(super) fn listener_set(values: &ServerFlagValues) -> PyResult<ListenerSet> {
+    let host = values.host.as_ref().map_or(DEFAULT_HOST, |host| host.value().as_str());
+    let port = values.port.as_ref().map_or(DEFAULT_PORT, |port| *port.value());
+    let addr = socket_addr(host, port)?;
+    let tls = match (&values.tls_cert, &values.tls_key) {
         (Some(cert), Some(key)) => Some(
-            mipyre_transport::tls::build_acceptor(cert, key, Protocols::Http2AndHttp1.alpn())
+            mipyre_transport::tls::build_acceptor(
+                &cert.value().to_string_lossy(),
+                &key.value().to_string_lossy(),
+                Protocols::Http2AndHttp1.alpn(),
+            )
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
         ),
-        (None, None) => None,
-        _ => {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "tls_cert and tls_key must be provided together",
-            ))
-        }
+        _ => None,
+    };
+    let ports = |given: &Option<crate::boot::FlagValue<Vec<std::num::NonZeroU16>>>| -> Vec<u16> {
+        given
+            .as_ref()
+            .map_or_else(Vec::new, |ports| ports.value().iter().map(|p| p.get()).collect())
     };
     ListenerSpec::set(
         addr,
         tls,
-        &extra_tls_ports.unwrap_or_default(),
-        &extra_plain_ports.unwrap_or_default(),
+        &ports(&values.extra_tls_ports),
+        &ports(&values.extra_plain_ports),
     )
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+/// The flags that name the addresses a server binds: the `.socket` unit names them instead
+/// when systemd hands the sockets over.
+const ADDRESS_FLAGS: [&str; 4] = ["host", "port", "extra_tls_ports", "extra_plain_ports"];
+
+/// Returns the address flags `values` gives (from the deployment or from code), which a server
+/// serving sockets systemd handed over does not use.
+pub(super) fn address_flags(values: &ServerFlagValues) -> Vec<(&'static crate::boot::Flag, crate::boot::FlagSource)> {
+    values
+        .given()
+        .into_iter()
+        .filter(|(flag, _)| ADDRESS_FLAGS.contains(&flag.name))
+        .collect()
 }
 
 /// Binds every listener of `specs` before any thread or worker exists, so a port in use is
 /// this call's `OSError(EADDRINUSE)` rather than a log line from a serving thread.
 ///
-/// Sockets systemd handed over are served instead, each with the server's TLS, and cannot be
-/// combined with extra ports.
-pub(super) fn bind(specs: &ListenerSet, copies: NonZeroUsize) -> PyResult<Endpoints> {
+/// Sockets systemd handed over are served instead, each with the server's TLS; then every
+/// address flag that was given (`addresses`) is unused, and the start fails naming each (D19).
+pub(super) fn bind(
+    specs: &ListenerSet,
+    copies: NonZeroUsize,
+    addresses: &[(&'static crate::boot::Flag, crate::boot::FlagSource)],
+) -> PyResult<Endpoints> {
     let tls = specs.specs().first().and_then(|spec| spec.tls.clone());
     match crate::serve::handed_by_systemd(tls, copies)? {
         None => Endpoints::bind(specs, copies, crate::serve::bind_options()).map_err(crate::serve::listener_error),
-        Some(_) if specs.specs().len() > 1 => Err(pyo3::exceptions::PyValueError::new_err(
-            "extra TLS / plain ports cannot be combined with sockets systemd handed over \
-             (LISTEN_FDS): the .socket unit binds the addresses, so list every one there",
-        )),
-        Some(handed) => {
-            println!("  Note: serving the sockets systemd handed over (LISTEN_FDS); host and port are not used");
-            Ok(handed)
-        }
+        Some(handed) => match crate::boot::ConfigError::of(handed_socket_errors(addresses)) {
+            Some(unused) => Err(unused.into()),
+            None => {
+                println!("  Serving the sockets systemd handed over (LISTEN_FDS)");
+                Ok(handed)
+            }
+        },
     }
 }
 
-/// Checks a count argument of `start()`; a value below 1 is a `ValueError` naming the
-/// argument, because a server with no worker or no IO thread serves nothing.
-///
-/// It is the only check of a size, reached from `Mipyre.run()`, its environment variables and
-/// the raw engine alike.
-pub(super) fn positive(name: &str, given: Option<PyGivenSize>) -> PyResult<Option<GivenSize>> {
-    given
-        .map(|given| {
-            let value = usize::try_from(given.value)
-                .ok()
-                .and_then(std::num::NonZeroUsize::new)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "{name} must be >= 1, got {}",
-                        given.value
-                    ))
-                })?;
-            Ok(GivenSize {
-                value,
-                origin: given.origin,
-            })
+fn handed_socket_errors(
+    addresses: &[(&'static crate::boot::Flag, crate::boot::FlagSource)],
+) -> Vec<crate::boot::FlagError> {
+    addresses
+        .iter()
+        .map(|(flag, given)| crate::boot::FlagError::UnusedByTopology {
+            flag: flag.name,
+            given: given.clone(),
+            user: "a server serving the sockets systemd handed over (LISTEN_FDS)".to_string(),
+            needs: "a server that binds its own sockets: the .socket unit names the addresses, so list every one there",
         })
-        .transpose()
+        .collect()
 }
 
 /// Parses `host` as an IPv4 or IPv6 address, bare or in brackets; a name such as `localhost`
 /// is refused, not resolved.
 fn socket_addr(host: &str, port: u16) -> Result<SocketAddr, BadHost> {
-    let ip = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+    let ip = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
     ip.parse::<std::net::IpAddr>()
         .map(|ip| SocketAddr::new(ip, port))
         .map_err(|source| BadHost {
@@ -220,11 +206,13 @@ impl BoundServer {
 fn serve_once<D: mipyre_transport::driver::TransportDriver>(
     run: &crate::sync::Mutex<Option<ServerRun<D>>>,
     py: Python<'_>,
+    readiness: ReadinessCallback,
 ) -> PyResult<()> {
-    let run = run.lock().take().ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err("this server has already served; start() another")
-    })?;
-    run.serve(py)
+    let run = run
+        .lock()
+        .take()
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("this server has already served; start() another"))?;
+    run.serve(py, readiness)
 }
 
 /// One server of an app, bound by `MipyreApp.start()`; its listeners are released when
@@ -234,11 +222,47 @@ pub(crate) struct Server {
     /// The token is shared with the run and cancelled by `shutdown()` or SIGINT.
     stop: CancellationToken,
     bound: BoundServer,
+    /// What `metrics()` asks, during the run and after.
+    parts: RunSources,
+}
+
+/// The parts of one run its metrics are read from, which say what it did and what it runs without: its counts (which also
+/// hold why its threads run unpinned), its process lanes, and its static mounts.
+pub(super) struct RunSources {
+    counters: std::sync::Arc<crate::telemetry::RunCounters>,
+    lanes: Option<std::sync::Arc<crate::runtime::process::ServerLanes>>,
+    mounts: Vec<mipyre_http::io::static_files::StaticMount>,
+}
+
+impl RunSources {
+    pub(super) fn of(site: &crate::serve::Site) -> Self {
+        RunSources {
+            counters: std::sync::Arc::clone(&site.counters),
+            lanes: site.process.clone(),
+            mounts: site.rules.routes.static_mounts().to_vec(),
+        }
+    }
+
+    /// Returns each part the run runs without, as `component: reason`, asking each owner.
+    fn degraded(&self, counts: &crate::telemetry::RunCounts) -> Vec<String> {
+        let pinning = counts.unpinned_because.iter().map(|why| format!("cpu_pinning: {why}"));
+        let lanes = self
+            .lanes
+            .iter()
+            .flat_map(|lanes| lanes.crash_looping())
+            .map(|(i, why)| format!("process_lane:{i}: {why}"));
+        let mounts = self.mounts.iter().filter_map(|mount| {
+            mount
+                .uncached_because()
+                .map(|(root, why)| format!("static_watch:{}: {why}", root.display()))
+        });
+        pinning.chain(lanes).chain(mounts).collect()
+    }
 }
 
 impl Server {
-    pub(super) fn new(stop: CancellationToken, bound: BoundServer) -> Self {
-        Server { stop, bound }
+    pub(super) fn new(stop: CancellationToken, bound: BoundServer, parts: RunSources) -> Self {
+        Server { stop, bound, parts }
     }
 }
 
@@ -247,13 +271,25 @@ impl Server {
     /// Serve until SIGINT or `shutdown()`, blocking this thread, then drain in-flight
     /// connections and return.
     ///
-    /// A server stopped before it served returns at once; serving a second time raises
-    /// `RuntimeError`.
-    pub(crate) fn serve(&self, py: Python<'_>) -> PyResult<()> {
+    /// `on_serving` is called once on this thread when the server serves: its workers are up
+    /// and it takes connections next. If it raises, the server stops and `serve()` raises that.
+    /// A server stopped before it served returns at once without calling it; serving a second
+    /// time raises `RuntimeError`.
+    #[pyo3(signature = (on_serving=None))]
+    pub(crate) fn serve(&self, py: Python<'_>, on_serving: Option<Py<PyAny>>) -> PyResult<()> {
+        let readiness = ReadinessCallback::new(on_serving);
         match &self.bound {
-            BoundServer::Tcp { run, .. } => serve_once(run, py),
-            BoundServer::Memory { run, .. } => serve_once(run, py),
+            BoundServer::Tcp { run, .. } => serve_once(run, py, readiness),
+            BoundServer::Memory { run, .. } => serve_once(run, py, readiness),
         }
+    }
+
+    /// This server's counts so far: its answers, refusals, workers and the rest of what one run
+    /// counts, apart from any other server of the process.
+    fn metrics(&self) -> crate::pyapi::config::RunMetrics {
+        let counts = self.parts.counters.read();
+        let degraded = self.parts.degraded(&counts);
+        crate::pyapi::config::RunMetrics { counts, degraded }
     }
 
     /// Stop this server the way SIGINT does; it may be called from any thread, any number of
@@ -322,24 +358,37 @@ mod tests {
 
     #[test]
     fn a_memory_server_refuses_every_socket_argument_given_by_name() {
-        assert!(socket_args_given(None, None, None, None, None, None).is_empty());
+        let given = |pairs: &[(&str, &str)]| {
+            let mut code = crate::boot::ServerFlags::default();
+            for (keyword, raw) in pairs {
+                code.give(crate::boot::CodeCall::Run, keyword, raw).unwrap();
+            }
+            socket_flags_given(&crate::boot::Deployment::default().over(&code))
+        };
+        assert!(given(&[("threads", "2")]).is_empty());
         assert_eq!(
-            socket_args_given(None, Some(0), Some("c.pem"), None, None, Some(&[])),
-            vec!["port", "tls_cert", "extra_plain_ports"]
+            given(&[
+                ("port", "0"),
+                ("tls_cert", "c.pem"),
+                ("extra_plain_ports", "8001"),
+                ("allowed_hosts", "a.example"),
+                ("trusted_proxies", "10.0.0.1")
+            ]),
+            vec![
+                "port",
+                "tls_cert",
+                "extra_plain_ports",
+                "allowed_hosts",
+                "trusted_proxies"
+            ]
         );
     }
 
     #[test]
     fn a_host_is_an_ip_address_and_its_error_names_it() {
-        assert_eq!(
-            socket_addr("127.0.0.1", 80).unwrap(),
-            "127.0.0.1:80".parse().unwrap()
-        );
+        assert_eq!(socket_addr("127.0.0.1", 80).unwrap(), "127.0.0.1:80".parse().unwrap());
         assert_eq!(socket_addr("::1", 80).unwrap(), "[::1]:80".parse().unwrap());
-        assert_eq!(
-            socket_addr("[::1]", 80).unwrap(),
-            "[::1]:80".parse().unwrap()
-        );
+        assert_eq!(socket_addr("[::1]", 80).unwrap(), "[::1]:80".parse().unwrap());
         for host in ["localhost", "", "1.2.3", "[127.0.0.1"] {
             let text = socket_addr(host, 80).unwrap_err().to_string();
             assert!(text.starts_with(&format!("host {host:?} ")), "{text}");

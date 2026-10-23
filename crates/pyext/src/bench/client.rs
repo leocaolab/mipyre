@@ -15,8 +15,7 @@ use super::run::BenchPartError;
 use crate::sync::{AtomicU64, Ordering};
 
 /// Is the request every client connection sends, pipelined [`PIPELINE_DEPTH`] deep.
-pub(crate) const BENCH_REQUEST: &[u8] =
-    b"GET / HTTP/1.1\r\nHost: bench\r\nConnection: keep-alive\r\n\r\n";
+pub(crate) const BENCH_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n";
 const PIPELINE_DEPTH: usize = 32;
 /// Bounds how long a loopback client retries a refused `connect` while the server threads bind.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
@@ -50,7 +49,6 @@ pub(crate) enum ProbeError {
     #[error("invalid Content-Length {0:?}")]
     InvalidContentLength(String),
 }
-
 
 pub(crate) fn run_loopback_clients(
     addr: SocketAddr,
@@ -125,10 +123,7 @@ pub(crate) async fn drive_client<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Sends one request, reads its whole response and returns the response's length.
-async fn probe<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-    request: &[u8],
-) -> Result<usize, ClientError> {
+async fn probe<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, request: &[u8]) -> Result<usize, ClientError> {
     stream.write_all(request).await?;
     let mut buf = Vec::with_capacity(4096);
     loop {
@@ -186,13 +181,11 @@ async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const OK_HEAD: &[u8] =
-        b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\n";
+    const OK_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\n";
 
     #[test]
     fn response_len_is_head_plus_content_length() {
@@ -217,10 +210,7 @@ mod tests {
     #[test]
     fn bad_content_length_is_reported_with_its_value() {
         let head = b"HTTP/1.1 200 OK\r\ncontent-length: two\r\n\r\n";
-        assert_eq!(
-            response_len(head),
-            Err(ProbeError::InvalidContentLength("two".into()))
-        );
+        assert_eq!(response_len(head), Err(ProbeError::InvalidContentLength("two".into())));
     }
 
     #[test]
@@ -242,13 +232,7 @@ mod tests {
             server_io
         });
         let counter = AtomicU64::new(0);
-        let result = drive_client(
-            client_io,
-            &counter,
-            &CancellationToken::new(),
-            BENCH_REQUEST,
-        )
-        .await;
+        let result = drive_client(client_io, &counter, &CancellationToken::new(), BENCH_REQUEST).await;
         assert!(
             matches!(result, Err(ClientError::Response(ProbeError::Not200(404)))),
             "{result:?}"

@@ -3,7 +3,7 @@
 Every test here runs a real server in a subprocess on the path it names, so it exercises
 the dispatch code that path runs:
 
-  - "gil"   MIPYRE_RUNTIME=main, MIPYRE_TPC=0  → handlers on main (Tokio blocking pool)
+  - "gil"   MIPYRE_TEST_MODE=main, MIPYRE_TPC=0  → handlers on main (Tokio blocking pool)
   - "tpc"   default runtime                        → TPC inline sub-interpreters; runtime="main"
                                                      routes go through the main-interp bridge
   - "pool"  default runtime, MIPYRE_TPC=0        → sub-interp pool; runtime="main" routes on main
@@ -32,7 +32,7 @@ from typing import Literal, Optional
 
 import pytest
 
-from tests._helpers import bound_port, settle
+from tests._helpers import bound_port, metric_count, set_subinterpreters, settle
 
 PYTHON = sys.executable
 HOST = "127.0.0.1"
@@ -66,15 +66,16 @@ class Reply:
 
 
 class Server:
-    """`script` served on `path`. The script's `app.run` reads port and workers from
-    `RA_PORT` / `RA_WORKERS` (see `RUN`); the "gil" path runs with `MIPYRE_RUNTIME=main`.
+    """`script` served on `path`. The script's `app.run` reads its port from `RA_PORT` (see
+    `RUN`) and its size from `MIPYRE_THREADS` / `MIPYRE_SUBINTERPRETERS`; the "gil" path runs
+    with `MIPYRE_TEST_MODE=main`.
     The port is 0, and `port` is the one the server bound, from its startup line."""
 
     def __init__(
         self,
         script: str,
         path: str,
-        workers: int = 2,
+        workers: int | None = 2,
         env: dict[str, str] | None = None,
         wait: bool = True,
     ):
@@ -86,15 +87,16 @@ class Server:
             f.write(textwrap.dedent(script))
         self.log_path = self.script_path + ".log"
         full_env = dict(os.environ)
-        full_env.pop("MIPYRE_RUNTIME", None)
+        full_env.pop("MIPYRE_TEST_MODE", None)
         if (runtime := PATHS[path]["runtime"]) is not None:
-            full_env["MIPYRE_RUNTIME"] = runtime
+            full_env["MIPYRE_TEST_MODE"] = runtime
         full_env["RA_PORT"] = "0"
-        full_env["RA_WORKERS"] = str(workers)
         full_env.pop("MIPYRE_TPC", None)
         full_env.pop("MIPYRE_LOG", None)
         if (tpc := PATHS[path]["tpc"]) is not None:
             full_env["MIPYRE_TPC"] = tpc
+        if workers is not None:
+            set_subinterpreters(full_env, str(workers))
         full_env.update(env or {})
         with open(self.log_path, "w") as log:
             self.proc = subprocess.Popen(
@@ -229,7 +231,7 @@ def serve(script: str, path: str, **kw):
 
 RUN = """
 import os
-app.run(host="127.0.0.1", port=int(os.environ["RA_PORT"]), workers=int(os.environ["RA_WORKERS"]))
+app.run(host="127.0.0.1", port=int(os.environ["RA_PORT"]))
 """
 
 
@@ -247,9 +249,10 @@ def _record_text(rec: dict) -> str:
 # ---------------------------------------------------------------------------
 
 PANIC_SCRIPT = """
+import os
 from mipyre import Mipyre
 from mipyre.engine import _fault_panic
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/panic")
 def panic(req):
@@ -317,14 +320,15 @@ def _assert_panic_logged_once(srv: Server, text: str, request_id: str) -> None:
 def test_panic_is_a_logged_500_and_the_thread_survives(path, route, healthy):
     # One thread of each kind (the pool has one sync and one async worker; BRIDGE_WORKERS
     # bridge threads): the N+1 panics all land on the threads that must survive them.
-    env = {"MIPYRE_GIL_BRIDGE_WORKERS": str(BRIDGE_WORKERS)}
+    # The multi-thread GIL server runs main's routes on its own threads, with no bridge to size.
+    env = {} if path == "gil" else {"MIPYRE_GIL_BRIDGE_WORKERS": str(BRIDGE_WORKERS)}
     workers = 2 if path == "pool" else 1
     with serve(PANIC_SCRIPT, path, workers=workers, env=env) as srv:
         for n in range(BRIDGE_WORKERS + 1):
             r = srv.get(f"{route}?n={n}")
             assert r.status == 500, (n, r.status, r.body)
             body = r.json()
-            assert body["error"] == GENERIC_500
+            assert body["detail"] == GENERIC_500
             prefix = ASYNC_PANIC_TEXT if route == "/async-panic" else PANIC_TEXT
             _assert_panic_logged_once(srv, f"{prefix}ra-panic {n}", body["request_id"])
         r = srv.get(healthy)
@@ -337,9 +341,10 @@ def test_panic_is_a_logged_500_and_the_thread_survives(path, route, healthy):
 # ---------------------------------------------------------------------------
 
 CTX_SCRIPT = """
+import os
 from mipyre import Mipyre, Response
 from mipyre.context import ctx
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.before_request
 async def tag(req):
@@ -379,7 +384,8 @@ CTX_WORKERS = {"tpc": 1, "pool": 2, "gil": 1}
 
 @pytest.mark.parametrize("path", ["tpc", "pool", "gil"])
 def test_async_hook_and_handler_ctx_writes_reach_the_rest_of_the_request(path):
-    env = {"MIPYRE_GIL_BRIDGE_WORKERS": "1"}
+    # The multi-thread GIL server runs main's routes on its own threads, with no bridge to size.
+    env = {} if path == "gil" else {"MIPYRE_GIL_BRIDGE_WORKERS": "1"}
     with serve(CTX_SCRIPT, path, workers=CTX_WORKERS[path], env=env) as srv:
         # Twice over: the second round runs every route on a thread that already ran the
         # async routes, whose writes must not leak into the sync ones.
@@ -403,7 +409,7 @@ def test_async_hook_and_handler_ctx_writes_reach_the_rest_of_the_request(path):
 
 def test_colon_param_is_refused_whatever_the_handler_takes():
     from mipyre import Mipyre
-    from mipyre.engine import MipyreApp
+    from mipyre.engine import MipyreApp, RuntimeChoice
 
     app = Mipyre()
     # A handler that takes only the request gets no injection, but the route would still
@@ -412,7 +418,7 @@ def test_colon_param_is_refused_whatever_the_handler_takes():
         app.get("/users/:id", lambda req: "x")
     # The engine's own registration refuses it too.
     with pytest.raises(ValueError, match=r"GET /users/:id: .*write it as `\{id\}`"):
-        MipyreApp().get("/users/:id", lambda req: "x")
+        MipyreApp().route("GET", "/users/:id", lambda req: "x", RuntimeChoice.Worker)
     # A colon inside a segment is literal text.
     app.get("/v1/items:batchGet", lambda req: "x")
 
@@ -425,8 +431,9 @@ def test_route_params_is_the_one_template_parser():
 
 
 TEMPLATE_SCRIPT = """
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/items/{item_id}")
 def item(req, item_id):
@@ -477,8 +484,9 @@ def test_isojson_refused_in_a_worker_stops_the_start(path):
     # start fails at the worker's own JSON check, not main's.
     script = """
     import sys
+    import os
     from mipyre import Mipyre
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def index(req):
@@ -503,7 +511,7 @@ def test_relative_import_failing_in_a_worker_says_why(tmp_path):
         import os
         from .models import GREETING
         from mipyre import Mipyre
-        app = Mipyre()
+        app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
         @app.get("/")
         def index(req):
@@ -511,7 +519,7 @@ def test_relative_import_failing_in_a_worker_says_why(tmp_path):
 
         if __name__ == "__main__":
             app.run(host="127.0.0.1", port=int(os.environ["RA_PORT"]),
-                    workers=1)
+                    subinterpreters=1)
     """))
     env = dict(os.environ, RA_PORT="0", MIPYRE_TPC="0")
     proc = subprocess.run(
@@ -529,9 +537,10 @@ def test_relative_import_failing_in_a_worker_says_why(tmp_path):
 # ---------------------------------------------------------------------------
 
 STREAM_SCRIPT = """
-from mipyre import Mipyre
-from mipyre.engine import BodyRejected
-app = Mipyre()
+import os
+from mipyre import BodyStream, Mipyre
+from mipyre.engine import BodyReadError
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.max_body_size = 1024
 app.request_timeout = REQUEST_BUDGET
 
@@ -539,28 +548,28 @@ app.request_timeout = REQUEST_BUDGET
 def buffered(req):
     return {"bytes": len(req.body)}
 
-@app.post("/iterate", runtime="main", stream=True)
+@app.post("/iterate", runtime="main", body=BodyStream)
 def iterate(req):
     total = 0
     for chunk in req.stream:
         total += len(chunk)
     return {"bytes": total}
 
-@app.post("/drain", runtime="main", stream=True)
+@app.post("/drain", runtime="main", body=BodyStream)
 def drain(req):
     return {"bytes": req.stream.drain_count()}
 
-@app.post("/catch", runtime="main", stream=True)
+@app.post("/catch", runtime="main", body=BodyStream)
 def catch(req):
     try:
         req.stream.read()
     except OSError as e:
-        return {"caught": type(e).__name__, "is_body_rejected": isinstance(e, BodyRejected),
+        return {"caught": type(e).__name__, "is_body_rejected": isinstance(e, BodyReadError),
                 "text": str(e)}
     return "read it all"
 """.replace("REQUEST_BUDGET", str(REQUEST_BUDGET_S)) + RUN
 
-TOO_LARGE = {"error": "payload too large"}
+TOO_LARGE = {"detail": "payload too large"}
 
 
 def _no_error_records(srv: Server) -> None:
@@ -571,7 +580,8 @@ def _no_error_records(srv: Server) -> None:
 
 @pytest.mark.parametrize("path", ["tpc", "pool", "gil"])
 def test_oversized_streamed_body_is_413_like_a_buffered_one(path):
-    with serve(STREAM_SCRIPT, path) as srv:
+    # Every route runs on the main interpreter, so no path has sub-interpreters to size.
+    with serve(STREAM_SCRIPT, path, workers=None) as srv:
         body = b"x" * 4096
         buffered = srv.post("/buffered", body)
         assert (buffered.status, buffered.json()) == (413, TOO_LARGE)
@@ -582,7 +592,7 @@ def test_oversized_streamed_body_is_413_like_a_buffered_one(path):
         r = srv.post("/catch", body)
         assert r.status == 200
         assert r.json() == {
-            "caught": "BodyRejected",
+            "caught": "BodyReadError",
             "is_body_rejected": True,
             "text": "request body is larger than max_body_size",
         }
@@ -595,7 +605,7 @@ def _send_partial_body(port: int, target: str) -> tuple[int, bytes]:
     """Declares a 100-byte body, sends 10 bytes, then waits for the answer."""
     with socket.create_connection((HOST, port), timeout=60) as s:
         s.sendall(
-            f"POST {target} HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n".encode()
+            f"POST {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 100\r\n\r\n".encode()
             + b"z" * 10
         )
         data = b""
@@ -642,13 +652,14 @@ def _mcp_call(server, name: str, arguments: dict) -> dict:
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": name, "arguments": arguments},
     })
-    return json.loads(server.handle_request(body))
+    return server.answer(json.loads(body))
 
 
 def test_mcp_wrong_argument_type_is_32602_with_the_reason():
+    from mipyre import Mipyre
     from mipyre.mcp import MCPServer
 
-    mcp = MCPServer()
+    mcp = MCPServer(Mipyre())
 
     @mcp.tool()
     def add(a: int, b: int) -> int:
@@ -712,9 +723,10 @@ class Point:
 
 
 def test_mcp_unmappable_hint_is_a_registration_error_naming_the_parameter():
+    from mipyre import Mipyre
     from mipyre.mcp import MCPServer
 
-    mcp = MCPServer()
+    mcp = MCPServer(Mipyre())
     with pytest.raises(TypeError, match=r"parameter 'where' is annotated .*Point.*input_schema="):
         @mcp.tool()
         def locate(name: str, where: Point) -> str:
@@ -734,9 +746,10 @@ def test_mcp_unmappable_hint_is_a_registration_error_naming_the_parameter():
 
 
 def test_mcp_non_str_results_are_json():
+    from mipyre import Mipyre
     from mipyre.mcp import MCPServer
 
-    mcp = MCPServer()
+    mcp = MCPServer(Mipyre())
 
     @mcp.tool()
     def items() -> list:
@@ -766,7 +779,7 @@ def test_mcp_non_str_results_are_json():
 LEVEL_SCRIPT = """
 import logging, os
 from mipyre import Mipyre
-app = Mipyre(debug=os.environ.get("RA_DEBUG") == "1")
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"), debug=os.environ.get("RA_DEBUG") == "1")
 app.enable_access_log(level=os.environ["RA_LEVEL"])
 
 @app.get("/log", runtime="main")
@@ -802,12 +815,12 @@ import logging, os
 from mipyre import Mipyre
 case = os.environ["RA_CASE"]
 if case == "configured-debug":
-    app = Mipyre(log_config={"level": "DEBUG"})
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"), log_config={"level": "DEBUG"})
 elif case == "pinned-error":
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
     app.enable_access_log(level="error")
 else:
-    app = Mipyre()  # ERROR would hide the INFO access lines
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))  # ERROR would hide the INFO access lines
 app.enable_access_log()  # as MIPYRE_LOG=1 / debug=True at run()
 
 @app.get("/log", runtime="main")
@@ -841,7 +854,7 @@ def test_enable_access_log_without_a_level_keeps_the_configured_one(case, lowest
 
 
 # ---------------------------------------------------------------------------
-# Python: model= rule, metrics counters, readiness timeouts, uploads
+# Python: body= rule, metrics counters, readiness timeouts, uploads
 # ---------------------------------------------------------------------------
 
 
@@ -853,7 +866,9 @@ def test_model_rule_is_checked_at_registration():
     class Item(BaseModel):
         name: str
 
-    app = Mipyre()
+    # On the main interpreter: PyPI's pydantic-core can't load in a sub-interpreter, which a
+    # runtime="subinterp" body= route is refused for first.
+    app = Mipyre(runtime="main")
 
     # The body annotated as the model, but standing where the request goes: `sku` was
     # meant as a path param the template lacks. Used to bind `item` to the request.
@@ -861,34 +876,22 @@ def test_model_rule_is_checked_at_registration():
         return sku
 
     with pytest.raises(TypeError, match=r"'item' is annotated Item but stands where the request goes"):
-        app.post("/items", misplaced, model=Item)
+        app.post("/items", misplaced, body=Item)
 
     # No parameter for the body at all: used to fail on every request instead.
     def bodiless():
         return "x"
 
     with pytest.raises(TypeError, match=r"no parameter for the validated Item body"):
-        app.post("/things", bodiless, model=Item)
+        app.post("/things", bodiless, body=Item)
 
     # The two shapes the rule allows.
-    app.post("/a/{item_id}", lambda req, body, item_id: None, model=Item)
-    app.post("/b/{item_id}", lambda body, item_id: None, model=Item)
-
-
-def test_corrupt_metrics_counter_fails_the_scrape_not_reads_as_zero():
-    from mipyre.observability import CorruptMetric, _render_prometheus
-
-    class State(dict):
-        pass
-
-    ok = _render_prometheus(State({"_m:req:total": "3"}))
-    assert "mipyre_http_requests_total 3" in ok
-    with pytest.raises(CorruptMetric, match=r"'_m:req:total' holds 'garbage'"):
-        _render_prometheus(State({"_m:req:total": "garbage"}))
+    app.post("/a/{item_id}", lambda req, body, item_id: None, body=Item)
+    app.post("/b/{item_id}", lambda body, item_id: None, body=Item)
 
 
 def test_sync_readiness_check_is_bounded_like_an_async_one(monkeypatch):
-    import mipyre.health as health
+    import mipyre._health as health
 
     monkeypatch.setattr(health, "_CHECK_TIMEOUT_S", 0.5)
     # The check hangs until the test releases it, after the run: the run returning at all is the proof that it
@@ -899,7 +902,8 @@ def test_sync_readiness_check_is_bounded_like_an_async_one(monkeypatch):
         health.ReadinessCheck.of("fine", lambda: True),
     ]
     try:
-        ok, results = health._run_checks_sync(checks, "rid-ra")
+        check_results = health._run_checks(checks)
+        ok, results = check_results.ok, check_results.checks
         assert not release.is_set()
     finally:
         release.set()
@@ -1029,15 +1033,13 @@ def test_type_mismatch_is_a_param_error(ra_pool):
 # ---------------------------------------------------------------------------
 
 GRPC_SCRIPT = """
-from mipyre import Mipyre, get_gil_metrics
-app = Mipyre()
+import os
+from mipyre import Mipyre
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.max_body_size = 64
 app.request_timeout = REQUEST_BUDGET
 app.enable_grpc_benchmark()
-
-@app.get("/total", runtime="main")
-def total(req):
-    return {"total": get_gil_metrics().total_requests}
+app.enable_metrics()
 """.replace("REQUEST_BUDGET", str(REQUEST_BUDGET_S)) + RUN
 
 GET_SUM = "/benchmark.BenchmarkService/GetSum"
@@ -1105,9 +1107,10 @@ def test_grpc_stalled_body_is_deadline_exceeded():
 @pytest.mark.parametrize("path", ["tpc", "gil"])
 def test_grpc_calls_are_counted(path):
     with serve(GRPC_SCRIPT, path, env={"MIPYRE_METRICS": "1"}) as srv:
-        before = srv.get("/total").json()["total"]
+        before = metric_count(srv.get("/metrics").body.decode(), "mipyre_http_requests_total")
         for _ in range(3):
             assert _grpc_call(srv.port, _grpc_frame(bytes([0x08, 1])))["grpc-status"] == "0"
-        after = srv.get("/total").json()["total"]
-        # the three calls and the second /total
+        after = metric_count(srv.get("/metrics").body.decode(), "mipyre_http_requests_total")
+        # This server's own count: what the readiness check sent, then the first page read and
+        # the three calls.
         assert after - before == 4, (before, after)

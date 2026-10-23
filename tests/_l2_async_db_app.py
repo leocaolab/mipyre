@@ -65,4 +65,4 @@ def background_state(req):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ["L2_PORT"]), workers=2)
+    app.run(host="127.0.0.1", port=int(os.environ["L2_PORT"]))

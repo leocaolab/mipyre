@@ -5,11 +5,11 @@ each fails on the code before the fix. No fixed ports: every server binds port 0
 
 - Q1: on TPC, `async def` routes run on the async worker pool, off the TPC thread.
 - Topology: one `Topology` resolved at start; GC modes a topology can't run are refused.
-- `workers` / `io_workers` of 0, and a host that isn't an IP, are `ValueError`s naming it.
+- `threads` / `subinterpreters` of 0, and a host that isn't an IP, are `ValueError`s naming it.
 - G4: a port another server listens on with SO_REUSEPORT is `OSError(EADDRINUSE)`.
 - R5: each server has its own stop handle (nested TestClients, a stop before serving).
 - TestClient never `os._exit`s the test process; `_prepare` is per server where it must be.
-- Registration: `stream=True` without `runtime="main"`, and hooks after the seal, are errors.
+- Registration: `body=BodyStream` without `runtime="main"`, and hooks after the seal, are errors.
 - RSS sampler: runs while a server with metrics serves, `None` after, back on the next run.
 """
 
@@ -30,9 +30,9 @@ import pytest
 
 import mipyre.engine
 import mipyre.testing
-from mipyre import Mipyre, get_gil_metrics
-from mipyre.app import _ServeSettings
-from mipyre.testing import TestClient
+from mipyre import BodyStream, Mipyre, get_gil_metrics
+from mipyre._server_run import ServerRun, runs_of
+from mipyre.testing import TestClient, TestServer
 from tests._helpers import poll_until
 from tests.apps import (
     final_w1_mcp_late,
@@ -75,11 +75,9 @@ def _run_script(tmp_path, body: str, timeout: float = 60, env_extra=None):
 
 
 @pytest.fixture
-def one_tpc_thread(monkeypatch):
+def one_tpc_thread():
     # One TPC thread: before Q1 it ran every route, async included, one at a time.
-    monkeypatch.setenv("MIPYRE_WORKERS", "1")
-    monkeypatch.delenv("MIPYRE_TPC", raising=False)
-    monkeypatch.delenv("MIPYRE_TPC_DARWIN", raising=False)
+    return mipyre.engine.ServerFlags(threads=1)
 
 
 def _status_and_text(url: str) -> tuple[int, str]:
@@ -101,14 +99,14 @@ def test_tpc_async_handlers_overlap_their_awaits(one_tpc_thread):
     for the fourth to arrive, and answers how many were in flight. Inline on the TPC thread
     the first would block the rest (and get its 504). Until b/441 this was `took < 1.8 s` for
     four 0.6 s sleeps, which two at a time (1.2 s) also passed."""
-    with TestClient(final_w1_tpc_async.app, transport="tcp") as c:
+    with TestServer(final_w1_tpc_async.app, config=one_tpc_thread) as server, TestClient(server) as c:
         assert _round_of_four(c.base_url, "q1") == [(200, "4")] * 4
 
 
 def test_the_round_sees_awaits_that_overlap_only_two_at_a_time(one_tpc_thread):
     """The round's own input: the same round with two requests let in at a time never has four
     in flight, so none of them completes it (each gets its 504 at the app's short budget)."""
-    with TestClient(final_w1_tpc_async_capped.app, transport="tcp") as c:
+    with TestServer(final_w1_tpc_async_capped.app, config=one_tpc_thread) as server, TestClient(server) as c:
         assert [status for status, _ in _round_of_four(c.base_url, "capped")] == [504] * 4
 
 
@@ -119,7 +117,7 @@ def test_a_sync_route_answers_while_an_async_one_awaits(one_tpc_thread, tmp_path
     instead of "released". Until b/441 this slept 0.3 s to guess the await had begun and
     checked `took < 1.5 s`."""
     entered, gate = tmp_path / "entered", tmp_path / "gate"
-    with TestClient(final_w1_tpc_async.app, transport="tcp") as c:
+    with TestServer(final_w1_tpc_async.app, config=one_tpc_thread) as server, TestClient(server) as c:
         slow: list[tuple[int, str]] = []
         waiter = threading.Thread(
             target=lambda: slow.append(_status_and_text(f"{c.base_url}/until_open?entered={entered}&gate={gate}"))
@@ -136,31 +134,27 @@ def test_a_sync_route_answers_while_an_async_one_awaits(one_tpc_thread, tmp_path
 # ---------------------------------------------------------------------------
 
 
-def test_a_gc_mode_the_topology_cannot_run_is_refused_at_start(monkeypatch):
-    monkeypatch.setenv("MIPYRE_TPC", "0")
-    monkeypatch.setenv("MIPYRE_GC_MODE", "idle")
+def test_a_gc_mode_the_topology_cannot_run_is_refused_at_start():
     engine = mipyre.engine.MipyreApp()
-    with pytest.raises(ValueError, match="MIPYRE_GC_MODE=idle.*sub-interpreter pool"):
-        engine.start(host=HOST, port=0, mode="subinterp")
+    # A route on a sub-interpreter is what makes the multi-thread server the pool.
+    engine.route("GET", "/", lambda req: "ok", mipyre.engine.RuntimeChoice.Worker)
+    flags = mipyre.engine.ServerFlags(host=HOST, port=0, tpc=False, gc_mode="idle")
+    with pytest.raises(ValueError, match="gc_mode=idle.*sub-interpreter pool"):
+        engine.start(config=flags)
 
 
-@pytest.mark.parametrize("arg", ["workers", "io_workers"])
+@pytest.mark.parametrize("arg", ["threads", "subinterpreters"])
 def test_zero_workers_is_a_value_error_naming_the_argument(arg):
     engine = mipyre.engine.MipyreApp()
-    with pytest.raises(ValueError, match=f"^{arg} must be >= 1, got 0"):
-        engine.start(
-            host=HOST,
-            port=0,
-            mode="gil",
-            **{arg: mipyre.engine.GivenSize(0, mipyre.engine.SizeOrigin.StartArg)},
-        )
+    with pytest.raises(ValueError, match=rf'^ServerFlags\({arg}=\): "0" is invalid'):
+        engine.start(config=mipyre.engine.ServerFlags(host=HOST, port=0, **{arg: 0}))
 
 
 @pytest.mark.parametrize("host", ["localhost", "not-a-host", "127.0.0"])
 def test_a_host_that_is_not_an_ip_is_a_value_error_naming_it(host):
     engine = mipyre.engine.MipyreApp()
     with pytest.raises(ValueError) as err:
-        engine.start(host=host, port=0, mode="gil")
+        engine.start(config=mipyre.engine.ServerFlags(host=host, port=0))
     assert f'host "{host}"' in str(err.value), err.value
 
 
@@ -171,7 +165,7 @@ def test_a_bare_ipv6_host_binds():
     except OSError:
         pytest.skip("no IPv6 loopback")
     engine = mipyre.engine.MipyreApp()
-    server = engine.start(host="::1", port=0, mode="gil")
+    server = engine.start(config=mipyre.engine.ServerFlags(host="::1", port=0))
     assert server.port != 0
     server.shutdown()
     server.serve()  # stopped before it served: returns at once, releasing the port
@@ -193,7 +187,7 @@ def test_a_port_held_with_reuseport_is_eaddrinuse():
     try:
         engine = mipyre.engine.MipyreApp()
         with pytest.raises(OSError) as err:
-            engine.start(host=HOST, port=port, mode="gil")
+            engine.start(config=mipyre.engine.ServerFlags(host=HOST, port=port))
         assert err.value.errno == errno.EADDRINUSE, err.value
     finally:
         other.close()
@@ -201,10 +195,10 @@ def test_a_port_held_with_reuseport_is_eaddrinuse():
 
 @pytest.mark.skipif(not hasattr(socket, "SO_REUSEPORT"), reason="no SO_REUSEPORT")
 def test_a_second_server_on_a_served_port_is_eaddrinuse():
-    with TestClient(final_w1_plain.app, transport="tcp") as c:
+    with TestServer(final_w1_plain.app) as server, TestClient(server) as c:
         engine = mipyre.engine.MipyreApp()
         with pytest.raises(OSError) as err:
-            engine.start(host=HOST, port=c.port, mode="gil")
+            engine.start(config=mipyre.engine.ServerFlags(host=HOST, port=c.port))
         assert err.value.errno == errno.EADDRINUSE, err.value
         assert c.get("/").text == "ok"
 
@@ -219,10 +213,11 @@ def test_nested_test_clients_on_one_app_stop_independently(monkeypatch):
     # (pytest-timeout ends it), so the return is the proof; it used to wait out the 60 s default (b/441 D4).
     monkeypatch.setattr(mipyre.testing, "_STOP_TIMEOUT_S", None)
     app = final_w1_plain.app
-    with TestClient(app, transport="tcp") as outer:
-        inner = TestClient(app, transport="tcp")
+    with TestServer(app) as server, TestClient(server) as outer:
+        inner = TestServer(app)
         assert inner.port != outer.port
-        assert inner.get("/").text == "ok"
+        with TestClient(inner) as c:
+            assert c.get("/").text == "ok"
         inner.close()
         # The inner close stopped the inner server only.
         assert outer.get("/").text == "ok"
@@ -234,7 +229,7 @@ def test_nested_test_clients_on_one_app_stop_independently(monkeypatch):
 
 def test_a_server_stopped_before_it_serves_returns_at_once():
     engine = mipyre.engine.MipyreApp()
-    server = engine.start(host=HOST, port=0, mode="gil")
+    server = engine.start(config=mipyre.engine.ServerFlags(host=HOST, port=0))
     port = server.port
     server.shutdown()
     # Returns at all: a serve that missed the earlier stop serves on and never returns (pytest-timeout ends it;
@@ -249,14 +244,15 @@ def test_a_server_stopped_before_it_serves_returns_at_once():
 
 
 def test_a_stop_while_starting_stops_the_server_it_was_meant_for():
-    # What TestClient.close() during startup does: the server is stopped as soon as it
-    # is bound, so `_start` returns instead of serving on.
+    # What TestClient.close() during startup does: a stop that came before the server
+    # existed stops it as soon as it does, so `serve` returns instead of serving on.
     app = final_w1_plain.app
-    settings = _ServeSettings.resolve(env={}, host=HOST, port=0, app_runtime="main")
+    run = ServerRun(app, mipyre.engine.Deployment(), mipyre.engine.ServerFlags(host=HOST, port=0))
+    run.stop()
     done = threading.Event()
 
     def start():
-        app._start(settings, on_bound=lambda server: server.shutdown())
+        run.serve()
         done.set()
 
     threading.Thread(target=start, daemon=True).start()
@@ -267,10 +263,10 @@ def test_app_stop_stops_every_server_of_the_app():
     app = final_w1_plain.app
     a = TestClient(app)
     b = TestClient(app)
-    app._stop()
+    runs_of(app).stop()
     for client in (a, b):
-        client._thread.join(20)
-        assert not client._thread.is_alive()
+        client.server._thread.join(20)
+        assert not client.server._thread.is_alive()
         client.close()
 
 
@@ -284,7 +280,7 @@ def test_abandoned_workers_raise_from_testclient_close(tmp_path):
         tmp_path,
         """
         from mipyre import Mipyre
-        from mipyre.app import WorkersAbandoned
+        from mipyre import AbandonedWorkersError
         from mipyre.testing import TestClient
 
         class AbandoningEngine:
@@ -313,8 +309,8 @@ def test_abandoned_workers_raise_from_testclient_close(tmp_path):
             c = TestClient(app)
             try:
                 c.close()
-            except WorkersAbandoned as e:
-                print("RAISED", e.workers, flush=True)
+            except AbandonedWorkersError as e:
+                print("RAISED", [str(w) for w in e.workers], flush=True)
             print("STILL-RUNNING", flush=True)
         """,
     )
@@ -328,6 +324,7 @@ def test_app_run_still_exits_when_workers_are_abandoned(tmp_path):
         """
         import threading, time, urllib.request
         from mipyre import Mipyre
+        from mipyre._server_run import runs_of
 
         class AbandoningEngine:
             # The app's engine, reporting the workers a pool shutdown gave up on.
@@ -352,10 +349,10 @@ def test_app_run_still_exits_when_workers_are_abandoned(tmp_path):
 
         def stop_when_up():
             for _ in range(200):
-                if app._servers:
+                if runs_of(app).serving():
                     break
                 time.sleep(0.05)
-            app._stop()
+            runs_of(app).stop()
 
         if __name__ == "__main__":
             threading.Thread(target=stop_when_up, daemon=True).start()
@@ -373,7 +370,10 @@ def test_the_mcp_route_comes_with_the_first_server_that_has_tools():
     with TestClient(app) as c:
         assert c.post("/mcp", body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).status_code == 404
 
-    @app.mcp.tool()
+    from mipyre.mcp import MCPServer
+    mcp = MCPServer(app)
+
+    @mcp.tool()
     def late_ping() -> str:
         return "pong"
 
@@ -386,14 +386,14 @@ def test_the_mcp_route_comes_with_the_first_server_that_has_tools():
 def test_servers_leave_the_blas_variables_of_the_server_process_alone(tmp_path):
     """BLAS thread limits belong to the process-lane adapters, in worker processes only
     (tests/test_blas_threads.py): no server changes the server process's environment.
-    The same app is served on the main interpreter (MIPYRE_RUNTIME=main) and on
+    The same app is served on the main interpreter (MIPYRE_TEST_MODE=main) and on
     sub-interpreter workers (the default runtime), each in its own process."""
     script = """
         import os
         from mipyre import Mipyre
         from mipyre.testing import TestClient
 
-        app = Mipyre()
+        app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
         @app.get("/")
         def index(req):
@@ -405,9 +405,9 @@ def test_servers_leave_the_blas_variables_of_the_server_process_alone(tmp_path):
             print("AFTER", os.environ.get("OPENBLAS_NUM_THREADS"), flush=True)
         """
     on_main = _run_script(
-        tmp_path, script, timeout=120, env_extra={"MIPYRE_WORKERS": "2", "MIPYRE_RUNTIME": "main"}
+        tmp_path, script, timeout=120, env_extra={"MIPYRE_THREADS": "2", "MIPYRE_TEST_MODE": "main"}
     )
-    on_workers = _run_script(tmp_path, script, timeout=120, env_extra={"MIPYRE_WORKERS": "2"})
+    on_workers = _run_script(tmp_path, script, timeout=120, env_extra={"MIPYRE_THREADS": "2"})
     assert "AFTER None" in on_main.stdout, on_main.stdout + on_main.stderr
     assert "AFTER None" in on_workers.stdout, on_workers.stdout + on_workers.stderr
 
@@ -423,8 +423,8 @@ def test_stream_without_gil_is_a_registration_error():
     def upload(req):
         return "ok"
 
-    with pytest.raises(ValueError, match="stream=True needs runtime='main'"):
-        app.post("/up", stream=True)(upload)
+    with pytest.raises(ValueError, match="body=BodyStream needs runtime='main'"):
+        app.post("/up", body=BodyStream)(upload)
     assert app.routes == []
 
 
@@ -436,8 +436,8 @@ def test_hooks_after_the_seal_are_refused_like_late_routes():
     def hook(req):
         return None
 
-    sealed = mipyre.engine.RegistrationSealed
-    assert issubclass(sealed, ValueError)
+    sealed = mipyre.engine.LateRegistrationError
+    assert issubclass(sealed, mipyre.DeclarationError)
     with pytest.raises(sealed, match="before_request hook is registered after"):
         app.before_request(hook)
     with pytest.raises(sealed, match="after_request hook is registered after"):
@@ -445,7 +445,7 @@ def test_hooks_after_the_seal_are_refused_like_late_routes():
     with pytest.raises(sealed, match="fallback handler is registered after"):
         app.fallback(lambda req: "fallback")
     with pytest.raises(sealed):
-        app.enable_cors()
+        app.enable_cors(allow_origins="*")
     # A late worker route gets the same type.
     with pytest.raises(sealed, match="registered after app.run"):
         app.get("/late", runtime="subinterp")(lambda req: "late")
@@ -470,11 +470,10 @@ def _rss_while(predicate):
 
 
 @pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="RSS sampled on Linux/macOS")
-def test_the_rss_sampler_runs_per_server_and_resets_after(monkeypatch):
-    monkeypatch.setenv("MIPYRE_METRICS", "1")
+def test_the_rss_sampler_runs_per_server_and_resets_after():
     app = final_w1_plain.app
     for _ in range(2):
-        with TestClient(app) as c:
+        with TestClient(app, config=mipyre.engine.ServerFlags(metrics=True)) as c:
             assert c.get("/").text == "ok"
             rss = _rss_while(lambda v: isinstance(v, int))
             assert isinstance(rss, int) and rss > 0, rss

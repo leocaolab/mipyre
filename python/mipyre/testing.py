@@ -1,13 +1,18 @@
-"""TestClient — exercise a Mipyre app without manually managing a server.
+"""TestServer and TestClient — integration-test a Mipyre app in the test process.
 
-Starts the app in a background thread, in the mode ``app.run()`` uses by
-default. By default (``transport="memory"``) the server binds no socket: each
-request is a connection made in this process, handed to the server's accept loop
-and served from there exactly as a TCP connection is (hyper, routing, sub-interp
-dispatch, CORS, compression, hooks). ``transport="tcp"`` serves on a real TCP
-socket instead, for what only a socket has (see below). Define the app at module
-level: sub-interpreter workers rebuild it by executing that module. Pure stdlib
-for HTTP; WebSocket support requires the ``websockets`` package.
+``TestServer(app)`` serves the app in a background thread on a real TCP port, as
+``mipyre run`` does (every runtime, process lanes too); any HTTP client reaches it at
+``server.url``. ``TestClient`` is an HTTP / WebSocket client: ``TestClient(server)``
+talks to a running ``TestServer``; ``TestClient(app)`` serves the app itself.
+
+``TestClient(app)`` starts the app in a background thread, in the mode ``app.run()`` uses by
+default, on a server that binds no socket: each request is a connection made in this
+process, handed to the server's accept loop and served from there exactly as a TCP
+connection is (hyper, routing, sub-interp dispatch, CORS, compression, hooks). For what
+only a socket has (see below), serve the app with ``TestServer`` and use
+``TestClient(server)``. Define the app at module level: sub-interpreter workers rebuild
+it by executing that module. Pure stdlib for HTTP; WebSocket support requires the
+``websockets`` package.
 
 A memory connection is one end of a Unix socket pair whose other end the
 server's accept loop takes: a real socket, so ``http.client`` and ``websockets``
@@ -21,7 +26,7 @@ the kernel's). What it does not have, it does not fake:
   socket's, so how many unread bytes stall a writer differs.
 
 Timeouts are the server's own either way (header read, write stall), and the
-client's ``timeout`` raises ``TimeoutError`` in both transports.
+client's ``timeout`` raises ``TimeoutError`` with either server.
 
 Basics::
 
@@ -44,32 +49,43 @@ WebSocket::
     with TestClient(app) as c, c.websocket_connect("/ws") as ws:
         ws.send("ping")
         assert ws.recv() == "pong"
+
+One server for the session, a fresh client per test::
+
+    @pytest.fixture(scope="session")
+    def server():
+        with TestServer(app) as s:
+            yield s
+
+    @pytest.fixture
+    def client(server):
+        with TestClient(server) as c:
+            yield c
 """
 
 from __future__ import annotations
 
 import http.client
 import json
-import logging as _logging
-import os
 import socket
 import threading
 import urllib.parse
 import urllib.request
 import urllib.error
 from collections import defaultdict
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
-from typing import Any, Iterator, NoReturn
+from typing import Any, Iterator
 
-from mipyre.app import Mipyre, Transport, WorkersAbandoned, _ServeSettings
+from mipyre.app import Mipyre
+from mipyre._server_run import ServerRun, Transport
+from mipyre.engine import RunMetrics, ServerFlags
 
-__all__ = ["TestClient", "TestResponse", "Transport", "WebSocketSession"]
+__all__ = ["TestClient", "TestResponse", "TestServer", "WebSocketSession"]
 
-_logger = _logging.getLogger("mipyre.testing")
-
-# How long the server may take to answer its first request; building the
-# sub-interpreter workers (each executes the app's module) dominates it.
+# How long the server may take to serve; building the sub-interpreter workers (each
+# executes the app's module) dominates it.
 _READY_TIMEOUT_S = 30
 # How long close() waits for the server to drain and run its shutdown hooks.
 _STOP_TIMEOUT_S = 60
@@ -136,32 +152,174 @@ class TestResponse:
             )
 
 
-class TestClient:
-    """Test client — serves the app in a background thread, the way ``app.run()`` does.
+def _url(host: str, port: int) -> str:
+    """``http://host:port``, an IPv6 address in brackets."""
+    if ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{port}"
 
-    The server serves as ``app.run()`` does, so routes run where they are declared
-    (sub-interpreter routes in sub-interpreter workers). Workers rebuild the app by
-    executing the module that created it, so define the app at module level (as in
+
+class TestServer:
+    """One run of ``app`` in a background thread, as ``mipyre run`` serves it: every runtime
+    (process lanes too), on a real TCP port. Returns once serving; any HTTP client reaches it
+    at ``url``.
+
+    The run is ``app.run()``'s, so routes run where they are declared. Workers rebuild the app
+    by executing the module that created it, so define the app at module level (as in
     production). An app created inside a function can only be served with
     ``Mipyre(runtime="main")``.
 
     Args:
         app: Mipyre app instance.
-        transport: ``Transport.MEMORY`` / ``"memory"`` (default): no socket, each
-              request a connection made in this process (see the module docstring for
-              what it lacks). ``Transport.TCP`` / ``"tcp"``: a real TCP listener, for
-              tests of what only a socket has (the client address, the port, raw
-              socket clients).
-        host: bind address with ``transport="tcp"`` (default ``127.0.0.1``).
-        port: bind port with ``transport="tcp"``. ``None`` has the server bind one the
-              kernel picks; the ``port`` attribute is the one it bound. ``host`` and
-              ``port`` with the memory transport are a ``ValueError``.
+        host: bind address (default ``127.0.0.1``).
+        port: bind port. ``0`` (default) has the server bind one the kernel picks; the
+              ``port`` attribute is the one it bound.
+        config: the server's other flags, as code gives them (``ServerFlags(threads=2)``).
+              A test server reads no environment variable and no ``pyproject.toml``: what it
+              runs with does not depend on where the test runs.
+
+    If the server cannot start (a startup hook raises, the port is taken, a worker cannot
+    build the app), the constructor raises that error and leaves no thread and no bound port.
+
+    ``close()`` (or leaving the ``with`` block) stops the server: shutdown hooks run and the
+    port is released. ``TestClient(server)`` is a client of this server that does not own it.
+    """
+
+    # Tell pytest this is not a test class.
+    __test__ = False
+
+    def __init__(
+        self, app: Mipyre, *, host: str = "127.0.0.1", port: int = 0, config: ServerFlags | None = None
+    ) -> None:
+        self._start(app, host, (config or ServerFlags())._with(host=host, port=port), Transport.TCP)
+
+    @classmethod
+    def _in_memory(cls, app: Mipyre, config: ServerFlags | None) -> TestServer:
+        """A server that binds no socket, reached only through ``_connect()``: the server a
+        ``TestClient(app)`` owns."""
+        server = cls.__new__(cls)
+        server._start(app, _MEMORY_HOST, config or ServerFlags(), Transport.MEMORY)
+        return server
+
+    def _start(self, app: Mipyre, host: str, config: ServerFlags, transport: Transport) -> None:
+        self.host = host
+        self._transport = transport
+        self._run = ServerRun.in_test_process(app, config, transport=transport)
+        # `_serving` is set once the server serves, `_settled` once it serves or its thread
+        # ended; `_outcome` is how the run ended, until raised.
+        self._serving = threading.Event()
+        self._settled = threading.Event()
+        self._outcome: BaseException | None = None
+        self._run.prepare()
+        self._thread = threading.Thread(target=self._serve, name="mipyre-testserver", daemon=True)
+        self._thread.start()
+        self._wait_until_serving()
+
+    def metrics(self) -> RunMetrics:
+        """This server's counts so far (its answers, refusals, workers), apart from any other
+        server in the process: the engine server's ``metrics()``."""
+        return self._run.metrics()
+
+    @property
+    def port(self) -> int:
+        """The port the server listens on (the one the kernel picked for ``port=0``). The
+        in-memory server of a ``TestClient(app)`` has none: ``AttributeError``."""
+        return self._run.port
+
+    @property
+    def url(self) -> str:
+        """``http://127.0.0.1:54321``; ``http://testserver`` for an in-memory server."""
+        if self._transport is Transport.MEMORY:
+            return f"http://{_MEMORY_HOST}"
+        return _url(self.host, self.port)
+
+    def _describe(self) -> str:
+        """The server, as messages name it."""
+        if self._transport is Transport.MEMORY:
+            return "in-memory server"
+        return f"server on port {self.port}"
+
+    def _serve(self) -> None:
+        try:
+            self._outcome = self._run.serve_to_end(on_serving=self._on_serving)
+        finally:
+            self._settled.set()
+
+    def _on_serving(self) -> None:
+        self._serving.set()
+        self._settled.set()
+
+    def _connect(self) -> socket.socket:
+        """A new in-memory connection to this server (memory transport): the client's end of
+        a socket pair, blocking."""
+        return self._run.connect()
+
+    def _alive(self) -> bool:
+        """Whether the run is still serving: its thread ends when it stops."""
+        return self._thread.is_alive()
+
+    def _wait_until_serving(self) -> None:
+        """Return once the server serves; raise the start's own error if its thread ended
+        first, or ``TimeoutError`` after stopping the server if neither happened in time."""
+        self._settled.wait(_READY_TIMEOUT_S)
+        if self._serving.is_set():
+            return
+        if self._settled.is_set():
+            self._thread.join()
+            self._raise_outcome()
+            raise RuntimeError("TestServer: the server stopped before it served, with no error")
+        self._run.stop()
+        self._thread.join(_STOP_TIMEOUT_S)
+        still = " and did not stop" if self._thread.is_alive() else ""
+        raise TimeoutError(f"TestServer: {self._describe()} did not serve within {_READY_TIMEOUT_S}s{still}")
+
+    def _raise_outcome(self) -> None:
+        """Raise how the server's run ended, once; a clean end raises nothing."""
+        outcome, self._outcome = self._outcome, None
+        if outcome is not None:
+            raise outcome
+
+    def close(self) -> None:
+        """Stop this server and wait until it has: its shutdown hooks have run and the port
+        (if any) is free. Other servers of the same app keep serving. Safe from any thread.
+        Raises how the run ended (a shutdown hook's error, ``AbandonedWorkersError`` when
+        worker threads outlived the shutdown grace period, …) once; a second ``close()``
+        returns. ``app.run()`` would exit the process on ``AbandonedWorkersError``; a test
+        process is left running, and exits with status 1 without finalizing if such a thread
+        still owns its interpreter at exit."""
+        self._run.stop()
+        self._thread.join(_STOP_TIMEOUT_S)
+        if self._thread.is_alive():
+            raise RuntimeError(f"TestServer: {self._describe()} did not stop within {_STOP_TIMEOUT_S}s")
+        self._raise_outcome()
+
+    def __enter__(self) -> TestServer:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
+class TestClient:
+    """Test client — an HTTP / WebSocket client of a server of the app.
+
+    ``TestClient(app)`` serves the app itself, in a background thread, the way
+    ``app.run()`` does, and stops it on ``close()``. ``TestClient(server)`` is a client of a
+    running :class:`TestServer` and leaves it running on ``close()``: one server, a fresh
+    client (and cookie jar) per test.
+
+    Args:
+        target: a Mipyre app, served by this client on a server that binds no socket (see
+              the module docstring for what it lacks), or a :class:`TestServer`.
         timeout: default per-request timeout in seconds (default 10).
         follow_redirects: whether to follow 3xx redirects (default True,
               matching urllib's historical behavior).
+        config: the flags of the server this client serves the app on
+              (``ServerFlags(threads=2)``); like ``TestServer``'s, it reads no environment
+              variable and no ``pyproject.toml``.
 
-    ``close()`` (or leaving the ``with`` block) stops the server: shutdown hooks
-    run and the port, if any, is released.
+    ``close()`` (or leaving the ``with`` block) stops the server this client serves, if it
+    serves one: shutdown hooks run and the port, if any, is released.
     """
 
     # Tell pytest this is not a test class (silences the collection
@@ -170,34 +328,36 @@ class TestClient:
 
     def __init__(
         self,
-        app: Mipyre,
-        host: str | None = None,
-        port: int | None = None,
+        target: Mipyre | TestServer,
         *,
-        transport: Transport | str = Transport.MEMORY,
         timeout: float = 10.0,
         follow_redirects: bool = True,
+        config: ServerFlags | None = None,
         **removed: object,
     ):
-        from mipyre import _runtime
+        from mipyre import _routes
 
-        _runtime.reject_removed_serve_args("TestClient(...)", removed)
-        self.transport = Transport(transport)
-        if self.transport is Transport.MEMORY and (host is not None or port is not None):
-            raise ValueError(
-                "TestClient(transport='memory') listens on no socket, so host/port cannot "
-                "be given; pass transport='tcp' for a real TCP listener"
-            )
-        self.host = "127.0.0.1" if host is None else host
+        for name in ("host", "port", "transport"):
+            if name in removed:
+                raise TypeError(
+                    f"TestClient(...): {name}= was removed. A server on a real TCP port is "
+                    "TestServer(app, host=..., port=...); TestClient(server) is a client of it"
+                )
+        _routes.reject_removed_serve_args("TestClient(...)", removed)
+        if isinstance(target, TestServer):
+            if config is not None:
+                raise TypeError("TestClient(server, config=...): the server was configured when it was made")
+            self.server, self._owns_server = target, False
+        else:
+            self.server, self._owns_server = TestServer._in_memory(target, config), True
         self.timeout = timeout
         self.follow_redirects = follow_redirects
 
         # Cookie jar — cookies set by the server persist across requests
         # made through this client, matching httpx.Client / requests.Session.
         self.cookies: CookieJar = CookieJar()
-        http_handler: urllib.request.HTTPHandler = (
-            _MemoryHTTPHandler(self) if self.transport is Transport.MEMORY
-            else urllib.request.HTTPHandler()
+        http_handler: _HTTPHandler = (
+            _MemoryHTTPHandler(self.server) if self.server._transport is Transport.MEMORY else _HTTPHandler()
         )
         self._opener = urllib.request.build_opener(
             http_handler,
@@ -205,159 +365,21 @@ class TestClient:
             _NoRedirectHandler() if not follow_redirects else urllib.request.HTTPRedirectHandler(),
         )
 
-        self._app = app
-        # Port 0: the server binds a port the kernel picks and reports it (no pick-then-
-        # rebind race with other processes).
-        self._settings = _ServeSettings.resolve(
-            env=os.environ,
-            host=self.host, port=0 if port is None else port, app_runtime=app._serving_runtime()
-        )
-        # Under a test runner `__main__` is the runner, not the app's script.
-        if app._app_file_path is None and app._defined_in is not None:
-            app._set_app_file(app._defined_in)
-
-        # This client's own server (an engine `Server`), once bound; `close()` stops that
-        # one server, never another server of the same app (e.g. an outer TestClient).
-        # `_closing` records a close() that came before the server existed, so the
-        # server is stopped as soon as it is bound. `_started` is set once the server is
-        # bound or its thread has ended, whichever comes first.
-        self._lock = threading.Lock()
-        self._server = None
-        self._closing = False
-        self._server_error: Exception | None = None
-        self._started = threading.Event()
-        self._thread = threading.Thread(
-            target=self._serve, name="mipyre-testclient", daemon=True
-        )
-        self._thread.start()
-        self._wait_until_ready()
-
     @property
     def port(self) -> int:
-        """The port the server listens on (the one the kernel picked for ``port=None``).
-        A memory-transport client has none: ``AttributeError``."""
-        if self.transport is Transport.MEMORY:
-            raise AttributeError(
-                "a TestClient with transport='memory' listens on no port; "
-                "pass transport='tcp' for a real TCP listener"
-            )
-        server = self._server
-        return self._settings.port if server is None else server.port
+        """The port of the server. An in-memory server has none: ``AttributeError``."""
+        return self.server.port
 
     @property
     def base_url(self) -> str:
-        if self.transport is Transport.MEMORY:
-            return f"http://{_MEMORY_HOST}"
-        return f"http://{self.host}:{self.port}"
-
-    def _describe(self) -> str:
-        """The server, as messages name it."""
-        if self.transport is Transport.MEMORY:
-            return "in-memory server"
-        return f"server on port {self.port}"
-
-    def _serve(self) -> None:
-        try:
-            self._app._serve(
-                self._settings,
-                lambda settings: self._app._start(
-                    settings, on_bound=self._bound, transport=self.transport
-                ),
-            )
-        except Exception as e:
-            self._server_error = e
-            _logger.error(
-                "TestClient %s stopped with an error; clients will see connection "
-                "refused", self._describe(), exc_info=e,
-            )
-        finally:
-            self._started.set()
-
-    def _bound(self, server) -> None:
-        """The engine bound this client's server; it serves next unless close() came first."""
-        with self._lock:
-            self._server = server
-            if self._closing:
-                server.shutdown()
-        self._started.set()
-
-    def _connect(self) -> socket.socket:
-        """A new in-memory connection to this client's server (memory transport): the
-        client's end of a socket pair, blocking."""
-        server = self._server
-        if server is None:
-            raise ConnectionRefusedError("the TestClient's server is not bound")
-        return server.connect()
-
-    def _wait_until_ready(self) -> None:
-        # The engine binds every listener (or opens its in-memory inboxes) before it builds
-        # a worker, and the server is this client's from then on; a connection made after
-        # that waits in the backlog until the workers serve it. So one request, once bound,
-        # says when it serves: any HTTP response (2xx-5xx) proves it, a failure means the
-        # start failed (the thread then ends with its error).
-        if not self._started.wait(_READY_TIMEOUT_S):
-            raise RuntimeError(
-                f"TestClient: server was not bound within {_READY_TIMEOUT_S}s"
-            )
-        if self._server is None:
-            self._thread.join(_STOP_TIMEOUT_S)
-            self._raise_exited_early()
-        try:
-            with self._opener.open(f"{self.base_url}/", timeout=_READY_TIMEOUT_S):
-                pass
-            return
-        except urllib.error.HTTPError as e:
-            # An HTTP error still proves the server is up. It holds the open
-            # connection: close it so the probe doesn't leak it.
-            e.close()
-            return
-        except (urllib.error.URLError, OSError) as e:
-            probe_error = e
-        # The server ended while starting: its own error is the cause, not the probe's.
-        self._thread.join(_STOP_TIMEOUT_S)
-        if not self._thread.is_alive():
-            self._raise_exited_early()
-        raise RuntimeError(
-            f"TestClient: {self._describe()} did not answer its first request within "
-            f"{_READY_TIMEOUT_S}s: {probe_error}"
-        ) from probe_error
-
-    def _raise_exited_early(self) -> NoReturn:
-        """The server thread ended before serving: raise what stopped it, as it is."""
-        err = self._server_error
-        if err is None:
-            raise RuntimeError("TestClient: server thread exited before accepting connections")
-        if self._app._defined_in is None and self._settings.mode.uses_workers:
-            err.add_note(
-                "This app was created inside a function, so sub-interpreter workers "
-                "cannot rebuild it by executing its module. Define it at module level, "
-                "or create it with Mipyre(runtime='main') to serve every handler on the "
-                "main interpreter."
-            )
-        raise err
+        return self.server.url
 
     def close(self) -> None:
-        """Stop this client's server and wait until it has: its shutdown hooks have run and
-        the port (if any) is free. Other servers of the same app keep serving. Safe from
-        any thread, also while the server is still starting. Idempotent.
-
-        Raises ``WorkersAbandoned`` when worker threads outlived the shutdown grace
-        period: ``app.run()`` would exit the process there; a test process is left
-        running, and exits with status 1 without finalizing if such a thread still
-        owns its interpreter at exit."""
-        with self._lock:
-            self._closing = True
-            server = self._server
-        if server is not None:
-            server.shutdown()
-        self._thread.join(_STOP_TIMEOUT_S)
-        if self._thread.is_alive():
-            raise RuntimeError(
-                f"TestClient: {self._describe()} did not stop within {_STOP_TIMEOUT_S}s"
-            )
-        err, self._server_error = self._server_error, None
-        if isinstance(err, WorkersAbandoned):
-            raise err
+        """Stop the server this client serves, if it serves one (``TestClient(app)``), and
+        raise how its run ended, as :meth:`TestServer.close` does. A client of a given
+        ``TestServer`` stops nothing."""
+        if self._owns_server:
+            self.server.close()
 
     def __enter__(self):
         return self
@@ -409,21 +431,18 @@ class TestClient:
                     headers=_collapse_headers(resp.headers),
                 )
         except urllib.error.HTTPError as e:
-            # Reading the error body can fail (timeout, connection reset): the status
-            # is still the answer, so the body is empty rather than the error escaping.
-            try:
-                err_body = e.read()
-            except (OSError, http.client.HTTPException):
-                err_body = b""
-            finally:
-                e.close()
-            return TestResponse(
-                status_code=e.code,
-                body=err_body,
-                headers=_collapse_headers(e.headers),
-            )
+            with e:
+                return TestResponse(
+                    status_code=e.code,
+                    body=e.read(),
+                    headers=_collapse_headers(e.headers),
+                )
         except urllib.error.URLError as e:
-            raise RuntimeError(f"TestClient: request failed: {e.reason}") from e
+            failed = RuntimeError(f"TestClient: request failed: {e.reason}")
+            if not self.server._alive():
+                # The server is gone: why it went is the cause, not the refused connection.
+                raise failed from (self.server._outcome or e)
+            raise failed from e
 
     def get(self, path: str, **kwargs) -> TestResponse:
         return self.request("GET", path, **kwargs)
@@ -469,11 +488,11 @@ class TestClient:
                 "TestClient.websocket_connect requires the websockets package. "
                 "Install with: pip install websockets"
             ) from e
-        if self.transport is Transport.MEMORY:
+        if self.server._transport is Transport.MEMORY:
             # A Unix socket: told so, the library sets no TCP option on it.
             uri = f"ws://{_MEMORY_HOST}{path}"
-            return WebSocketSession(_ws_unix_connect(uri=uri, sock=self._connect(), **connect_kwargs))
-        uri = f"ws://{self.host}:{self.port}{path}"
+            return WebSocketSession(_ws_unix_connect(uri=uri, sock=self.server._connect(), **connect_kwargs))
+        uri = "ws://" + self.server.url.removeprefix("http://") + path
         return WebSocketSession(_ws_connect(uri, **connect_kwargs))
 
 
@@ -483,27 +502,28 @@ class WebSocketSession:
     directly so tests don't have to learn the underlying library."""
 
     def __init__(self, conn: Any):
-        self._conn = conn
+        # The session owns the connection's lifetime from here, so it enters the connection's own context:
+        # websockets (17.1+) warns on every send/recv of a connection that was never entered.
+        self._lifetime = ExitStack()
+        self._conn = self._lifetime.enter_context(conn)
 
     def __enter__(self) -> "WebSocketSession":
         return self
 
-    def __exit__(self, *args):
-        self.close()
+    def __exit__(self, *args) -> None:
+        self._lifetime.__exit__(*args)
 
     def send(self, msg: str | bytes) -> None:
         self._conn.send(msg)
 
     def recv(self, timeout: float | None = None) -> str | bytes:
-        if timeout is not None:
-            return self._conn.recv(timeout=timeout)
-        return self._conn.recv()
+        return self._conn.recv(timeout=timeout)
 
     def __iter__(self) -> Iterator[str | bytes]:
         yield from self._conn
 
     def close(self) -> None:
-        self._conn.close()
+        self._lifetime.close()
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -514,16 +534,15 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 class _MemoryHTTPConnection(http.client.HTTPConnection):
-    """An ``HTTPConnection`` whose socket is a new in-memory connection to the client's
-    server: the request and response bytes are HTTP as on TCP, parsed by hyper and by
-    ``http.client``."""
+    """An ``HTTPConnection`` whose socket is a new in-memory connection to a server: the
+    request and response bytes are HTTP as on TCP, parsed by hyper and by ``http.client``."""
 
-    def __init__(self, host: str, *, client: TestClient, **kwargs: Any) -> None:
+    def __init__(self, host: str, *, server: TestServer, **kwargs: Any) -> None:
         super().__init__(host, **kwargs)
-        self._client = client
+        self._server = server
 
     def connect(self) -> None:
-        sock = self._client._connect()
+        sock = self._server._connect()
         # A number or None as given; anything else is http.client's "the global default"
         # marker, which leaves the connection's default (block until done).
         timeout = self.timeout
@@ -532,15 +551,28 @@ class _MemoryHTTPConnection(http.client.HTTPConnection):
         self.sock = sock
 
 
-class _MemoryHTTPHandler(urllib.request.HTTPHandler):
+class _HTTPHandler(urllib.request.HTTPHandler):
+    """urllib's ``http://`` handler, sending the request as given: urllib adds
+    ``Content-Type: application/x-www-form-urlencoded`` to any request with a body the caller
+    gave no type for, and that one is taken off again."""
+
+    def http_request(self, req):
+        given = req.has_header("Content-type")
+        req = super().http_request(req)
+        if not given:
+            req.remove_header("Content-type")
+        return req
+
+
+class _MemoryHTTPHandler(_HTTPHandler):
     """urllib's ``http://`` handler, opening each request on an in-memory connection."""
 
-    def __init__(self, client: TestClient) -> None:
+    def __init__(self, server: TestServer) -> None:
         super().__init__()
-        self._client = client
+        self._server = server
 
     def http_open(self, req):
         def connection(host: str, **kwargs: Any) -> _MemoryHTTPConnection:
-            return _MemoryHTTPConnection(host, client=self._client, **kwargs)
+            return _MemoryHTTPConnection(host, server=self._server, **kwargs)
 
         return self.do_open(connection, req)

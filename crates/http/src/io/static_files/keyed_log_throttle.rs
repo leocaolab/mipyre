@@ -73,7 +73,10 @@ impl<K: Hash + Eq> PerKeyThrottles<K> {
                 .min_by_key(|e| e.seen)
                 .map(|e| (e.seen, e.throttle.held()));
             let Some((forgotten, held)) = expired else {
-                return self.unremembered.admit(now, self.period).map(HeldLines::OfUnrememberedKeys);
+                return self
+                    .unremembered
+                    .admit(now, self.period)
+                    .map(HeldLines::OfUnrememberedKeys);
             };
             self.remembered.retain(|_, e| e.seen != forgotten);
             self.unremembered.add_held(held);

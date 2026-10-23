@@ -1,21 +1,31 @@
 """Postgres support for Mipyre handlers.
 
-Thin Python-side re-export of the Rust `PgPool` class. Initialize once at
-startup, then call `pool.fetch_one(...)`, `.fetch_all(...)`, `.fetch_scalar(...)`,
-`.execute(...)` from any handler, sub-interpreter workers included: every
-interpreter that connects to a DSN shares that DSN's pool. The query runs on a dedicated DB
-runtime while the calling thread waits with its GIL released, so other
-workers make progress. The `*_async` variants run on the main interpreter
-(`runtime="main"` routes); in a worker they raise `NotImplementedError`.
+Thin Python-side re-export of the Rust `PgPool` class. Connect once at startup (module
+level), then call `pool.fetch_one(...)`, `.fetch_all(...)`, `.fetch_scalar(...)`,
+`.execute(...)` from a handler on the main interpreter or a sub-interpreter worker. A
+`runtime="process"` route runs in a worker process of its own, apart from the server's pools:
+there every `PgPool` call raises `RuntimeError`. The query runs on a dedicated DB runtime while
+the calling thread waits with its GIL released, so other workers make progress. The `*_async`
+variants run on the main interpreter (`runtime="main"` routes); in a worker they raise
+`NotImplementedError`.
 
-A DSN has one pool per process: a later `PgPool.connect()` to the same DSN returns
-the same pool, and raises `ValueError` if it asks for different pool settings
-(`max_connections`, `acquire_timeout_secs`, `runtime_threads`, `max_lifetime_secs`,
-`idle_timeout_secs`, `ping_on_acquire`), naming the one that differs. Settings left
-out match the open pool. Another DSN (a read replica, a second database) gets a pool
-of its own. `runtime_threads` sizes the one DB runtime every pool's protocol work and
-socket I/O runs on; the default is one thread per 4 CPUs the process may use, at
-least 2, and the first `connect()` fixes it for every pool.
+The pools belong to the server run (b/335 D17). `PgPool.connect()` connects nothing: it
+returns a handle and records what it asked for and which module asked. When a server starts it
+opens one pool per DSN from every handle the main interpreter still holds that its own app's
+modules made (the module that created the app, its script, its routers), and binds them to it;
+another app's handles are left alone; it closes the pools
+when it stops. Two calls for one DSN that name different pool settings (`max_connections`,
+`acquire_timeout_secs`, `runtime_threads`, `max_lifetime_secs`, `idle_timeout_secs`,
+`ping_on_acquire`) stop the start with `ValueError`, every one named at once; a setting left out
+takes what another call named. Another DSN (a read replica, a second database) gets a pool of
+its own. A worker's `connect()` binds to its run's pool for the DSN, raising `ValueError` if it
+names a setting that pool does not have. `runtime_threads` sizes the run's one DB runtime,
+which every pool's protocol work and socket I/O runs on; the default is one thread per 4 CPUs
+the process may use, at least 2. One handle is one run's at a time: two servers of one app serving at
+once that would share a handle stop the second's start.
+
+Outside any server run (a script, a migration) a handle opens a pool of its own on its first
+query, raising `ConnectionError` there if it cannot connect, and closes it when dropped.
 
 Connections that died while idle
 --------------------------------
@@ -46,7 +56,7 @@ connection that the test would have caught, one more round trip per query)::
 
 Example::
 
-    from mipyre import Mipyre
+    from mipyre import HTTPException, Mipyre
     from mipyre.db import PgPool
 
     app = Mipyre()
@@ -59,7 +69,7 @@ Example::
             int(req.params["id"]),
         )
         if row is None:
-            return Response({"error": "not found"}, 404)
+            raise HTTPException(404, "no such user")
         return row
 
 Parameters are encoded as the type the statement declares for them (the

@@ -70,7 +70,7 @@ def do_exec(req):
     return {"affected": n}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ["MIPYRE_PORT"]), workers=2)
+    app.run(host="127.0.0.1", port=int(os.environ["MIPYRE_PORT"]), threads=2)
 '''
 
 

@@ -6,16 +6,18 @@
 use super::slot_len::{decode_len, SlotLengthError};
 
 /// No peer has reported on the attempt yet.
-const NOT_REPORTED: u32 = 0;
-const READY: u32 = 1;
-const FAILED: u32 = 2;
+pub(crate) const NOT_REPORTED: u32 = 0;
+pub(crate) const READY: u32 = 1;
+pub(crate) const FAILED: u32 = 2;
 
 /// What the peer says came of its start attempt, its note's length checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartClaim {
     Ready,
     /// It could not start, and left a note of `note_len` bytes.
-    Failed { note_len: u32 },
+    Failed {
+        note_len: u32,
+    },
 }
 
 /// A start report holds a value no peer writes.
@@ -65,13 +67,22 @@ mod tests {
         );
         assert_eq!(
             decode_start(FAILED, NOTE_BYTES + 1, NOTE_BYTES),
-            Err(StartReportError::NoteLength(SlotLengthError::PastSlot { len: NOTE_BYTES + 1, max: NOTE_BYTES }))
+            Err(StartReportError::NoteLength(SlotLengthError::PastSlot {
+                len: NOTE_BYTES + 1,
+                max: NOTE_BYTES
+            }))
         );
     }
 
     #[test]
     fn a_state_no_peer_writes_is_refused_with_its_value() {
-        assert_eq!(decode_start(FAILED + 1, 0, NOTE_BYTES), Err(StartReportError::UnknownState(FAILED + 1)));
-        assert_eq!(decode_start(u32::MAX, 0, NOTE_BYTES), Err(StartReportError::UnknownState(u32::MAX)));
+        assert_eq!(
+            decode_start(FAILED + 1, 0, NOTE_BYTES),
+            Err(StartReportError::UnknownState(FAILED + 1))
+        );
+        assert_eq!(
+            decode_start(u32::MAX, 0, NOTE_BYTES),
+            Err(StartReportError::UnknownState(u32::MAX))
+        );
     }
 }

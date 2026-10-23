@@ -7,18 +7,23 @@
 # member, with a warning.
 [workspace]
 members = ["crates/*"]
+# Vendored crates are patched in below, not members: they keep their own manifests and lints.
+exclude = ["third_party/kqueue"]
 resolver = "2"
 
 # Suppressions are written down (b/53 E1-2, design §5.1): a lint is silenced only by
 # `#[expect(lint, reason = "...")]` — which turns red once the lint stops firing, so a stale one cannot stay —
 # and a test is ignored only with a reason. The merge gate's clippy step (-D warnings) is what enforces these.
-# The two verification builds name their cfg: `sync_model` (the Loom models: each package's sync primitives are
-# swapped for Loom's model of them, `RUSTFLAGS="--cfg sync_model"`) and
+# The verification builds name their cfg: `sync_model` (the Loom models: each package's sync primitives are
+# swapped for Loom's model of them, `RUSTFLAGS="--cfg sync_model"`; with `--cfg sync_shuttle` as well, a package that
+# has Shuttle models takes Shuttle's names instead, and `sync_shuttle_random` adds their nightly random schedules),
+# `shm_model` (mipyre_shm's own Loom models, which
+# also drop its OS half, so the engine's `sync_model` builds leave that package as shipped) and
 # `kani` (the Kani proofs, set by `cargo kani`). The Loom cfg is ours, not the plain `loom` the crates.io ecosystem
 # reads: under `--cfg loom` tokio swaps its own internals for Loom's and stops building (`tokio::net` is gone, the
 # runtime builder has no `on_thread_park`), so every package that uses tokio could not be built for a model at all.
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sync_model)", "cfg(kani)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sync_model)", "cfg(sync_shuttle)", "cfg(sync_shuttle_random)", "cfg(shm_model)", "cfg(shm_shuttle)", "cfg(shm_shuttle_random)", "cfg(lane_dst_random)", "cfg(shm_wrap_nightly)", "cfg(kani)"] }
 
 [workspace.lints.clippy]
 allow_attributes = "deny"
@@ -30,21 +35,59 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [workspace.package]
-version = "1.0.0"
-license = "Apache-2.0"
+version = "2.0.0"
 edition = "2021"
+license = "Apache-2.0"
+
+# Test, clippy and fuzz builds (`test` and `fuzz` inherit it): line tables only, so a panic's backtrace still names
+# file and line; the variable and type info nothing here reads is not generated (b/958).
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
-lto = "fat"            # Cross-crate inlining: LLVM optimizes across hyper/tokio/pyo3 boundaries
+lto = "fat"           # Cross-crate inlining: LLVM optimizes across hyper/tokio/pyo3 boundaries
 codegen-units = 1      # Single codegen unit: max optimization at cost of compile time
 opt-level = 3          # Aggressive optimization
 strip = true           # Strip symbols: smaller binary, better icache
 
+# The engine the merge gate tests (stubtest and the default pytest run, b/973): release's code without the link-time
+# work. The gate judges what the engine does, not how fast it does it; speed is the wheel's, and the wheel and the
+# counts keep `release` with fat LTO. Fat LTO with one codegen unit cost the gate ~75-97 s each round it rebuilt.
+# Its own target dir (target/gate), apart from target/release where the microbench counts build.
+[profile.gate]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+
+# The gate's fault-injection build (`--features fault_injection`, b/959): the gate's engine with the test-only
+# feature, in its own target dir (target/fault-injection) so the two builds do not rebuild each other.
+[profile.fault-injection]
+inherits = "gate"
+
+# What the Loom and Shuttle models in dev/proofs.toml build with: the gate's build (release's optimization, which the
+# model checkers need to get through their schedules in time, without fat LTO and one codegen unit), kept incremental
+# since each model target dir rebuilds only the crates a change touched. With release, every change to the engine
+# crate was a three-minute rebuild in each model target dir; the models run as fast either way (b/960).
+[profile.model]
+inherits = "gate"
+incremental = true
+
+# What `cargo bolero test` builds the fuzz targets with (its default profile name): optimized, with the checks a
+# test build has. The corpora it grows are what plain `cargo test` replays (`src/**/__fuzz__/*/corpus`).
+[profile.fuzz]
+inherits = "dev"
+opt-level = 3
+codegen-units = 1
+
 # PyO3 with per-interpreter state for own-GIL sub-interpreters (leocaolab/pyo3).
 # Released as tags; the version stays 0.29.2 so `pyo3 = "0.29"` keeps matching.
 [patch.crates-io]
-pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
-pyo3-ffi = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
-pyo3-macros = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
-pyo3-macros-backend = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
-pyo3-build-config = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-16.5" }
+pyo3 = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-22.1" }
+pyo3-ffi = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-22.1" }
+pyo3-macros = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-22.1" }
+pyo3-macros-backend = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-22.1" }
+pyo3-build-config = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-22.1" }
+# kqueue 1.2.1 (notify's macOS backend) with one change, an O_NONBLOCK open in
+# Watcher::add_filename so a FIFO in a watched tree does not hang the watcher (b/951);
+# third_party/README.md says what was taken and what was changed.
+kqueue = { path = "third_party/kqueue" }

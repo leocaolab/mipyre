@@ -24,8 +24,7 @@ const DEPTH: usize = 24;
 type CallStack = [usize; DEPTH];
 
 /// Maps each recorded stack to its allocation count and bytes.
-static STACKS: LazyLock<Mutex<HashMap<CallStack, (u64, u64)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static STACKS: LazyLock<Mutex<HashMap<CallStack, (u64, u64)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 thread_local! {
     /// Is set while this thread records a stack, so the recording's own allocations are neither
@@ -147,11 +146,7 @@ pub(crate) fn stop() -> Allocations {
         })
         .collect();
     stacks.sort_by_key(|s| std::cmp::Reverse(s.count));
-    Allocations {
-        allocs,
-        bytes,
-        stacks,
-    }
+    Allocations { allocs, bytes, stacks }
 }
 
 fn resolve(stack: &CallStack) -> Vec<String> {

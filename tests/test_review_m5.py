@@ -17,7 +17,8 @@ import textwrap
 import pytest
 
 from mipyre import Mipyre
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
+from tests._helpers import set_subinterpreters
 
 HOST = "127.0.0.1"
 # A server that should have refused to start is killed after this long.
@@ -57,21 +58,22 @@ def _run(script: str, env: dict[str, str] | None = None, timeout: float = REFUSE
 # ---------------------------------------------------------------------------
 
 _RAW_ENGINE = """
-    from mipyre.engine import MipyreApp
+    from mipyre.engine import MipyreApp, RuntimeChoice
 
     def root(req):
         return "ok"
 
     app = MipyreApp()
-    app.get("/", root)
+    app.route("GET", "/", root, RuntimeChoice.Main)
     if __name__ == "__main__":
-        app.run(host="127.0.0.1", port=0, mode={mode!r})
+        app.run(host="127.0.0.1", port=0)
 """
 
 
 _RUNTIME_APP = """
+    import os
     from mipyre import Mipyre
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def root(req):
@@ -82,7 +84,9 @@ _RUNTIME_APP = """
 """
 
 
-def test_a_runtime_typo_in_the_environment_is_rejected_by_mipyre_run():
+def test_a_runtime_in_the_environment_is_rejected_by_mipyre_run_as_no_setting():
+    # An app's runtime is its code's (b/335 D9): MIPYRE_RUNTIME is no setting any more, and a
+    # MIPYRE_ variable no setting reads ends the start (D19).
     d = tempfile.mkdtemp(prefix="mipyre-m5-")
     with open(os.path.join(d, "m5_runtime_app.py"), "w") as f:
         f.write(textwrap.dedent(_RUNTIME_APP))
@@ -99,30 +103,14 @@ def test_a_runtime_typo_in_the_environment_is_rejected_by_mipyre_run():
     except subprocess.TimeoutExpired as e:
         pytest.fail(f"mipyre run started and kept serving instead of refusing:\n{e.stdout}\n{e.stderr}")
     assert r.returncode != 0
-    assert "MIPYRE_RUNTIME" in r.stderr, r.stderr
-    assert "'asynk'" in r.stderr.replace('"', "'"), r.stderr
-
-
-def test_mode_is_an_enum_on_both_sides():
-    from mipyre.app import _ServeSettings
-    from mipyre.engine import Mode
-
-    assert Mode.parse("gil") == Mode.Gil
-    assert Mode.parse("default") == Mode.Gil
-    assert Mode.parse("subinterp") == Mode.Subinterp
-    assert Mode.parse("auto") == Mode.Subinterp
-    assert Mode.Subinterp.uses_workers and not Mode.Gil.uses_workers
-    with pytest.raises(ValueError, match="hybrid"):
-        Mode.parse("hybrid")
-    assert _ServeSettings.resolve(env={}, port=1).mode == Mode.Subinterp
-    assert _ServeSettings.resolve(env={}, port=1, app_runtime="main").mode == Mode.Gil
+    assert "MIPYRE_RUNTIME is set, but it is not one of mipyre's settings" in r.stderr, r.stderr
 
 
 def test_a_bad_engine_env_value_is_a_startup_error():
     """The wiring: the engine's environment is parsed at start, and a bad value ends the
     process naming the variable and the value. Which values are bad is EnvConfig::parse's,
     tested in crates/pyext/src/boot/config.rs."""
-    r = _run(_RAW_ENGINE.format(mode="gil"), env={"MIPYRE_TPC": "maybe"})
+    r = _run(_RAW_ENGINE, env={"MIPYRE_TPC": "maybe"})
     assert r.returncode != 0
     assert "MIPYRE_TPC" in r.stderr and "maybe" in r.stderr, r.stderr
 
@@ -145,7 +133,7 @@ def test_the_worker_log_level_comes_from_the_engine_not_the_environment():
         import logging, os, threading, urllib.request
         from mipyre import Mipyre
 
-        app = Mipyre(log_config={"level": "WARN"})
+        app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"), log_config={"level": "WARN"})
 
         @app.get("/log")
         def log(req):
@@ -155,9 +143,10 @@ def test_the_worker_log_level_comes_from_the_engine_not_the_environment():
 
         def probe():
             import time
-            while not app._servers:  # bound on port 0: read the port it got
+            from mipyre._server_run import runs_of  # main only: the workers execute this script too
+            while not runs_of(app).serving():  # bound on port 0: read the port it got
                 time.sleep(0.05)
-            port = next(iter(app._servers)).port
+            port = runs_of(app).serving()[0].port
             for _ in range(200):
                 try:
                     urllib.request.urlopen(f"http://127.0.0.1:{port}/log", timeout=2).read()
@@ -165,11 +154,11 @@ def test_the_worker_log_level_comes_from_the_engine_not_the_environment():
                 except Exception:
                     time.sleep(0.1)
             print("LEAKED" if "MIPYRE_LOG_LEVEL" in os.environ else "NOT-LEAKED", flush=True)
-            app._stop()
+            runs_of(app).stop()
 
         if __name__ == "__main__":
             threading.Thread(target=probe, daemon=True).start()
-            app.run(host="127.0.0.1", port=0, workers=1)
+            app.run(host="127.0.0.1", port=0, threads=1)
         """,
         timeout=60,
     )
@@ -244,7 +233,7 @@ def test_two_apps_in_one_process_keep_their_own_websocket_cap():
 # 3. One listener set, bound before anything starts, on every run path
 # ---------------------------------------------------------------------------
 
-# (label, mode, extra env); the "gil" paths run with MIPYRE_RUNTIME=main (`_path_env`).
+# (label, mode, extra env); the "gil" paths run with MIPYRE_TEST_MODE=main (`_path_env`).
 _RUN_PATHS = [
     ("tpc-gil", "gil", {}),
     ("tpc-subinterp", "subinterp", {}),
@@ -256,9 +245,10 @@ if sys.platform == "darwin":
 
 _TLS_APP = """
     import sys
+    import os
     from mipyre import Mipyre
 
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def root(req):
@@ -266,18 +256,19 @@ _TLS_APP = """
 
     if __name__ == "__main__":
         plain, tls, cert, key = sys.argv[1:5]
-        app.run(host="127.0.0.1", port=int(plain), workers=2,
+        app.run(host="127.0.0.1", port=int(plain),
                 tls_cert=cert, tls_key=key, extra_tls_ports=[int(tls)])
 """
 
 
 def _path_env(mode: str, env: dict[str, str]) -> dict[str, str]:
     """A run path's environment: "gil" serves every handler on the main interpreter (the
-    app's runtime "main"), "subinterp" leaves the default runtime."""
-    full_env = {k: v for k, v in os.environ.items() if k != "MIPYRE_RUNTIME"}
+    app's runtime "main"), "subinterp" leaves the default runtime; two sub-interpreters."""
+    full_env = {k: v for k, v in os.environ.items() if k != "MIPYRE_TEST_MODE"}
     full_env.update(env)
     if mode == "gil":
-        full_env["MIPYRE_RUNTIME"] = "main"
+        full_env["MIPYRE_TEST_MODE"] = "main"
+    set_subinterpreters(full_env, "2")
     return full_env
 
 
@@ -359,9 +350,10 @@ def test_a_port_in_use_is_an_oserror_from_run(label, mode, env):
         r = _run(
             f"""
             import errno
+            import os
             from mipyre import Mipyre
 
-            app = Mipyre()
+            app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
             @app.get("/")
             def root(req):
@@ -369,7 +361,7 @@ def test_a_port_in_use_is_an_oserror_from_run(label, mode, env):
 
             if __name__ == "__main__":
                 try:
-                    app.run(host="127.0.0.1", port={port}, workers=2)
+                    app.run(host="127.0.0.1", port={port})
                 except OSError as e:
                     print("OSERROR", e.errno == errno.EADDRINUSE, e, flush=True)
                     raise SystemExit(3)
@@ -391,9 +383,8 @@ def _bound_root(req):
 
 
 def test_testclient_reports_the_port_the_engine_bound():
-    with TestClient(_bound, transport="tcp") as c:
-        assert c._settings.port == 0
-        assert c.port == c._server.port
+    with TestServer(_bound) as server, TestClient(server) as c:
+        assert c.port == c.server._run._server.port
         assert c.port != 0
         assert c.get("/").text == "ok"
         port = c.port
@@ -423,7 +414,7 @@ def test_a_duplicate_websocket_path_is_an_error():
 
 
 def test_a_failing_async_check_fails_the_registration():
-    from mipyre.engine import MipyreApp
+    from mipyre.engine import MipyreApp, RuntimeChoice
 
     class Handler:
         __name__ = "handler"
@@ -434,7 +425,7 @@ def test_a_failing_async_check_fails_the_registration():
 
     app = MipyreApp()
     with pytest.raises(RuntimeError, match="m5: __call__ lookup failed"):
-        app.get("/", Handler())
+        app.route("GET", "/", Handler(), RuntimeChoice.Worker)
 
 
 def test_a_programmatic_stop_on_the_main_thread_restores_sigint():
@@ -442,6 +433,7 @@ def test_a_programmatic_stop_on_the_main_thread_restores_sigint():
         """
         import signal, threading, time, urllib.request
         from mipyre import Mipyre
+        from mipyre._server_run import runs_of
 
         app = Mipyre(runtime="main")
 
@@ -450,16 +442,16 @@ def test_a_programmatic_stop_on_the_main_thread_restores_sigint():
             return "ok"
 
         def stop_when_up():
-            while not app._servers:  # bound on port 0: read the port it got
+            while not runs_of(app).serving():  # bound on port 0: read the port it got
                 time.sleep(0.05)
-            port = next(iter(app._servers)).port
+            port = runs_of(app).serving()[0].port
             for _ in range(200):
                 try:
                     urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1).read()
                     break
                 except Exception:
                     time.sleep(0.05)
-            app._stop()
+            runs_of(app).stop()
 
         if __name__ == "__main__":
             before = signal.getsignal(signal.SIGINT)

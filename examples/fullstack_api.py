@@ -6,7 +6,6 @@ Features used:
   - Pydantic validation
   - Cookie-based auth
   - File upload
-  - Redirect
   - CORS
   - SharedState as in-memory database
   - Structured logging

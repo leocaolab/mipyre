@@ -85,7 +85,10 @@ pub(crate) fn with_exact_stacks(_test: &str, body: impl FnOnce()) {
 #[test]
 fn a_thread_built_with_tokios_default_reads_less_than_a_python_thread() {
     with_exact_stacks(
-        concat!(module_path!(), "::a_thread_built_with_tokios_default_reads_less_than_a_python_thread"),
+        concat!(
+            module_path!(),
+            "::a_thread_built_with_tokios_default_reads_less_than_a_python_thread"
+        ),
         || {
             let python = of_a_thread_with(mipyre_subinterp::PYTHON_THREAD_STACK);
             assert!(of_a_thread_with(2 << 20) < python, "{python}");

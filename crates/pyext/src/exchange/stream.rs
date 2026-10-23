@@ -11,8 +11,7 @@ use pyo3::types::PyDict;
 use tokio::sync::mpsc;
 
 use crate::exchange::response::{
-    header_text, header_value, http_status, response_headers_from_py, response_headers_to_py,
-    sent_content_type,
+    header_text, header_value, http_status, response_headers_from_py, response_headers_to_py, sent_content_type,
 };
 
 /// This many chunks are buffered for a slow client before a fast producer gets `BlockingIOError`
@@ -50,19 +49,12 @@ impl ResponseStream {
     /// Creates a stream, `text/event-stream` by default, with `headers` as for `Response`.
     #[new]
     #[pyo3(signature = (content_type=None, status_code=200, headers=None))]
-    fn new(
-        content_type: Option<&str>,
-        status_code: u16,
-        headers: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Self> {
+    fn new(content_type: Option<&str>, status_code: u16, headers: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         let content_type = match content_type {
             Some(ct) => header_value("content_type", ct)?,
             None => HeaderValue::from_static("text/event-stream"),
         };
-        let headers = headers
-            .map(response_headers_from_py)
-            .transpose()?
-            .unwrap_or_default();
+        let headers = headers.map(response_headers_from_py).transpose()?.unwrap_or_default();
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAP);
         Ok(ResponseStream {
             tx: crate::sync::poisoning::Mutex::new(Some(tx)),
@@ -157,19 +149,17 @@ impl ResponseStream {
     /// is closed or the client is gone.
     fn push(&self, chunk: Bytes) -> PyResult<()> {
         let tx_guard = self.tx.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = tx_guard.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyConnectionError::new_err("stream was explicitly closed")
-        })?;
+        let tx = tx_guard
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyConnectionError::new_err("stream was explicitly closed"))?;
         match tx.try_send(Ok(chunk)) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                Err(pyo3::exceptions::PyBlockingIOError::new_err(
-                    "stream buffer full (client is slow); retry after a brief pause",
-                ))
+            Err(mpsc::error::TrySendError::Full(_)) => Err(pyo3::exceptions::PyBlockingIOError::new_err(
+                "stream buffer full (client is slow); retry after a brief pause",
+            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(pyo3::exceptions::PyConnectionError::new_err("client disconnected"))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(
-                pyo3::exceptions::PyConnectionError::new_err("client disconnected"),
-            ),
         }
     }
 
@@ -243,9 +233,7 @@ mod tests {
             let err = stream.send("data: 2\n\n").expect_err("the client is gone");
             assert!(err.is_instance_of::<PyConnectionError>(py), "{err}");
             assert_eq!(err.value(py).to_string(), "client disconnected");
-            let err = stream
-                .send_event("3", None, None)
-                .expect_err("and stays gone");
+            let err = stream.send_event("3", None, None).expect_err("and stays gone");
             assert_eq!(err.value(py).to_string(), "client disconnected");
 
             stream.close();

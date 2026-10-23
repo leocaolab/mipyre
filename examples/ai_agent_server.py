@@ -1,35 +1,22 @@
-"""
-AI Agent Server — demonstrates Mipyre for agentic AI applications.
-
-Features used:
-  - MCP Server (AI tool discovery)
-  - SSE streaming (token-by-token LLM output)
-  - async handlers (concurrent LLM calls)
-  - SharedState (agent session memory)
-  - Pydantic validation
-  - CORS (frontend integration)
+"""AI agent server: MCP tools, a chat route validated with pydantic, the answer streamed as
+Server-Sent Events, and session memory shared by every interpreter.
 
 Layout (each interpreter imports only the modules it serves):
-  ai_agent/main.py  the app, its MCP tools and its sub-interpreter routes
-  ai_agent/chat.py  Router(runtime="main"): /chat (a pydantic body), /stream, /memory
+  ai_agent/main.py    the app, its MCP tools and its sub-interpreter routes
+  ai_agent/chat.py    Router(runtime="main"): POST /chat, GET /stream
+  ai_agent/memory.py  the session history in app.state
 
 Run:
+  pip install mipyre pydantic
   python examples/ai_agent_server.py
 
-Test:
-  # Chat endpoint (simulated LLM)
-  curl -X POST http://127.0.0.1:8000/chat -H 'Content-Type: application/json' \
+Try:
+  curl -X POST http://127.0.0.1:8000/chat -H 'content-type: application/json' \
     -d '{"prompt": "What is Python?", "session_id": "user1"}'
-
-  # Streaming response
-  curl -N http://127.0.0.1:8000/stream?prompt=hello
-
-  # MCP tool discovery
-  curl -X POST http://127.0.0.1:8000/mcp -H 'Content-Type: application/json' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-
-  # Check session memory
+  curl -N 'http://127.0.0.1:8000/stream?prompt=hello&session_id=user1'
   curl http://127.0.0.1:8000/memory/user1
+  curl -X POST http://127.0.0.1:8000/mcp -H 'content-type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 """
 
 from ai_agent.main import app

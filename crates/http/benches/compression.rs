@@ -17,14 +17,17 @@ fn browser_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in [
         ("host", "127.0.0.1:8000"),
-        ("user-agent", "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0"),
+        (
+            "user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+        ),
         ("accept", "application/json"),
         ("accept-language", "en-US,en;q=0.5"),
         ("accept-encoding", "gzip, deflate, br, zstd"),
         ("connection", "keep-alive"),
     ] {
-        let value = HeaderValue::from_maybe_shared(Bytes::copy_from_slice(value.as_bytes()))
-            .must("a valid header value");
+        let value =
+            HeaderValue::from_maybe_shared(Bytes::copy_from_slice(value.as_bytes())).must("a valid header value");
         headers.insert(HeaderName::from_static(name), value);
     }
     headers

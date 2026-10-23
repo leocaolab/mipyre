@@ -14,8 +14,8 @@ use pyo3::sync::PerInterpreterCell;
 use pyo3::types::{PyTuple, PyType};
 
 use super::numeric::NumericError;
-use super::pool::PoolSettingDifferences;
 use super::query::QueryMethod;
+use crate::runtime::{OwnPoolError, PoolSettingDifferences, TaskError};
 
 pyo3::create_exception!(
     mipyre.engine,
@@ -53,13 +53,8 @@ pub(crate) enum DbError {
     },
     /// Postgres always describes the parameters' types, so this means the server or driver
     /// broke that promise; `count` is the parameter count it did give, if any.
-    #[error(
-        "{op}: the server did not describe the statement's parameter types (count: {count:?})"
-    )]
-    Undescribed {
-        op: QueryMethod,
-        count: Option<usize>,
-    },
+    #[error("{op}: the server did not describe the statement's parameter types (count: {count:?})")]
+    Undescribed { op: QueryMethod, count: Option<usize> },
     #[error(transparent)]
     Param(#[from] ParamError),
     #[error(transparent)]
@@ -85,9 +80,7 @@ impl DbError {
             Self::SettingsDiffer(_) => PyValueError::new_err(message),
             // The SQLSTATE is set when the server answered (28P01 bad password, 3D000 no such
             // database) and is `None` when it was never reached (refused, DNS, TLS).
-            Self::ConnectFailed(_) => {
-                with_sqlstate(py, PyConnectionError::new_err(message), self.sqlstate())
-            }
+            Self::ConnectFailed(_) => with_sqlstate(py, PyConnectionError::new_err(message), self.sqlstate()),
             // The statement's arity is the caller's code, not a value, so it is no ParamError.
             Self::Param(ParamError::WrongCount { .. }) => PyTypeError::new_err(message),
             // If the class cannot be made, the error is still raised as a TypeError with the
@@ -132,10 +125,7 @@ fn with_sqlstate(py: Python<'_>, err: PyErr, sqlstate: Option<String>) -> PyErr 
 fn param_error_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
     static TYPE_OBJECT: PerInterpreterCell<Py<PyType>> = PerInterpreterCell::new();
     let ty = TYPE_OBJECT.get_or_try_init(py, || {
-        let bases = PyTuple::new(
-            py,
-            [py.get_type::<PyTypeError>(), py.get_type::<PyValueError>()],
-        )?;
+        let bases = PyTuple::new(py, [py.get_type::<PyTypeError>(), py.get_type::<PyValueError>()])?;
         // SAFETY: The thread is attached, both strings are NUL-terminated, and `bases` is a
         // tuple of exception classes; the call returns a new reference or NULL with an
         // exception set, which `from_owned_ptr_or_err` takes.
@@ -183,10 +173,7 @@ pub(crate) enum ParamError {
         given: &'static str,
     },
     #[error("parameter ${index}: {problem}")]
-    ValueDoesNotFit {
-        index: usize,
-        problem: ParamValueError,
-    },
+    ValueDoesNotFit { index: usize, problem: ParamValueError },
     #[error("parameter ${index}: {source}")]
     NotEncodable {
         index: usize,
@@ -214,33 +201,16 @@ pub(crate) enum ParamError {
 pub(crate) enum ParamValueError {
     /// `value` is the text Python shows for it, so an int of any size fits.
     #[error("{value} is out of range for {pg_type}")]
-    OutOfRange {
-        value: String,
-        pg_type: &'static str,
-    },
+    OutOfRange { value: String, pg_type: &'static str },
     #[error(transparent)]
     Numeric(#[from] NumericError),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum TaskError {
-    #[error("mipyre-db task panicked: {0}")]
-    Panicked(String),
-    #[error("mipyre-db task was cancelled")]
-    Cancelled,
-    #[error("mipyre-db runtime shut down before the task finished")]
-    RuntimeGone,
-    /// The OS refused to build the runtime (threads or fds exhausted). Nothing ran, and the
-    /// next query tries to build it again.
-    #[error("mipyre-db runtime could not be built: {0}")]
-    RuntimeNotBuilt(#[source] std::io::Error),
-}
-
-impl From<tokio::task::JoinError> for TaskError {
-    fn from(e: tokio::task::JoinError) -> Self {
-        match e.try_into_panic() {
-            Ok(payload) => Self::Panicked(mipyre_tpc::panic_message(&*payload)),
-            Err(_cancelled) => Self::Cancelled,
+impl From<OwnPoolError> for DbError {
+    fn from(e: OwnPoolError) -> Self {
+        match e {
+            OwnPoolError::Runtime(e) => DbError::Task(e),
+            OwnPoolError::ConnectFailed(e) => DbError::ConnectFailed(e),
         }
     }
 }

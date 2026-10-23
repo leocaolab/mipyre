@@ -11,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 from tests._helpers import bound_port, lines_with, read_file
 
 REPO = Path(__file__).resolve().parent.parent
@@ -26,7 +26,7 @@ def _get(conn, path):
 def test_a_worker_of_an_app_without_async_does_not_import_asyncio():
     from tests.apps.lazy_asyncio_sync import app
 
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         # One connection: one TPC thread, one worker.
         conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=10)
         assert _get(conn, "/asyncio-loaded") == (200, "False")
@@ -39,7 +39,7 @@ def test_a_worker_of_an_app_without_async_does_not_import_asyncio():
 def test_an_app_with_an_async_route_works_as_before():
     from tests.apps.lazy_asyncio_async import app
 
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=10)
         assert _get(conn, "/asyncio-loaded") == (200, "True")
         assert _get(conn, "/async") == (200, "async ran")

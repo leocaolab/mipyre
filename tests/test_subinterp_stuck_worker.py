@@ -24,7 +24,6 @@ from tests._helpers import answers, bound_port, kill_session, read_file, text_ap
 
 LOOP_SCRIPT = r'''
 import logging, os
-os.environ["MIPYRE_WORKER"] = ""
 from mipyre import Mipyre
 
 app = Mipyre()
@@ -46,7 +45,7 @@ def say(req):
     return "said"
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, workers=1)
+    app.run(host="127.0.0.1", port=0, subinterpreters=1)
 '''
 
 def start_server(tmp_path, source):
@@ -104,7 +103,6 @@ def loop_server(tmp_path):
 
 RAISE_SCRIPT = r'''
 import os
-os.environ["MIPYRE_WORKER"] = ""
 from mipyre import Mipyre
 
 app = Mipyre()
@@ -119,7 +117,7 @@ def raises(req):
     raise KeyboardInterrupt("raised by the handler itself, not by the watchdog")
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, workers=1)
+    app.run(host="127.0.0.1", port=0, subinterpreters=1)
 '''
 
 

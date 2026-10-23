@@ -1,7 +1,7 @@
 //! Runs one request's before hooks, handler and after hooks in the request's own
 //! `contextvars.Context`, for every synchronous path on main and in workers.
 //!
-//! The async engine repeats this order in Python (`_async_engine.py`), because there a request is
+//! The async engine repeats this order in Python (`_worker/async_engine.py`), because there a request is
 //! a task on the engine's already running loop.
 
 use pyo3::call::PyCallArgs;
@@ -35,8 +35,7 @@ pub(crate) trait EventLoopProvider {
     fn event_loop<'py>(&self, py: Python<'py>) -> Result<Bound<'py, PyAny>, HandlerError>;
 }
 
-pub(crate) type ResponseMapping =
-    for<'py> fn(Bound<'py, PyAny>) -> Result<HandlerResponse, ResponseError>;
+pub(crate) type ResponseMapping = for<'py> fn(Bound<'py, PyAny>) -> Result<HandlerResponse, ResponseError>;
 
 pub(crate) fn main_response(value: Bound<'_, PyAny>) -> Result<HandlerResponse, ResponseError> {
     crate::exchange::to_response::extract_response_data(value.py(), value)
@@ -70,12 +69,7 @@ impl<'py, L: EventLoopProvider> Chain<'_, 'py, L> {
         req: &Bound<'py, Request>,
     ) -> Result<Option<HandlerResponse>, HandlerError> {
         for hook in hooks {
-            let value = self.call(
-                hook,
-                (req,),
-                RequestStage::BeforeHook,
-                ExceptionMapping::AsRaised,
-            )?;
+            let value = self.call(hook, (req,), RequestStage::BeforeHook, ExceptionMapping::AsRaised)?;
             if !value.is_none() {
                 return Ok(Some((self.to_response)(value)?));
             }
@@ -140,9 +134,7 @@ impl<'py, L: EventLoopProvider> Chain<'_, 'py, L> {
         let value = f.bind(py).call1(args).map_err(|e| {
             raised(match meaning {
                 ExceptionMapping::AsRaised => e,
-                ExceptionMapping::NoLoopHint { key, handler } => {
-                    explain_no_current_loop(py, key, handler, e)
-                }
+                ExceptionMapping::NoLoopHint { key, handler } => explain_no_current_loop(py, key, handler, e),
             })
         })?;
         match AwaitableKind::of(&value).map_err(raised)? {
@@ -168,12 +160,7 @@ impl<'py, L: EventLoopProvider> Chain<'_, 'py, L> {
 /// `mipyre.engine.NoEventLoopError` naming the route and what works instead, with asyncio's error
 /// as its cause; any other error comes back unchanged. A `def` handler has no current loop because
 /// the worker's loop was set on the thread that built the worker, not on the one serving.
-fn explain_no_current_loop(
-    py: Python<'_>,
-    key: &RouteKey,
-    handler: &Py<PyAny>,
-    raised: PyErr,
-) -> PyErr {
+fn explain_no_current_loop(py: Python<'_>, key: &RouteKey, handler: &Py<PyAny>, raised: PyErr) -> PyErr {
     if !is_no_current_loop(py, &raised) {
         return raised;
     }

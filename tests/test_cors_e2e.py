@@ -13,8 +13,8 @@ SERVER = '''
 import os
 from mipyre import Mipyre, Response
 
-app = Mipyre()
-app.enable_cors()
+app = Mipyre(runtime=os.environ["MIPYRE_TEST_MODE"])
+app.enable_cors(allow_origins="*")
 
 @app.get("/__ping")
 def ping(req):

@@ -163,8 +163,7 @@ impl<'py> ContextEntry<'py> {
         let ctx = self.into_context();
         exit(&ctx)?;
         // SAFETY: The `Bound` proves the thread is attached, and it holds a live context.
-        let reusable =
-            unsafe { ffi::Py_REFCNT(ctx.as_ptr()) == 1 && ffi::PyObject_Length(ctx.as_ptr()) == 0 };
+        let reusable = unsafe { ffi::Py_REFCNT(ctx.as_ptr()) == 1 && ffi::PyObject_Length(ctx.as_ptr()) == 0 };
         if reusable {
             spare.0 = Some(ctx.unbind());
         }

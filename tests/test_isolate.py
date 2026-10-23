@@ -1,4 +1,4 @@
-"""app.isolate() — per-worker C-extension copies.
+"""runtime="isolated" — per-worker C-extension copies.
 
 Verifies numpy loads in EVERY own-GIL sub-interpreter worker (no
 "cannot load module more than once") and each worker's numpy resolves to its
@@ -9,16 +9,14 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
-import sysconfig
 import urllib.request
-from pathlib import Path
 
 import pytest
 
+from tests import _pyo3_fixture
 from tests._helpers import FINALIZE_MARK_SNIPPET, bound_port, finalized, read_file
 
 _supported = pytest.mark.skipif(
@@ -29,7 +27,7 @@ _supported = pytest.mark.skipif(
 _SERVER = '''
 from mipyre import Mipyre
 app = Mipyre(runtime="isolated")
-import numpy   # loaded by every worker at start (what app.isolate("numpy") did up front)
+import numpy   # loaded by every worker at start
 
 import os as _os
 _ISO_DIR = _os.environ.get("MIPYRE_ISOLATE_DIR", "/tmp/mipyre-isolate")
@@ -57,7 +55,7 @@ def isolate_server(tmp_path):
     copies = tmp_path / "copies"
     env = dict(
         os.environ,
-        MIPYRE_WORKERS="4",
+        MIPYRE_THREADS="4",
         MIPYRE_ISOLATE_DIR=str(copies),
     )
     log = tmp_path / "iso_server.log"
@@ -103,25 +101,23 @@ def test_isolate_numpy_across_workers(isolate_server):
     assert len(worker_numpys) == 4, f"expected 4 per-worker numpy copies, got {len(worker_numpys)}"
 
 
-# -- Reactive auto-isolate (no app.isolate() call at all) ---------------------
+# -- Automatic isolation: an unmodified `import numpy` ---------------------------
 #
-# The self-healing import hook (_bootstrap._iso_import) must make an UNMODIFIED
-# `import numpy` work in every own-GIL worker: the first import trips
-# "does not support loading in subinterpreters", the hook reads the offending
-# module out of the error, clones numpy, and retries — with zero app.isolate().
+# The worker's finder must make an UNMODIFIED `import numpy` work in every own-GIL
+# worker: the first time a worker resolves numpy it reads numpy's extension files,
+# finds single-phase ones, and resolves numpy to that worker's own copy.
 
 _SERVER_AUTO = '''
 from mipyre import Mipyre
 app = Mipyre(runtime="isolated")
-# NOTE: no app.isolate(...) — isolation must happen reactively.
 
 import os as _os
 _ISO_DIR = _os.environ.get("MIPYRE_ISOLATE_DIR", "/tmp/mipyre-isolate")
 
 # Top-level `import numpy` (the realistic way a user writes it): every worker
-# runs the script body at init, so each independently trips the isolation error
-# and reactively clones its own numpy — no reliance on request load spreading
-# across all workers (pyre may route a burst to a single worker).
+# runs the script body at init, so each makes its own copy of numpy — no
+# reliance on request load spreading across all workers (pyre may route a burst
+# to a single worker).
 import numpy as np
 
 @app.get("/np")
@@ -146,7 +142,7 @@ def auto_isolate_server(tmp_path):
     copies = tmp_path / "copies"
     env = dict(
         os.environ,
-        MIPYRE_WORKERS="4",
+        MIPYRE_THREADS="4",
         MIPYRE_ISOLATE_DIR=str(copies),
     )
     log = tmp_path / "auto_iso_server.log"
@@ -181,9 +177,9 @@ def test_auto_isolate_numpy_without_declaration(auto_isolate_server):
         results = list(ex.map(hit, range(200)))
 
     # Every response: numpy loaded and resolved to an isolated per-worker copy —
-    # achieved reactively, with no app.isolate("numpy") in the server script.
+    # achieved by the finder alone, with nothing but `import numpy` in the server script.
     assert all("numpy" in r for r in results)
-    assert all(r["isolated"] for r in results), "reactive auto-isolate did not isolate numpy"
+    assert all(r["isolated"] for r in results), "the finder did not isolate numpy"
 
     # Reactive isolations land under the stable `auto` bucket (no declared-lib
     # signature); each of the 4 workers cloned its own numpy there.
@@ -206,7 +202,7 @@ def _start_server(script_text, tmp_path, name, workers=4, isolate_dir=None, env_
     script = tmp_path / f"{name}.py"
     script.write_text(script_text.format(port=0))
     log = tmp_path / f"{name}.log"
-    env = dict(os.environ, MIPYRE_WORKERS=str(workers))
+    env = dict(os.environ, MIPYRE_THREADS=str(workers))
     if isolate_dir is not None:
         env["MIPYRE_ISOLATE_DIR"] = str(isolate_dir)
     if env_extra:
@@ -244,7 +240,7 @@ from mipyre import Mipyre
 app = Mipyre(runtime="isolated")
 import os as _o
 _D = _o.environ.get("MIPYRE_ISOLATE_DIR", "/tmp/mipyre-isolate")
-import numpy as np   # top-level, no app.isolate() -> reactive auto-isolate
+import numpy as np   # top-level: each worker resolves numpy to its own copy
 @app.get("/np")
 def h(req):
     return {{"v": np.__version__, "isolated": np.__file__.startswith(_D)}}
@@ -366,41 +362,7 @@ def test_builtin_single_phase_ext_loads_in_workers(tmp_path):
         _stop(proc)
 
 
-# The PyO3 multi-phase fixture (tests/fixtures/pyo3_mp), built twice: the variant without the feature does not
-# declare per-interpreter GIL support, the one with it does (see the crate's lib.rs). CPython's own check decides on
-# that declaration alone, so each test's expectation follows from how its variant was built.
-_ROOT = Path(__file__).resolve().parent.parent
-# A standalone crate (its own [workspace]): test asset, not a workspace package, not in any wheel.
-_FIXTURE_DIR = _ROOT / "tests" / "fixtures" / "pyo3_mp"
-_FIXTURE_MODULE = "pyo3_mp"
-_FIXTURE_VARIANTS = {"undeclared": [], "declared": ["--features", "declare_per_interpreter"]}
-
-
-@pytest.fixture(scope="session")
-def pyo3_fixture_dirs(tmp_path_factory):
-    """{variant: dir holding the importable module}. Built with cargo (an up-to-date build costs next to nothing).
-    No cargo is a failure, never a skip: a skip is red at the gate."""
-    cargo = shutil.which("cargo")
-    if cargo is None:
-        pytest.fail("cargo not found: test_isolate.py builds its PyO3 fixture (tests/fixtures/pyo3_mp) with cargo; "
-                    "install a Rust toolchain (the merge gate has one)")
-    env = dict(os.environ, PYO3_PYTHON=sys.executable)
-    target = Path(os.environ.get("CARGO_TARGET_DIR") or _FIXTURE_DIR / "target") / "debug"
-    lib_ext = ".dylib" if sys.platform == "darwin" else ".so"
-    suffix = sysconfig.get_config_var("EXT_SUFFIX")
-    root_dir = tmp_path_factory.mktemp("pyo3_fixtures")
-    dirs = {}
-    for variant, feature_args in _FIXTURE_VARIANTS.items():
-        # Both variants build the same lib path, so each is copied out before the next build replaces it.
-        cmd = [cargo, "build", "--lib", "--manifest-path", str(_FIXTURE_DIR / "Cargo.toml"), *feature_args]
-        built = subprocess.run(cmd, cwd=_ROOT, env=env, capture_output=True, text=True, check=False)
-        if built.returncode != 0:
-            pytest.fail(f"cargo build of the PyO3 fixture ({variant}) failed:\n{built.stderr[-3000:]}")
-        dest = root_dir / variant
-        dest.mkdir()
-        shutil.copyfile(target / f"lib{_FIXTURE_MODULE}{lib_ext}", dest / f"{_FIXTURE_MODULE}{suffix}")
-        dirs[variant] = dest
-    return dirs
+_ROOT, _FIXTURE_DIR, _FIXTURE_MODULE = _pyo3_fixture.ROOT, _pyo3_fixture.FIXTURE_DIR, _pyo3_fixture.MODULE
 
 
 def _toml_section_text(path, header):
@@ -502,3 +464,103 @@ def test_isolated_multiphase_ext_declaring_subinterp_loads_shared(pyo3_fixture_d
     """
     r = _run_multiphase(pyo3_fixture_dirs["declared"], tmp_path, "declared")
     assert r == {"isolated": False, "ok": True}, r
+
+
+_SERVER_POLARS = '''
+from mipyre import Mipyre
+app = Mipyre(runtime="isolated")
+import polars as pl   # polars/_plr.py tries its runtimes under `except ImportError: pass`
+@app.get("/pl")
+def h(req):
+    return {{"ok": int(pl.Series([1, 2]).sum())}}
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port={port})
+'''
+
+
+@_supported
+def test_polars_works_in_isolated_workers_without_importing_its_runtime_first(tmp_path):
+    """b/755: polars tries `_polars_runtime_32` under `except ImportError: pass`. The finder copies the runtime when
+    polars first resolves it, so no ImportError ever reaches polars, and the startup line says why it was copied."""
+    proc, log = _start_server(_SERVER_POLARS, tmp_path, "srv_polars", workers=2, isolate_dir=tmp_path / "copies")
+    try:
+        assert _wait_ready("/pl", proc, log) == {"ok": 3}
+    finally:
+        _stop(proc)
+    text = log.read_text(errors="replace")
+    assert "Polars binary is missing" not in text, text[-3000:]
+    line = next(line for line in text.splitlines() if "per-worker copies of" in line)
+    assert "_polars_runtime_32 (" in line and "does not declare per-interpreter GIL support" in line, line
+
+
+_SERVER_FALLBACK = '''
+from mipyre import Mipyre
+app = Mipyre(runtime="isolated")
+import os as _os
+import fallbacklib
+@app.get("/fb")
+def h(req):
+    import {mod} as m
+    return {{"fallback": fallbacklib.FALLBACK, "isolated": m.__file__.startswith(_os.environ["MIPYRE_ISOLATE_DIR"])}}
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port={port})
+'''
+
+
+@_supported
+def test_a_library_that_falls_back_on_import_error_gets_its_extension_from_a_copy(pyo3_fixture_dirs, tmp_path):
+    """A pure-Python library with a fallback (`try: import ext except ImportError`) around an extension that does not
+    declare per-interpreter GIL support: the extension is copied before it loads, so the fallback never runs."""
+    lib = tmp_path / "lib" / "fallbacklib"
+    lib.mkdir(parents=True)
+    (lib / "__init__.py").write_text(
+        f"try:\n    import {_FIXTURE_MODULE}  # noqa: F401\n    FALLBACK = False\nexcept ImportError:\n    FALLBACK = True\n"
+    )
+    script = _SERVER_FALLBACK.replace("{mod}", _FIXTURE_MODULE)
+    path = os.pathsep.join([str(pyo3_fixture_dirs["undeclared"]), str(tmp_path / "lib"), os.environ.get("PYTHONPATH", "")])
+    proc, log = _start_server(script, tmp_path, "srv_fallback", workers=2, isolate_dir=tmp_path / "copies",
+                              env_extra={"PYTHONPATH": path})
+    try:
+        assert _wait_ready("/fb", proc, log) == {"fallback": False, "isolated": True}
+    finally:
+        _stop(proc)
+
+
+_SERVER_UNUSABLE_DIR = '''
+from mipyre import Mipyre
+app = Mipyre(runtime="isolated")
+@app.get("/up")
+def up(req):
+    return {{"up": True}}
+@app.get("/lazy")
+def h(req):
+    try:
+        import {mod}  # noqa: F401
+    except ImportError:
+        return {{"caught": "ImportError"}}
+    except RuntimeError as e:
+        return {{"caught": type(e).__name__, "said": str(e)}}
+    return {{"caught": None}}
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port={port})
+'''
+
+
+@_supported
+def test_a_copy_that_cannot_be_made_is_an_isolation_error_no_import_error_handler_hides(pyo3_fixture_dirs, tmp_path):
+    # The directory is checked when the server starts (b/335 M7.1), so it turns unusable after
+    # that: the copy made at the first isolated import is what fails.
+    shared = tmp_path / "copies"
+    script = _SERVER_UNUSABLE_DIR.replace("{mod}", _FIXTURE_MODULE)
+    path = os.pathsep.join([str(pyo3_fixture_dirs["undeclared"]), os.environ.get("PYTHONPATH", "")])
+    proc, log = _start_server(script, tmp_path, "srv_unusable", workers=1, isolate_dir=shared,
+                              env_extra={"PYTHONPATH": path})
+    try:
+        assert _wait_ready("/up", proc, log) == {"up": True}
+        shared.chmod(0o777)
+        got = _wait_ready("/lazy", proc, log)
+    finally:
+        _stop(proc)
+    assert got["caught"] == "IsolationError", got
+    assert f"could not load {_FIXTURE_MODULE}" in got["said"] and "writable by other users" in got["said"], got
+    assert "does not declare per-interpreter GIL support" in got["said"], got

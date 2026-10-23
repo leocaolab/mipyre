@@ -12,7 +12,6 @@ use std::cell::RefCell;
 use mipyre_http::plan::compression::{self, Codec, CompressionSettings, GzipStream};
 use mipyre_http::plan::response::HandlerResponse;
 
-
 /// Bytes of buffers one thread keeps for reuse; a buffer that would take its pool past this
 /// is dropped instead, so the pools' memory is bounded (per serving thread).
 const POOL_MAX_BYTES_PER_THREAD: usize = 4 << 20;
@@ -44,9 +43,7 @@ impl BufferPool {
 
     fn give(&mut self, mut buf: Vec<u8>) {
         let cap = buf.capacity();
-        if self.bufs.len() < POOL_SLOTS_PER_THREAD
-            && self.bytes() + cap <= POOL_MAX_BYTES_PER_THREAD
-        {
+        if self.bufs.len() < POOL_SLOTS_PER_THREAD && self.bytes() + cap <= POOL_MAX_BYTES_PER_THREAD {
             buf.clear();
             self.bufs.push(buf);
         }
@@ -72,7 +69,6 @@ impl Drop for PooledBuffer {
         let _ = COMPRESS_POOL.try_with(|pool| pool.borrow_mut().give(buf));
     }
 }
-
 
 /// Compresses `body` with `codec` into a buffer from this thread's pool, returning `None` when
 /// encoding failed, which is logged, or did not shrink the body.
@@ -163,9 +159,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mipyre_http::plan::compression::{plan, INLINE_MAX_BYTES};
     use crate::serve::pipeline::AcceptEncoding;
     use hyper::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING, VARY};
+    use mipyre_http::plan::compression::{plan, INLINE_MAX_BYTES};
     use mipyre_http::plan::response::HeaderLines;
 
     fn settings(min_size: i64, gzip: bool, brotli: bool) -> CompressionSettings {
@@ -187,11 +183,7 @@ mod tests {
 
     /// Runs `data` through the request's `AcceptEncoding` gate and `compress` on a current-thread
     /// runtime, as a TPC thread does; `None` settings means compression is off.
-    fn compressed(
-        data: HandlerResponse,
-        accept: &str,
-        settings: Option<&CompressionSettings>,
-    ) -> HandlerResponse {
+    fn compressed(data: HandlerResponse, accept: &str, settings: Option<&CompressionSettings>) -> HandlerResponse {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, HeaderValue::from_str(accept).unwrap());
         let accept_encoding = AcceptEncoding::from_headers(&headers, settings);
@@ -214,11 +206,7 @@ mod tests {
     #[test]
     fn enabled_compresses_json() {
         let payload = vec![b'x'; 4096];
-        let data = compressed(
-            json(payload.clone()),
-            "br, gzip",
-            Some(&settings(100, true, true)),
-        );
+        let data = compressed(json(payload.clone()), "br, gzip", Some(&settings(100, true, true)));
         assert!(data.body.len() < payload.len());
         assert_eq!(data.headers().get("content-encoding").unwrap(), "br");
         assert_eq!(
@@ -237,11 +225,7 @@ mod tests {
         let payload = vec![b'y'; INLINE_MAX_BYTES * 4];
         let job = plan(&json(payload.clone()), "gzip", &settings(100, true, false)).unwrap();
         assert!(!job.runs_inline());
-        let data = compressed(
-            json(payload.clone()),
-            "gzip",
-            Some(&settings(100, true, false)),
-        );
+        let data = compressed(json(payload.clone()), "gzip", Some(&settings(100, true, false)));
         assert!(data.body.len() < payload.len());
         assert_eq!(data.headers().get("content-encoding").unwrap(), "gzip");
     }
@@ -276,7 +260,9 @@ mod tests {
     #[test]
     fn handler_content_encoding_preserved() {
         let mut headers = HeaderLines::new();
-        assert!(headers.append(CONTENT_ENCODING, HeaderValue::from_static("identity")).is_none());
+        assert!(headers
+            .append(CONTENT_ENCODING, HeaderValue::from_static("identity"))
+            .is_none());
         let data = json_with(vec![b'x'; 2048], headers);
         let data = compressed(data, "gzip, br", Some(&settings(100, true, true)));
         assert_eq!(data.headers().get("Content-Encoding").unwrap(), "identity");

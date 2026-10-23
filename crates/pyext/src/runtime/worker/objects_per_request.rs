@@ -23,6 +23,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 
 use super::sync_runner::tests::sync_worker;
+use crate::exchange::json::tests::import_isojson;
 use crate::exchange::request::Request;
 use crate::exchange::RequestBody;
 use crate::runtime::request_context::tests::register_awaitable_module;
@@ -89,33 +90,6 @@ fn install_tracer(_py: Python<'_>) {
     });
 }
 
-/// Makes `isojson` importable here: a test binary's interpreter is the base install, so this adds
-/// the site-packages of the venv `PYO3_PYTHON` names, else this checkout's `.venv-gate` or `.venv`.
-fn import_isojson(py: Python<'_>) {
-    let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let venvs: Vec<std::path::PathBuf> = std::env::var_os("PYO3_PYTHON")
-        .map(std::path::PathBuf::from)
-        .and_then(|python| Some(python.parent()?.parent()?.to_path_buf()))
-        .into_iter()
-        .chain([checkout.join(".venv-gate"), checkout.join(".venv")])
-        .collect();
-    let found = py.import("sys").and_then(|sys| {
-        let version = sys.getattr("version_info")?;
-        let lib = format!("python{}.{}", version.get_item(0)?, version.get_item(1)?);
-        let path = sys.getattr("path")?;
-        for venv in &venvs {
-            let site = venv.join("lib").join(&lib).join("site-packages");
-            if site.is_dir() {
-                path.call_method1("append", (site.to_string_lossy(),))?;
-            }
-        }
-        py.import("isojson").map(drop)
-    });
-    if let Err(e) = found {
-        panic!("isojson is not importable from the venvs {venvs:?}: {e}");
-    }
-}
-
 /// Returns the Python objects made on this thread while `f` runs, by type name.
 fn objects_made<T>(f: impl FnOnce() -> T) -> (T, BTreeMap<String, u64>) {
     MADE.with(|made| *made.borrow_mut() = Some(HashMap::new()));
@@ -142,10 +116,7 @@ fn request(params: &[(&str, &str)]) -> Request {
         .into_parts();
     let head = crate::exchange::RequestHead {
         parts,
-        params: params
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect(),
+        params: params.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
         client: mipyre_transport::driver::Peer::Ip(std::net::Ipv4Addr::LOCALHOST.into()),
         request_id: mipyre_http::io::request_id::RequestId::mint(),
     };
@@ -176,7 +147,7 @@ fn sync_path(
                     import_isojson(py);
                     register_awaitable_module(py);
                 })
-                .expect("the tracer installed, isojson and mipyre._awaitable importable");
+                .expect("the tracer installed, isojson and mipyre._worker.awaitable importable");
             let mut serve = || {
                 let served = worker.serve_inline(route, request(params));
                 let answer = served.response.map(|r| r.body).map_err(|e| e.to_string());
@@ -199,8 +170,7 @@ fn sync_path(
 }
 
 /// It is the response body of `PAYLOAD`, each app's first line.
-const PAYLOAD_JSON: &[u8] =
-    br#"{"id":1,"name":"mipyre","tags":["a","b","c"],"price":12.5,"ok":true}"#;
+const PAYLOAD_JSON: &[u8] = br#"{"id":1,"name":"mipyre","tags":["a","b","c"],"price":12.5,"ok":true}"#;
 
 /// It is set in the run of the test binary that runs one test alone.
 const ALONE: &str = "OBJECTS_PER_REQUEST_ALONE";
@@ -260,11 +230,7 @@ macro_rules! app {
 fn json() {
     alone(concat!(module_path!(), "::json"), || {
         let made = sync_path(
-            app!(
-                "def handler(req): return PAYLOAD",
-                "before = []",
-                "after = []"
-            ),
+            app!("def handler(req): return PAYLOAD", "before = []", "after = []"),
             &[],
             PAYLOAD_JSON,
         );
@@ -276,11 +242,7 @@ fn json() {
 fn plaintext() {
     alone(concat!(module_path!(), "::plaintext"), || {
         let made = sync_path(
-            app!(
-                "def handler(req): return 'Hello, World!'",
-                "before = []",
-                "after = []"
-            ),
+            app!("def handler(req): return 'Hello, World!'", "before = []", "after = []"),
             &[],
             b"Hello, World!",
         );
@@ -292,11 +254,7 @@ fn plaintext() {
 fn path_param() {
     alone(concat!(module_path!(), "::path_param"), || {
         let made = sync_path(
-            app!(
-                "def handler(req): return req.params['id']",
-                "before = []",
-                "after = []"
-            ),
+            app!("def handler(req): return req.params['id']", "before = []", "after = []"),
             &[("id", "42")],
             b"42",
         );
@@ -351,10 +309,7 @@ fn sync_hooks() {
             &[],
             PAYLOAD_JSON,
         );
-        print(
-            "hooks (json; one before, two after, all return None)",
-            &made,
-        );
+        print("hooks (json; one before, two after, all return None)", &made);
     });
 }
 
@@ -371,14 +326,11 @@ fn async_before_hook() {
             &[],
             PAYLOAD_JSON,
         );
-        print(
-            "async before hook (json; async def before hook returns None)",
-            &made,
-        );
+        print("async before hook (json; async def before hook returns None)", &made);
     });
 }
 
-/// It sets up the engine's request coroutine and loop as `_async_engine.py` does, minus the fetcher
+/// It sets up the engine's request coroutine and loop as `_worker/async_engine.py` does, minus the fetcher
 /// thread: `serve(inbox)` schedules every job as the fetcher does, then runs the loop for two
 /// iterations, one to start the tasks and one to run them.
 const ASYNC_ENGINE: &CStr = c"
@@ -428,20 +380,16 @@ fn async_engine() {
                         let requests = pyo3::types::PyModule::from_code(
                             py,
                             &std::ffi::CString::new(include_str!(
-                                "../../../../../python/mipyre/_async_requests.py"
+                                "../../../../../python/mipyre/_worker/async_requests.py"
                             ))
                             .expect("no NUL"),
-                            c"_async_requests.py",
-                            c"_async_requests",
+                            c"async_requests.py",
+                            c"async_requests",
                         )
-                        .expect("_async_requests runs");
-                        let harness = pyo3::types::PyModule::from_code(
-                            py,
-                            ASYNC_ENGINE,
-                            c"b588_engine.py",
-                            c"b588_engine",
-                        )
-                        .expect("the harness runs");
+                        .expect("async_requests runs");
+                        let harness =
+                            pyo3::types::PyModule::from_code(py, ASYNC_ENGINE, c"b588_engine.py", c"b588_engine")
+                                .expect("the harness runs");
                         let serve = harness
                             .getattr("engine")
                             .and_then(|engine| {
@@ -477,10 +425,7 @@ fn async_engine() {
                             drop(queue);
                             let inbox = Bound::new(
                                 py,
-                                AsyncInbox::new(
-                                    queued,
-                                    RequestBudget::from_secs(32.0).expect("a request budget"),
-                                ),
+                                AsyncInbox::new(queued, RequestBudget::from_secs(32.0).expect("a request budget")),
                             )
                             .expect("the inbox");
                             let (served, made) = objects_made(|| serve.call1((&inbox,)).map(drop));
@@ -491,11 +436,7 @@ fn async_engine() {
                                     .expect("answered")
                                     .map(|r| r.body)
                                     .map_err(|e| format!("{e:?}"));
-                                assert_eq!(
-                                    body.as_deref(),
-                                    Ok(PAYLOAD_JSON),
-                                    "the request was answered"
-                                );
+                                assert_eq!(body.as_deref(), Ok(PAYLOAD_JSON), "the request was answered");
                             }
                             made
                         };
@@ -512,25 +453,17 @@ fn async_engine() {
             .join()
             .expect("the worker thread's assertions hold");
         let [one, two, three] = made;
-        let per_request =
-            |from: &BTreeMap<String, u64>, to: &BTreeMap<String, u64>| -> BTreeMap<String, u64> {
-                to.iter()
-                    .filter_map(|(ty, &n)| {
-                        let extra = n - from.get(ty).copied().unwrap_or(0);
-                        assert_eq!(extra % N as u64, 0, "{ty}: {extra} more over {N} requests");
-                        (extra > 0).then(|| (ty.clone(), extra / N as u64))
-                    })
-                    .collect()
-            };
+        let per_request = |from: &BTreeMap<String, u64>, to: &BTreeMap<String, u64>| -> BTreeMap<String, u64> {
+            to.iter()
+                .filter_map(|(ty, &n)| {
+                    let extra = n - from.get(ty).copied().unwrap_or(0);
+                    assert_eq!(extra % N as u64, 0, "{ty}: {extra} more over {N} requests");
+                    (extra > 0).then(|| (ty.clone(), extra / N as u64))
+                })
+                .collect()
+        };
         let first = per_request(&one, &two);
-        assert_eq!(
-            first,
-            per_request(&two, &three),
-            "every request makes the same objects"
-        );
-        print(
-            "async engine (async def handler returns a dict, no hooks)",
-            &first,
-        );
+        assert_eq!(first, per_request(&two, &three), "every request makes the same objects");
+        print("async engine (async def handler returns a dict, no hooks)", &first);
     });
 }

@@ -42,28 +42,17 @@ impl std::ops::Deref for AppStore {
     }
 }
 
-/// The running app's map in this interpreter; it is unset on main and in interpreters mipyre did
-/// not create.
-static WORKER_MAP: pyo3::sync::PyOnceLock<AppStore> = pyo3::sync::PyOnceLock::new();
-
-/// Gives the attached worker interpreter the running app's map.
-///
-/// It must run once, right after the interpreter is created and before its script runs: the
-/// PyO3 fork's `PyOnceLock` holds one value per interpreter and starts empty in a new one.
-pub(crate) fn hand_to_worker(
-    py: Python<'_>,
-    map: &AppStore,
-) -> Result<(), crate::runtime::worker::start::InterpreterState> {
-    WORKER_MAP
-        .set(py, map.clone())
-        .map_err(|_| crate::runtime::worker::start::InterpreterState::SharedMap)
-}
-
 /// Returns the running app's map inside a worker, and a fresh one elsewhere so TestClient apps
 /// in one process keep separate maps.
-pub(crate) fn map_for_new(py: Python<'_>) -> AppStore {
-    match WORKER_MAP.get(py) {
-        Some(map) => map.clone(),
-        None => AppStore::default(),
+///
+/// # Errors
+///
+/// Returns the Python error when this interpreter's `mipyre.engine` cannot be reached.
+pub(crate) fn map_for_new(py: Python<'_>) -> pyo3::PyResult<AppStore> {
+    // The main interpreter is never assigned a map (a process-lane worker's is assigned only
+    // its routers), so it does not look.
+    if mipyre_subinterp::attach::on_main(py) {
+        return Ok(AppStore::default());
     }
+    super::worker_app::EngineModule::with(py, super::worker_app::EngineModule::store)
 }

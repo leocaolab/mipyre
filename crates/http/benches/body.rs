@@ -36,7 +36,9 @@ fn stream_feed_per_frame(n: u64) {
             body,
             tx,
             usize::MAX,
-            mipyre_http::plan::limits::BodyTimeAllowance::absolute(mipyre_http::plan::limits::RequestBudget::from_secs(3600.0).must("an hour is a budget")),
+            mipyre_http::plan::limits::BodyTimeAllowance::absolute(
+                mipyre_http::plan::limits::RequestBudget::from_secs(3600.0).must("an hour is a budget"),
+            ),
         ));
         let mut chunks: u64 = 0;
         while let Some(message) = rx.recv().await {
@@ -63,11 +65,11 @@ fn read_body_ready(n: u64) {
     let limits = black_box(mipyre_http::plan::limits::Limits::DEFAULT);
     let mut cx = Context::from_waker(std::task::Waker::noop());
     measure("read_body_ready", n, |_| {
-        let body = http_body_util::BodyExt::map_err(
-            http_body_util::Full::new(Bytes::from_static(b"{\"a\":1}")),
-            |never| match never {},
-        );
-        let read = std::pin::pin!(mipyre_http::io::body::read_body(body, limits.max_body.as_usize(), || limits.body_time()));
+        let body =
+            http_body_util::BodyExt::map_err(http_body_util::Full::new(Bytes::from_static(b"{\"a\":1}")), |never| {
+                match never {}
+            });
+        let read = std::pin::pin!(mipyre_http::io::body::read_body(body, &limits));
         assert!(matches!(black_box(read.poll(&mut cx)), Poll::Ready(Ok(_))));
     });
 }

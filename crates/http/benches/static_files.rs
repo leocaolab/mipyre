@@ -1,8 +1,10 @@
-//! Measures answering a request no route matched from the static file cache.
+//! Measures answering a request no route matched from the static file cache, and from disk for
+//! a file the cache has no room for.
 // The package's clippy.toml is plan/'s list; a bench measures the world through io/.
 #![expect(
     clippy::disallowed_methods,
     clippy::disallowed_macros,
+    clippy::disallowed_types,
     reason = "a bench writes the files it serves and prints"
 )]
 
@@ -11,10 +13,12 @@ use std::future::Future;
 use std::hint::black_box;
 use std::task::{Context, Poll, Waker};
 
-use bytes::Bytes;
 use hyper::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING, ETAG, IF_NONE_MATCH};
 use hyper::Method;
-use mipyre_http::io::static_files::{try_static_file, MountWatch, StaticMount};
+use mipyre_http::io::body::ResponseBody;
+use mipyre_http::io::static_files::{
+    try_static_file, CacheBudget, MountWatch, StaticMount, DEFAULT_CACHE_BUDGET_BYTES,
+};
 use mipyre_http::plan::request::{decide, RequestDecision};
 use mipyre_http::plan::route::RouteTable;
 use mipyre_http::plan::static_plan::Copies;
@@ -100,6 +104,8 @@ fn static_answer(
         StaticMount::new("/static", &dir.0.to_string_lossy(), copies),
         "mount the static directory",
     );
+    // A server hands its mounts a cache budget when it seals its run.
+    mount.cache_within(&std::sync::Arc::new(CacheBudget::new(DEFAULT_CACHE_BUDGET_BYTES)));
     let watched = mount.clone();
     let mut table: RouteTable<(), StaticMount> = RouteTable::new();
     table.add_static_mount(mount);
@@ -116,7 +122,10 @@ fn static_answer(
     );
     let answer = |headers: &HeaderMap, stage: &str, status: u16| match rt.block_on(unrouted(&table, path, headers)) {
         Some(resp) if resp.status().as_u16() == status => resp,
-        other => stop(&format!("{name}: the {stage} answered {:?}, not {status}", other.map(|r| r.status()))),
+        other => stop(&format!(
+            "{name}: the {stage} answered {:?}, not {status}",
+            other.map(|r| r.status())
+        )),
     };
     let set_up_status = if revalidate { 200 } else { status };
     answer(&headers, "first request", set_up_status);
@@ -131,13 +140,16 @@ fn static_answer(
     }
     match watch {
         MountWatch::Active | MountWatch::Unstarted => {}
-        MountWatch::Started | MountWatch::Failed => {
-            stop(&format!("{name}: the mount's watch is {watch:?}, so nothing would be cached"))
-        }
+        MountWatch::Started | MountWatch::Failed => stop(&format!(
+            "{name}: the mount's watch is {watch:?}, so nothing would be cached"
+        )),
     }
     let cached = answer(&headers, "request after the watch was up", set_up_status);
     if revalidate {
-        let etag = dir.must(cached.headers().get(ETAG).ok_or("no ETag"), "a static answer carries its ETag");
+        let etag = dir.must(
+            cached.headers().get(ETAG).ok_or("no ETag"),
+            "a static answer carries its ETag",
+        );
         headers.insert(IF_NONE_MATCH, etag.clone());
         answer(&headers, "revalidating request", status);
     }
@@ -159,7 +171,7 @@ async fn unrouted(
     table: &RouteTable<(), StaticMount>,
     path: &str,
     headers: &HeaderMap,
-) -> Option<hyper::Response<http_body_util::Full<Bytes>>> {
+) -> Option<hyper::Response<ResponseBody>> {
     match decide(&Method::GET, path, headers, table) {
         RequestDecision::NoRoute(no_route) => try_static_file(no_route.static_lookups()).await,
         _ => stop("a table without routes routes nothing"),
@@ -168,7 +180,14 @@ async fn unrouted(
 
 /// Serves the static part of the `static-hit` path.
 fn static_hit(n: u64) {
-    static_answer("static_hit", n, Copies::Original, "/static/hello.txt", (None, false), 200);
+    static_answer(
+        "static_hit",
+        n,
+        Copies::Original,
+        "/static/hello.txt",
+        (None, false),
+        200,
+    );
 }
 
 fn static_hit_twin(n: u64) {
@@ -184,20 +203,123 @@ fn static_hit_twin(n: u64) {
 
 /// Answers `304` to a client revalidating the `static_hit` file with its `ETag`.
 fn static_not_modified(n: u64) {
-    static_answer("static_not_modified", n, Copies::Original, "/static/hello.txt", (None, true), 304);
+    static_answer(
+        "static_not_modified",
+        n,
+        Copies::Original,
+        "/static/hello.txt",
+        (None, true),
+        304,
+    );
 }
 
 /// Refuses a path that climbs out of the mount before any lookup.
 fn static_refused(n: u64) {
-    static_answer("static_refused", n, Copies::Original, "/static/%2e%2e/etc/passwd", (None, false), 403);
+    static_answer(
+        "static_refused",
+        n,
+        Copies::Original,
+        "/static/%2e%2e/etc/passwd",
+        (None, false),
+        403,
+    );
+}
+
+/// Each file fills an eighth of a server's 128 MiB cache budget. They are sparse, so writing
+/// them costs no disk.
+const FILLER_BYTES: u64 = 16 * 1024 * 1024;
+const FILLERS: usize = 8;
+
+/// Answers `GET /static/hello.txt` from disk, the cache being full: each call opens the file,
+/// reads it once for its `ETag`, answers, and sends its one chunk, as a miss of a file the cache
+/// has no room for does. Every call takes two trips to the blocking pool.
+fn static_sent_from_disk(n: u64) {
+    let name = "static_sent_from_disk";
+    let dir = StaticDir::new();
+    for i in 0..FILLERS {
+        let filler = dir.must(
+            std::fs::File::create(dir.0.join(format!("filler-{i}.bin"))),
+            "create a filler",
+        );
+        dir.must(filler.set_len(FILLER_BYTES), "size a filler");
+    }
+    let mount = dir.must(
+        StaticMount::new("/static", &dir.0.to_string_lossy(), Copies::Original),
+        "mount the static directory",
+    );
+    mount.cache_within(&std::sync::Arc::new(CacheBudget::new(DEFAULT_CACHE_BUDGET_BYTES)));
+    let watched = mount.clone();
+    let mut table: RouteTable<(), StaticMount> = RouteTable::new();
+    table.add_static_mount(mount);
+    let headers = HeaderMap::new();
+    let rt = dir.must(
+        tokio::runtime::Builder::new_current_thread().enable_all().build(),
+        "build the runtime",
+    );
+    let answer = |path: &str| rt.block_on(sent(&table, path, &headers));
+    answer("/static/hello.txt");
+    let mut watch = watched.watch();
+    for _ in 0..1000 {
+        if watch != MountWatch::Started {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        watch = watched.watch();
+    }
+    if watch != MountWatch::Active {
+        stop(&format!(
+            "{name}: the mount's watch is {watch:?}, so nothing would fill the cache"
+        ));
+    }
+    for i in 0..FILLERS {
+        answer(&format!("/static/filler-{i}.bin"));
+    }
+    if answer("/static/hello.txt") != Origin::FromDisk {
+        stop(&format!(
+            "{name}: hello.txt is kept: the fillers did not fill the cache"
+        ));
+    }
+    measure(name, n, |_| {
+        black_box(rt.block_on(sent(
+            black_box(&table),
+            black_box("/static/hello.txt"),
+            black_box(&headers),
+        )));
+    });
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Origin {
+    FromMemory,
+    FromDisk,
+}
+
+/// Answers `GET path` and reads the answer's body to its end.
+async fn sent(table: &RouteTable<(), StaticMount>, path: &str, headers: &HeaderMap) -> Origin {
+    use http_body_util::BodyExt;
+    let Some(resp) = unrouted(table, path, headers).await else {
+        stop(&format!("{path} is not served"))
+    };
+    let from = match resp.body() {
+        ResponseBody::File(_) => Origin::FromDisk,
+        _ => Origin::FromMemory,
+    };
+    match resp.into_body().collect().await {
+        Ok(body) => {
+            black_box(body);
+        }
+        Err(error) => stop(&format!("{path}: {error}")),
+    }
+    from
 }
 
 fn main() {
-    let cases: [Case; 4] = [
+    let cases: [Case; 5] = [
         ("static_hit", static_hit),
         ("static_hit_twin", static_hit_twin),
         ("static_not_modified", static_not_modified),
         ("static_refused", static_refused),
+        ("static_sent_from_disk", static_sent_from_disk),
     ];
     run(&cases);
 }

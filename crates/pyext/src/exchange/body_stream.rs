@@ -1,10 +1,10 @@
-//! Lets a `stream=True` route read `req.stream`, an iterator of the body's chunks as they arrive.
+//! Lets a `body=BodyStream` route read `req.stream`, an iterator of the body's chunks as they arrive.
 //!
 //! The channel from the feeder is bounded, so a slow handler stops the feeder polling the body,
 //! which closes the client's TCP window. The body keeps the size and time limits a buffered body
 //! has, not counting the time it waits for the handler to read.
 //!
-//! A rejected body raises [`BodyRejected`], and a handler that lets it through gets the 413, 408
+//! A rejected body raises [`PyBodyReadError`], and a handler that lets it through gets the 413, 408
 //! or 400 a buffered body would, logged as a rejection rather than a server error. A stream that
 //! failed raises the same error on every later read.
 
@@ -15,26 +15,29 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use mipyre_http::io::body::{BodyMessage, BodyReceiver, BodyReadError};
+use mipyre_http::io::body::{BodyMessage, BodyReadError, BodyReceiver};
 
-pyo3::create_exception!(
-    mipyre.engine,
-    BodyRejected,
-    PyOSError,
-    "A streamed request body was rejected, as a buffered one would be: larger than \
-     max_body_size, too slow, or a failed read. An OSError, so `except OSError` still \
-     catches it; left uncaught, the request gets the buffered body's 413 / 408 / 400."
-);
+/// Python's `BodyReadError`, named as the Rust [`BodyReadError`] it carries.
+mod py_error {
+    pyo3::create_exception!(
+        mipyre.engine,
+        BodyReadError,
+        pyo3::exceptions::PyOSError,
+        "A streamed request body was rejected, as a buffered one would be: larger than \
+         max_body_size, too slow, or a failed read. An OSError, so `except OSError` still \
+         catches it; left uncaught, the request gets the buffered body's 413 / 408 / 400."
+    );
+}
+pub(crate) use py_error::BodyReadError as PyBodyReadError;
 
-/// The server hangs this on a `BodyRejected` it raises, as `_rejection`, so the dispatcher can
+/// The server hangs this on a `BodyReadError` it raises, as `_rejection`, so the dispatcher can
 /// answer the rejection as what it is.
 #[pyclass(frozen, name = "_BodyRejection", module = "mipyre.engine")]
 struct Rejection(BodyReadError);
 
 fn body_rejected(py: Python<'_>, reject: BodyReadError) -> PyErr {
-    let err = BodyRejected::new_err(reject.to_string());
-    let carried = Bound::new(py, Rejection(reject))
-        .and_then(|r| err.value(py).setattr(intern!(py, "_rejection"), r));
+    let err = PyBodyReadError::new_err(reject.to_string());
+    let carried = Bound::new(py, Rejection(reject)).and_then(|r| err.value(py).setattr(intern!(py, "_rejection"), r));
     match carried {
         Ok(()) => err,
         Err(failed) => {
@@ -44,9 +47,9 @@ fn body_rejected(py: Python<'_>, reject: BodyReadError) -> PyErr {
     }
 }
 
-/// Returns `None` for a handler's own `raise BodyRejected(...)`, which carries no rejection.
+/// Returns `None` for a handler's own `raise BodyReadError(...)`, which carries no rejection.
 pub(crate) fn rejection_of(py: Python<'_>, err: &PyErr) -> Option<BodyReadError> {
-    if !err.is_instance_of::<BodyRejected>(py) {
+    if !err.is_instance_of::<PyBodyReadError>(py) {
         return None;
     }
     let carried = err.value(py).getattr(intern!(py, "_rejection")).ok()?;
@@ -169,7 +172,7 @@ impl BodyStream {
         slf
     }
 
-    /// Blocks until the next chunk arrives; raises `StopIteration` at the end and [`BodyRejected`]
+    /// Blocks until the next chunk arrives; raises `StopIteration` at the end and [`PyBodyReadError`]
     /// for a rejected body, again on every later read.
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
         match py.detach(|| self.next_message()) {
@@ -205,7 +208,7 @@ impl BodyStream {
     /// Consumes the rest of the stream and returns its byte count, without the GIL round trip and
     /// `bytes` object per chunk that iterating in Python pays.
     ///
-    /// Raises [`BodyRejected`] for a rejected body, and `RuntimeError` on a stream already read
+    /// Raises [`PyBodyReadError`] for a rejected body, and `RuntimeError` on a stream already read
     /// to its end, where `0` would read as an empty body.
     fn drain_count(&self, py: Python<'_>) -> PyResult<u64> {
         match py.detach(|| self.drain()) {
@@ -222,7 +225,7 @@ impl BodyStream {
 mod tests {
     use super::*;
 
-    /// Keeps an unread body out of `BodyRejected`, which the dispatcher would answer as the
+    /// Keeps an unread body out of `BodyReadError`, which the dispatcher would answer as the
     /// client's fault with a 408.
     #[test]
     fn an_unread_body_reads_as_an_oserror_naming_the_handler_not_a_rejection() {
@@ -237,7 +240,7 @@ mod tests {
             };
             let assert_unread = |err: PyErr| {
                 assert!(err.is_instance_of::<PyOSError>(py), "{err}");
-                assert!(!err.is_instance_of::<BodyRejected>(py), "{err}");
+                assert!(!err.is_instance_of::<PyBodyReadError>(py), "{err}");
                 assert!(rejection_of(py, &err).is_none(), "{err}");
                 let text = err.value(py).to_string();
                 assert!(

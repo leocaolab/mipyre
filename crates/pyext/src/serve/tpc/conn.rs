@@ -18,48 +18,19 @@ use mipyre_transport::driver::{Peer, TransportDriver};
 use crate::runtime::{MainInterpBridge, Retirement, SubInterpreterWorker, ThreadResident, WorkerIndex, WorkerLife};
 use crate::serve::conn::{drive_connection, drive_local_connection, ConnectionTimeouts, LocalExec};
 use crate::serve::site::Site;
-use crate::serve::websocket::{upgrade_or, Upgrades};
-
-/// Every TPC thread holds the same runners for the requests it does not run itself.
-#[derive(Clone, Default)]
-pub(crate) struct OffThreadRunners {
-    /// It is `None` when the table has no main-interpreter route.
-    pub(crate) main_bridge: Option<Arc<MainInterpBridge>>,
-    /// It is `None` when the table has no `async def` route.
-    pub(crate) async_pool: Option<Arc<crate::runtime::InterpreterPool>>,
-}
+use crate::serve::websocket::upgrade_or;
 
 /// The thread's connection tasks share it through an `Rc`, one non-atomic clone per request, and
 /// it never leaves the thread.
 pub(crate) struct TpcThread {
-    pub(crate) slot: WorkerSlot,
+    /// It says which process lanes the thread hosts, whether or not it holds a worker.
+    pub(crate) index: WorkerIndex,
+    pub(crate) worker: Option<ThreadWorker>,
     pub(crate) site: Arc<Site>,
-    pub(crate) runners: OffThreadRunners,
-}
-
-/// Its index says which process lanes the thread hosts, whether or not it holds a worker.
-pub(crate) enum WorkerSlot {
-    /// The worker is boxed because it is far larger than an index.
-    Filled(Box<ThreadWorker>),
-    Empty(WorkerIndex),
-}
-
-impl WorkerSlot {
-    /// Returns the slot's index. It borrows the worker, so it must not be called while a request
-    /// holds it.
-    pub(crate) fn index(&self) -> WorkerIndex {
-        match self {
-            WorkerSlot::Filled(worker) => worker.worker.borrow().worker_id(),
-            WorkerSlot::Empty(index) => *index,
-        }
-    }
-
-    pub(crate) fn worker(&self) -> Option<&ThreadWorker> {
-        match self {
-            WorkerSlot::Filled(worker) => Some(worker),
-            WorkerSlot::Empty(_) => None,
-        }
-    }
+    /// It is `None` when the table has no main-interpreter route.
+    pub(crate) main_bridge: Option<Arc<MainInterpBridge>>,
+    /// It is `None` when the table has no `async def` route.
+    pub(crate) async_pool: Option<Arc<crate::runtime::InterpreterPool>>,
 }
 
 /// A worker retires when its `gc.collect()` fails and then takes no more requests: the thread
@@ -79,11 +50,7 @@ pub(crate) struct ThreadWorker {
 
 impl ThreadWorker {
     /// The server makes `retired` before the thread starts, so the fanout acceptor can read it.
-    pub(crate) fn new(
-        worker: SubInterpreterWorker,
-        life: WorkerLife,
-        retired: Arc<OnceLock<Arc<str>>>,
-    ) -> Self {
+    pub(crate) fn new(worker: SubInterpreterWorker, life: WorkerLife, retired: Arc<OnceLock<Arc<str>>>) -> Self {
         ThreadWorker {
             worker: RefCell::new(worker),
             retired,
@@ -143,13 +110,13 @@ impl TpcThread {
     pub(crate) fn end(tpc_thread: Rc<TpcThread>) {
         match Rc::try_unwrap(tpc_thread) {
             Ok(tpc_thread) => {
-                if let WorkerSlot::Filled(worker) = tpc_thread.slot {
-                    (*worker).end();
+                if let Some(worker) = tpc_thread.worker {
+                    worker.end();
                 }
             }
             Err(still_shared) => tracing::error!(
                 target: "mipyre::server",
-                worker = still_shared.slot.index().get(),
+                worker = still_shared.index.get(),
                 "a worker is still referenced after its thread's runtime ended; leaking its \
                  interpreter"
             ),
@@ -166,8 +133,12 @@ impl ThreadResident for ThreadWorker {
 /// Sets up an accepted connection on this thread, registered and TLS-handshaken when the listener
 /// has an acceptor, and serves its requests with `handle`; the TLS decision stays at the transport
 /// boundary.
-pub(super) async fn serve_accepted<D, H, Fut>(accepted: D::Connection, upgrades: Upgrades, handle: H, stop: StopWaiter)
-where
+pub(super) async fn serve_accepted<D, H, Fut>(
+    accepted: D::Connection,
+    ws_site: Option<Arc<Site>>,
+    handle: H,
+    stop: StopWaiter,
+) where
     D: TransportDriver,
     H: Fn(Request<Incoming>, Peer) -> Fut + 'static,
     Fut: Future<Output = Result<Response<ResponseBody>, hyper::Error>> + 'static,
@@ -176,24 +147,24 @@ where
     let Some(stream) = D::into_stream(accepted).await else {
         return;
     };
-    drive_conn(stream, peer, upgrades, handle, stop).await;
+    drive_conn(stream, peer, ws_site, handle, stop).await;
 }
 
 /// Serves one connection on this thread with `handle`. Without WebSocket routes the service has no
 /// upgrade branch and the connection takes the thread-local driver, which shares the connection's
 /// write state without a lock.
-pub(crate) async fn drive_conn<IO, H, Fut>(io: IO, peer: Peer, upgrades: Upgrades, handle: H, stop: StopWaiter)
+pub(crate) async fn drive_conn<IO, H, Fut>(io: IO, peer: Peer, ws_site: Option<Arc<Site>>, handle: H, stop: StopWaiter)
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Fn(Request<Incoming>, Peer) -> Fut + 'static,
     Fut: Future<Output = Result<Response<ResponseBody>, hyper::Error>> + 'static,
 {
-    match upgrades {
-        Upgrades::WebSocket(site) => {
+    match ws_site {
+        Some(site) => {
             let svc = service_fn(move |req: Request<Incoming>| upgrade_or(req, &site, peer, &handle));
             drive_connection(io, svc, LocalExec, ConnectionTimeouts::DEFAULT, stop).await;
         }
-        Upgrades::Off => {
+        None => {
             let svc = service_fn(move |req: Request<Incoming>| handle(req, peer));
             drive_local_connection(io, svc, ConnectionTimeouts::DEFAULT, stop).await;
         }

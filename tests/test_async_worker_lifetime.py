@@ -1,7 +1,7 @@
 """An async request's deadline runs from the request, not from the worker's start; the
 server then stops cleanly.
 
-`_async_engine.py` used to wait for its fetcher thread with a 30 s timeout that started
+`_worker/async_engine.py` used to wait for its fetcher thread with a 30 s timeout that started
 counting when the worker started. 30 s into normal serving it logged a false "fetcher
 did not exit" error and cancelled every task on the worker's loop, so any async request
 in flight at that moment failed. The script sets a short request budget B
@@ -44,7 +44,7 @@ async def slow(req):
     return {"slow": True}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, workers=2)
+    app.run(host="127.0.0.1", port=0, subinterpreters=2)
 '''.replace("BUDGET", str(BUDGET_S)).replace("SLOW_FOR", str(BUDGET_S / 5))
 
 

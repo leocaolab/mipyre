@@ -30,14 +30,12 @@ pub(crate) struct Window<T> {
     pub(crate) counted: T,
 }
 
-
 /// Says whether a profile also records the call stacks that allocated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProfileDepth {
     Counts,
     WithStacks,
 }
-
 
 pub(crate) fn measure(counter: &AtomicU64, duration: Duration) -> Measurement {
     std::thread::sleep(WARMUP);

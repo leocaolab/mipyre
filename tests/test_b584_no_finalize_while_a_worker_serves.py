@@ -3,7 +3,7 @@
 `Py_Finalize` (CPython 3.14) ends every sub-interpreter left and deletes its threads' states. A
 worker thread left running past the shutdown grace, in a handler that keeps sleeping, restores
 its thread state after every sleep inside CPython: once finalization deleted it, that restore is
-a use-after-free. Unlike `app.run()`, a `TestClient` caller goes on after `WorkersAbandoned`, so
+a use-after-free. Unlike `app.run()`, a `TestClient` caller goes on after `AbandonedWorkersError`, so
 the check is at exit: a thread still owning its interpreter then makes the process exit 1 with
 no finalization. The b/496 test is the other side: threads only on their way out are waited for,
 and the process finalizes and exits 0.
@@ -43,13 +43,13 @@ import threading
 read_started, write_started = os.pipe()
 os.environ["B584_STARTED_FD"] = str(write_started)
 
-from mipyre.app import WorkersAbandoned
+from mipyre import AbandonedWorkersError
 from mipyre.testing import TestClient
 
 import b584_app
 
 b584_app.app.shutdown_timeout = 0.05
-client = TestClient(b584_app.app, port=None)
+client = TestClient(b584_app.app)
 client.__enter__()
 
 
@@ -64,7 +64,7 @@ threading.Thread(target=never_answered, daemon=True).start()
 os.read(read_started, 1)
 try:
     client.close()
-except WorkersAbandoned as e:
+except AbandonedWorkersError as e:
     print("b584-abandoned", len(e.workers), flush=True)
 '''
 
@@ -83,3 +83,11 @@ def test_a_worker_still_serving_at_exit_keeps_the_process_from_finalizing(tmp_pa
     assert "still in use at exit" in done.stderr, done.stderr[-4000:]
     assert "exiting without finalization" in done.stderr, done.stderr[-4000:]
     assert done.returncode == 1, (done.returncode, done.stderr[-4000:])
+
+
+def test_one_thread_running_python_at_exit_is_a_refusal_and_none_is_not():
+    from mipyre._finalize import refusal_at_exit
+
+    assert refusal_at_exit(0, ["w-1"]) is None
+    why = refusal_at_exit(1, ["w-1", "w-2"])
+    assert why is not None and "still in use at exit" in why and "w-1, w-2" in why

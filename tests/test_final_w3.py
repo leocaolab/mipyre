@@ -6,7 +6,7 @@ Server tests run a real server in a subprocess on the path they name:
   - "pool"  default runtime, MIPYRE_TPC=0        → the sub-interpreter pool (sync workers and
                                                      the async engine)
   - "tpc"   default runtime                        → TPC inline sub-interpreters
-  - "gil"   MIPYRE_RUNTIME=main, MIPYRE_TPC=0  → handlers on the main interpreter
+  - "gil"   MIPYRE_TEST_MODE=main, MIPYRE_TPC=0  → handlers on the main interpreter
 
 Each binds port 0 and reads the port it got from its "Listening on" line: no fixed ports.
 
@@ -15,7 +15,6 @@ The panic test needs a `--features fault_injection` build (skipped otherwise).
 
 from __future__ import annotations
 
-import ast
 import logging
 import os
 import re
@@ -32,10 +31,9 @@ import httpx
 import pytest
 
 import mipyre.engine
-from tests._helpers import bound_port, poll_until
+from tests._helpers import bound_port, isolation_adapter_ns, poll_until, set_subinterpreters
 
 ROOT = Path(__file__).resolve().parent.parent
-BOOTSTRAP = ROOT / "python" / "mipyre" / "_subinterp" / "isolation.py"
 SRC = ROOT / "crates" / "pyext" / "src"
 # The sub-interpreter lifecycle moved to its own crate (b/47 S2a-5, q/5 a).
 # These rules are about the code that enters an interpreter and holds its objects, so they
@@ -59,7 +57,7 @@ _WAS_PYTHON = ("exchange/body_stream.rs", "runtime/hook_chain.rs", "runtime/isol
 def _worker_code() -> list:
     """Every file of the worker lifecycle: pyre's own and the shared crate's."""
     return sorted(SRC / f for f in _WAS_PYTHON) + sorted(SUBINTERP.glob("*.rs"))
-ASYNC_ENGINE = ROOT / "python" / "mipyre" / "_async_engine.py"
+ASYNC_ENGINE = ROOT / "python" / "mipyre" / "_worker" / "async_engine.py"
 
 PATHS: dict[str, dict[str, str | None]] = {
     "pool": {"runtime": None, "MIPYRE_TPC": "0"},
@@ -70,7 +68,7 @@ PATHS: dict[str, dict[str, str | None]] = {
 RUN = """
 if __name__ == "__main__":
     import os as _os
-    app.run(host="127.0.0.1", port=0, workers=int(_os.environ.get("W3_WORKERS", "2")))
+    app.run(host="127.0.0.1", port=0)
 """
 
 
@@ -86,13 +84,13 @@ class Server:
         self.log_path = self.script_path + ".log"
         full_env = dict(os.environ)
         full_env.pop("MIPYRE_TPC", None)
-        full_env.pop("MIPYRE_RUNTIME", None)
+        full_env.pop("MIPYRE_TEST_MODE", None)
         if (runtime := PATHS[path]["runtime"]) is not None:
-            full_env["MIPYRE_RUNTIME"] = runtime
-        full_env["W3_WORKERS"] = str(workers)
+            full_env["MIPYRE_TEST_MODE"] = runtime
         full_env["MIPYRE_LOG"] = "1"
         if (tpc := PATHS[path]["MIPYRE_TPC"]) is not None:
             full_env["MIPYRE_TPC"] = tpc
+        set_subinterpreters(full_env, str(workers))
         full_env.update(env or {})
         with open(self.log_path, "w") as log:
             self.proc = subprocess.Popen(
@@ -229,25 +227,9 @@ def _holds_raw_py_object(ty: str) -> bool:
     return any(m.group(1) not in _NOT_PY_OBJECTS for m in _RAW_PY_OBJECT.finditer(ty))
 
 
-def _bootstrap_ns(assigned: tuple[str, ...] = ()):
-    """The isolation adapter's top-level functions and classes (it runs inside workers and
-    can't be imported), plus the module-level assignments named in `assigned` and the
-    imports they need, in a fresh namespace."""
-    import logging
-
-    from mipyre import _clone
-
-    # The engine runs mipyre/_clone.py in the same namespace first.
-    ns = {name: value for name, value in vars(_clone).items() if not name.startswith("__")}
-    ns.update({"_os": os, "_logging": logging,
-               "_ISO": {"worker_dir": None, "path_inserted": False, "isolated": set(), "reported": set()}})
-    for node in ast.parse(BOOTSTRAP.read_text()).body:
-        keep = isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Import))
-        if isinstance(node, ast.Assign):
-            keep = any(isinstance(t, ast.Name) and t.id in assigned for t in node.targets)
-        if keep:
-            exec(compile(ast.Module([node], []), str(BOOTSTRAP), "exec"), ns)  # noqa: S102 — the adapter runs only inside a worker, so the test loads its parts by hand
-    return ns
+def _bootstrap_ns():
+    """The isolation adapter's namespace, as a worker's bootstrap holds it (`isolation_adapter_ns`)."""
+    return isolation_adapter_ns()
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +294,12 @@ def test_rebind_takes_the_error_it_reports_instead_of_clearing_it():
 def test_run_context_reports_a_missing_thread_state_as_a_value():
     code = _code(SUBINTERP / "attach.rs")
     assert 'assert!(!tstate.is_null()' not in code
-    assert "fn ensure(&self, main: InterpreterHandle) -> Result<(), ThreadStateCreationFailure>" in code
+    returned = re.search(r"fn ensure\(&self, main: InterpreterHandle\) -> Result<\(\), (\w+)>", code)
+    assert returned, "ensure returns its failure as a value"
+    error = returned.group(1)
+    cases = re.search(r"enum " + error + r" \{(.*?)\n\}", code, re.S)
+    assert cases, f"{error} is an enum in attach.rs"
+    assert "#[from] ThreadStateCreationFailure" in cases.group(1), cases.group(1)
 
 
 def test_conn_driver_renamed_and_interp_facade_gone():
@@ -335,10 +322,12 @@ def test_worker_app_record_lives_outside_app_rs_and_does_not_import_it():
     # `pyapi/app/`. The module the app lives in is `crate::pyapi`.
     app = "".join(_code(p) for p in sorted((SRC / "pyapi" / "app").glob("*.rs")))
     app += _code(SRC / "boot" / "run.rs")
-    assert "static WORKER_APP" not in app
+    # Since b/646 the record is a field of the engine module's state (`EngineModule.app`), not a
+    # static.
+    assert "struct WorkerApp" not in app
     assert "struct WorkerRoutes" not in app
     worker_app = _code(SRC / "runtime" / "worker_app.rs")
-    assert "static WORKER_APP" in worker_app
+    assert "struct WorkerApp" in worker_app
     assert "struct WorkerRoutes" in worker_app
     for module in ("crate::pyapi", "crate::boot"):
         assert module not in worker_app
@@ -349,7 +338,8 @@ def test_worker_app_record_lives_outside_app_rs_and_does_not_import_it():
 def test_worker_api_passes_named_objects_not_tuples():
     code = _code(SRC / "runtime" / "worker_api.rs")
     assert "(u64, usize" not in code and "pool_id: u64" not in code
-    assert "struct AsyncJob" in code and "struct WorkerHooks" in code
+    assert "struct AsyncJob" in code
+    assert "struct EngineRoutes" in _code(SRC / "runtime" / "worker" / "async_engine.rs")
 
 
 def test_split_error_uses_thiserror():
@@ -373,8 +363,9 @@ def test_unit_tests_link_without_the_extension_module_feature():
 
 ASYNC_SCRIPT = """
 import asyncio, gc, sys
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/__w3_probe__")
 def probe(req):
@@ -467,15 +458,16 @@ def test_a_non_response_on_the_async_path_is_logged_as_the_typed_error():
 # ---------------------------------------------------------------------------
 
 
-def test_two_pool_servers_in_one_process_both_serve_async_routes(monkeypatch):
+def test_two_pool_servers_in_one_process_both_serve_async_routes():
+    from mipyre.engine import ServerFlags
     from mipyre.testing import TestClient
     from tests.apps.w3_pool_a import app as app_a
     from tests.apps.w3_pool_b import app as app_b
 
-    monkeypatch.setenv("MIPYRE_TPC", "0")
-    monkeypatch.setenv("MIPYRE_WORKERS", "2")
-    with TestClient(app_a) as a:
-        with TestClient(app_b) as b:
+    # A TestClient reads no environment (b/335 M5.6): the pool server is its config.
+    pool = ServerFlags(tpc=False, subinterpreters=2)
+    with TestClient(app_a, config=pool) as a:
+        with TestClient(app_b, config=pool) as b:
             for _ in range(5):
                 assert b.get("/which").json() == {"app": "b"}
                 assert a.get("/which").json() == {"app": "a"}
@@ -491,8 +483,9 @@ def test_a_stuck_worker_is_reported_by_the_run_that_abandoned_it():
     # 504 ends.
     script = """
 import time
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.request_timeout = 1
 # The shutdown's join waits this long for the stuck thread (5 s by default).
 app.shutdown_timeout = 0.5
@@ -526,8 +519,9 @@ def stuck(req):
 
 START_FAILURE = """
 import sys
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/__w3_probe__")
 def probe(req):
@@ -539,7 +533,7 @@ if __name__ == "__mipyre_worker__":
 if __name__ == "__main__":
     import os, mipyre.engine
     try:
-        app.run(host="127.0.0.1", port=0, workers=1)
+        app.run(host="127.0.0.1", port=0)
     except BaseException as e:
         cause = e.__cause__
         print("RAISED", type(e).__name__, "|", isinstance(e, ImportError), "|",
@@ -559,6 +553,7 @@ def _start_failure(failure: str, path: str) -> str:
     env.pop("MIPYRE_TPC", None)
     if (tpc := PATHS[path]["MIPYRE_TPC"]) is not None:
         env["MIPYRE_TPC"] = tpc
+    set_subinterpreters(env, "1")
     done = subprocess.run([sys.executable, script], env=env, capture_output=True, text=True,
                           timeout=120)
     out = done.stdout + done.stderr
@@ -594,11 +589,11 @@ def test_a_non_str_sys_path_entry_does_not_stop_the_workers(tmp_path):
     pkgdir.mkdir()
     (pkgdir / "w3_from_pathlike.py").write_text("VALUE = 'from a pathlib.Path entry'\n")
     script = f"""
-import pathlib, sys
+import os, pathlib, sys
 sys.path.append(12345)
 sys.path.append(pathlib.Path({str(pkgdir)!r}))
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/__w3_probe__")
 def probe(req):
@@ -626,7 +621,7 @@ def test_isolated_flag_reaches_the_workers_without_the_environment():
     script = """
 import os, sys
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.get("/__w3_probe__")
 def probe(req):
@@ -657,109 +652,6 @@ def test_packages_distributions_failure_surfaces_with_its_cause(monkeypatch):
     with pytest.raises(RuntimeError, match="packages_distributions") as raised:
         ns["_iso_pkg2dist"]()
     assert isinstance(raised.value.__cause__, KeyError)
-
-
-def test_the_import_hook_guard_is_per_thread():
-    # Thread A is inside a hooked import; thread B's import must still self-heal (clone
-    # and retry) instead of being taken for A's nested import.
-    inside_a = threading.Event()
-    release_a = threading.Event()
-    calls = {"b": 0}
-
-    def real_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "a_mod":
-            inside_a.set()
-            release_a.wait(5)
-            return "a"
-        calls["b"] += 1
-        if calls["b"] == 1:
-            raise ImportError("does not support loading in subinterpreters", name="b_mod")
-        return "b"
-
-    ns = _bootstrap_ns(("_ISO_SHARED_SINGLE_PHASE", "_ISO_ERROR_MARKERS"))
-    hook = ns["_iso_make_import"](real_import, lambda top: True, lambda lib: None)
-    a = threading.Thread(target=lambda: hook("a_mod"))
-    a.start()
-    assert inside_a.wait(5)
-    try:
-        assert hook("b_mod") == "b"
-        assert calls["b"] == 2
-    finally:
-        release_a.set()
-        a.join(5)
-
-
-_PLAN_NAMES = ("_ISO_CREATE_HERE", "_ISO_REFUSE_SINGLE_PHASE", "_ISO_LOAD_CHECKED")
-
-
-@pytest.mark.parametrize(
-    ("private", "enforced", "single_phase", "plan"),
-    [
-        (True, True, True, "_ISO_CREATE_HERE"),
-        (True, False, False, "_ISO_CREATE_HERE"),
-        (False, True, True, "_ISO_REFUSE_SINGLE_PHASE"),
-        (False, True, False, "_ISO_LOAD_CHECKED"),
-        # The check can't be switched on (the main interpreter): nothing to refuse for.
-        (False, False, True, "_ISO_LOAD_CHECKED"),
-    ],
-)
-def test_how_an_extension_file_is_loaded(private, enforced, single_phase, plan):
-    ns = _bootstrap_ns(_PLAN_NAMES)
-    assert ns["_iso_load_plan"](private, enforced, single_phase) == ns[plan]
-
-
-def _isolation_error(name):
-    return ImportError("module x does not support loading in subinterpreters", name=name)
-
-
-def test_an_isolation_failure_clones_the_failing_package_and_evicts_the_statement():
-    ns = _bootstrap_ns(("_ISO_SHARED_SINGLE_PHASE", "_ISO_ERROR_MARKERS"))
-    step = ns["_iso_next_after_failure"]
-    assert step(_isolation_error("numpy.core._multiarray_umath"), "pandas", set()) == ("numpy", "pandas")
-    # A package re-raising its extension's error as its own: found along the chain.
-    wrapped = ImportError("the scipy install seems to be broken")
-    wrapped.__cause__ = _isolation_error("scipy.linalg._fblas")
-    assert step(wrapped, "scipy", set()) == ("scipy", "scipy")
-    # No name on the error: the statement's own package; a relative import has none.
-    assert step(_isolation_error(None), "orjson", set()) == ("orjson", "orjson")
-    assert step(_isolation_error(None), "", set()) is None
-
-
-def test_an_isolation_failure_is_raised_when_cloning_cannot_help():
-    ns = _bootstrap_ns(("_ISO_SHARED_SINGLE_PHASE", "_ISO_ERROR_MARKERS"))
-    step = ns["_iso_next_after_failure"]
-    assert step(ImportError("No module named 'nope'", name="nope"), "nope", set()) is None
-    assert step(_isolation_error("numpy"), "numpy", {"numpy"}) is None  # cloned once already
-    assert step(_isolation_error("mipyre.engine"), "mipyre", set()) is None
-    # A failure under mipyre's import of another package clones that one, never evicts mipyre.
-    assert step(_isolation_error("orjson"), "mipyre", set()) == ("orjson", None)
-
-
-def test_the_import_hook_clones_once_then_retries_or_raises():
-    ns = _bootstrap_ns(("_ISO_SHARED_SINGLE_PHASE", "_ISO_ERROR_MARKERS"))
-    calls, isolated, evicted = [], [], []
-
-    def real_import(name, globals=None, locals=None, fromlist=(), level=0):
-        calls.append(name)
-        if not isolated:
-            raise _isolation_error("lib._ext")
-        return name
-
-    hook = ns["_iso_make_import"](real_import, lambda top: isolated.append(top) or True, evicted.append)
-    assert hook("lib.sub") == "lib.sub"
-    assert (calls, isolated, evicted) == (["lib.sub", "lib.sub"], ["lib"], ["lib"])
-
-    def still_failing(name, globals=None, locals=None, fromlist=(), level=0):
-        raise _isolation_error("lib._ext")
-
-    tries = []
-    hook = ns["_iso_make_import"](still_failing, lambda top: tries.append(top) or True, lambda lib: None)
-    with pytest.raises(ImportError, match="does not support loading"):
-        hook("lib")
-    assert tries == ["lib"]
-    hook = ns["_iso_make_import"](still_failing, lambda top: False, lambda lib: None)
-    with pytest.raises(ImportError, match="does not support loading"):
-        hook("lib")
 
 
 def _clone_twice(tmp_path, make_src, change_src):
@@ -900,9 +792,10 @@ def test_a_vendored_libs_clone_missing_a_file_is_recloned(tmp_path):
 
 CHAIN_SCRIPT = """
 import asyncio
+import os
 from mipyre import Mipyre, Response
 from mipyre.context import ctx
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.before_request
 async def tag(req):

@@ -112,13 +112,13 @@ pub struct ConnectionFacts {
 /// reading it into locals, because splitting it by `kept` or passing `conn` by value measured
 /// more instructions at the call site.
 #[inline]
-pub fn write(
-    conn: &ConnectionFacts,
-    kept: usize,
-    draining: bool,
-    bufs: &[IoSlice<'_>],
-) -> WriteDecision {
-    let ConnectionFacts { protocol, poll, input_unread, vectored } = *conn;
+pub fn write(conn: &ConnectionFacts, kept: usize, draining: bool, bufs: &[IoSlice<'_>]) -> WriteDecision {
+    let ConnectionFacts {
+        protocol,
+        poll,
+        input_unread,
+        vectored,
+    } = *conn;
     if protocol == Protocol::Http2 {
         // Bytes kept while the preface was still being sniffed go out first.
         return WriteDecision {
@@ -226,7 +226,9 @@ mod tests {
     fn keep(drain_first: bool, total: usize) -> WriteDecision {
         WriteDecision {
             drain_first,
-            action: WriteAction::Keep { total: u32::try_from(total).unwrap() },
+            action: WriteAction::Keep {
+                total: u32::try_from(total).unwrap(),
+            },
         }
     }
 
@@ -241,7 +243,10 @@ mod tests {
     /// is kept first and then keeps the write.
     #[test]
     fn a_write_that_fills_the_buffer_to_the_limit_is_kept_and_one_byte_more_drains_first() {
-        assert_eq!(http1(100, false, COALESCE_LIMIT - 100), keep(false, COALESCE_LIMIT - 100));
+        assert_eq!(
+            http1(100, false, COALESCE_LIMIT - 100),
+            keep(false, COALESCE_LIMIT - 100)
+        );
         assert_eq!(http1(100, false, COALESCE_LIMIT - 99), keep(true, COALESCE_LIMIT - 99));
     }
 
@@ -279,7 +284,10 @@ mod tests {
     /// was writing out does not count against the write.
     #[test]
     fn a_write_out_under_way_goes_first_and_leaves_the_buffer_empty() {
-        assert_eq!(http1(COALESCE_LIMIT, true, COALESCE_LIMIT - 1), keep(true, COALESCE_LIMIT - 1));
+        assert_eq!(
+            http1(COALESCE_LIMIT, true, COALESCE_LIMIT - 1),
+            keep(true, COALESCE_LIMIT - 1)
+        );
         assert_eq!(http1(COALESCE_LIMIT, true, COALESCE_LIMIT), direct(true));
     }
 
@@ -361,14 +369,20 @@ mod tests {
         let two = [IoSlice::new(&head), IoSlice::new(&body)];
         assert_eq!(write(&scalar, 0, false, &two), keep(false, 30));
         assert_eq!(write(&scalar, 0, false, &[IoSlice::new(&head)]), alone());
-        let vectored = ConnectionFacts { vectored: true, ..scalar };
+        let vectored = ConnectionFacts {
+            vectored: true,
+            ..scalar
+        };
         assert_eq!(write(&vectored, 0, false, &two), alone());
     }
 
     #[test]
     fn the_preface_is_recognised_across_reads_and_anything_else_is_http1() {
         let seen = PartialPreface;
-        assert_eq!(sniffed(PartialPreface::EMPTY, &H2_PREFACE[..10]), Protocol::Sniffing(seen(10)));
+        assert_eq!(
+            sniffed(PartialPreface::EMPTY, &H2_PREFACE[..10]),
+            Protocol::Sniffing(seen(10))
+        );
         assert_eq!(sniffed(seen(10), &H2_PREFACE[10..]), Protocol::Http2);
         assert_eq!(sniffed(seen(10), &H2_PREFACE[10..23]), Protocol::Sniffing(seen(23)));
         assert_eq!(sniffed(PartialPreface::EMPTY, b"PRI * HTTP/1.1"), Protocol::Http1);
@@ -438,10 +452,21 @@ mod proofs {
         let protocol = match kani::any::<u8>() % 3 {
             0 => Protocol::Http1,
             1 => Protocol::Http2,
-            _ => Protocol::Sniffing(PartialPreface(kani::any_where(|n: &u8| usize::from(*n) < H2_PREFACE.len()))),
+            _ => Protocol::Sniffing(PartialPreface(kani::any_where(|n: &u8| {
+                usize::from(*n) < H2_PREFACE.len()
+            }))),
         };
-        let poll = if kani::any() { PollPhase::Outside } else { PollPhase::Inside { blocked: kani::any() } };
-        ConnectionFacts { protocol, poll, input_unread: kani::any(), vectored: kani::any() }
+        let poll = if kani::any() {
+            PollPhase::Outside
+        } else {
+            PollPhase::Inside { blocked: kani::any() }
+        };
+        ConnectionFacts {
+            protocol,
+            poll,
+            input_unread: kani::any(),
+            vectored: kani::any(),
+        }
     }
 
     /// Proves that `keep`'s `as u32` and the IO's `as usize` back lose nothing.

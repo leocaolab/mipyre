@@ -3,7 +3,7 @@
 //! shipping code (the cause's lock is Loom's here, `crate::sync`). The token is the model's own
 //! [`Cancellable`]: a flag stored with Release and read with Acquire, the least a
 //! `CancellationToken` gives (tokio_util's sets it under a lock that its readers take). Run with
-//! `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_tpc --lib --release --target-dir target/loom loom`.
+//! `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_tpc --lib --profile model --target-dir target/loom loom`.
 //!
 //! It proves what the run's cause rests on: a companion (a failure that came after the stop
 //! reached its thread) never becomes the cause, because a cause is recorded only while the token
@@ -52,7 +52,9 @@ fn companion(stop: &ModelRun) -> thread::JoinHandle<()> {
         while !stop.is_stopped() {
             thread::yield_now();
         }
-        drop(stop_on_failure(&ThreadStop::new(stop, "companion".into()), |_| failure()));
+        drop(stop_on_failure(&ThreadStop::new(stop, "companion".into()), |_| {
+            failure()
+        }));
     })
 }
 
@@ -85,6 +87,9 @@ fn of_two_roots_and_a_companion_the_cause_is_a_roots() {
         two.join().unwrap();
         companion.join().unwrap();
         let cause = stop.cause();
-        assert!(cause == failed("one") || cause == failed("two"), "the cause is {cause:?}");
+        assert!(
+            cause == failed("one") || cause == failed("two"),
+            "the cause is {cause:?}"
+        );
     });
 }

@@ -1,7 +1,9 @@
 //! Holds what is true of any byte stream, whichever transport carries it: whether an IO error
-//! says the peer went away, the write timeout, and the counts of what happened to streams.
+//! says the peer went away, the write timeout, the lingering close, and the counts of what
+//! happened to streams.
 
 pub mod events;
+pub mod linger;
 pub mod stall;
 
 use std::io;

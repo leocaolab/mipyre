@@ -13,7 +13,7 @@ simulate in pytest; this checks functional correctness (the handler still
 receives every chunk). The streamed-body budget is covered by test_final_w2.
 """
 
-from mipyre import Mipyre
+from mipyre import BodyStream, Mipyre
 from mipyre.testing import TestClient
 
 # Module level: TestClient serves it through sub-interpreter workers, which rebuild
@@ -26,7 +26,7 @@ def root(req):
     return "ready"
 
 
-@app.post("/upload", runtime="main", stream=True)
+@app.post("/upload", runtime="main", body=BodyStream)
 def upload(req):
     total = 0
     chunks = 0
@@ -41,7 +41,7 @@ def test_streaming_handler_receives_all_chunks():
     new bounded channel. Sends 1 MB split into ~16KB hyper frames and
     the handler should see the same total byte count."""
     payload = b"x" * (1 * 1024 * 1024)  # 1 MB
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         resp = c.post("/upload", body=payload)
         data = resp.json()
         assert data["bytes"] == len(payload)

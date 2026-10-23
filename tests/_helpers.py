@@ -14,7 +14,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from typing import Callable, TypeVar
+from typing import Callable, MutableMapping, TypeVar
 
 from tests._test_cost import polling
 
@@ -25,6 +25,17 @@ T = TypeVar("T")
 LISTENING = re.compile(r"Listening on (?P<scheme>https?)://(?P<host>\[[^\]]+\]|[^\s:/]+):(?P<port>\d+)")
 
 POLL_INTERVAL_S = 0.05
+
+
+def set_subinterpreters(env: MutableMapping[str, str], count: str) -> None:
+    """Sets in `env` how many sub-interpreters a server started with it runs: the thread-per-core
+    server runs one per thread (`MIPYRE_THREADS`), the `MIPYRE_TPC=0` server a pool of
+    `MIPYRE_SUBINTERPRETERS`. A `MIPYRE_TPC=0` server of a script given `MIPYRE_TEST_MODE=main`
+    runs no sub-interpreter, so nothing is set: a size it does not use is an error (b/335 D19)."""
+    if env.get("MIPYRE_TPC") != "0":
+        env["MIPYRE_THREADS"] = count
+    elif env.get("MIPYRE_TEST_MODE") != "main":
+        env["MIPYRE_SUBINTERPRETERS"] = count
 
 
 def poll_until(
@@ -197,3 +208,52 @@ def finalized(mark: str | os.PathLike[str]) -> bool:
             return f.read() == "finalized"
     except FileNotFoundError:
         return False
+
+
+_ADAPTER_SOURCES = ("_clone.py", "_worker/extension_support.py", "_isolated/isolation.py")
+
+
+def isolation_adapter_ns(isolate_dir: str | os.PathLike[str] | None = None) -> dict:
+    """A namespace holding the `runtime="isolated"` adapter as a worker's bootstrap does: the engine runs these files,
+    in this order, in one module's namespace (registered in `sys.modules`, as the bootstrap module is), with
+    `ISOLATE_DIR` the server's isolate dir as the engine sets it. Nothing is installed: the bootstrap inserts the finder
+    itself."""
+    import sys
+    import types
+    from pathlib import Path
+
+    package = Path(__file__).resolve().parent.parent / "python" / "mipyre"
+    module = types.ModuleType(f"__mipyre_adapter_under_test_{len(sys.modules)}__")
+    sys.modules[module.__name__] = module
+    module.__dict__["ISOLATE_DIR"] = None if isolate_dir is None else os.fspath(isolate_dir)
+    for name in _ADAPTER_SOURCES:
+        path = package / name
+        exec(compile(path.read_text(), str(path), "exec"), module.__dict__)  # noqa: S102 — the adapter runs only in a worker's bootstrap namespace, so the test builds that namespace
+    return module.__dict__
+
+
+# A Prometheus page's samples (`mipyre_x{a="b"} 3`): a server's counts as its `/metrics` page
+# shows them, the view of them a test outside the server's process has.
+_METRIC_SAMPLE = re.compile(r'^([a-z_]+)(?:\{(.*)\})? (\S+)$')
+_METRIC_LABEL = re.compile(r'([a-z_]+)="((?:[^"\\]|\\.)*)"')
+
+
+def metric_value(body: str, name: str, **labels: str) -> float:
+    """The sum of ``name``'s samples whose labels include ``labels``; a family that shows only
+    its non-zero samples has none for what was not counted, so that is 0. A family missing from
+    the page fails."""
+    if f"# TYPE {name} " not in body and f"# TYPE {name.rsplit('_', 1)[0]} histogram" not in body:
+        raise AssertionError(f"metric {name!r} not found in:\n{body}")
+    total = 0.0
+    for line in body.splitlines():
+        sample = _METRIC_SAMPLE.match(line)
+        if sample is None or sample[1] != name:
+            continue
+        have = dict(_METRIC_LABEL.findall(sample[2] or ""))
+        if all(have.get(k) == v for k, v in labels.items()):
+            total += float(sample[3])
+    return total
+
+
+def metric_count(body: str, name: str, **labels: str) -> int:
+    return int(metric_value(body, name, **labels))

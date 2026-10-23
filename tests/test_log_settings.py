@@ -4,7 +4,7 @@
 import pytest
 
 from mipyre import LogLevel, Mipyre
-from mipyre.app import _AccessLogChoice, _LogSettings
+from mipyre._log.settings import _AccessLog, _LogSettings
 
 
 def test_debug_and_production_defaults():
@@ -26,7 +26,7 @@ def test_asked_by_neither_the_user_nor_the_launch_the_settings_are_as_configured
 
 @pytest.mark.parametrize("hidden", [LogLevel.Error, LogLevel.Off])
 @pytest.mark.parametrize(
-    "choice,launch_log", [(_AccessLogChoice(None), False), (None, True)], ids=["user", "launch"]
+    "choice,launch_log", [(_AccessLog(None), False), (None, True)], ids=["user", "launch"]
 )
 def test_the_access_log_raises_a_level_that_would_hide_it_to_info(hidden, choice, launch_log):
     settings = _LogSettings(hidden, False, "json").with_access_log(choice, launch_log)
@@ -35,13 +35,13 @@ def test_the_access_log_raises_a_level_that_would_hide_it_to_info(hidden, choice
 
 def test_the_access_log_keeps_a_level_that_shows_it():
     configured = _LogSettings(LogLevel.Warn, False, "json")
-    assert configured.with_access_log(_AccessLogChoice(None), False).level == LogLevel.Warn
+    assert configured.with_access_log(_AccessLog(None), False).level == LogLevel.Warn
 
 
 @pytest.mark.parametrize("launch_log", [False, True])
 def test_the_level_the_user_gave_wins_over_the_configured_one_and_the_launch(launch_log):
     settings = _LogSettings(LogLevel.Info, False, "json").with_access_log(
-        _AccessLogChoice(LogLevel.Error), launch_log
+        _AccessLog(LogLevel.Error), launch_log
     )
     assert (settings.level, settings.access_log) == (LogLevel.Error, True)
 
@@ -50,7 +50,7 @@ def test_an_explicit_level_is_kept_by_a_later_call_without_one():
     app = Mipyre()
     app.enable_access_log(level="error")
     app.enable_access_log()
-    assert app._access_log_choice == _AccessLogChoice(LogLevel.Error)
+    assert app._access_log == _AccessLog(LogLevel.Error)
 
 
 def test_a_bad_call_leaves_the_users_choice_as_it_was():
@@ -58,4 +58,4 @@ def test_a_bad_call_leaves_the_users_choice_as_it_was():
     app.enable_access_log(level="warn")
     with pytest.raises(ValueError):
         app.enable_access_log(level="error", sample=0)
-    assert app._access_log_choice == _AccessLogChoice(LogLevel.Warn)
+    assert app._access_log == _AccessLog(LogLevel.Warn)

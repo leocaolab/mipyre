@@ -5,11 +5,11 @@ build-backend = "maturin"
 [project]
 name = "mipyre"
 dynamic = ["version"]
-description = "High-performance Python web framework powered by Rust — 2x faster than Robyn"
+description = "A Python web framework with a Rust HTTP server, running Python handlers in parallel on every core in one process"
 requires-python = ">=3.14"
+readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-readme = "README.md"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
@@ -19,7 +19,7 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
     "Framework :: AsyncIO",
 ]
-dependencies = ["isojson>=0.2"]
+dependencies = ["isojson>=0.3"]
 
 [project.optional-dependencies]
 test = [
@@ -66,7 +66,15 @@ lint = [
     "mypy==2.4.0",
     # dev/gate_timing.py reads merge.yml with PyYAML; its stubs let mypy check that use.
     "types-PyYAML==6.0.12.20260906",
+    # examples/trading/analytics.py imports pandas, which the lint venv does not install; its stubs let mypy check it.
+    "pandas-stubs==3.0.5.260914",
 ]
+
+# Not extras: a dependency group is not in the wheel's metadata.
+[dependency-groups]
+# The pandas tier of the process-lane chaos soak (benchmarks/process_lane_e2e/tiers.py); the rest of what it imports
+# is in the `test` extra.
+process-lane-e2e = ["pandas"]
 
 [project.scripts]
 mipyre = "mipyre.cli:main"

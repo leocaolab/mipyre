@@ -16,7 +16,7 @@ import urllib.request
 
 import pytest
 
-from tests._helpers import bound_port, poll_until, read_file
+from tests._helpers import bound_port, poll_until, read_file, set_subinterpreters
 
 HOST = "127.0.0.1"
 
@@ -29,9 +29,10 @@ _RUN_PATHS = [
 
 _APP = """
     import sys
+    import os
     from mipyre import Mipyre
 
-    app = Mipyre()
+    app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
     @app.get("/")
     def root(req):
@@ -39,7 +40,7 @@ _APP = """
 
     if __name__ == "__main__":
         port, extra = sys.argv[1:3]
-        app.run(host="127.0.0.1", port=int(port), workers=2, extra_plain_ports=[int(extra)])
+        app.run(host="127.0.0.1", port=int(port), extra_plain_ports=[int(extra)])
 """
 
 
@@ -71,10 +72,11 @@ def test_an_extra_plain_port_serves_http1_and_h2c(tmp_path, label, mode, env):
     extra = _unused_port()
     log_path = tmp_path / "server.log"
     # The "gil" paths serve every handler on the main interpreter: the app's runtime "main".
-    full_env = {k: v for k, v in os.environ.items() if k != "MIPYRE_RUNTIME"}
+    full_env = {k: v for k, v in os.environ.items() if k != "MIPYRE_TEST_MODE"}
     full_env.update(env)
     if mode == "gil":
-        full_env["MIPYRE_RUNTIME"] = "main"
+        full_env["MIPYRE_TEST_MODE"] = "main"
+    set_subinterpreters(full_env, "2")
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
             [sys.executable, str(script), "0", str(extra)],

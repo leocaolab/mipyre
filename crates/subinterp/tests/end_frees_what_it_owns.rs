@@ -49,11 +49,9 @@ impl Releasable for Nothing {
 }
 
 fn create_and_end(label: String) -> Result<(), NewInterpreterError> {
-    SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-        label,
-        std::convert::identity,
-        |_py| Ok(Nothing),
-    )?
+    SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(label, std::convert::identity, |_py| {
+        Ok(Nothing)
+    })?
     .end_on_own_thread();
     Ok(())
 }

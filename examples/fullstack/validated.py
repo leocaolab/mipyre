@@ -1,16 +1,14 @@
 """Routes whose JSON bodies pydantic validates. pydantic can't load in a sub-interpreter,
 so they run on the main interpreter and only the main interpreter imports this module."""
 
-import hashlib
 import json
 import time
 
 from pydantic import BaseModel, Field, field_validator
 
-from mipyre import Response, Router, SharedState
-from mipyre.cookies import set_cookie
+from mipyre import Cookie, Response, Router, SharedState
 
-from fullstack.auth import hash_password, require_auth
+from fullstack.auth import hash_password, new_session_token, password_matches, require_auth
 
 router = Router(runtime="main")
 
@@ -61,7 +59,7 @@ class ItemUpdate(BaseModel):
 # Auth routes
 # ---------------------------------------------------------------------------
 
-@router.post("/auth/register", model=UserRegister)
+@router.post("/auth/register", body=UserRegister)
 def register(req, user: UserRegister):
     state = _state()
     # Check if user exists
@@ -84,7 +82,7 @@ def register(req, user: UserRegister):
     return {"status": "registered", "username": user.username}
 
 
-@router.post("/auth/login", model=UserLogin)
+@router.post("/auth/login", body=UserLogin)
 def login(req, creds: UserLogin):
     state = _state()
     user_json = state.get(f"user:{creds.username}")
@@ -96,27 +94,28 @@ def login(req, creds: UserLogin):
         )
 
     user = json.loads(user_json)
-    if user["password_hash"] != hash_password(creds.password):
+    if not password_matches(creds.password, user["password_hash"]):
         return Response(
             body=json.dumps({"error": "invalid credentials"}),
             status_code=401,
             content_type="application/json",
         )
 
-    # Create session token
-    token = hashlib.sha256(f"{creds.username}:{time.time()}".encode()).hexdigest()[:32]
+    token = new_session_token()
     state[f"session:{token}"] = json.dumps({"username": creds.username, "email": user["email"]})
 
-    resp = Response(body=json.dumps({"status": "logged in", "username": creds.username}),
-                       content_type="application/json")
-    return set_cookie(resp, "session_token", token, httponly=True, max_age=86400)
+    return Response(
+        body=json.dumps({"status": "logged in", "username": creds.username}),
+        content_type="application/json",
+        headers={"set-cookie": Cookie("session_token", token, httponly=True, max_age=86400)},
+    )
 
 
 # ---------------------------------------------------------------------------
 # CRUD — Items
 # ---------------------------------------------------------------------------
 
-@router.post("/items", model=ItemCreate)
+@router.post("/items", body=ItemCreate)
 def create_item(req, item: ItemCreate):
     state = _state()
     auth = require_auth(req, state)
@@ -125,7 +124,7 @@ def create_item(req, item: ItemCreate):
 
     items = json.loads(state.get("items_db") or "[]")
     new_item = {
-        "id": len(items) + 1,
+        "id": state.incr("items:last_id", 1),
         "name": item.name,
         "price": item.price,
         "tags": item.tags,
@@ -142,17 +141,16 @@ def create_item(req, item: ItemCreate):
     )
 
 
-@router.put("/items/{item_id}", model=ItemUpdate)
-def update_item(req, updates: ItemUpdate):
+@router.put("/items/{item_id}", body=ItemUpdate)
+def update_item(req, updates: ItemUpdate, item_id):
     state = _state()
     auth = require_auth(req, state)
     if isinstance(auth, Response):
         return auth
 
-    item_id = int(req.params["item_id"])
     items = json.loads(state.get("items_db") or "[]")
     for item in items:
-        if item["id"] == item_id:
+        if str(item["id"]) == item_id:
             if updates.name is not None:
                 item["name"] = updates.name
             if updates.price is not None:

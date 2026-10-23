@@ -4,7 +4,6 @@ Covers the full leak story from 2026-04-19:
 
 Yesterday's fixes (v1.4.5 security + correctness):
   - Cookie CRLF injection rejection
-  - router.lookup case-insensitive
   - Sub-interp accept() errno backoff
   - etc. — see CHANGELOG v1.4.5
 
@@ -58,7 +57,7 @@ _server_port: int | None = None
 SERVER_SCRIPT = '''
 import gc, sys, os
 from mipyre import Mipyre
-from mipyre.cookies import set_cookie
+from mipyre.cookies import Cookie
 from mipyre.engine import Response
 
 app = Mipyre()
@@ -161,7 +160,7 @@ def probe_stats(req):
 
 @app.get("/cookie_ok")
 def cookie_ok(req):
-    return set_cookie(Response(body="ok"), "session", "abc123")
+    return Response(body="ok", headers={"set-cookie": Cookie("session", "abc123")})
 
 @app.get("/cookie_crlf")
 def cookie_crlf(req):
@@ -170,18 +169,17 @@ def cookie_crlf(req):
     # quoted outer template.
     bad_value = "bad" + chr(13) + chr(10) + "Set-Cookie: evil=1"
     try:
-        set_cookie(Response(body="ok"), "x", bad_value)
+        Cookie("x", bad_value)
         return {"rejected": False}
     except ValueError as e:
         return {"rejected": True, "err": str(e)[:60]}
 
 @app.get("/lowercase_route_match")
 def lowercase_route_match(req):
-    # router.lookup is case-insensitive now
     return "matched"
 
 if __name__ == "__main__":
-    app.run(host="{HOST}", port={PORT}, workers={WORKERS})
+    app.run(host="{HOST}", port={PORT}, threads={WORKERS})
 '''
 
 
@@ -328,10 +326,9 @@ def test_cookie_plain_still_works(server):
     assert r.get("raw") == "ok"
 
 
-def test_router_case_insensitive_for_lowercase_method(server):
-    """Correctness: router.lookup must normalize method (RFC 9110 §9.1)."""
-    # Request with a mixed-case 'Get' should still route. urllib always
-    # sends canonical upper-case 'GET', so exercise via raw socket.
+def test_a_lowercase_method_is_not_the_route_registered_in_uppercase(server):
+    """A method is case-sensitive (RFC 9110 §9.1, b/945): `get` is not `GET`, so the `GET`
+    route answers it 405 and names the spellings it does serve."""
     import socket
 
     s = socket.create_connection((HOST, _server_port), timeout=5)
@@ -347,9 +344,9 @@ def test_router_case_insensitive_for_lowercase_method(server):
             break
         body += chunk
     s.close()
-    assert b"200 OK" in body or b"matched" in body, (
-        f"lowercase 'get' must still match route, got: {body[:200]!r}"
-    )
+    head = body.split(b"\r\n\r\n", 1)[0].lower()
+    assert head.startswith(b"http/1.1 405"), f"got: {body[:200]!r}"
+    assert b"\r\nallow: get, head" in head, f"got: {body[:200]!r}"
 
 
 # ─────────────────────────────────────────────────────────────────

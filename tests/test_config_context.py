@@ -83,24 +83,19 @@ def test_ctx_set_get():
         ctx.clear()
 
 
-def test_ctx_request_id_default_none():
-    ctx.clear()
-    assert ctx.request_id() is None
-
-
-def test_ctx_populated_by_request_id_middleware():
+def test_the_clients_request_id_reaches_the_handler_and_a_ctx_snapshot_is_detached():
     app = Mipyre(runtime="main")
-    app.enable_request_id()
+    app.enable_request_id_header()
     seen = {}
 
     @app.get("/")
     def root(req):
-        seen["rid"] = ctx.request_id()
+        seen["rid"] = req.request_id
         seen["snap"] = ctx.snapshot()
         return "ok"
 
     # The handler writes into this test's dict/list: only the main interpreter shares it.
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         r = c.get("/", headers={"X-Request-ID": "trace-xyz"})
         assert r.status_code == 200
         assert seen["rid"] == "trace-xyz"
@@ -129,7 +124,7 @@ def test_the_snapshot_check_sees_a_write_to_the_live_ctx():
 
 def test_ctx_isolated_between_requests():
     app = Mipyre(runtime="main")
-    app.enable_request_id()
+    app.enable_request_id_header()
     observed: list[str | None] = []
 
     @app.get("/set")
@@ -143,7 +138,7 @@ def test_ctx_isolated_between_requests():
         return "ok"
 
     # The handler writes into this test's dict/list: only the main interpreter shares it.
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         c.get("/set")
         c.get("/read")
         # Second request started with a fresh ctx — it must not see the

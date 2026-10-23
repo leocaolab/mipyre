@@ -4,7 +4,7 @@ email.utils itself, the bootstrap imports ctypes on its first private clone."""
 
 import http.client
 
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 
 
 def _get(conn, path):
@@ -16,7 +16,7 @@ def _get(conn, path):
 def test_a_worker_of_a_sync_app_does_not_import_metadata_email_or_ctypes():
     from tests.apps.lazy_imports_sync import app
 
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         # One connection: one TPC thread, one worker.
         conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=10)
         assert _get(conn, "/deferred-loaded") == (200, "")

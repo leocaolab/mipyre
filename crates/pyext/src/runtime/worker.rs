@@ -60,26 +60,43 @@ pub(crate) trait RequestRunner: mipyre_subinterp::Releasable {
 
 pub(crate) struct SubInterpreterWorker<R: RequestRunner = SyncRunner> {
     index: WorkerIndex,
-    interp: SubInterpreter<R>,
+    interp: SubInterpreter<Held<R>>,
+}
+
+/// What a worker's interpreter holds and lets go of as it ends: its runner, and the app its
+/// script recorded in `mipyre.engine`'s module state, which the garbage collector does not visit.
+/// Both go in the interpreter's own end, which runs only while finalization has not begun; once it
+/// has, `Py_Finalize` ends the interpreter and nothing here is touched.
+struct Held<R> {
+    worker: WorkerIndex,
+    runner: R,
+}
+
+impl<R: RequestRunner> mipyre_subinterp::Releasable for Held<R> {
+    fn release(self, py: Python<'_>) {
+        release_app(py, self.worker);
+        self.runner.release(py);
+    }
 }
 
 impl<R: RequestRunner> SubInterpreterWorker<R> {
     /// Creates a sub-interpreter on the calling thread, which then serves it, and runs
     /// [`start::prepare`] in it; on failure the interpreter is ended before the error returns. Another
     /// thread state current on this thread aborts the process.
-    pub(crate) fn create(
-        worker: WorkerIndex,
-        spec: &WorkerSpec<'_>,
-    ) -> Result<Self, WorkerStartError> {
+    pub(crate) fn create(worker: WorkerIndex, spec: &WorkerSpec<'_>) -> Result<Self, WorkerStartError> {
         SubInterpreter::create_on_this_thread(
             worker.to_string(),
             |source| WorkerStartError::CreationFailed { worker, source },
-            |py| start::prepare::<R>(py, worker, spec),
+            |py| match start::prepare::<R>(py, worker, spec) {
+                Ok(runner) => Ok(Held { worker, runner }),
+                Err(e) => {
+                    // The interpreter ends right after this; an app its script recorded goes first.
+                    release_app(py, worker);
+                    Err(e)
+                }
+            },
         )
-        .map(|interp| SubInterpreterWorker {
-            index: worker,
-            interp,
-        })
+        .map(|interp| SubInterpreterWorker { index: worker, interp })
     }
 
     pub(crate) fn worker_id(&self) -> WorkerIndex {
@@ -90,10 +107,17 @@ impl<R: RequestRunner> SubInterpreterWorker<R> {
         self.interp.end_on_own_thread()
     }
 
-    fn with_gil<T>(
-        &mut self,
-        f: impl for<'py> FnOnce(&mut R, Python<'py>) -> T,
-    ) -> std::thread::Result<T> {
-        self.interp.with_gil(f)
+    fn with_gil<T>(&mut self, f: impl for<'py> FnOnce(&mut R, Python<'py>) -> T) -> std::thread::Result<T> {
+        self.interp.with_gil(|held, py| f(&mut held.runner, py))
+    }
+}
+
+/// Lets go of the app `worker`'s script recorded, before its interpreter ends: the module state
+/// that holds it is not visited by the garbage collector. One that cannot be reached is logged;
+/// it stays allocated, and the worker still ends.
+fn release_app(py: Python<'_>, worker: WorkerIndex) {
+    if let Err(e) = crate::runtime::EngineModule::release_app(py) {
+        tracing::warn!(target: "mipyre::server", worker = worker.get(), error = %e, error_type = "PyErr",
+            "the worker's app could not be let go of; it stays allocated past its interpreter's end");
     }
 }

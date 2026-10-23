@@ -1,5 +1,5 @@
 {
-  "_about": "The template socket's frames, as bytes: commands written by crates/pyext/src/lane/template.rs (TemplateCommand::frame) and read by python/mipyre/_process_lane/template.py (split_frame, parse_start, ...); reports written by template.py (forked_frame, exited_frame, ...) and read by template.rs (decode_template_report). Checked on both sides: lane/tests.rs and tests/test_process_lane_start_failures.py.",
+  "_about": "The template socket's frames, as bytes: commands written by crates/pyext/src/runtime/process/template.rs (TemplateCommand::frame) and read by python/mipyre/_process_lane/template.py (split_frame, parse_start, ...); reports written by template.py (forked_frame, exited_frame, ...) and read by template.rs (decode_template_report). Checked on both sides: runtime/process/tests.rs and tests/test_process_lane_start_failures.py.",
   "max_frame_bytes": 65536,
   "commands": [
     {
@@ -13,6 +13,12 @@
       "kind": "lane",
       "lane": 3,
       "hex": "050000000203000000"
+    },
+    {
+      "what": "a run's command line",
+      "kind": "run",
+      "json": "{\"argv\":[[97]],\"flags\":{},\"parsed\":false}",
+      "hex": "2a000000087b2261726776223a5b5b39375d5d2c22666c616773223a7b7d2c22706172736564223a66616c73657d"
     },
     {
       "what": "start lane 0, attempt 0",

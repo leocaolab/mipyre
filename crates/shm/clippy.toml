@@ -1,6 +1,6 @@
-# plan/ decides; it does not do. clippy reads one of these per package, so it binds the whole package: a module that
-# must name one of these (the atomics' names in sync.rs, the system calls in os.rs) lifts it with `#![expect(...)]`,
-# which turns red once it stops needing it.
+# plan/ decides; it does not do. clippy reads one of these per package, so it binds the whole package: the one module
+# that must name an atomic type (sync.rs, which gives every other module an alias) lifts it with `#![expect(...)]`,
+# which turns red once it stops needing it, under the normal build and the model alike.
 disallowed-methods = [
   { path = "std::fs::read", reason = "plan/ does no IO" },
   { path = "std::fs::write", reason = "plan/ does no IO" },
@@ -21,6 +21,13 @@ disallowed-types = [
   { path = "std::fs::File", reason = "plan/ does no IO" },
   { path = "std::sync::atomic::AtomicU32", reason = "plan/ takes the values the counters held, never the counters" },
   { path = "std::sync::atomic::AtomicU64", reason = "plan/ takes the values the counters held, never the counters" },
+  # Loom's, under `--cfg shm_model`: sync.rs names the atomics under both builds, so its expectation holds under both.
+  # A normal build has no loom, hence `allow-invalid`.
+  { path = "loom::sync::atomic::AtomicU32", reason = "plan/ takes the values the counters held, never the counters", allow-invalid = true },
+  { path = "loom::sync::atomic::AtomicU64", reason = "plan/ takes the values the counters held, never the counters", allow-invalid = true },
+  # Shuttle's, under `--cfg shm_model --cfg shm_shuttle` (b/744), for the same reason.
+  { path = "shuttle::sync::atomic::AtomicU32", reason = "plan/ takes the values the counters held, never the counters", allow-invalid = true },
+  { path = "shuttle::sync::atomic::AtomicU64", reason = "plan/ takes the values the counters held, never the counters", allow-invalid = true },
 ]
 disallowed-macros = [
   { path = "std::println", reason = "plan/ prints nothing: it returns what it decided" },

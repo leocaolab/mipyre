@@ -6,7 +6,9 @@
 #![forbid(unsafe_code)]
 #![deny(unreachable_pub, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod geometry;
 pub mod ring;
 pub mod slot_len;
 pub mod spin_window;
 pub mod start;
+pub mod wakes;

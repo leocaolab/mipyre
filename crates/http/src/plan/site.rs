@@ -7,6 +7,8 @@ use http::StatusCode;
 
 use crate::plan::compression::CompressionSettings;
 use crate::plan::cors::Cors;
+use crate::plan::cross_origin::HostNames;
+use crate::plan::forwarded::Proxies;
 use crate::plan::header::own_header_name;
 use crate::plan::limits::Limits;
 use crate::plan::route::RouteTable;
@@ -16,6 +18,10 @@ pub struct ServeSettings {
     pub limits: Limits,
     pub cors: Option<Cors>,
     pub compression: Option<CompressionSettings>,
+    /// The names a request's host must be one of, which a server's deployment sets when it starts.
+    pub names: HostNames,
+    /// The proxies whose `X-Forwarded-For` names a request's client; none by default.
+    pub proxies: Proxies,
     /// The header a client's request id arrives in; with `None` the server mints every id.
     pub request_id_header: Option<HeaderName>,
 }
@@ -42,6 +48,8 @@ impl ServeSettings {
             limits: Limits::DEFAULT,
             cors: None,
             compression: None,
+            names: HostNames::LOCALHOST,
+            proxies: Proxies::default(),
             request_id_header: None,
         }
     }
@@ -52,6 +60,8 @@ impl ServeSettings {
             limits: self.limits,
             cors: self.cors.as_ref().map(Cors::own_copy),
             compression: self.compression,
+            names: self.names.clone(),
+            proxies: self.proxies.clone(),
             request_id_header: self.request_id_header.as_ref().map(own_header_name),
         }
     }

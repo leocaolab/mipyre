@@ -11,8 +11,8 @@ license.workspace = true
 # crate uses fork-only APIs (`Python::attach_current`, `InterpreterHandle::try_attach`, see
 # `interp.rs` and the README).
 [features]
-# Start-phase timestamps (`trace`), printed to stderr when `MIPYRE_B183_TRACE` is set. Off in
-# every other build; the consumer's `startup_trace` feature turns it on.
+# Start-phase timestamps (`trace`), printed to stderr. Off in every other build; the consumer's
+# `startup_trace` feature turns it on.
 startup_trace = []
 
 [dependencies]
@@ -25,9 +25,14 @@ tracing = "0.1"
 
 # The Loom model of a slot's state word (`src/interp/loom_model.rs`), built only under `--cfg sync_model`, which swaps
 # `src/sync.rs`'s names for Loom's in every package built with it, so Loom is a dependency under that cfg only:
-# `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_subinterp --lib --release --target-dir target/loom`.
-[target.'cfg(sync_model)'.dependencies]
+# `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_subinterp --lib --profile model --target-dir target/loom`.
+[target.'cfg(all(sync_model, not(sync_shuttle)))'.dependencies]
 loom = "0.7"
+
+# The Shuttle model of the same protocol at scale (`src/interp/shuttle_model.rs`, b/744), built only under
+# `--cfg sync_model --cfg sync_shuttle`, which swaps `src/sync.rs`'s names for Shuttle's instead.
+[target.'cfg(all(sync_model, sync_shuttle))'.dependencies]
+shuttle = "0.9.8"
 
 [dev-dependencies]
 # The microbenches' harness and counting allocator.

@@ -24,6 +24,7 @@ import pytest
 from tests._helpers import poll_until
 
 from mipyre import Mipyre
+from mipyre._server_run import runs_of
 
 
 if shutil.which("openssl") is None:
@@ -72,7 +73,7 @@ def tls_server(cert_key):
     )
     t.start()
     # Bound on port 0: the app's server reports the port it got.
-    port = poll_until(lambda: [srv.port for srv in list(app._servers)], what="TLS bind")[0]
+    port = poll_until(lambda: [run.port for run in runs_of(app).serving()], what="TLS bind")[0]
 
     # Wait for TLS listener. Plain TCP connect succeeds the instant the
     # listener binds; we need to actually complete a TLS handshake to

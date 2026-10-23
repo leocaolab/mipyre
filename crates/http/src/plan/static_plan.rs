@@ -157,9 +157,7 @@ impl<'r, 'p, D: AsRef<StaticMountRule>> Iterator for StaticLookups<'r, 'p, D> {
             .find_map(|mount| mount.as_ref().relative(path).map(|rel| (mount, rel)))?;
         let rule = mount.as_ref();
         let accept_encoding = if rule.copies() == Copies::Precompressed {
-            self.headers
-                .get(ACCEPT_ENCODING)
-                .and_then(|v| v.to_str().ok())
+            self.headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok())
         } else {
             None
         };
@@ -250,17 +248,8 @@ mod tests {
 
     #[test]
     fn equivalent_spellings_of_a_path_share_one_entry() {
-        assert!(matches!(
-            relative_key("a/b.css"),
-            RelativeKey::Named(Cow::Borrowed(_))
-        ));
-        for rel in [
-            "a//b.css",
-            "./a/b.css",
-            "a/./b.css",
-            "%61/b.css",
-            "a%2fb.css",
-        ] {
+        assert!(matches!(relative_key("a/b.css"), RelativeKey::Named(Cow::Borrowed(_))));
+        for rel in ["a//b.css", "./a/b.css", "a/./b.css", "%61/b.css", "a%2fb.css"] {
             assert_eq!(
                 relative_key(rel),
                 RelativeKey::Named(Cow::Borrowed(b"a/b.css")),
@@ -292,18 +281,9 @@ mod tests {
     #[test]
     fn mounts_are_asked_in_order_and_accept_encoding_only_on_a_precompressed_one() {
         let mounts = [
-            Mount(
-                StaticMountRule::new("/a", Copies::Original).unwrap(),
-                "first",
-            ),
-            Mount(
-                StaticMountRule::new("/b", Copies::Precompressed).unwrap(),
-                "second",
-            ),
-            Mount(
-                StaticMountRule::new("/a", Copies::Precompressed).unwrap(),
-                "third",
-            ),
+            Mount(StaticMountRule::new("/a", Copies::Original).unwrap(), "first"),
+            Mount(StaticMountRule::new("/b", Copies::Precompressed).unwrap(), "second"),
+            Mount(StaticMountRule::new("/a", Copies::Precompressed).unwrap(), "third"),
         ];
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, http::HeaderValue::from_static("br"));
@@ -313,11 +293,7 @@ mod tests {
                 let Lookup::File(lookup) = lookup else {
                     panic!("a plain path under the mount is refused");
                 };
-                (
-                    lookup.mount.1,
-                    lookup.key.into_owned(),
-                    lookup.accept_encoding,
-                )
+                (lookup.mount.1, lookup.key.into_owned(), lookup.accept_encoding)
             })
             .collect();
         assert_eq!(
@@ -332,10 +308,7 @@ mod tests {
 
     #[test]
     fn a_refused_path_is_yielded_as_its_refusal() {
-        let mounts = [Mount(
-            StaticMountRule::new("/a", Copies::Original).unwrap(),
-            "only",
-        )];
+        let mounts = [Mount(StaticMountRule::new("/a", Copies::Original).unwrap(), "only")];
         let headers = HeaderMap::new();
         let mut asked = lookups("/a/%2e%2e/etc/passwd", &headers, &mounts);
         assert!(matches!(
@@ -343,10 +316,7 @@ mod tests {
             Some(Lookup::Refused(StaticPathError::Traversal))
         ));
         let mut asked = lookups("/a/x%00.txt", &headers, &mounts);
-        assert!(matches!(
-            asked.next(),
-            Some(Lookup::Refused(StaticPathError::NulByte))
-        ));
+        assert!(matches!(asked.next(), Some(Lookup::Refused(StaticPathError::NulByte))));
         assert_eq!(StaticPathError::Traversal.status(), StatusCode::FORBIDDEN);
         assert_eq!(StaticPathError::NulByte.status(), StatusCode::BAD_REQUEST);
     }
@@ -361,10 +331,7 @@ mod tests {
     fn mime_js_css() {
         assert_eq!(mime_from_ext("css"), "text/css; charset=utf-8");
         assert_eq!(mime_from_ext("js"), "application/javascript; charset=utf-8");
-        assert_eq!(
-            mime_from_ext("mjs"),
-            "application/javascript; charset=utf-8"
-        );
+        assert_eq!(mime_from_ext("mjs"), "application/javascript; charset=utf-8");
     }
 
     #[test]
@@ -413,10 +380,7 @@ mod tests {
         assert_eq!(choose_precompressed(Some("br;q=0, gzip;q=0"), both), None);
         assert_eq!(choose_precompressed(None, both), None);
         let only_gz = CodingSet::only(Coding::Gzip);
-        assert_eq!(
-            choose_precompressed(Some("br, gzip"), only_gz),
-            Some(Coding::Gzip)
-        );
+        assert_eq!(choose_precompressed(Some("br, gzip"), only_gz), Some(Coding::Gzip));
         assert_eq!(choose_precompressed(Some("br"), only_gz), None);
     }
 }

@@ -5,18 +5,16 @@
 //! socket2 types outside `io/`. Nothing checks that these files' dependency closure is free of
 //! those crates, because the package has one dependency list and `io/` needs them.
 #![forbid(unsafe_code)]
-#![deny(
-    unreachable_pub,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic
-)]
+#![deny(unreachable_pub, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod answer;
 pub mod body_limit;
 pub mod coalesce;
 pub mod compression;
 pub mod conditional;
 pub mod cors;
+pub mod cross_origin;
+pub mod forwarded;
 pub mod header;
 pub mod limits;
 pub mod reject;

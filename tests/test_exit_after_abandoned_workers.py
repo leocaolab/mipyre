@@ -30,17 +30,17 @@ def root(req):
 '''
 
 SCRIPT = '''
-from mipyre.app import WorkersAbandoned
+from mipyre import AbandonedWorkersError
 from mipyre.testing import TestClient
 
 import b496_app
 
 b496_app.app.shutdown_timeout = 1e-9
-client = TestClient(b496_app.app, port=None)
+client = TestClient(b496_app.app)
 client.__enter__()
 try:
     client.close()
-except WorkersAbandoned as e:
+except AbandonedWorkersError as e:
     print("b496-abandoned", len(e.workers), flush=True)
 '''
 

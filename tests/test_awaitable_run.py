@@ -1,4 +1,4 @@
-"""`mipyre._awaitable.run` against what it replaces (b/550).
+"""`mipyre._worker.awaitable.run` against what it replaces (b/550).
 
 A sync path runs a hook's or handler's coroutine as a task in the request's context. It did so
 with `loop.run_until_complete(loop.create_task(coro, context=ctx))`, which turns the loop at
@@ -16,7 +16,7 @@ import gc
 
 import pytest
 
-from mipyre._awaitable import run
+from mipyre._worker.awaitable import run
 
 VAR = contextvars.ContextVar("b550_var", default="unset")
 

@@ -1,10 +1,12 @@
 """Test: async def handlers in both GIL and sub-interpreter modes.
 
-Run it with MIPYRE_RUNTIME=main to serve every handler on the main interpreter (the GIL
+Run it with MIPYRE_TEST_MODE=main to serve every handler on the main interpreter (the GIL
 mode); without it, it serves on sub-interpreters."""
+import os
+
 from mipyre import Mipyre
 
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 
 @app.get("/sync")

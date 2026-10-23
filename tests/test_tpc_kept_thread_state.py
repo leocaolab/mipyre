@@ -16,7 +16,7 @@ import time
 import urllib.parse
 
 from mipyre import Mipyre
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 
 from tests._helpers import poll_until, read_file
 
@@ -58,7 +58,7 @@ def test_a_python_thread_of_the_worker_runs_while_the_server_is_idle(tmp_path):
     """Whether the TPC thread really lets the worker's GIL go when it parks is a runtime fact: only a
     Python thread of that interpreter making progress while no request arrives shows it."""
     progress = tmp_path / "progress"
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         # One connection: one TPC thread, one worker interpreter.
         conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=10)
         assert _get(conn, f"/start?progress={urllib.parse.quote(str(progress))}") == (200, "started")
@@ -74,9 +74,9 @@ def test_a_python_thread_of_the_worker_runs_while_the_server_is_idle(tmp_path):
 
 
 def test_the_server_stops_after_serving_with_the_thread_state_kept():
-    client = TestClient(app, transport="tcp")
-    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=10)
+    server = TestServer(app)
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
     for _ in range(50):
         assert _get(conn, "/done")[0] == 200
     conn.close()
-    client.close()
+    server.close()

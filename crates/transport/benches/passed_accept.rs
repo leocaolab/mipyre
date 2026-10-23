@@ -22,9 +22,9 @@ use mipyre_transport::endpoint::{EndpointSource, Endpoints, ListenerSet, Listene
 use mipyre_transport::tcp::listener::{create_reuseport_listener, BindOptions, BoundListeners, DEFAULT_BACKLOG};
 
 const OPTIONS: BindOptions = BindOptions {
-        backlog: DEFAULT_BACKLOG,
-        defer_accept: Duration::from_secs(10),
-    };
+    backlog: DEFAULT_BACKLOG,
+    defer_accept: Duration::from_secs(10),
+};
 
 /// Returns the process's context switches, voluntary and involuntary, and its user and system CPU seconds.
 fn usage() -> (i64, f64) {
@@ -63,7 +63,10 @@ fn main() {
             for _ in 1..loops {
                 handed.push(create_reuseport_listener(addr, OPTIONS).must("bind a handed socket"));
             }
-            Endpoints::sharing_tls(BoundListeners::passed(handed, copies).must("serve the handed sockets"), None)
+            Endpoints::sharing_tls(
+                BoundListeners::passed(handed, copies).must("serve the handed sockets"),
+                None,
+            )
         }
         "reuseport" => Endpoints::bind(
             &ListenerSet::one(ListenerSpec {

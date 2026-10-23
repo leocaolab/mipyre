@@ -16,9 +16,9 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
-from mipyre.engine import LaneSet, _set_routers_to_load
+from mipyre.engine import CommandLine, LaneSet, _set_routers_to_load
 
-from mipyre._process_lane import LaneSetup, LaneWorker, adapters, refuse_unpinned_start, unpin_env
+from mipyre._process_lane.server import START_REFUSED, LaneSetup, LaneWorker, refuse_unpinned_start, unpin_env
 
 
 def _leave_template(sock, template_pid: int, template_fds: tuple[int, ...]) -> None:
@@ -37,37 +37,68 @@ def _leave_template(sock, template_pid: int, template_fds: tuple[int, ...]) -> N
         os._exit(0)  # the template died before the death signal was armed
 
 
+def install_command_line(text: str) -> None:
+    """Make the run's command line (`CommandLine.encode()` text) this process's: its `sys.argv`
+    and its flag values."""
+    from mipyre import flags
+
+    flags._install(CommandLine.decode(text))
+
+
 def load_app(setup: LaneSetup):
-    """Imports the app as the server did, with only the routers that have process routes."""
+    """Imports the app as the server did, with its `sys.path` and only the routers that have
+    process routes, after the thread-pool limits the libraries read when they load. The run's
+    command line is installed first."""
+    os.environ.update(setup.thread_limits)
     os.chdir(setup.cwd)
     sys.path[:] = setup.sys_path
     _set_routers_to_load(list(setup.routers))
-    from mipyre import _runtime
+    from mipyre import _target
 
-    _module, app = _runtime.import_target(setup.target)
+    _module, app = _target.import_target(setup.target)
     return app
 
 
 def import_app(lanes: LaneSet, worker: LaneWorker):
-    """`start="import"`: the adapters, then the app; a failed import is reported to the server."""
-    adapters.prepare_all(os.environ)
+    """`start="import"`: the app, imported here with the run's command line; a failed import is
+    reported to the server."""
     try:
+        install_command_line(worker.command_line)
         return load_app(worker.setup)
     except BaseException:
-        lanes._report_start_failure(worker.lane, traceback.format_exc())
+        lanes._report_start_failure(traceback.format_exc())
         raise
 
 
-def run(lanes: LaneSet, worker: LaneWorker, sock, template_fds: tuple[int, ...], app: Callable[[], Any]) -> None:
-    """Leave the template, then serve the app `app` returns until the process ends.
+def attach(worker: LaneWorker) -> LaneSet:
+    """Map `worker`'s lane from the fds the template handed it. A worker that cannot map its lane
+    cannot report into it either: it refuses its start (START_REFUSED), which the server takes as
+    final for the lane."""
+    setup = worker.setup
+    shm, bell = worker.fds
+    try:
+        # A spawned worker got its pair inheritable; the bell stays open for the worker's life,
+        # and a program the app runs must not get it.
+        os.set_inheritable(bell, False)
+        return LaneSet._attach(worker.lane, worker.attempt, setup.depth, setup.slot_bytes, setup.worker_spin_us, shm, bell)
+    except BaseException:  # noqa: BLE001 — printed; the process exits START_REFUSED
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(START_REFUSED)
 
-    Each worker reseeds before `app` runs: a forked worker drops the random state it copied
+
+def run(worker: LaneWorker, sock, template_fds: tuple[int, ...], app_of: Callable[[LaneSet], Any]) -> None:
+    """Leave the template, map the lane, then serve the app `app_of` returns until the process ends.
+
+    Each worker reseeds before the app is had: a forked worker drops the random state it copied
     from the template, and an imported one keeps any seed its app sets at import.
     """
     try:
         _leave_template(sock, worker.template_pid, template_fds)
+        lanes = attach(worker)
+        _log_as_the_server(worker)
         _reseed()
-        app()._engine._serve_lane_worker(lanes, worker.lane, worker.template_pid)
+        app_of(lanes)._engine._serve_lane_worker(lanes, worker.template_pid)
         print(f"mipyre: process-lane worker {worker.lane} left its loop", file=sys.stderr, flush=True)
     except BaseException:  # noqa: BLE001 — a worker never returns into the template
         traceback.print_exc()
@@ -76,21 +107,48 @@ def run(lanes: LaneSet, worker: LaneWorker, sock, template_fds: tuple[int, ...],
         os._exit(70)
 
 
-def _spawned_main() -> None:
-    """A worker the SpawnDriver started: its setup is in MIPYRE_LANE_WORKER, its fds
-    (the shared memory, the wake pipes) inherited, its `mipyre` the launcher's pinned copy
-    (the first PYTHONPATH entry), which the processes the app starts do not inherit."""
+def _log_as_the_server(worker: LaneWorker) -> None:
+    """Route this worker's Python logging, its app's import included, into the engine's log at
+    the server's level and format, each line with the worker's lane: the same lines a
+    sub-interpreter worker writes. Each line is written by the call that logs it, with no writer
+    thread: a worker the server kills (a handler past its timeout) loses none."""
+    from mipyre._log import bridge
+    from mipyre.engine import _python_log_level, _stop_log_writer, emit_python_log, init_logger
+
+    init_logger(worker.setup.log_level, False, worker.setup.log_format)
+    _stop_log_writer()
+    bridge.install_root_handler(emit_python_log, _python_log_level(), lane=worker.lane)
+
+
+def _spawned_main(argv: list[str]) -> None:
+    """A worker the SpawnDriver started: `argv` is `--setup-fd N`, the inherited socket its
+    template writes its setup to; its lane's two fds are inherited too, and its `mipyre` is the
+    launcher's pinned copy (the first PYTHONPATH entry), which the processes the app starts do
+    not inherit. A setup it cannot read, or one from another build, ends it with START_REFUSED
+    before it touches a lane."""
     run_dir = os.environ.get("PYTHONPATH", "").split(os.pathsep)[0]
-    refuse_unpinned_start(run_dir, os.environ.get("MIPYRE_BUILD_ID"))
-    unpin_env(os.environ, run_dir)
-    worker = LaneWorker.decode(os.environ.pop("MIPYRE_LANE_WORKER"))
-    setup = worker.setup
     try:
-        lanes = LaneSet._attach(setup.workers, setup.depth, setup.slot_bytes, setup.worker_spin_us, list(worker.fds))
-    except BaseException:  # noqa: BLE001 — printed; the process exits 70
+        worker = LaneWorker.decode(_read_setup(argv))
+    except (SetupFdError, OSError, ValueError, KeyError, TypeError):  # each says what was wrong
         traceback.print_exc()
-        os._exit(70)
-    run(lanes, worker, None, (), lambda: import_app(lanes, worker))
+        sys.stderr.flush()
+        os._exit(START_REFUSED)
+    refuse_unpinned_start(run_dir, worker.build)
+    unpin_env(os.environ, run_dir)
+    run(worker, None, (), lambda lanes: import_app(lanes, worker))
+
+
+class SetupFdError(Exception):
+    """A spawned worker's command line does not name its setup fd as `--setup-fd N`."""
+
+
+def _read_setup(argv: list[str]) -> str:
+    """Reads the setup the template writes to the fd `argv` names, to its end (the template
+    closes its side once it is written)."""
+    if len(argv) != 2 or argv[0] != "--setup-fd" or not argv[1].isdigit():
+        raise SetupFdError(f"a spawned process-lane worker takes --setup-fd N, got {argv!r}")
+    with os.fdopen(int(argv[1]), "rb") as setup:
+        return setup.read().decode()
 
 
 def _die_with_parent() -> None:
@@ -120,4 +178,4 @@ def _reseed() -> None:
 
 
 if __name__ == "__main__":
-    _spawned_main()
+    _spawned_main(sys.argv[1:])

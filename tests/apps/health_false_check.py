@@ -1,13 +1,12 @@
 """App for tests/test_health.py::test_readyz_503_on_false_return. Its own module: a
 worker serves one app per module."""
 
-from mipyre import Mipyre
+from mipyre import HealthProbes, Mipyre
 
 app = Mipyre()
+probes = HealthProbes(app)
 
 
-@app.readiness_check("feature_flag")
+@probes.check("feature_flag")
 def _():
     return False
-
-app.enable_health_probes()

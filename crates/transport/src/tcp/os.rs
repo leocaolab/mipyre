@@ -85,12 +85,7 @@ pub(crate) fn reuse_port(_socket: &socket2::Socket) -> io::Result<()> {
 pub(crate) fn defer_accept(socket: &socket2::Socket, secs: u64) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let secs = libc::c_int::try_from(secs).unwrap_or(libc::c_int::MAX);
-    setsockopt_int(
-        socket.as_raw_fd(),
-        libc::IPPROTO_TCP,
-        libc::TCP_DEFER_ACCEPT,
-        secs,
-    )
+    setsockopt_int(socket.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, secs)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -189,10 +184,7 @@ pub(crate) fn adopt_handed(fd: i32) -> io::Result<std::net::TcpListener> {
 /// kernel buffers.
 #[cfg(unix)]
 pub(crate) fn is_exhaustion_code(code: i32) -> bool {
-    matches!(
-        code,
-        libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM
-    )
+    matches!(code, libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
 }
 
 #[cfg(windows)]
@@ -245,10 +237,7 @@ pub(crate) fn is_one_connection_code(_code: i32) -> bool {
 /// changes.
 #[cfg(unix)]
 pub(crate) fn is_listener_broken_code(code: i32) -> bool {
-    matches!(
-        code,
-        libc::EBADF | libc::ENOTSOCK | libc::EINVAL | libc::EFAULT
-    )
+    matches!(code, libc::EBADF | libc::ENOTSOCK | libc::EINVAL | libc::EFAULT)
 }
 
 #[cfg(not(unix))]
@@ -278,8 +267,7 @@ mod tests {
         let listening = std::net::TcpListener::bind(loopback()).unwrap();
         assert!(is_listening(&listening).unwrap());
 
-        let bound_only =
-            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        let bound_only = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
         bound_only.bind(&loopback().into()).unwrap();
         let bound_only = std::net::TcpListener::from(std::os::fd::OwnedFd::from(bound_only));
         assert!(!is_listening(&bound_only).unwrap());

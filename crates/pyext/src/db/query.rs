@@ -84,12 +84,7 @@ pub(super) async fn bind(
     // Postgres always describes parameter types; without them nothing can be encoded.
     let declared = match prepared.parameters() {
         Some(Either::Left(types)) => types,
-        Some(Either::Right(count)) => {
-            return Err(DbError::Undescribed {
-                op,
-                count: Some(count),
-            })
-        }
+        Some(Either::Right(count)) => return Err(DbError::Undescribed { op, count: Some(count) }),
         None => return Err(DbError::Undescribed { op, count: None }),
     };
     let args = param::encode_args(declared, params)?;
@@ -121,11 +116,7 @@ impl QueryAnswer {
     }
 }
 
-pub(super) async fn run(
-    pool: sqlx::PgPool,
-    stmt: SqlQuery,
-    fetch: FetchMode,
-) -> Result<QueryAnswer, DbError> {
+pub(super) async fn run(pool: sqlx::PgPool, stmt: SqlQuery, fetch: FetchMode) -> Result<QueryAnswer, DbError> {
     let op = QueryMethod::Answer(fetch);
     let query_error = |source| DbError::QueryFailed { op, source };
     let mut conn = pool.acquire().await.map_err(query_error)?;

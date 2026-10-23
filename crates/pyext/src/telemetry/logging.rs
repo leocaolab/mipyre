@@ -3,19 +3,23 @@
 //! A background thread writes every line, because at hundreds of thousands of access-log lines a
 //! second, Tokio workers writing stderr themselves would serialize on its lock.
 
+use std::io::{IsTerminal, Write};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::time::SystemTime;
-use tracing_subscriber::layer::{Layered, SubscriberExt};
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, reload, EnvFilter, Layer, Registry};
+use tracing_subscriber::{fmt, EnvFilter, Layer, Registry};
 
 use super::access_line::{JsonLines, ACCESS_TARGET};
-use super::log_writer::{log_channel, FenceError, LogChannel};
+use super::log_writer::{FenceError, LogChannel, LogQueue, LogWriter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogFormat {
@@ -97,11 +101,26 @@ impl LogLevel {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LoggerConfig {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoggerConfig {
     level: LogLevel,
     access_log: bool,
     format: LogFormat,
+}
+
+impl std::fmt::Display for LoggerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let format = match self.format {
+            LogFormat::Text => "text",
+            LogFormat::Json => "json",
+        };
+        write!(
+            f,
+            "level {}, access log {}, format {format}",
+            self.level.filter(),
+            if self.access_log { "on" } else { "off" }
+        )
+    }
 }
 
 impl LoggerConfig {
@@ -122,8 +141,7 @@ impl LoggerConfig {
         } else {
             format!("{level},{ACCESS_TARGET}=off")
         };
-        EnvFilter::try_new(&directives)
-            .map_err(|source| LoggerError::InvalidFilter { directives, source })
+        EnvFilter::try_new(&directives).map_err(|source| LoggerError::InvalidFilter { directives, source })
     }
 }
 
@@ -138,8 +156,16 @@ pub(crate) enum LoggerError {
          or `log` logger is already set: {0}"
     )]
     SubscriberAlreadySet(#[from] tracing_subscriber::util::TryInitError),
-    #[error("could not reconfigure the mipyre tracing subscriber: {0}")]
-    ReloadFailed(#[from] reload::Error),
+    /// The log is configured once per process (b/335 D14): a second, different configuration
+    /// is refused rather than silently ignored or applied.
+    #[error(
+        "the log is already configured in this process ({installed}); a different configuration \
+         ({wanted}) cannot replace it: one process has one log"
+    )]
+    AlreadyConfigured {
+        installed: LoggerConfig,
+        wanted: LoggerConfig,
+    },
     #[error("invalid tracing filter {directives:?}: {source}")]
     InvalidFilter {
         directives: String,
@@ -155,11 +181,9 @@ pub(crate) enum LoggerError {
 impl From<LoggerError> for PyErr {
     fn from(e: LoggerError) -> Self {
         match e {
-            LoggerError::UnknownLevel(_) | LoggerError::UnknownFormat(_) => {
-                PyValueError::new_err(e.to_string())
-            }
+            LoggerError::UnknownLevel(_) | LoggerError::UnknownFormat(_) => PyValueError::new_err(e.to_string()),
             LoggerError::SubscriberAlreadySet(_)
-            | LoggerError::ReloadFailed(_)
+            | LoggerError::AlreadyConfigured { .. }
             | LoggerError::InvalidFilter { .. }
             | LoggerError::LogWriterStopped(_)
             | LoggerError::WriterThread(_) => PyRuntimeError::new_err(e.to_string()),
@@ -167,29 +191,69 @@ impl From<LoggerError> for PyErr {
     }
 }
 
-type FilterLayer = reload::Layer<EnvFilter, Registry>;
-type SubscriberBase = Layered<FilterLayer, Registry>;
-/// The format layer is boxed so that it can be swapped on reload.
-type FmtLayer = Box<dyn Layer<SubscriberBase> + Send + Sync>;
-
-/// The process-wide subscriber, installed by the first `init_logger` call.
-///
-/// tracing allows one global subscriber per process, but one process can run several apps
-/// (TestClient, embedding), each with its own config. The filter and the format layer sit behind
-/// `reload` handles so a later `init_logger` really applies its config instead of silently keeping
-/// the first one.
+/// The process-wide subscriber, installed by the first `init_logger` call: tracing allows one
+/// global subscriber per process, and this process has one log configuration (b/335 D14).
 struct GlobalSubscriber {
-    /// Every interpreter gates its Python logging on the level the filter currently applies.
-    level: LogLevel,
-    filter: reload::Handle<EnvFilter, Registry>,
-    fmt: reload::Handle<FmtLayer, SubscriberBase>,
-    /// This sender is never dropped, so the writer thread lives as long as the process.
-    writer: LogChannel,
+    config: LoggerConfig,
+    queue: LogQueue,
+    /// The thread that writes the queue to stderr; `None` while the process must run no thread of
+    /// the logger's (it is about to fork), and in the child of that fork.
+    writer: Option<LogWriter>,
+    /// Whether each logging thread writes its lines to stderr itself (`writer` is `None`).
+    direct: Arc<AtomicBool>,
+}
+
+/// Where the formatted lines go: into the queue the writer thread drains, or, while there is no
+/// writer thread, straight to stderr from the thread that logs. One atomic load per line.
+#[derive(Clone)]
+struct LogSink {
+    queue: LogChannel,
+    direct: Arc<AtomicBool>,
+}
+
+/// One line's way out, as [`LogSink`] picked it.
+enum SinkWriter {
+    Queue(LogChannel),
+    Stderr(std::io::Stderr),
+}
+
+impl Write for SinkWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            SinkWriter::Queue(queue) => queue.write(buf),
+            SinkWriter::Stderr(stderr) => stderr.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            SinkWriter::Queue(queue) => queue.flush(),
+            SinkWriter::Stderr(stderr) => stderr.flush(),
+        }
+    }
+}
+
+impl<'a> MakeWriter<'a> for LogSink {
+    type Writer = SinkWriter;
+
+    fn make_writer(&'a self) -> SinkWriter {
+        if self.direct.load(Ordering::Acquire) {
+            SinkWriter::Stderr(std::io::stderr())
+        } else {
+            SinkWriter::Queue(self.queue.clone())
+        }
+    }
 }
 
 static LOGGER: Mutex<Option<GlobalSubscriber>> = Mutex::new(None);
 
-fn fmt_layer(format: LogFormat, writer: LogChannel) -> FmtLayer {
+/// The format layer, boxed so the text and JSON formats are one type.
+type FmtLayer = Box<dyn Layer<tracing_subscriber::layer::Layered<EnvFilter, Registry>> + Send + Sync>;
+
+fn fmt_layer<W>(format: LogFormat, writer: W, ansi: bool) -> FmtLayer
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
     match format {
         LogFormat::Json => fmt::layer()
             .with_writer(writer)
@@ -199,41 +263,44 @@ fn fmt_layer(format: LogFormat, writer: LogChannel) -> FmtLayer {
         LogFormat::Text => fmt::layer()
             .with_writer(writer)
             .with_target(true)
-            .with_ansi(true)
+            .with_ansi(ansi)
             .boxed(),
     }
 }
 
 fn install(config: &LoggerConfig) -> Result<GlobalSubscriber, LoggerError> {
-    // The thread is never joined, and the process's exit does not wait for it; `flush_logs` does.
-    let (writer, _thread) = log_channel(std::io::stderr()).map_err(LoggerError::WriterThread)?;
-    let (filter_layer, filter) = reload::Layer::new(config.filter()?);
-    let (format_layer, fmt) = reload::Layer::new(fmt_layer(config.format, writer.clone()));
+    // The process's exit does not wait for the thread; `flush_logs` does.
+    let stderr = std::io::stderr();
+    let ansi = stderr.is_terminal();
+    let queue = LogQueue::new();
+    let writer = queue.start_writer(stderr).map_err(LoggerError::WriterThread)?;
+    let direct = Arc::new(AtomicBool::new(false));
+    let sink = LogSink {
+        queue: queue.channel().clone(),
+        direct: Arc::clone(&direct),
+    };
     tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(format_layer)
+        .with(config.filter()?)
+        .with(fmt_layer(config.format, sink, ansi))
         .try_init()?;
     Ok(GlobalSubscriber {
-        level: config.level,
-        filter,
-        fmt,
-        writer,
+        config: *config,
+        queue,
+        writer: Some(writer),
+        direct,
     })
 }
 
-fn reconfigure(installed: &mut GlobalSubscriber, config: &LoggerConfig) -> Result<(), LoggerError> {
-    installed.filter.reload(config.filter()?)?;
-    installed
-        .fmt
-        .reload(fmt_layer(config.format, installed.writer.clone()))?;
-    installed.level = config.level;
-    Ok(())
-}
-
+/// Installs the log once; the same configuration again does nothing, and a different one is
+/// refused (D14).
 fn apply(config: &LoggerConfig) -> Result<(), LoggerError> {
     let mut slot = LOGGER.lock();
-    match slot.as_mut() {
-        Some(installed) => reconfigure(installed, config),
+    match slot.as_ref() {
+        Some(installed) if installed.config == *config => Ok(()),
+        Some(installed) => Err(LoggerError::AlreadyConfigured {
+            installed: installed.config,
+            wanted: *config,
+        }),
         None => {
             *slot = Some(install(config)?);
             Ok(())
@@ -241,21 +308,19 @@ fn apply(config: &LoggerConfig) -> Result<(), LoggerError> {
     }
 }
 
-/// Installs the tracing subscriber, or reconfigures it if already installed; `access_log: false`
-/// turns off the `mipyre::access` target, and `format` is `"text"` or `"json"`.
+/// Installs the tracing subscriber once per process; `access_log: false` turns off the
+/// `mipyre::access` target, and `format` is `"text"` or `"json"`. A later call with the same
+/// configuration does nothing.
 ///
-/// An event that passes the filter takes a few uncontended `RwLock` reads for the `reload`
-/// layers on top of formatting and the channel send; a filtered-out event is rejected by the
-/// cached callsite interest and never reaches a lock.
+/// An event that passes the filter takes one atomic load (where its line goes) on top of
+/// formatting and the queue send; a filtered-out event is rejected by the cached callsite
+/// interest.
 ///
 /// # Errors
 ///
-/// Fails on an unknown format, or when a foreign global subscriber already holds the slot.
-pub(crate) fn init_logger(
-    level: LogLevel,
-    access_log: bool,
-    format: &str,
-) -> Result<(), LoggerError> {
+/// Fails on an unknown format, when a foreign global subscriber already holds the slot, and
+/// when the log is already configured differently.
+pub(crate) fn init_logger(level: LogLevel, access_log: bool, format: &str) -> Result<(), LoggerError> {
     let config = LoggerConfig::new(level, access_log, format)?;
     apply(&config)?;
     tracing::info!(
@@ -276,10 +341,58 @@ pub(crate) fn init_logger(
 ///
 /// Fails when the writer thread has stopped.
 pub(crate) fn flush_logs(py: Python<'_>) -> Result<(), LoggerError> {
-    let Some(channel) = LOGGER.lock().as_ref().map(|installed| installed.writer.clone()) else {
-        return Ok(());
+    let channel = match LOGGER.lock().as_ref() {
+        Some(installed) if installed.writer.is_some() => installed.queue.channel().clone(),
+        // Each line was written by the call that logged it.
+        Some(_) | None => return Ok(()),
     };
     py.detach(move || channel.fence())?;
+    Ok(())
+}
+
+/// Stops the log's writer thread, so the process runs no thread of the logger's, and returns
+/// whether one was running. Until [`start_log_writer`], each thread that logs writes its lines
+/// itself; the lines queued before are written out first.
+///
+/// # Errors
+///
+/// Fails when the writer thread had already stopped (it panicked on a line).
+pub(crate) fn stop_log_writer(py: Python<'_>) -> Result<bool, LoggerError> {
+    let mut slot = LOGGER.lock();
+    let Some(installed) = slot.as_mut() else {
+        return Ok(false);
+    };
+    let Some(writer) = installed.writer.take() else {
+        return Ok(false);
+    };
+    // Lines from here on go to stderr directly; the ones already queued are written before the
+    // thread ends, and one that raced the switch waits for the next writer.
+    installed.direct.store(true, Ordering::Release);
+    py.detach(|| writer.stop())?;
+    Ok(true)
+}
+
+/// Starts the log's writer thread again after [`stop_log_writer`]; with no logger installed, or
+/// its thread running, it does nothing.
+///
+/// # Errors
+///
+/// Fails when the thread cannot be started; the log stays written by the logging threads.
+pub(crate) fn start_log_writer() -> Result<(), LoggerError> {
+    let mut slot = LOGGER.lock();
+    let Some(installed) = slot.as_mut() else {
+        return Ok(());
+    };
+    if installed.writer.is_some() {
+        return Ok(());
+    }
+    installed.writer = Some(
+        installed
+            .queue
+            .start_writer(std::io::stderr())
+            .map_err(LoggerError::WriterThread)?,
+    );
+    installed.direct.store(false, Ordering::Release);
     Ok(())
 }
 
@@ -289,7 +402,7 @@ pub(crate) fn flush_logs(py: Python<'_>) -> Result<(), LoggerError> {
 /// before formatting or crossing into Rust.
 #[pyfunction]
 pub(crate) fn _python_log_level() -> Option<i64> {
-    Some(LOGGER.lock().as_ref()?.level.python_level())
+    Some(LOGGER.lock().as_ref()?.config.level.python_level())
 }
 
 mod py_level {
@@ -319,12 +432,13 @@ impl RecordLevel {
 /// distinct static callsite, so `EnvFilter` keeps its near-zero-cost skip; a `None` `$wid`
 /// records no `worker` field.
 macro_rules! dispatch_python_log {
-    ($level:expr, $wid:expr, $name:expr, $pathname:expr, $lineno:expr, $message:expr $(,)?) => {
+    ($level:expr, $wid:expr, $lane:expr, $name:expr, $pathname:expr, $lineno:expr, $message:expr $(,)?) => {
         match $level {
             RecordLevel::Trace => {
                 tracing::trace!(
                     target: "mipyre::app",
                     worker = $wid,
+                    lane = $lane,
                     logger = %$name,
                     file = %$pathname,
                     line = $lineno,
@@ -335,6 +449,7 @@ macro_rules! dispatch_python_log {
                 tracing::debug!(
                     target: "mipyre::app",
                     worker = $wid,
+                    lane = $lane,
                     logger = %$name,
                     file = %$pathname,
                     line = $lineno,
@@ -345,6 +460,7 @@ macro_rules! dispatch_python_log {
                 tracing::info!(
                     target: "mipyre::app",
                     worker = $wid,
+                    lane = $lane,
                     logger = %$name,
                     file = %$pathname,
                     line = $lineno,
@@ -355,6 +471,7 @@ macro_rules! dispatch_python_log {
                 tracing::warn!(
                     target: "mipyre::app",
                     worker = $wid,
+                    lane = $lane,
                     logger = %$name,
                     file = %$pathname,
                     line = $lineno,
@@ -365,6 +482,7 @@ macro_rules! dispatch_python_log {
                 tracing::error!(
                     target: "mipyre::app",
                     worker = $wid,
+                    lane = $lane,
                     logger = %$name,
                     file = %$pathname,
                     line = $lineno,
@@ -377,11 +495,12 @@ macro_rules! dispatch_python_log {
 
 /// Route a Python logging record through Rust tracing.
 ///
-/// `mipyre._log_bridge.RustLogHandler.emit()` calls it in every interpreter. `worker_id=None`,
-/// the main interpreter, records no `worker` field, so a main-interpreter line can't pass for
-/// worker 0's.
+/// `mipyre._log.bridge.RustLogHandler.emit()` calls it in every interpreter and every
+/// process-lane worker. A sub-interpreter worker passes its `worker_id`, a process-lane worker
+/// its `lane` (the server's own lines about that worker name it the same way); the main
+/// interpreter passes neither and records neither field, so its line can't pass for a worker's.
 #[pyfunction]
-#[pyo3(signature = (levelno, name, message, pathname, lineno, worker_id=None))]
+#[pyo3(signature = (levelno, name, message, pathname, lineno, worker_id=None, lane=None))]
 pub(crate) fn emit_python_log(
     levelno: i64,
     name: &str,
@@ -389,10 +508,12 @@ pub(crate) fn emit_python_log(
     pathname: &str,
     lineno: u32,
     worker_id: Option<usize>,
+    lane: Option<usize>,
 ) {
     dispatch_python_log!(
         RecordLevel::from_levelno(levelno),
         worker_id,
+        lane,
         name,
         pathname,
         lineno,
@@ -419,10 +540,7 @@ mod tests {
 
     #[test]
     fn level_accepts_documented_names_only() {
-        assert_eq!(
-            "warning".parse::<LogLevel>().unwrap(),
-            LogLevel::At(RecordLevel::Warn)
-        );
+        assert_eq!("warning".parse::<LogLevel>().unwrap(), LogLevel::At(RecordLevel::Warn));
         assert_eq!("Off".parse::<LogLevel>().unwrap(), LogLevel::Off);
         for bad in ["", "3", "verbose", "mipyre=debug"] {
             assert!(
@@ -469,8 +587,7 @@ mod tests {
         if std::env::var_os(SLOT_TAKEN_CHILD).is_some() {
             tracing::subscriber::set_global_default(tracing_subscriber::registry())
                 .expect("the child's slot is empty until here");
-            let err = init_logger(LogLevel::At(RecordLevel::Info), false, "text")
-                .expect_err("the slot is taken");
+            let err = init_logger(LogLevel::At(RecordLevel::Info), false, "text").expect_err("the slot is taken");
             assert!(matches!(err, LoggerError::SubscriberAlreadySet(_)), "{err:?}");
             let said = err.to_string();
             assert!(said.contains("already set"), "{said}");
@@ -498,13 +615,73 @@ mod tests {
         assert!(out.contains("1 passed"), "the child ran no test:\n{out}");
     }
 
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Lines {
+        type Writer = Lines;
+        fn make_writer(&'a self) -> Lines {
+            self.clone()
+        }
+    }
+
+    fn text_line(ansi: bool) -> String {
+        let lines = Lines::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(fmt_layer(LogFormat::Text, lines.clone(), ansi));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "mipyre::app", "started");
+        });
+        let written = lines.0.lock().unwrap().clone();
+        String::from_utf8(written).unwrap()
+    }
+
+    #[test]
+    fn the_text_format_writes_colour_codes_only_when_asked() {
+        let plain = text_line(false);
+        assert!(plain.contains("started") && !plain.contains('\x1b'), "{plain:?}");
+        let coloured = text_line(true);
+        assert!(
+            coloured.contains("started") && coloured.contains('\x1b'),
+            "{coloured:?}"
+        );
+    }
+
+    fn config(level: &str, format: &str) -> LoggerConfig {
+        LoggerConfig::new(level.parse().unwrap(), false, format).unwrap()
+    }
+
+    #[test]
+    fn a_configuration_differing_in_any_part_is_not_the_installed_one() {
+        assert_eq!(config("INFO", "text"), config("INFO", "text"));
+        assert_ne!(config("INFO", "text"), config("INFO", "json"));
+        assert_ne!(config("INFO", "text"), config("WARN", "text"));
+        let refused = LoggerError::AlreadyConfigured {
+            installed: config("ERROR", "text"),
+            wanted: config("INFO", "json"),
+        };
+        let text = refused.to_string();
+        assert!(
+            text.contains("(level error, access log off, format text)")
+                && text.contains("(level info, access log off, format json)"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn access_log_off_adds_its_directive() {
         let config = LoggerConfig::new(LogLevel::At(RecordLevel::Info), false, "text").unwrap();
-        assert!(config
-            .filter()
-            .unwrap()
-            .to_string()
-            .contains("mipyre::access=off"));
+        assert!(config.filter().unwrap().to_string().contains("mipyre::access=off"));
     }
 }

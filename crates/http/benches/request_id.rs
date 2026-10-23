@@ -16,10 +16,8 @@ const HEADER: HeaderName = HeaderName::from_static("x-request-id");
 fn client_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     // Hyper hands header values over as shared slices of its read buffer, so the bench does too.
-    let value = HeaderValue::from_maybe_shared(Bytes::copy_from_slice(
-        b"4bf92f3577b34da6a3ce929d0e0e4736",
-    ))
-    .must("a valid header value");
+    let value = HeaderValue::from_maybe_shared(Bytes::copy_from_slice(b"4bf92f3577b34da6a3ce929d0e0e4736"))
+        .must("a valid header value");
     headers.insert(HEADER, value);
     headers
 }
@@ -50,11 +48,21 @@ fn request_id_write_minted(n: u64) {
     });
 }
 
+/// Writes a minted id as a response header's value, as every response does once the app names a
+/// request-id header.
+fn request_id_header_minted(n: u64) {
+    let id = RequestId::mint();
+    measure("request_id_header_minted", n, |_| {
+        black_box(black_box(&id).header_value());
+    });
+}
+
 fn main() {
-    let cases: [Case; 3] = [
+    let cases: [Case; 4] = [
         ("request_id_of_client", request_id_of_client),
         ("request_id_clone_client", request_id_clone_client),
         ("request_id_write_minted", request_id_write_minted),
+        ("request_id_header_minted", request_id_header_minted),
     ];
     run(&cases);
 }

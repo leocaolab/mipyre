@@ -9,8 +9,8 @@ use mipyre_tpc::Placement;
 use crate::telemetry::RunCounters;
 
 /// Renders the banner before the server is handed to its threads; [`log_startup`] prints it once
-/// they have all started. The GIL server passes `has_workers` so the banner does not say it has
-/// no sub-interpreters.
+/// they have all started. `has_workers` is false when no route runs on a sub-interpreter, so
+/// the server starts none.
 pub(crate) fn tpc_banner(
     threads: usize,
     logical_cpus: NonZeroUsize,
@@ -44,20 +44,17 @@ pub(crate) fn tpc_banner(
 }
 
 /// Logs the start and also prints it to stdout.
-pub(super) fn log_startup(mode: &str, listening: &[String], banner: &str) {
+pub(crate) fn log_startup(topology: &str, listening: &[String], banner: &str) {
     tracing::info!(
         target: "mipyre::server",
         version = env!("CARGO_PKG_VERSION"),
-        mode,
+        topology,
         tpc = true,
         listening = %listening.join(", "),
         banner = banner.trim_end(),
         "Mipyre started"
     );
-    println!(
-        "\n  Mipyre v{} [TPC mode, {mode}]",
-        env!("CARGO_PKG_VERSION")
-    );
+    println!("\n  Mipyre v{} [TPC mode, {topology}]", env!("CARGO_PKG_VERSION"));
     crate::serve::print_listening(listening);
     println!("{banner}");
 }
@@ -74,11 +71,7 @@ pub(crate) fn thread_cpus(pin_order: &Result<PinOrder, PinOrderError>) -> Vec<Co
 
 /// Logs and counts, once per start, what the pin order means for `threads` TPC threads. CPUs the OS
 /// would not name also mark the server degraded; a platform without pinning says nothing.
-pub(crate) fn report_pinning(
-    pin_order: &Result<PinOrder, PinOrderError>,
-    threads: usize,
-    counters: &RunCounters,
-) {
+pub(crate) fn report_pinning(pin_order: &Result<PinOrder, PinOrderError>, threads: usize, counters: &RunCounters) {
     match pin_order {
         Ok(PinOrder::Pinned {
             cpus,
@@ -116,16 +109,11 @@ pub(crate) fn report_pinning(
                 os_errno = ?os_error.and_then(std::io::Error::raw_os_error),
                 "could not read which CPUs to pin the TPC threads to; they run unpinned"
             );
-            crate::telemetry::set_degraded(crate::telemetry::Component::CpuPinning, format!("threads not pinned: {error}"));
         }
     }
 }
 
-fn tpc_threads_line(
-    threads: usize,
-    logical_cpus: usize,
-    pin_order: &Result<PinOrder, PinOrderError>,
-) -> String {
+fn tpc_threads_line(threads: usize, logical_cpus: usize, pin_order: &Result<PinOrder, PinOrderError>) -> String {
     let pinned = match pin_order {
         Ok(PinOrder::Pinned { cpus, .. }) if cpus.cpus().len() >= threads => "pinned".to_owned(),
         Ok(PinOrder::Pinned { cpus, .. }) => {
@@ -254,43 +242,34 @@ mod pin_tests {
         assert_eq!(run.read().cpu_threads_beyond_cpus, 0);
     }
 
-    fn cpu_pinning_degraded() -> bool {
-        crate::telemetry::degraded_list()
-            .iter()
-            .any(|line| line.starts_with("cpu_pinning:"))
+    fn cpu_pinning_degraded(run: &RunCounters) -> bool {
+        run.read()
+            .unpinned_because
+            .is_some_and(|why| why.starts_with("threads not pinned: "))
     }
 
     #[test]
     fn a_platform_without_pinning_is_normal_not_degraded_and_counts_nothing() {
         let _lock = pin_lock();
-        crate::telemetry::clear_degraded(&crate::telemetry::Component::CpuPinning);
         let run = RunCounters::new(false);
         let cpus = started(&Ok(PinOrder::Unsupported), 3, &run);
         assert!(cpus.is_empty());
-        assert_eq!(
-            with_cores(vec![1, 2, 3], &cpus),
-            vec![(1, None), (2, None), (3, None)]
-        );
+        assert_eq!(with_cores(vec![1, 2, 3], &cpus), vec![(1, None), (2, None), (3, None)]);
         assert_eq!(pin_counters(&run), [0; 4]);
-        assert!(!cpu_pinning_degraded());
+        assert!(!cpu_pinning_degraded(&run));
     }
 
     #[test]
     fn an_unreadable_affinity_mask_is_degraded_counted_and_leaves_every_thread_unpinned() {
         let _lock = pin_lock();
-        crate::telemetry::clear_degraded(&crate::telemetry::Component::CpuPinning);
         let run = RunCounters::new(false);
         let affinity = PinOrderError::Affinity(io::Error::from_raw_os_error(libc::EPERM));
         let cpus = started(&Err(affinity), 3, &run);
         assert!(cpus.is_empty());
-        assert_eq!(
-            with_cores(vec![1, 2, 3], &cpus),
-            vec![(1, None), (2, None), (3, None)]
-        );
+        assert_eq!(with_cores(vec![1, 2, 3], &cpus), vec![(1, None), (2, None), (3, None)]);
         // Only `cpu_affinity_unreadable` moves.
         assert_eq!(pin_counters(&run), [0, 0, 1, 0]);
-        assert!(cpu_pinning_degraded());
-        crate::telemetry::clear_degraded(&crate::telemetry::Component::CpuPinning);
+        assert!(cpu_pinning_degraded(&run));
     }
 
     #[test]
@@ -300,10 +279,7 @@ mod pin_tests {
             cache_unread: None,
             perf_unread: None,
         });
-        assert_eq!(
-            tpc_threads_line(4, 18, &pinned),
-            "TPC threads: 4 (CPUs: 18, pinned)"
-        );
+        assert_eq!(tpc_threads_line(4, 18, &pinned), "TPC threads: 4 (CPUs: 18, pinned)");
         let partly = Ok(PinOrder::Pinned {
             cpus: CpuOrder::new(ids(2)).unwrap(),
             cache_unread: None,
@@ -317,9 +293,7 @@ mod pin_tests {
             tpc_threads_line(4, 18, &Ok(PinOrder::Unsupported)),
             "TPC threads: 4 (CPUs: 18, not pinned: this platform has no CPU pinning)"
         );
-        let unreadable = Err(PinOrderError::Affinity(
-            io::Error::from_raw_os_error(libc::EPERM),
-        ));
+        let unreadable = Err(PinOrderError::Affinity(io::Error::from_raw_os_error(libc::EPERM)));
         let line = tpc_threads_line(4, 18, &unreadable);
         assert!(
             line.starts_with("TPC threads: 4 (CPUs: 18, not pinned: could not read which CPUs"),
@@ -352,20 +326,14 @@ mod pin_tests {
         let log = crate::exchange::captured_log(|| {
             report_pinning(&pinned_to(&cpus), 3, &run);
             let paired = with_cores(vec!["a", "b", "c"], &cpus);
-            assert_eq!(
-                paired,
-                vec![("a", Some(cpus[0])), ("b", Some(cpus[1])), ("c", None)]
-            );
+            assert_eq!(paired, vec![("a", Some(cpus[0])), ("b", Some(cpus[1])), ("c", None)]);
         });
         assert_eq!(run.read().cpu_threads_beyond_cpus, 1);
         let line = log
             .lines()
             .find(|l| l.contains("more TPC threads than CPUs"))
             .unwrap_or_else(|| panic!("no warning for the unpinned thread:\n{log}"));
-        assert!(
-            line.contains("\"threads\":3") && line.contains("\"cpus\":2"),
-            "{line}"
-        );
+        assert!(line.contains("\"threads\":3") && line.contains("\"cpus\":2"), "{line}");
         assert!(line.contains("\"level\":\"WARN\""), "{line}");
     }
 
@@ -414,6 +382,9 @@ mod pin_tests {
         });
         assert_eq!(pin_counters(&run), [0, 0, 1, 1]);
         let line = log.lines().find(|l| l.contains("thread_siblings_list")).expect(&log);
-        assert!(line.contains(&format!("Some({})", libc::ENOENT)), "the errno is logged: {line}");
+        assert!(
+            line.contains(&format!("Some({})", libc::ENOENT)),
+            "the errno is logged: {line}"
+        );
     }
 }

@@ -88,6 +88,14 @@ def return_huge(req):
     return {"v": 10**100}
 
 
+_WIDE_INTS = {"u64_plus_1": 2**64, "below_minus_u64": -(2**64) - 1}
+
+
+@app.get("/int/wide/{which}")
+def return_wide_int(req):
+    return {"n": _WIDE_INTS[req.params["which"]]}
+
+
 @app.get("/float/normal")
 def return_float(req):
     return {"v": 3.14}
@@ -384,7 +392,7 @@ def _assert_generic_500(resp) -> str:
     body = resp.json()
     rid = body.get("request_id")
     assert isinstance(rid, str) and rid, body
-    assert body == {"error": "Internal Server Error", "request_id": rid}, body
+    assert body == {"detail": "Internal Server Error", "request_id": rid}, body
     return rid
 
 
@@ -434,18 +442,26 @@ class TestPrimitives:
         assert client.get("/int/min64").json()["v"] == -(2**63)
 
     def test_bigint_is_number(self, client):
-        """2**63 fits in orjson's u64 range — serialized as a JSON integer."""
         v = client.get("/int/bigint").json()["v"]
         assert isinstance(v, int)
         assert v == 2**63
 
-    def test_bigint_neg_raises_error(self, client):
-        """-(2**63)-1 is below i64::MIN — orjson raises TypeError → 500."""
-        assert client.get("/int/bigint_neg").status_code == 500
+    def test_below_i64_min_is_written_in_full(self, client):
+        r = client.get("/int/bigint_neg")
+        assert r.status_code == 200
+        assert r.body == b'{"v":-9223372036854775809}'
 
-    def test_huge_int_raises_error(self, client):
-        """10**100 exceeds u64::MAX — orjson raises TypeError → 500."""
-        assert client.get("/int/huge").status_code == 500
+    def test_huge_int_is_written_in_full(self, client):
+        r = client.get("/int/huge")
+        assert r.status_code == 200
+        assert r.json()["v"] == 10**100
+
+    @pytest.mark.parametrize("which", sorted(_WIDE_INTS))
+    def test_int_wider_than_64_bits_answers_what_json_dumps_writes(self, client, which):
+        """b/760: isojson raised `Integer exceeds 64-bit range` and the client got a 500."""
+        r = client.get(f"/int/wide/{which}")
+        assert r.status_code == 200
+        assert r.body == json.dumps({"n": _WIDE_INTS[which]}, separators=(",", ":")).encode()
 
 
 class TestFloats:

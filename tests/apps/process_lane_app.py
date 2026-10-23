@@ -23,6 +23,11 @@ def pid(req):
     return {"pid": os.getpid(), "ppid": os.getppid()}
 
 
+@app.get("/mipyre-env", runtime="process")
+def mipyre_env(req):
+    return sorted(name for name in os.environ if name.startswith("MIPYRE_"))
+
+
 @app.post("/echo/{name}", runtime="process")
 def echo(req, name):
     return Response(
@@ -36,6 +41,11 @@ def echo(req, name):
 @app.get("/raise", runtime="process")
 def boom(req):
     raise ValueError("process lane test exception 7f3a")
+
+
+@app.get("/too-many-headers", runtime="process")
+def too_many_headers(req):
+    return Response("hi", headers={f"x-{i}": "v" for i in range(24_577)})
 
 
 @app.get("/exit", runtime="process")
@@ -123,7 +133,7 @@ def server_pid(req):
 
 @app.get("/lane_stats", runtime="main")
 def lane_stats(req):
-    stats = app._process_lanes.stats()
+    stats = app.process_lanes.stats()
     return {"deaths": stats["deaths"], "respawns": stats["respawns"]}
 
 

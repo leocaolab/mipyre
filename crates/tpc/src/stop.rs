@@ -272,9 +272,7 @@ mod tests {
         local(async {
             let token = CancellationToken::new();
             let stop = LocalStop::follow(&token);
-            let waiters: Vec<_> = (0..3)
-                .map(|_| tokio::task::spawn_local(stop.stopped()))
-                .collect();
+            let waiters: Vec<_> = (0..3).map(|_| tokio::task::spawn_local(stop.stopped())).collect();
             tokio::task::yield_now().await;
             for w in &waiters {
                 assert!(!w.is_finished());
@@ -344,15 +342,9 @@ mod tests {
             let task = stop.0.watcher.clone().expect("the watcher task");
             assert!(!task.is_finished(), "the watcher waits on the token");
             drop(stop);
-            assert!(
-                weak.upgrade().is_none(),
-                "the task held no strong reference"
-            );
+            assert!(weak.upgrade().is_none(), "the task held no strong reference");
             tokio::task::yield_now().await;
-            assert!(
-                task.is_finished(),
-                "dropping the last LocalStop aborts its task"
-            );
+            assert!(task.is_finished(), "dropping the last LocalStop aborts its task");
             token.cancel();
         });
     }
@@ -399,14 +391,8 @@ mod tests {
             let (old, old_waker) = counting();
             let (new, new_waker) = counting();
             let mut waiter = std::pin::pin!(stop.stopped());
-            assert!(waiter
-                .as_mut()
-                .poll(&mut Context::from_waker(&old_waker))
-                .is_pending());
-            assert!(waiter
-                .as_mut()
-                .poll(&mut Context::from_waker(&new_waker))
-                .is_pending());
+            assert!(waiter.as_mut().poll(&mut Context::from_waker(&old_waker)).is_pending());
+            assert!(waiter.as_mut().poll(&mut Context::from_waker(&new_waker)).is_pending());
             token.cancel();
             tokio::task::yield_now().await;
             assert_eq!(wakes(&new), 1, "the waker of the latest poll is woken");
@@ -431,8 +417,7 @@ mod tests {
     fn a_never_signal_never_completes() {
         local(async {
             let stop = LocalStop::never();
-            let waited =
-                tokio::time::timeout(std::time::Duration::from_millis(5), stop.stopped()).await;
+            let waited = tokio::time::timeout(std::time::Duration::from_millis(5), stop.stopped()).await;
             assert!(waited.is_err());
         });
     }
@@ -447,7 +432,12 @@ mod tests {
         for slot in held {
             slots.give_back(slot);
             let bound = 2 * held_count(slots).max(SPARE_SLOTS);
-            assert!(slots.free.len() <= bound, "{} free for {} held", slots.free.len(), held_count(slots));
+            assert!(
+                slots.free.len() <= bound,
+                "{} free for {} held",
+                slots.free.len(),
+                held_count(slots)
+            );
         }
     }
 
@@ -484,19 +474,39 @@ mod tests {
         for _ in 0..1_000 {
             let burst = taken(&mut slots, 3 * SPARE_SLOTS);
             give_all_back(&mut slots, burst);
-            assert!(slots.made.len() <= 2 * slots.live.max(SPARE_SLOTS) + 4 * SPARE_SLOTS, "{} entries for {} slots", slots.made.len(), slots.live);
+            assert!(
+                slots.made.len() <= 2 * slots.live.max(SPARE_SLOTS) + 4 * SPARE_SLOTS,
+                "{} entries for {} slots",
+                slots.made.len(),
+                slots.live
+            );
         }
         give_all_back(&mut slots, steady);
     }
 
     #[test]
     fn after_a_flood_a_thread_keeps_at_most_twice_the_spare() {
-        for flood in [SPARE_SLOTS, SPARE_SLOTS + 1, 2 * SPARE_SLOTS, 2 * SPARE_SLOTS + 1, 10 * SPARE_SLOTS, 100 * SPARE_SLOTS] {
+        for flood in [
+            SPARE_SLOTS,
+            SPARE_SLOTS + 1,
+            2 * SPARE_SLOTS,
+            2 * SPARE_SLOTS + 1,
+            10 * SPARE_SLOTS,
+            100 * SPARE_SLOTS,
+        ] {
             let mut slots = WakerSlots::default();
             let held = taken(&mut slots, flood);
             give_all_back(&mut slots, held);
-            assert!(slots.live <= 2 * SPARE_SLOTS, "a flood of {flood} left {} slots", slots.live);
-            assert!(slots.made.len() <= 2 * SPARE_SLOTS + flood.min(2 * SPARE_SLOTS), "{} entries", slots.made.len());
+            assert!(
+                slots.live <= 2 * SPARE_SLOTS,
+                "a flood of {flood} left {} slots",
+                slots.live
+            );
+            assert!(
+                slots.made.len() <= 2 * SPARE_SLOTS + flood.min(2 * SPARE_SLOTS),
+                "{} entries",
+                slots.made.len()
+            );
         }
     }
 
@@ -554,7 +564,10 @@ mod tests {
             let token = CancellationToken::new();
             let stop = LocalStop::follow(&token);
             let mut waiter = std::pin::pin!(stop.stopped());
-            assert!(waiter.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
         });
     }
 
@@ -584,13 +597,19 @@ mod tests {
             let stop = LocalStop::never();
             if reuse {
                 let mut first = std::pin::pin!(stop.stopped());
-                assert!(first.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                assert!(first
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending());
             }
             let other = stop.clone();
             ON_CLONE.with(|on| {
                 *on.borrow_mut() = Some(Box::new(move || {
                     let mut waiter = Box::pin(other.stopped());
-                    assert!(waiter.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                    assert!(waiter
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending());
                 }));
             });
             let waker = reentrant_waker();

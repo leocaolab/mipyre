@@ -18,6 +18,7 @@ import urllib.request
 
 import pytest
 
+from mipyre import BodyStream
 from tests._helpers import bound_port, kill_session, poll_until, read_file
 
 APP = os.path.join(os.path.dirname(__file__), "apps", "process_lane_app.py")
@@ -69,7 +70,7 @@ class Server:
 
 @pytest.fixture
 def server(tmp_path):
-    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=2, MIPYRE_PROCESS_TIMEOUT_MS=1500)
+    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=2, MIPYRE_PROCESS_TIMEOUT=1.5)
     yield s
     s.stop()
 
@@ -82,17 +83,32 @@ def worker_pids(s: Server, n=8) -> set[int]:
 
 
 def test_the_ring_depth_is_the_largest_power_of_two_up_to_8_the_queue_holds():
-    from mipyre._process_lane import ring_depth
+    from mipyre._process_lane.server import ring_depth
 
     assert [ring_depth(q) for q in (1, 2, 3, 4, 5, 7, 8, 9, 128)] == [1, 2, 2, 4, 4, 4, 8, 8, 8]
 
 
+@pytest.mark.parametrize(
+    "stat, exiting",
+    [
+        ("1234 (mipyre-tpc-4) R 1 1 1 0 -1 4194372 0 0 0 0", True),  # PF_EXITING set: joined, not yet gone
+        ("1234 (mipyre-tpc-4) S 1 1 1 0 -1 4194368 0 0 0 0", False),
+        ("5 (a) b (c)) S 1 1 1 0 -1 4194368 0 0", False),  # a name with spaces and ")"
+        ("5 (a) b (c)) S 1 1 1 0 -1 4 0 0", True),
+    ],
+)
+def test_a_thread_is_exiting_by_its_kernel_flag(stat, exiting):
+    from mipyre._process_lane.threads import is_exiting
+
+    assert is_exiting(stat) is exiting
+
+
 def test_a_fork_is_refused_naming_every_other_thread():
-    from mipyre._process_lane.threads import TemplateNotSingleThreaded, refusal
+    from mipyre._process_lane.threads import ThreadedTemplateError, refusal
 
     assert refusal([], "the template", "fix it") is None
     error = refusal(["polars-ooc-clea", ""], "the template", "Use import.")
-    assert isinstance(error, TemplateNotSingleThreaded)
+    assert isinstance(error, ThreadedTemplateError)
     assert str(error) == (
         "the template must be single-threaded when it forks (a fork copies only the calling thread, so a "
         "pool these threads belong to would be missing in every worker), but it runs 2 other thread(s): "
@@ -108,6 +124,13 @@ def test_hello_answers_from_a_worker_process(server):
     pids = worker_pids(server)
     assert server_pid not in pids
     assert len(pids) == 2
+
+
+def test_a_worker_gets_its_setup_from_the_template_not_from_the_environment(server):
+    # The setup goes over the worker's own fd (spawned) or is inherited in memory (forked): no
+    # MIPYRE_LANE_WORKER reaches the worker, nor the programs its handlers start.
+    names = server.json("/mipyre-env")
+    assert "MIPYRE_LANE_WORKER" not in names, names
 
 
 def test_request_parts_and_response_parts_cross_the_lane(server):
@@ -133,6 +156,17 @@ def test_a_raising_handler_is_500_and_its_worker_lives(server):
     assert worker_pids(server) == before
 
 
+def test_too_many_response_headers_are_500_and_the_worker_lives(server):
+    """b/927: past the lines a header map takes room for is the handler's ValueError, not a panic."""
+    before = worker_pids(server)
+    status, _, body = server.get("/too-many-headers")
+    assert status == 500, body
+    rid = json.loads(body)["request_id"]
+    log = poll_until(lambda: rid in server.read() and server.read(), what="error log line")
+    assert "more than 24560 lines" in next(ln for ln in log.splitlines() if rid in ln)
+    assert worker_pids(server) == before
+
+
 def test_os_exit_is_502_and_the_worker_is_replaced(server):
     before = worker_pids(server)
     status, _, body = server.get("/exit")
@@ -147,7 +181,7 @@ def test_os_exit_is_502_and_the_worker_is_replaced(server):
 
 # A lane timeout no request reaches (10 min): in the tests that use it, only what the test does
 # to a worker ends its request.
-PATIENT_MS = 600_000
+PATIENT_S = 600
 
 
 def block_path(mark) -> str:
@@ -162,7 +196,7 @@ def blocked_worker(mark) -> int:
 
 
 def test_sigkill_of_a_busy_worker_is_502_and_it_is_replaced(tmp_path):
-    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=2, MIPYRE_PROCESS_TIMEOUT_MS=PATIENT_MS)
+    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=2, MIPYRE_PROCESS_TIMEOUT=PATIENT_S)
     try:
         mark = tmp_path / "busy.pid"
         with concurrent.futures.ThreadPoolExecutor(1) as ex:
@@ -204,26 +238,35 @@ def test_a_handler_past_its_memory_limit_fails_alone_and_the_lanes_keep_serving(
     assert len(after & before) >= 1  # the worker that did not hog is the one it was
 
 
-def test_a_request_queued_behind_a_dying_worker_is_answered_by_its_replacement(tmp_path):
+def test_a_request_queued_behind_a_dying_worker_is_502_and_the_replacement_serves_only_later_ones(tmp_path):
     """One lane: a request waits in the lane while its worker runs a handler that is then
-    killed. The running request is a 502; the waiting one is not lost but answered by the
-    replacement worker, and the respawn is counted with its latency. (Which slot the waiting
-    request is in when the worker dies is pinned by the host's own test,
-    `a_dead_worker_gives_up_only_the_request_it_ran_and_the_rest_wait_for_the_next`.)"""
-    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=1, MIPYRE_PROCESS_TIMEOUT_MS=PATIENT_MS)
+    killed. The running request and the waiting one are both 502: the waiting one is not run
+    by the replacement, since the dead worker could have rewritten its bytes. A request sent
+    after the death is answered by the replacement, and the respawn is counted with its
+    latency. (Which slots the take-over gives up is pinned by the host's own test,
+    `a_dead_worker_gives_up_the_request_it_ran_and_those_it_never_took`.)"""
+    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=1, MIPYRE_PROCESS_TIMEOUT=PATIENT_S)
     try:
         assert s.json("/lanes")["respawns"] == 0
         mark = tmp_path / "busy.pid"
         with concurrent.futures.ThreadPoolExecutor(2) as ex:
             running = ex.submit(s.get, block_path(mark), None)
             dying = blocked_worker(mark)
-            waiting = ex.submit(s.json, "/pid", timeout=None)
-            # A round trip through the server after the waiting request was sent.
+            waiting = ex.submit(s.get, "/pid", None)
             assert s.json("/server_pid")["pid"] != dying
+            # The kill waits until the host holds both requests, the blocked one and the one queued
+            # behind it: a submit returns before its request reaches the server, so a round trip
+            # sent after it does not prove it arrived (b/971).
+            poll_until(lambda: s.json("/lanes")["requests_in_lanes"] == 2, timeout=None, what="/pid queued behind /block")
             os.kill(dying, signal.SIGKILL)
             status, _, body = running.result()
-            answer = waiting.result()
+            waiting_status, _, waiting_body = waiting.result()
         assert status == 502, body
+        assert waiting_status == 502, waiting_body
+        rid = json.loads(waiting_body)["request_id"]
+        log = poll_until(lambda: rid in s.read() and s.read(), what="the untaken request's log line")
+        assert "died before it took the request" in next(ln for ln in log.splitlines() if rid in ln and "died" in ln)
+        answer = s.json("/pid", timeout=None)
         assert answer["pid"] != dying
         stats = poll_until(lambda: (st := s.json("/lanes"))["respawn_us"] and st, timeout=None,
                            what="the respawn latency recorded")
@@ -255,7 +298,7 @@ def test_a_handler_past_the_timeout_is_504_and_its_worker_is_replaced(server, tm
 
 
 def test_a_full_queue_is_503_never_a_wait(tmp_path):
-    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=1, MIPYRE_PROCESS_QUEUE=8, MIPYRE_PROCESS_TIMEOUT_MS=30000)
+    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=1, MIPYRE_PROCESS_QUEUE=8, MIPYRE_PROCESS_TIMEOUT=30)
     try:
         with concurrent.futures.ThreadPoolExecutor(40) as ex:
             results = list(ex.map(lambda _: s.get("/sleep?s=0.3", timeout=30)[0], range(40)))
@@ -358,7 +401,7 @@ def test_numpy_longdouble_from_int_in_a_worker(server):
 @pytest.mark.parametrize(
     "kwargs, fn_src, needle",
     [
-        ({"stream": True, "runtime": "process"}, "def h(req): return 1", "stream=True"),
+        ({"body": BodyStream, "runtime": "process"}, "def h(req): return 1", "body=BodyStream"),
         ({"runtime": "process"}, "async def h(req): return 1", "async def"),
     ],
 )
@@ -372,18 +415,24 @@ def test_unservable_process_routes_are_registration_errors(kwargs, fn_src, needl
         app.post("/x", ns["h"], **kwargs)
 
 
-def test_python_app_py_with_process_routes_is_refused_with_the_command_to_run(tmp_path):
-    """The template must hold no app code, so mipyre must start before the app: under
-    `python app.py` the app is already imported. The error gives the equivalent command."""
+def test_python_app_py_serves_process_routes_after_its_import_started_threads(tmp_path):
+    """Under `python app.py` the app's first run starts the template, after the app was
+    imported. This app's import ran a polars query, which started polars' threads: the
+    template is a new interpreter on every platform (b/909), which the threads do not reach,
+    so the route serves."""
     app = os.path.join(os.path.dirname(__file__), "apps", "process_lane_threaded_app.py")
-    r = subprocess.run([sys.executable, app], capture_output=True, text=True, timeout=60)
-    assert r.returncode != 0, r.stdout[-2000:]
-    out = r.stdout + r.stderr
-    assert "ProcessLanesNeedLauncher" in out, out[-3000:]
-    assert "mipyre run tests/apps/process_lane_threaded_app.py:app --host 127.0.0.1 --port 0" in out or (
-        "process_lane_threaded_app.py:app --host 127.0.0.1 --port 0" in out
-    ), out[-3000:]
-    assert "Listening on" not in out
+    log_path = str(tmp_path / "server.log")
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen([sys.executable, app], stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                                env=dict(os.environ, MIPYRE_PROCESS_WORKERS="1"))
+    try:
+        port = bound_port(read_file(log_path), proc)
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/q", timeout=30) as r:
+            assert r.status == 200 and json.loads(r.read()) == {"n": 3}
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
 
 
 def test_a_polars_query_at_import_no_longer_matters(tmp_path):
@@ -430,7 +479,7 @@ def test_a_worker_stuck_in_a_handler_dies_with_its_template(tmp_path):
     """SIGKILL the template while its worker is in a handler: the worker is gone within 1 s
     (macOS: a kqueue EVFILT_PROC watch thread; Linux: PR_SET_PDEATHSIG). The worker is in its
     handler once the handler has written its pid (b/494: until then a 0.5 s sleep guessed it)."""
-    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=1, MIPYRE_PROCESS_TIMEOUT_MS=PATIENT_MS)
+    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=1, MIPYRE_PROCESS_TIMEOUT=PATIENT_S)
     try:
         mark = tmp_path / "stuck.pid"
         with concurrent.futures.ThreadPoolExecutor(1) as ex:
@@ -461,7 +510,7 @@ def test_a_worker_stuck_in_a_handler_dies_with_its_template(tmp_path):
 
 def test_start_fork_serves_and_replaces_a_killed_worker(tmp_path):
     """start="fork": the template imported the app; workers are forked from it."""
-    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=2, MIPYRE_PROCESS_START="fork", MIPYRE_PROCESS_TIMEOUT_MS=1500)
+    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=2, MIPYRE_PROCESS_START="fork", MIPYRE_PROCESS_TIMEOUT=1.5)
     try:
         assert s.get("/hello")[2] == b"hello"
         before = worker_pids(s)
@@ -482,7 +531,7 @@ def test_start_fork_refuses_an_app_whose_import_starts_threads(tmp_path):
                        env=dict(os.environ, MIPYRE_PROCESS_WORKERS="1", MIPYRE_PROCESS_START="fork"))
     out = r.stdout + r.stderr
     assert r.returncode != 0, out[-3000:]
-    assert "TemplateNotSingleThreaded" in out and "polars-ooc-clea" in out, out[-3000:]
+    assert "ThreadedTemplateError" in out and "polars-ooc-clea" in out, out[-3000:]
     assert 'start="import"' in out
     assert "Listening on" not in out or "could not start" in out
 

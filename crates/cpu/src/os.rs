@@ -14,14 +14,10 @@ use std::path::PathBuf;
 use core_affinity::CoreId;
 
 #[cfg(any(target_os = "linux", test))]
-use crate::plan::{
-    decide, parse_cpu_max, perf_gap, perf_value, CoreGroups, CpuFacts, CpuSet, Facts,
-};
+use crate::plan::{decide, parse_cpu_max, perf_gap, perf_value, CoreGroups, CpuFacts, CpuSet, Facts};
 #[cfg(target_os = "linux")]
 use crate::plan::{parse_cpu_list, tightest, CpuMask, MAX_CPUS};
-use crate::plan::{
-    threads_for, CpuListError, CpuMaskError, CpuMaxError, CpuOrder, Cpus, PerfValueError, Quota,
-};
+use crate::plan::{threads_for, CpuListError, CpuMaskError, CpuMaxError, CpuOrder, Cpus, PerfValueError, Quota};
 
 /// Holds the counts the threads are sized from and the CPUs they are pinned to. On Linux the
 /// physical cores and the pin order come from one read, so they cannot disagree; the logical
@@ -87,10 +83,7 @@ impl fmt::Display for CpuReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CpuReadError::Logical(e) => {
-                write!(
-                    f,
-                    "the OS did not say how many CPUs this process may use: {e}"
-                )
+                write!(f, "the OS did not say how many CPUs this process may use: {e}")
             }
             CpuReadError::Cores { logical } => write!(
                 f,
@@ -229,11 +222,9 @@ impl fmt::Display for CapacityFileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CapacityFileError::Os(e) => write!(f, "{e}"),
-            CapacityFileError::Malformed { path, text, source } => write!(
-                f,
-                "{}: {text:?} is not a capacity: {source}",
-                path.display()
-            ),
+            CapacityFileError::Malformed { path, text, source } => {
+                write!(f, "{}: {text:?} is not a capacity: {source}", path.display())
+            }
         }
     }
 }
@@ -331,11 +322,7 @@ impl PinError {
 
 impl fmt::Display for PinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "could not pin the thread to CPU {}: {}",
-            self.core.id, self.fault
-        )
+        write!(f, "could not pin the thread to CPU {}: {}", self.core.id, self.fault)
     }
 }
 
@@ -365,14 +352,8 @@ impl fmt::Display for PinFault {
         match self {
             PinFault::NoRoom(e) => write!(f, "{e}"),
             PinFault::Os(e) => write!(f, "{e}"),
-            PinFault::Unsupported => write!(
-                f,
-                "this platform has no CPU pinning (macOS keeps no thread affinity)"
-            ),
-            PinFault::Refused => write!(
-                f,
-                "core_affinity::set_for_current refused (it gives no OS error code)"
-            ),
+            PinFault::Unsupported => write!(f, "this platform has no CPU pinning (macOS keeps no thread affinity)"),
+            PinFault::Refused => write!(f, "core_affinity::set_for_current refused (it gives no OS error code)"),
         }
     }
 }
@@ -390,9 +371,7 @@ fn pin_current(core: CoreId) -> Result<(), PinFault> {
     let mask = CpuMask::of_one(core.id).map_err(PinFault::NoRoom)?;
     // SAFETY: pid 0 is the calling thread; the kernel reads `mask.bytes()` from the mask's
     // words, which outlive the call.
-    let rc = unsafe {
-        libc::sched_setaffinity(0, mask.bytes(), mask.words().as_ptr().cast::<libc::cpu_set_t>())
-    };
+    let rc = unsafe { libc::sched_setaffinity(0, mask.bytes(), mask.words().as_ptr().cast::<libc::cpu_set_t>()) };
     if rc != 0 {
         return Err(PinFault::Os(io::Error::last_os_error()));
     }
@@ -419,9 +398,7 @@ fn pin_current(core: CoreId) -> Result<(), PinFault> {
 #[cfg(target_os = "macos")]
 pub fn elevate_thread_qos_macos() -> io::Result<()> {
     // SAFETY: sets the calling thread's own QoS class; no pointers.
-    let rc = unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
-    };
+    let rc = unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
     if rc == 0 {
         return Ok(());
     }
@@ -461,10 +438,7 @@ impl HostCpus {
 
 /// Takes `cores` as `None` when the pin-order read failed; that read keeps its own error.
 #[cfg(any(target_os = "linux", test))]
-fn counted(
-    logical: io::Result<NonZeroUsize>,
-    cores: Option<NonZeroUsize>,
-) -> Result<Cpus, CpuReadError> {
+fn counted(logical: io::Result<NonZeroUsize>, cores: Option<NonZeroUsize>) -> Result<Cpus, CpuReadError> {
     match (logical, cores) {
         (Err(e), _) => Err(CpuReadError::Logical(e)),
         (Ok(logical), Some(cores)) => Ok(Cpus::new(logical, cores)),
@@ -496,11 +470,8 @@ fn read_pinning() -> Result<PinOrder, PinOrderError> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_pinning() -> Result<PinOrder, PinOrderError> {
-    let ids = core_affinity::get_core_ids().ok_or_else(|| {
-        PinOrderError::Affinity(io::Error::other(
-            "core_affinity could not list this process's CPUs",
-        ))
-    })?;
+    let ids = core_affinity::get_core_ids()
+        .ok_or_else(|| PinOrderError::Affinity(io::Error::other("core_affinity could not list this process's CPUs")))?;
     let cpus = CpuOrder::new(ids).ok_or(PinOrderError::EmptyMask)?;
     Ok(PinOrder::Pinned {
         cpus,
@@ -639,8 +610,7 @@ fn decided(
 /// Walks the cgroups the same way std's `available_parallelism` does.
 #[cfg(target_os = "linux")]
 pub fn read_cpu_quota() -> Result<Quota, QuotaReadError> {
-    let cgroup =
-        std::fs::read_to_string("/proc/self/cgroup").map_err(QuotaReadError::ProcCgroup)?;
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").map_err(QuotaReadError::ProcCgroup)?;
     let Some(path) = cgroup.lines().find_map(|line| line.strip_prefix("0::")) else {
         return Err(QuotaReadError::NotCgroupV2 { text: cgroup });
     };
@@ -650,10 +620,7 @@ pub fn read_cpu_quota() -> Result<Quota, QuotaReadError> {
 /// Refuses a group with `..` in it: joined to `root`, it would read files outside the cgroup tree.
 #[cfg(target_os = "linux")]
 fn quota_under(root: &Path, group: &str) -> Result<Quota, QuotaReadError> {
-    if Path::new(group)
-        .components()
-        .any(|c| c == Component::ParentDir)
-    {
+    if Path::new(group).components().any(|c| c == Component::ParentDir) {
         return Err(QuotaReadError::OutsideNamespace {
             group: group.to_owned(),
         });
@@ -706,12 +673,10 @@ fn read_cpu_max_entry(dir: &Path) -> Result<CpuMaxEntry, QuotaReadError> {
 #[cfg(any(target_os = "linux", test))]
 fn level_quota(group: &str, dir: &Path, entry: CpuMaxEntry) -> Result<Quota, QuotaReadError> {
     match entry {
-        CpuMaxEntry::Text(text) => {
-            parse_cpu_max(&text).map_err(|source| QuotaReadError::Malformed {
-                path: dir.join("cpu.max").display().to_string(),
-                source,
-            })
-        }
+        CpuMaxEntry::Text(text) => parse_cpu_max(&text).map_err(|source| QuotaReadError::Malformed {
+            path: dir.join("cpu.max").display().to_string(),
+            source,
+        }),
         CpuMaxEntry::NoFile => Ok(Quota::Unlimited),
         CpuMaxEntry::NoGroup => Err(QuotaReadError::NoGroupDir {
             group: group.to_owned(),
@@ -731,20 +696,15 @@ pub fn read_cpu_quota() -> Result<Quota, QuotaReadError> {
 fn physical_cores() -> io::Result<NonZeroUsize> {
     let (name, count) = match sysctl_int(c"hw.perflevel0.physicalcpu") {
         Ok(count) => ("hw.perflevel0.physicalcpu", count),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            ("hw.physicalcpu", sysctl_int(c"hw.physicalcpu")?)
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => ("hw.physicalcpu", sysctl_int(c"hw.physicalcpu")?),
         Err(e) => return Err(e),
     };
-    usize::try_from(count)
-        .ok()
-        .and_then(NonZeroUsize::new)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("sysctl {name} answered {count} cores"),
-            )
-        })
+    usize::try_from(count).ok().and_then(NonZeroUsize::new).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sysctl {name} answered {count} cores"),
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -803,11 +763,7 @@ fn allowed_cpus() -> io::Result<Vec<CoreId>> {
         // SAFETY: pid 0 is the calling thread; the kernel writes at most `mask.bytes()` into
         // the mask's words, which outlive the call.
         let rc = unsafe {
-            libc::sched_getaffinity(
-                0,
-                mask.bytes(),
-                mask.words_mut().as_mut_ptr().cast::<libc::cpu_set_t>(),
-            )
+            libc::sched_getaffinity(0, mask.bytes(), mask.words_mut().as_mut_ptr().cast::<libc::cpu_set_t>())
         };
         if rc == 0 {
             break;
@@ -869,11 +825,7 @@ mod reading_tests {
 
     fn pinned(
         read: Result<(CoreGroups, PinOrder), PinOrderError>,
-    ) -> (
-        CoreGroups,
-        Option<TopologyReadError>,
-        Option<TopologyReadError>,
-    ) {
+    ) -> (CoreGroups, Option<TopologyReadError>, Option<TopologyReadError>) {
         let (cores, pin_order) = read.unwrap();
         let PinOrder::Pinned {
             cache_unread,
@@ -910,10 +862,7 @@ mod reading_tests {
         let Some(TopologyReadError::CpuList(e)) = &cache_unread else {
             panic!("{cache_unread:?}")
         };
-        assert_eq!(
-            e.os_error().and_then(io::Error::raw_os_error),
-            Some(libc::ENOENT)
-        );
+        assert_eq!(e.os_error().and_then(io::Error::raw_os_error), Some(libc::ENOENT));
         assert!(e.to_string().contains(path), "{e}");
         assert!(perf_unread.is_none());
     }
@@ -930,11 +879,7 @@ mod reading_tests {
             }
         });
         let (cores, cache_unread, perf_unread) = pinned(decided(files, Ok(None)));
-        assert_eq!(
-            cores.top_count().get(),
-            4,
-            "CPU 0 alone would be the fast tier"
-        );
+        assert_eq!(cores.top_count().get(), 4, "CPU 0 alone would be the fast tier");
         assert!(cache_unread.is_none());
         let Some(TopologyReadError::Capacity(CapacityFileError::Os(e))) = &perf_unread else {
             panic!("{perf_unread:?}")
@@ -952,10 +897,7 @@ mod reading_tests {
         let Some(TopologyReadError::CpuList(e)) = &perf_unread else {
             panic!("{perf_unread:?}")
         };
-        assert_eq!(
-            e.os_error().and_then(io::Error::raw_os_error),
-            Some(libc::EACCES)
-        );
+        assert_eq!(e.os_error().and_then(io::Error::raw_os_error), Some(libc::EACCES));
     }
 
     #[test]
@@ -987,10 +929,7 @@ mod reading_tests {
     fn an_unreadable_siblings_file_keeps_its_errno_for_the_caller() {
         let path = "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list";
         let err = PinOrderError::Topology(CpuListFileError::Os(os_error(path, libc::EACCES)));
-        assert_eq!(
-            err.os_error().and_then(io::Error::raw_os_error),
-            Some(libc::EACCES)
-        );
+        assert_eq!(err.os_error().and_then(io::Error::raw_os_error), Some(libc::EACCES));
         assert!(err.to_string().contains(path), "{err}");
         let source = std::error::Error::source(&err).expect("the file error");
         assert!(source.is::<CpuListFileError>(), "{source}");
@@ -1005,17 +944,12 @@ mod reading_tests {
 
     #[test]
     fn counts_read_are_counts_and_each_failure_is_its_own_error() {
-        assert_eq!(
-            counted(Ok(n(16)), Some(n(8))).unwrap(),
-            Cpus::new(n(16), n(8))
-        );
+        assert_eq!(counted(Ok(n(16)), Some(n(8))).unwrap(), Cpus::new(n(16), n(8)));
         let Err(CpuReadError::Cores { logical }) = counted(Ok(n(16)), None) else {
             panic!("no cores read")
         };
         assert_eq!(logical, n(16));
-        let Err(CpuReadError::Logical(e)) =
-            counted(Err(io::Error::other("no parallelism")), Some(n(8)))
-        else {
+        let Err(CpuReadError::Logical(e)) = counted(Err(io::Error::other("no parallelism")), Some(n(8))) else {
             panic!("no logical count")
         };
         assert_eq!(e.to_string(), "no parallelism");
@@ -1036,10 +970,7 @@ mod cgroup_level_tests {
     #[test]
     fn a_group_directory_without_cpu_max_sets_no_limit() {
         let dir = Path::new("/sys/fs/cgroup/a");
-        assert_eq!(
-            level_quota("/a", dir, CpuMaxEntry::NoFile).unwrap(),
-            Quota::Unlimited
-        );
+        assert_eq!(level_quota("/a", dir, CpuMaxEntry::NoFile).unwrap(), Quota::Unlimited);
     }
 
     #[test]
@@ -1058,14 +989,8 @@ mod cgroup_level_tests {
     fn a_level_with_cpu_max_is_its_parsed_limit_and_a_bad_one_names_the_file() {
         let dir = Path::new("/sys/fs/cgroup/a");
         let text = |t: &str| CpuMaxEntry::Text(t.to_owned());
-        assert_eq!(
-            level_quota("/a", dir, text("200000 100000\n")).unwrap(),
-            cores(2)
-        );
-        assert_eq!(
-            level_quota("/a", dir, text("max 100000\n")).unwrap(),
-            Quota::Unlimited
-        );
+        assert_eq!(level_quota("/a", dir, text("200000 100000\n")).unwrap(), cores(2));
+        assert_eq!(level_quota("/a", dir, text("max 100000\n")).unwrap(), Quota::Unlimited);
         let e = level_quota("/a", dir, text("oops 100000")).unwrap_err();
         let QuotaReadError::Malformed { path, .. } = &e else {
             panic!("{e}")
@@ -1121,18 +1046,12 @@ mod tests {
         let allowed = allowed_cpus().expect("sched_getaffinity");
         assert!(!allowed.is_empty());
         if allowed.len() == 1 {
-            eprintln!(
-                "one allowed CPU ({:?}): narrowing cannot be observed",
-                allowed[0]
-            );
+            eprintln!("one allowed CPU ({:?}): narrowing cannot be observed", allowed[0]);
         }
         let one = allowed[0];
         let (seen, still_allowed) = std::thread::spawn(move || {
             pin_current(one).expect("pin to an allowed CPU");
-            (
-                allowed_cpus().expect("sched_getaffinity after pinning"),
-                vec![one],
-            )
+            (allowed_cpus().expect("sched_getaffinity after pinning"), vec![one])
         })
         .join()
         .expect("the pinning thread");
@@ -1142,10 +1061,7 @@ mod tests {
 
     #[test]
     fn the_smallest_mask_is_the_size_of_cpu_set_t() {
-        assert_eq!(
-            CpuMask::empty(1).bytes(),
-            std::mem::size_of::<libc::cpu_set_t>()
-        );
+        assert_eq!(CpuMask::empty(1).bytes(), std::mem::size_of::<libc::cpu_set_t>());
     }
 
     #[test]
@@ -1175,10 +1091,7 @@ mod tests {
     impl Tree {
         fn new(tag: &str) -> io::Result<Self> {
             let seq = TREE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "mipyre_cpu_quota_{tag}_{}_{seq}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir().join(format!("mipyre_cpu_quota_{tag}_{}_{seq}", std::process::id()));
             std::fs::create_dir_all(&dir)?;
             Ok(Tree(dir))
         }
@@ -1253,10 +1166,7 @@ mod tests {
             panic!("{e}")
         };
         assert_eq!(group, "/user.slice/a.scope");
-        assert_eq!(
-            *dir,
-            tree.0.join("user.slice/a.scope").display().to_string()
-        );
+        assert_eq!(*dir, tree.0.join("user.slice/a.scope").display().to_string());
     }
 
     #[test]
@@ -1292,14 +1202,10 @@ mod tests {
         want.sort_unstable();
         assert_eq!(sorted, want, "every allowed CPU is pinned exactly once");
         let firsts: std::collections::BTreeSet<CoreId> = first_cpus(&cores).into_iter().collect();
-        let leading: std::collections::BTreeSet<CoreId> =
-            pinned[..firsts.len()].iter().copied().collect();
+        let leading: std::collections::BTreeSet<CoreId> = pinned[..firsts.len()].iter().copied().collect();
         assert_eq!(leading, firsts, "first CPUs of the cores come first");
         assert!(cores.top_count().get() <= core_count(&cores));
-        assert_eq!(
-            threads_for(cores.top_count(), Quota::Unlimited),
-            cores.top_count()
-        );
+        assert_eq!(threads_for(cores.top_count(), Quota::Unlimited), cores.top_count());
     }
 
     #[test]
@@ -1335,11 +1241,7 @@ mod tests {
         let tree = Tree::new("absent").unwrap();
         let path = tree.0.join("cpus");
         let e = read_cpu_list_file(path.clone()).unwrap_err();
-        let CpuListFileError::Os(FileError {
-            path: named,
-            source,
-        }) = &e
-        else {
+        let CpuListFileError::Os(FileError { path: named, source }) = &e else {
             panic!("{e}")
         };
         assert_eq!(*named, path);

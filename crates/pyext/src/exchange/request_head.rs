@@ -7,10 +7,10 @@ use hyper::http::request::Parts;
 
 use crate::exchange::error::RequestLabel;
 use crate::exchange::request::Request;
-use mipyre_transport::driver::Peer;
-use mipyre_http::plan::route::Params;
 use crate::exchange::request::RequestBody;
 use mipyre_http::io::request_id::RequestId;
+use mipyre_http::plan::route::Params;
+use mipyre_transport::driver::Peer;
 
 pub(crate) struct RequestHead {
     pub(crate) parts: Parts,

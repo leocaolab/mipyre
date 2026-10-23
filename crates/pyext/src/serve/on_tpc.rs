@@ -2,7 +2,8 @@
 //!
 //! A `def` worker route runs inline on the TPC thread, in its own sub-interpreter, with no
 //! cross-thread wake; an `async def` route goes to the async worker pool, and a `runtime="main"`
-//! route or the fallback to the main-interpreter bridge.
+//! route or the fallback to the main-interpreter bridge (an `async def` one to main's async
+//! engine).
 //!
 //! The inline path allocates nothing of its own per request: the handler's `Request` takes the
 //! method, URI, headers and body bytes hyper already holds, and the log line keeps only a copy of
@@ -15,20 +16,18 @@ use hyper::body::Incoming;
 use hyper::{Request, Response};
 
 use crate::exchange;
-use crate::exchange::{
-    refuse, HandlerError, UnansweredError, ReplyHolder, RequestHead, RequestLabel, WorkerGroup,
-};
-use crate::runtime::{BridgeJob, MainInterpBridge, ServeOutcome};
-use crate::serve::tpc::{ThreadWorker, TpcThread};
-use crate::serve::site::Site;
-use mipyre_http::plan::route::{BodyMode, HandlerCall, HandlerKind, HandlerTarget, RouteId};
 use crate::exchange::RequestBody;
+use crate::exchange::{refuse, HandlerError, ReplyHolder, RequestHead, RequestLabel, UnansweredError, WorkerGroup};
+use crate::runtime::{BridgeJob, MainInterpBridge, ServeOutcome};
+use crate::serve::site::Site;
+use crate::serve::tpc::{ThreadWorker, TpcThread};
 use mipyre_http::io::body::{body_channel, stream_body_feeder, ResponseBody};
+use mipyre_http::plan::route::{BodyMode, HandlerCall, HandlerKind, HandlerTarget, MainHandler, RouteId};
 
 use super::on_pool::serve_on_pool;
 use super::pipeline::{
-    await_reply, await_streamed_reply, collect_body, fail, finish, preprocess, reply_or_lost,
-    without_workers, AcceptEncoding, Disposition, HandlerRequest, ResponseSource,
+    await_reply, await_streamed_reply, collect_body, fail, finish, preprocess, reply_or_lost, without_workers,
+    AcceptEncoding, Disposition, HandlerRequest, Requester, ResponseSource,
 };
 use super::respond::{build_main_http_response, http_response};
 
@@ -46,34 +45,20 @@ pub(crate) async fn handle_request_tpc_inline(
     // tables with async or main routes, so a missing one is a bug in building the server: that
     // request gets a 500 and the thread keeps serving.
     let resp = match prepared.call {
-        HandlerCall::Worker(route, HandlerKind::Sync) => match tpc_thread.slot.worker() {
+        HandlerCall::Worker(route, HandlerKind::Sync) => match tpc_thread.worker.as_ref() {
             Some(worker) => run_inline(site, worker, prepared, route).await,
-            None => without_workers(
-                site,
-                prepared,
-                WorkerGroup::Subinterp,
-                ResponseSource::Inline,
-            ),
+            None => without_workers(site, prepared, WorkerGroup::Subinterp, ResponseSource::Inline),
         },
         // It runs off this thread so the handler's awaits overlap other requests and its budget
         // is enforced on time.
-        HandlerCall::Worker(route, kind @ HandlerKind::Async) => {
-            match tpc_thread.runners.async_pool.as_ref() {
-                Some(pool) => serve_on_pool(pool, site, prepared, route, kind).await,
-                None => {
-                    without_workers(site, prepared, WorkerGroup::Subinterp, ResponseSource::Pool)
-                }
-            }
-        }
+        HandlerCall::Worker(route, kind @ HandlerKind::Async) => match tpc_thread.async_pool.as_ref() {
+            Some(pool) => serve_on_pool(pool, site, prepared, route, kind).await,
+            None => without_workers(site, prepared, WorkerGroup::Subinterp, ResponseSource::Pool),
+        },
         HandlerCall::Lane(route) => super::on_lane::serve_on_lane(site, prepared, route).await,
-        HandlerCall::Main(target, body) => match tpc_thread.runners.main_bridge.as_deref() {
-            Some(bridge) => run_on_bridge(site, bridge, prepared, target, body).await,
-            None => without_workers(
-                site,
-                prepared,
-                WorkerGroup::MainBridge,
-                ResponseSource::Bridge,
-            ),
+        HandlerCall::Main(target, handler) => match tpc_thread.main_bridge.as_deref() {
+            Some(bridge) => run_on_bridge(site, bridge, prepared, target, handler).await,
+            None => without_workers(site, prepared, WorkerGroup::MainBridge, ResponseSource::Bridge),
         },
     };
     Ok(resp)
@@ -99,18 +84,9 @@ async fn run_inline(
         ..
     } = prepared;
     let label = head.label();
+    let client = head.client;
     let resp = match collect_body(body, &site.rules.settings.limits).await {
-        Ok(bytes) => {
-            call_inline(
-                site,
-                worker,
-                route,
-                head,
-                RequestBody::Buffered(bytes),
-                &label,
-            )
-            .await
-        }
+        Ok(bytes) => call_inline(site, worker, route, head, RequestBody::Buffered(bytes), &label).await,
         Err(e) => fail(e, &label, &site.counters),
     };
     finish(
@@ -118,6 +94,7 @@ async fn run_inline(
         site,
         &label.method,
         label.uri.path(),
+        Requester::Given(&label.id, &client),
         timer,
         origin,
         ResponseSource::Inline,
@@ -179,12 +156,7 @@ fn overran(took: Duration, budget: Duration) -> bool {
 /// raised so the overrun's one log line shows it.
 #[cold]
 #[inline(never)]
-fn overrun<T>(
-    result: Result<T, HandlerError>,
-    took: Duration,
-    budget: Duration,
-    handler: &str,
-) -> UnansweredError {
+fn overrun<T>(result: Result<T, HandlerError>, took: Duration, budget: Duration, handler: &str) -> UnansweredError {
     UnansweredError::Overran {
         handler: handler.to_owned(),
         budget,
@@ -198,7 +170,7 @@ async fn run_on_bridge(
     bridge: &MainInterpBridge,
     prepared: HandlerRequest,
     target: HandlerTarget,
-    body: BodyMode,
+    handler: MainHandler,
 ) -> Response<ResponseBody> {
     let HandlerRequest {
         head,
@@ -208,21 +180,14 @@ async fn run_on_bridge(
         ..
     } = prepared;
     let label = head.label();
-    let resp = dispatch_to_bridge(
-        bridge,
-        head,
-        incoming,
-        target,
-        body,
-        site,
-        &label,
-    )
-    .await;
+    let client = head.client;
+    let resp = dispatch_to_bridge(bridge, head, incoming, target, handler, site, &label).await;
     finish(
         resp,
         site,
         &label.method,
         label.uri.path(),
+        Requester::Given(&label.id, &client),
         timer,
         origin,
         ResponseSource::Bridge,
@@ -234,7 +199,7 @@ async fn dispatch_to_bridge(
     head: RequestHead,
     incoming: Incoming,
     target: HandlerTarget,
-    body_mode: BodyMode,
+    handler: MainHandler,
     site: &Site,
     label: &RequestLabel,
 ) -> Response<ResponseBody> {
@@ -242,7 +207,7 @@ async fn dispatch_to_bridge(
     // A streamed body is fed on this thread's LocalSet while the bridge's handler reads it.
     // The feeder's handle is kept so a rejected dispatch can stop it: dropping the receiver
     // alone isn't seen while the feeder waits on the client's next frame.
-    let (body, feeder) = match body_mode {
+    let (body, feeder) = match handler.body() {
         BodyMode::Streamed => {
             let (tx, rx) = body_channel();
             let feeder = tokio::task::spawn_local(stream_body_feeder(
@@ -266,7 +231,7 @@ async fn dispatch_to_bridge(
         request: exchange::Request::new(head, body),
         reply,
     };
-    if let Err(err) = bridge.try_dispatch(item) {
+    if let Err(err) = bridge.try_dispatch(item, handler) {
         if let Some(feeder) = feeder {
             feeder.abort();
         }
@@ -275,15 +240,11 @@ async fn dispatch_to_bridge(
 
     let reply = reply_or_lost(response_rx, ReplyHolder::MainBridge);
     let reply = match feeder {
-        Some(mut feeder) => {
-            await_streamed_reply(settings.limits.request_budget, &mut feeder, reply).await
-        }
+        Some(mut feeder) => await_streamed_reply(settings.limits.request_budget, &mut feeder, reply).await,
         None => await_reply(settings.limits.request_budget, reply).await,
     };
     match reply {
-        Ok(result) => {
-            build_main_http_response(result, &accept_encoding, &site.counters).await
-        }
+        Ok(result) => build_main_http_response(result, &accept_encoding, &site.counters).await,
         Err(e) => fail(e, label, &site.counters),
     }
 }
@@ -313,8 +274,12 @@ mod tests {
     fn a_call_past_its_budget_is_an_overrun_and_its_result_is_dropped() {
         let took = BUDGET + Duration::from_nanos(1);
         assert!(overran(took, BUDGET));
-        let UnansweredError::Overran { handler, budget, took: t, raised } =
-            overrun(Ok::<_, HandlerError>(7), took, BUDGET, "slow")
+        let UnansweredError::Overran {
+            handler,
+            budget,
+            took: t,
+            raised,
+        } = overrun(Ok::<_, HandlerError>(7), took, BUDGET, "slow")
         else {
             panic!("an overrun");
         };
@@ -339,8 +304,7 @@ mod tests {
             .insert("GET", "/", (), "index".into(), HandlerPlace::Worker(HandlerKind::Sync))
             .expect("one route");
         let route = table.route_id(0);
-        let n: u64 =
-            std::env::var("BENCH_N").map_or(16, |n| n.parse().expect("BENCH_N: a number of checks"));
+        let n: u64 = std::env::var("BENCH_N").map_or(16, |n| n.parse().expect("BENCH_N: a number of checks"));
         for _ in 0..n {
             let response: Result<HandlerResponse, HandlerError> = Ok(HandlerResponse::new(
                 hyper::StatusCode::OK,
@@ -364,8 +328,9 @@ mod tests {
     #[test]
     fn an_overrun_carries_what_the_handler_raised() {
         let late = BUDGET + Duration::from_secs(1);
-        let UnansweredError::Overran { raised: Some(raised), .. } =
-            overrun::<()>(Err(raised()), late, BUDGET, "slow")
+        let UnansweredError::Overran {
+            raised: Some(raised), ..
+        } = overrun::<()>(Err(raised()), late, BUDGET, "slow")
         else {
             panic!("an overrun carrying the error");
         };

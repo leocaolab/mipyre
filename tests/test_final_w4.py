@@ -22,7 +22,7 @@ import threading
 import pytest
 
 from mipyre import Mipyre, Response, Stream
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 from tests.test_review_ra import RUN, serve
 
 PYTHON = sys.executable
@@ -45,20 +45,24 @@ def _run_script(body: str, env: dict[str, str] | None = None, timeout: float = 3
 
 
 # ---------------------------------------------------------------------------
-# F1 / G3: /mcp and @app.rpc refuse cross-site requests
+# F1 / G3: /mcp and @app.rpc take only the body types they decode; the engine refuses
+# cross-site requests before them (docs/design/cross-site-check.md)
 # ---------------------------------------------------------------------------
 
 CSRF_SCRIPT = """
 import os
-from mipyre import Mipyre
-app = Mipyre()
-app.trusted_origins = ["https://app.example.com"]
+from mipyre import Mipyre, rpc
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
+app.enable_cors(allow_origins=["https://app.example.com"])
 
-@app.rpc("/rpc/echo")
+@rpc(app)
 def echo(data):
     return data
 
-@app.mcp.tool()
+from mipyre.mcp import MCPServer
+mcp = MCPServer(app)
+
+@mcp.tool()
 def ping() -> str:
     return "pong"
 """ + RUN
@@ -86,16 +90,14 @@ def test_f1_rpc_cross_site_origin_is_403_with_the_reason(csrf_srv):
     r = csrf_srv.post("/rpc/echo", b'{"a": 1}', headers={
         "Content-Type": "application/json", "Origin": "https://evil.example"})
     assert r.status == 403, r.body
-    assert r.json()["ok"] is False
-    assert "https://evil.example" in r.json()["error"]
+    assert "https://evil.example" in r.json()["detail"]
 
 
-def test_f1_mcp_cross_site_origin_is_403_as_a_json_rpc_error(csrf_srv):
+def test_f1_mcp_cross_site_origin_is_403_before_the_route(csrf_srv):
     r = csrf_srv.post("/mcp", MCP_LIST, headers={
         "Content-Type": "application/json", "Origin": "null"})
     assert r.status == 403, r.body
-    err = r.json()["error"]
-    assert err["code"] == -32600 and "Origin" in err["message"], err
+    assert '"null"' in r.json()["detail"], r.body
 
 
 @pytest.mark.parametrize("origin", [None, "same-host", "https://app.example.com"])
@@ -107,7 +109,7 @@ def test_f1_no_origin_same_host_and_trusted_origins_are_admitted(csrf_srv, origi
         headers["Origin"] = origin
     r = csrf_srv.post("/rpc/echo", b'{"a": 1}', headers=headers)
     assert r.status == 200, r.body
-    assert r.json() == {"ok": True, "result": {"a": 1}}
+    assert r.json() == {"a": 1}
     r = csrf_srv.post("/mcp", MCP_LIST, headers=headers)
     assert r.status == 200, r.body
     assert [t["name"] for t in r.json()["result"]["tools"]] == ["ping"]
@@ -118,31 +120,19 @@ def test_f1_rpc_still_takes_msgpack(csrf_srv):
     r = csrf_srv.post("/rpc/echo", msgpack.packb({"a": 2}), headers={
         "Content-Type": "application/msgpack", "Accept": "application/msgpack"})
     assert r.status == 200, r.body
-    assert msgpack.unpackb(r.body) == {"ok": True, "result": {"a": 2}}
+    assert msgpack.unpackb(r.body) == {"a": 2}
 
 
-def test_f1_origin_policy_is_parsed_once_and_bad_entries_raise():
-    from mipyre._csrf import Origin, OriginPolicy
-
-    policy = OriginPolicy.of(["https://app.example.com", "http://localhost:3000"])
-    assert policy.admits(None, "127.0.0.1:8000")
-    assert policy.admits("https://app.example.com:443", "127.0.0.1:8000")
-    assert policy.admits("http://localhost:3000", "127.0.0.1:8000")
-    assert not policy.admits("http://localhost:3001", "127.0.0.1:8000")
-    # Same host: Origin host:port == Host, a missing port meaning the scheme's default.
-    assert policy.admits("http://api.example.com", "api.example.com")
-    assert policy.admits("http://[::1]:8000", "[::1]:8000")
-    assert not policy.admits("https://api.example.com", "api.example.com:80")
-    assert not policy.admits("null", "api.example.com")
-    assert Origin.parse("https://a.example/path") is None
-    for bad in (["not an origin"], ["ftp://x.example"], ["https://x.example/p"], [3]):
-        with pytest.raises(ValueError):
-            OriginPolicy.of(bad)
+def test_f1_allow_origins_entries_are_origins():
     app = Mipyre()
-    with pytest.raises(ValueError):
-        app.trusted_origins = ["javascript:alert(1)"]
-    app.trusted_origins = ["https://app.example.com"]
-    assert app.trusted_origins == ["https://app.example.com:443"]
+    for bad in (["not an origin"], ["ftp://x.example"], ["https://x.example/p"], ["javascript:alert(1)"], ["null"]):
+        with pytest.raises(ValueError, match="not an origin"):
+            app.enable_cors(allow_origins=bad)
+    with pytest.raises(TypeError):
+        app.enable_cors(allow_origins=[3])
+    with pytest.raises(TypeError):
+        app.enable_cors()
+    app.enable_cors(allow_origins=["https://app.example.com:443", "http://localhost:3000"])
 
 
 # ---------------------------------------------------------------------------
@@ -150,15 +140,16 @@ def test_f1_origin_policy_is_parsed_once_and_bad_entries_raise():
 # ---------------------------------------------------------------------------
 
 JSON_SCRIPT = """
-from mipyre import Mipyre
-app = Mipyre()
+import os
+from mipyre import HTTPException, Mipyre
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.post("/decode")
 def decode(req):
     try:
         value = req.json()
-    except ValueError as e:
-        return {"error": type(e).__name__}
+    except HTTPException as e:
+        return {"error": type(e.__cause__).__name__}
     return {"repr": repr(value)}
 """ + RUN
 
@@ -212,9 +203,10 @@ def test_f2_jsonb_column_keeps_wide_integers_exact():
 # ---------------------------------------------------------------------------
 
 CACHE_SCRIPT = """
+import os
 from mipyre import Mipyre
 from mipyre.cache import cached_json
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 CALLS = []
 
 @app.get("/item/{item_id}")
@@ -278,7 +270,7 @@ def test_f5_a_wrapper_that_drops_the_path_params_is_a_registration_error():
 
 
 def test_f7_hung_check_runs_on_one_daemon_thread_however_often_it_is_probed(monkeypatch):
-    import mipyre.health as health
+    import mipyre._health as health
 
     monkeypatch.setattr(health, "_CHECK_TIMEOUT_S", 0.2)
     release = threading.Event()
@@ -286,7 +278,8 @@ def test_f7_hung_check_runs_on_one_daemon_thread_however_often_it_is_probed(monk
     before = {t.ident for t in threading.enumerate()}
     try:
         for _ in range(5):
-            ok, results = health._run_checks_sync([check], "rid-w4")
+            check_results = health._run_checks([check])
+            ok, results = check_results.ok, check_results.checks
             assert ok is False and results == {"hangs": {"ok": False}}
         started = [
             t for t in threading.enumerate()
@@ -301,9 +294,9 @@ def test_f7_hung_check_runs_on_one_daemon_thread_however_often_it_is_probed(monk
 def test_f7_a_hung_call_does_not_block_interpreter_exit():
     r = _run_script("""
         import time
-        from mipyre._bounded import call_with_timeout
+        from mipyre._bounded import BoundedCall
         try:
-            call_with_timeout(lambda: time.sleep(120), 0.2)
+            BoundedCall(lambda: time.sleep(120), 0.2)()
         except TimeoutError:
             print("timed out")
     """, timeout=20)
@@ -311,21 +304,20 @@ def test_f7_a_hung_call_does_not_block_interpreter_exit():
 
 
 def test_f7_helper_works_from_inside_a_running_loop():
-    from mipyre._bounded import call_with_timeout
+    from mipyre._bounded import BoundedCall
     from mipyre.mcp import MCPServer
 
     async def slow_double(x: int) -> int:
         await asyncio.sleep(0.01)
         return 2 * x
 
-    mcp = MCPServer()
+    mcp = MCPServer(Mipyre())
     mcp.tool(slow_double)
 
     async def main():
-        direct = call_with_timeout(lambda: slow_double(4), 5)
-        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                           "params": {"name": "slow_double", "arguments": {"x": 5}}})
-        return direct, json.loads(mcp.handle_request(body))
+        direct = BoundedCall(lambda: slow_double(4), 5)()
+        return direct, await mcp.answer({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                         "params": {"name": "slow_double", "arguments": {"x": 5}}})
 
     direct, resp = asyncio.run(main())
     assert direct == 8
@@ -333,7 +325,7 @@ def test_f7_helper_works_from_inside_a_running_loop():
 
 
 def test_f7_readiness_fails_only_on_raise_timeout_or_false(monkeypatch):
-    import mipyre.health as health
+    import mipyre._health as health
 
     monkeypatch.setattr(health, "_CHECK_TIMEOUT_S", 0.3)
 
@@ -351,7 +343,8 @@ def test_f7_readiness_fails_only_on_raise_timeout_or_false(monkeypatch):
         ("raises", boom), ("slow", release.wait),
     ]]
     try:
-        ok, results = health._run_checks_sync(checks, "rid-w4")
+        check_results = health._run_checks(checks)
+        ok, results = check_results.ok, check_results.checks
     finally:
         release.set()
     assert ok is False
@@ -367,7 +360,7 @@ def test_f7_readiness_fails_only_on_raise_timeout_or_false(monkeypatch):
 def mcp():
     from mipyre.mcp import MCPServer
 
-    server = MCPServer()
+    server = MCPServer(Mipyre())
 
     @server.tool()
     def add(a: int, b: int) -> int:
@@ -385,7 +378,7 @@ def mcp():
 
 
 def _call(server, payload):
-    return json.loads(server.handle_request(json.dumps(payload)))
+    return server.answer(payload)
 
 
 @pytest.mark.parametrize("payload,code,words", [
@@ -419,23 +412,25 @@ def test_mcp_prompt_result_is_sent_as_json(mcp):
 # Small items: RPCClient result, DbError::Connect sqlstate
 # ---------------------------------------------------------------------------
 
-def test_rpc_client_raises_when_an_ok_reply_has_no_result():
+def test_rpc_client_raises_for_a_2xx_reply_it_cannot_decode_and_takes_null_as_none():
     pytest.importorskip("httpx")
-    from mipyre.rpc import RPCClient
+    from mipyre import RPCReplyError
+    from mipyre import RPCClient
 
     app = Mipyre(runtime="main")
 
     @app.post("/rpc/partial")
     def partial(req):
-        return {"ok": True}
+        return Response(body=b"{not json", content_type="application/json")
 
     @app.post("/rpc/full")
     def full(req):
-        return {"ok": True, "result": None}
+        return Response(body=b"null", content_type="application/json")
 
-    with TestClient(app, transport="tcp") as c, RPCClient(c.base_url, use_msgpack=False) as rpc:
-        with pytest.raises(RuntimeError, match="no 'result'"):
+    with TestServer(app) as server, TestClient(server) as c, RPCClient(c.base_url, use_msgpack=False) as rpc:
+        with pytest.raises(RPCReplyError) as raised:
             rpc.partial()
+        assert (raised.value.status, raised.value.body) == (200, b"{not json")
         assert rpc.full() is None
 
 
@@ -445,7 +440,8 @@ def test_db_connect_error_carries_sqlstate():
     r = _run_script(f"""
         from mipyre.db import PgPool
         try:
-            PgPool.connect({base + "/w4_no_such_database"!r})
+            # A handle connects on its first query outside a server run (b/335 D17).
+            PgPool.connect({base + "/w4_no_such_database"!r}).fetch_scalar("SELECT 1")
         except ConnectionError as e:
             print("sqlstate", e.sqlstate)
     """)
@@ -454,7 +450,7 @@ def test_db_connect_error_carries_sqlstate():
     r = _run_script("""
         from mipyre.db import PgPool
         try:
-            PgPool.connect("postgres://nobody@127.0.0.1:1/none", acquire_timeout_secs=2)
+            PgPool.connect("postgres://nobody@127.0.0.1:1/none", acquire_timeout_secs=2).fetch_scalar("SELECT 1")
         except ConnectionError as e:
             print("sqlstate", e.sqlstate)
     """)
@@ -518,9 +514,9 @@ def test_logging_level_is_typed_and_parsed_when_given():
     with pytest.raises(ValueError):
         Mipyre(log_config={"level": "loud"})
     app.enable_access_log(level=LogLevel.Warn)
-    assert app._access_log_choice.level == LogLevel.Warn
+    assert app._access_log.level == LogLevel.Warn
     app.enable_access_log(level="error")
-    assert app._access_log_choice.level == LogLevel.Error
+    assert app._access_log.level == LogLevel.Error
     assert LogLevel.parse("warning") == LogLevel.Warn
 
 
@@ -528,7 +524,7 @@ def test_logging_main_root_level_comes_from_the_engine():
     r = _run_script("""
         import logging
         from mipyre.engine import LogLevel, init_logger
-        from mipyre._log_bridge import install_root_handler
+        from mipyre._log.bridge import install_root_handler
         from mipyre.engine import _python_log_level, emit_python_log
         init_logger(LogLevel.Warn, False, "text")
         install_root_handler(emit_python_log, _python_log_level())
@@ -542,8 +538,9 @@ def test_logging_main_root_level_comes_from_the_engine():
 
 LOG_WORKER_SCRIPT = """
 import logging
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.enable_access_log(level="warn")
 
 @app.get("/log-setup")
@@ -626,27 +623,40 @@ def test_sse_event_lines_split_on_every_line_ending():
     ), repr(r.text)
 
 
+_UNCOUNTED_SERVER = """
+from mipyre import Mipyre
+from mipyre.testing import TestClient
+
+app = Mipyre(runtime="main")
+app.get("/")(lambda req: "ok")
+with TestClient(app) as c:
+    assert c.get("/").status_code == 200
+    print(c.server.metrics().total_requests)
+"""
+
+
 def test_total_requests_is_none_when_metrics_are_off():
     env = {k: v for k, v in os.environ.items() if k != "MIPYRE_METRICS"}
     r = subprocess.run(
-        [PYTHON, "-c", "from mipyre import get_gil_metrics; print(get_gil_metrics().total_requests)"],
+        [PYTHON, "-c", _UNCOUNTED_SERVER],
         capture_output=True, text=True, timeout=30, env=env,
     )
-    assert r.stdout.strip() == "None", (r.stdout, r.stderr)
+    # The server prints its banner first; the script's own line is the last.
+    assert r.stdout.strip().splitlines()[-1] == "None", (r.stdout, r.stderr)
 
 
 def test_routes_are_typed_records():
-    from mipyre import FastRouteInfo, RouteInfo
+    from mipyre import FastRoute, Route, Runtime
 
     app = Mipyre()
 
-    @app.get("/a/{x}", runtime="main")
     async def a(req, x):
         return x
 
+    app.get("/a/{x}", a, runtime="main")
     app.add_fast_response("GET", "/health", b"ok")
     [route] = app.routes
-    assert route == RouteInfo(method="GET", path="/a/{x}", handler=a.__qualname__,
-                              gil=True, stream=False, model=None, is_async=True, runtime="main")
-    assert app.fast_routes == [FastRouteInfo(method="GET", path="/health", status_code=200,
-                                             content_type="text/plain", body_bytes=2)]
+    assert route == Route(method="GET", path="/a/{x}", handler=a, runtime=Runtime.MAIN, is_async=True,
+                          body=None, query=None, in_openapi=True)
+    assert app.fast_routes == [FastRoute(method="GET", path="/health", status_code=200,
+                                         content_type="text/plain", body_bytes=2)]

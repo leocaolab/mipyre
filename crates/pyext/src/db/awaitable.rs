@@ -1,16 +1,22 @@
 //! Hands a DB-runtime result to an asyncio future on the caller's loop, for the `*_async` methods.
 
+use std::sync::Arc;
+
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::sync::InterpreterHandle;
 
 use mipyre_subinterp::attach::{with_interpreter, with_main};
 
-use super::error::{DbError, TaskError};
-use super::runtime::runtime;
+use crate::runtime::{DbRuntime, TaskError};
 
-/// Runs `fut` on the DB runtime and returns an asyncio future on the caller's running loop that
+use super::error::DbError;
+
+/// Runs `fut` on the DB runtime `rt` and returns an asyncio future on the caller's running loop that
 /// completes with `convert(result)`.
+///
+/// The query holds `rt` until its result is delivered, so it is answered even when the handle lets
+/// go of the pool meanwhile (a run sealing binds the handle to the run's pool).
 ///
 /// The result is delivered by attaching to the interpreter captured here, because the PyO3 fork
 /// refuses a bare attach from a runtime thread once more than one interpreter has run the
@@ -21,9 +27,10 @@ use super::runtime::runtime;
 ///
 /// # Errors
 ///
-/// Returns the Python error when there is no running loop or the DB runtime cannot be built.
+/// Returns the Python error when there is no running loop.
 pub(super) fn await_on_loop<'py, T, F, C>(
     py: Python<'py>,
+    rt: &Arc<DbRuntime>,
     fut: F,
     convert: C,
 ) -> PyResult<Bound<'py, PyAny>>
@@ -39,10 +46,11 @@ where
         target: Some((event_loop.unbind(), py_fut.clone().unbind())),
     };
 
-    let rt = runtime().map_err(|e| DbError::from(e).into_pyerr(py))?;
     let query = rt.spawn(fut);
     let abort = query.abort_handle();
+    let runs_on = Arc::clone(rt);
     rt.spawn(async move {
+        let _runs_on = runs_on;
         let result = match query.await {
             Ok(done) => done,
             Err(join_error) => Err(DbError::from(TaskError::from(join_error))),
@@ -97,8 +105,8 @@ impl LoopFuture {
         }
         let interp = self.interp;
         let run = move |py: Python<'_>| {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| outcome(py)))
-                .unwrap_or_else(|payload| {
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| outcome(py))).unwrap_or_else(|payload| {
                     Err(PyRuntimeError::new_err(format!(
                         "converting the database result to Python panicked: {}",
                         mipyre_tpc::panic_message(&*payload)
@@ -111,10 +119,7 @@ impl LoopFuture {
             let sent = resolver(py).and_then(|resolve| {
                 event_loop
                     .bind(py)
-                    .call_method1(
-                        "call_soon_threadsafe",
-                        (resolve, py_fut.bind(py), ok, value),
-                    )
+                    .call_method1("call_soon_threadsafe", (resolve, py_fut.bind(py), ok, value))
                     .map(drop)
             });
             if let Err(e) = sent {

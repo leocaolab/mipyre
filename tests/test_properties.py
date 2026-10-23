@@ -9,6 +9,8 @@ from urllib.parse import quote_from_bytes
 
 import pytest
 
+from mipyre import Mipyre
+
 hypothesis = pytest.importorskip("hypothesis")
 from hypothesis import HealthCheck, given, settings  # noqa: E402 — after importorskip, so a missing hypothesis is a skip
 from hypothesis import strategies as st  # noqa: E402 — after importorskip, so a missing hypothesis is a skip
@@ -192,7 +194,7 @@ json_values = st.recursive(
     max_leaves=12,
 )
 
-mcp = MCPServer()
+mcp = MCPServer(Mipyre())
 
 
 @mcp.tool()
@@ -232,10 +234,9 @@ def _accepts(args: dict) -> bool:
 
 
 def _call(arguments) -> dict:
-    body = json.dumps(
+    return mcp.answer(
         {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "typed", "arguments": arguments}}
     )
-    return json.loads(mcp.handle_request(body))
 
 
 well_typed = st.fixed_dictionaries(
@@ -270,10 +271,10 @@ def test_mcp_argument_verdict_matches_the_hints(args, field, value):
 @PROPERTY_SETTINGS
 @given(request=json_values | st.dictionaries(st.sampled_from(["jsonrpc", "id", "method", "params"]), json_values))
 def test_mcp_any_json_request_gets_a_json_rpc_reply_not_an_internal_error(request):
-    reply = mcp.handle_request(json.dumps(request))
-    if reply == "":
+    reply = mcp.answer(request)
+    if reply is None:
         return  # a notification
-    parsed = json.loads(reply)
+    parsed = json.loads(json.dumps(reply))
     assert parsed["jsonrpc"] == "2.0"
     if "error" in parsed:
         assert parsed["error"]["code"] != JsonRpcCode.INTERNAL_ERROR, parsed

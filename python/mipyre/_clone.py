@@ -20,19 +20,6 @@ class PrivateCopyError(RuntimeError):
     """A private directory, a name in it, or a copy of a package into it could not be made."""
 
 
-def _user_cache_dir() -> str:
-    """Return `~/Library/Caches` on macOS; elsewhere `$XDG_CACHE_HOME`, else `~/.cache`.
-
-    A relative `$XDG_CACHE_HOME` is ignored, as the XDG spec says.
-    """
-    if sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Caches")
-    xdg = os.environ.get("XDG_CACHE_HOME")
-    if xdg and os.path.isabs(xdg):
-        return xdg
-    return os.path.expanduser("~/.cache")
-
-
 def ensure_private_dir(path: str) -> None:
     """Create `path` private to this user, or check that an existing one is.
 

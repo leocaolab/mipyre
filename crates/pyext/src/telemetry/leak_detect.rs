@@ -35,6 +35,14 @@ use pyo3::ffi;
 /// first, so the dump says why no sample arrived instead of printing an empty histogram.
 static SNAPSHOTTER: OnceLock<Result<Snapshotter, String>> = OnceLock::new();
 
+/// Returns why leak detection runs without its recorder, or `None` while it has one or none was
+/// asked for yet.
+pub(super) fn degraded() -> Option<String> {
+    SNAPSHOTTER
+        .get()
+        .and_then(|installed| installed.as_ref().err().cloned())
+}
+
 fn ensure_recorder_installed() -> Option<&'static Snapshotter> {
     SNAPSHOTTER
         .get_or_init(|| {
@@ -43,12 +51,10 @@ fn ensure_recorder_installed() -> Option<&'static Snapshotter> {
             recorder.install().map(|()| snap).map_err(|e| {
                 tracing::error!(target: "mipyre::server", error = %e,
                     "leak diagnostic disabled: the metrics recorder could not be installed");
-                let reason = format!(
+                format!(
                     "DebuggingRecorder::install() failed: {e} (another metrics recorder \
                      is already installed in this process)"
-                );
-                crate::telemetry::set_degraded(crate::telemetry::Component::LeakDetect, reason.clone());
-                reason
+                )
             })
         })
         .as_ref()
@@ -131,17 +137,19 @@ pub(crate) fn dump_to_stderr() {
 
 const DUMP_ROWS: usize = 30;
 
-/// Reads a `tp_name` C string, stopping at its NUL or after `MAX` bytes, and interns it.
+/// The most bytes of a `tp_name` that `type_name_bounded` reads.
+const TYPE_NAME_CAP: usize = 256;
+
+/// Reads a `tp_name` C string, stopping at its NUL or after `TYPE_NAME_CAP` bytes, and interns it.
 /// `record_drop` samples corrupted objects by design (the `"<0"` bucket), whose `tp_name` may
 /// have no NUL, and `CStr::from_ptr`'s unbounded scan could run into unmapped memory.
 ///
 /// # Safety
 /// `ptr` must be non-null and point at readable memory for at least its
-/// NUL-terminated length (or `MAX` bytes if not terminated within `MAX`).
+/// NUL-terminated length (or `TYPE_NAME_CAP` bytes if not terminated within `TYPE_NAME_CAP`).
 unsafe fn type_name_bounded(ptr: *const std::os::raw::c_char) -> &'static str {
-    const MAX: usize = 256;
     let mut len = 0usize;
-    while len < MAX {
+    while len < TYPE_NAME_CAP {
         if *ptr.add(len) == 0 {
             break;
         }
@@ -150,10 +158,10 @@ unsafe fn type_name_bounded(ptr: *const std::os::raw::c_char) -> &'static str {
     // SAFETY: Every byte in 0..len was just read above, so the slice is valid.
     let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
     // A corrupted object's name is what the sample is about, so the bytes are kept as they are
-    // with invalid UTF-8 replaced; there are at most MAX of them, so garbage stays bounded.
+    // with invalid UTF-8 replaced; there are at most TYPE_NAME_CAP of them, so garbage stays bounded.
     let name = String::from_utf8_lossy(bytes);
-    if len == MAX {
-        intern(&format!("{name}… (no NUL within {MAX} bytes)"))
+    if len == TYPE_NAME_CAP {
+        intern(&format!("{name}… (no NUL within {TYPE_NAME_CAP} bytes)"))
     } else {
         intern(&name)
     }
@@ -164,8 +172,7 @@ unsafe fn type_name_bounded(ptr: *const std::os::raw::c_char) -> &'static str {
 fn intern(s: &str) -> &'static str {
     use parking_lot::Mutex;
 
-    static TABLE: OnceLock<Mutex<std::collections::HashMap<String, &'static str>>> =
-        OnceLock::new();
+    static TABLE: OnceLock<Mutex<std::collections::HashMap<String, &'static str>>> = OnceLock::new();
     let t = TABLE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut g = t.lock();
     if let Some(&cached) = g.get(s) {
@@ -186,5 +193,42 @@ fn rc_label(rc: ffi::Py_ssize_t) -> &'static str {
         PRECOMPUTED[rc as usize]
     } else {
         "9+"
+    }
+}
+
+/// Feeds `type_name_bounded` names on both sides of its cap; under Miri a read past the bytes the
+/// contract promises is reported as undefined behaviour (`dev/proofs.toml`, b/719).
+#[cfg(test)]
+mod tests {
+    use super::{type_name_bounded, TYPE_NAME_CAP};
+
+    /// Reads the name in `bytes`, which hold exactly what the contract asks for and nothing after.
+    fn read(bytes: &[u8]) -> &'static str {
+        // SAFETY: `bytes` is non-null and readable up to its NUL, or for `TYPE_NAME_CAP` bytes
+        // when it has none; every caller below gives one or the other.
+        unsafe { type_name_bounded(bytes.as_ptr().cast()) }
+    }
+
+    #[test]
+    fn a_name_ending_just_inside_the_cap_is_read_whole() {
+        let mut bytes = vec![b'a'; TYPE_NAME_CAP];
+        bytes[TYPE_NAME_CAP - 1] = 0;
+        assert_eq!(read(&bytes), "a".repeat(TYPE_NAME_CAP - 1));
+        assert_eq!(read(&[0]), "");
+    }
+
+    #[test]
+    fn a_name_without_a_nul_within_the_cap_is_read_to_the_cap_and_no_further() {
+        let bytes = vec![b'b'; TYPE_NAME_CAP];
+        let name = read(&bytes);
+        assert_eq!(
+            name,
+            format!("{}… (no NUL within {TYPE_NAME_CAP} bytes)", "b".repeat(TYPE_NAME_CAP))
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_kept_with_the_bad_bytes_replaced() {
+        assert_eq!(read(&[b'x', 0xff, b'y', 0]), "x\u{fffd}y");
     }
 }

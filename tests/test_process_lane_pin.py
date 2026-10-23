@@ -18,7 +18,7 @@ import mipyre
 from mipyre import engine
 from tests._helpers import bound_port, poll_until, read_file
 from mipyre._clone import PrivateCopyError, claim_name, clone_tree, ensure_private_dir
-from mipyre._process_lane import (
+from mipyre._process_lane.server import (
     START_REFUSED,
     _remove_stale_run_dirs,
     is_pinned,
@@ -261,7 +261,7 @@ def test_a_stale_run_dir_that_cannot_be_removed_is_reported_and_the_sweep_goes_o
 _CLAIM_AND_SWEEP = """
 import os, sys
 from mipyre._clone import claim_name
-from mipyre._process_lane import _remove_run_dir, _remove_stale_run_dirs
+from mipyre._process_lane.server import _remove_run_dir, _remove_stale_run_dirs
 
 root = sys.argv[1]
 for _ in range(200):
@@ -364,14 +364,45 @@ def test_workers_keep_the_launchers_mipyre_while_the_install_changes(tmp_path):
     assert os.listdir(run_root) == [], log_path.read_text()[-3000:]
 
 
-def _spawned_worker(pythonpath, build_id):
-    env = {k: v for k, v in os.environ.items() if k != "MIPYRE_BUILD_ID"}
-    env["PYTHONPATH"] = pythonpath
-    if build_id is not None:
-        env["MIPYRE_BUILD_ID"] = build_id
-    return subprocess.run(
-        [sys.executable, "-m", "mipyre._process_lane.worker"], env=env, capture_output=True, text=True, timeout=60
+def _spawned_worker(pythonpath, build):
+    """A spawned worker's entry, its `mipyre` pinned by `pythonpath`, handed a setup from a
+    template of `build` over its setup fd as the template hands it."""
+    from mipyre._process_lane.server import LaneSetup, LaneWorker
+
+    setup = LaneSetup(
+        start=engine.StartStrategy.Import,
+        workers=1,
+        depth=8,
+        slot_bytes=4096,
+        worker_spin_us=50,
+        target="/srv/app.py:app",
+        routers=(),
+        sys_path=("/srv",),
+        cwd="/srv",
+        thread_limits={},
+        log_level="WARN",
+        log_format="text",
+        run_dir=pythonpath,
     )
+    one = LaneWorker(setup, 0, os.getpid(), 1, (5, 6), '{"argv": [], "parsed": false}', build)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = pythonpath
+    read_end, write_end = os.pipe()
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "mipyre._process_lane.worker", "--setup-fd", str(read_end)],
+            env=env,
+            pass_fds=(read_end,),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    finally:
+        os.close(read_end)
+    with os.fdopen(write_end, "wb") as w:
+        w.write(one.encode().encode())
+    out, err = proc.communicate(timeout=60)
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 def test_a_spawned_worker_that_imported_another_mipyre_refuses_to_start(tmp_path):

@@ -35,12 +35,13 @@ DRIVER = textwrap.dedent(
     """
     import gc, importlib, os, sys
     sys.path.insert(0, {apps!r})
+    from mipyre.engine import ServerFlags
     from mipyre.testing import TestClient
     import restart_const as mod
 
     for _ in range({cycles}):
         mod = importlib.reload(mod)
-        with TestClient(mod.app) as client:
+        with TestClient(mod.app, config=ServerFlags(threads={workers})) as client:
             assert client.get("/").status_code == 200
         del client
         gc.collect()
@@ -52,9 +53,9 @@ DRIVER = textwrap.dedent(
 def _freed_after_each_stop(marks: Path, **env_extra: str) -> list[int]:
     """How many workers' apps were freed after each stop, in order."""
     apps = str(Path(__file__).parent / "apps")
-    env = {**os.environ, "MIPYRE_WORKERS": str(WORKERS), "RESTART_MARKS": str(marks), **env_extra}
+    env = {**os.environ, "RESTART_MARKS": str(marks), **env_extra}
     done = subprocess.run(
-        [sys.executable, "-c", DRIVER.format(apps=apps, cycles=CYCLES)],
+        [sys.executable, "-c", DRIVER.format(apps=apps, cycles=CYCLES, workers=WORKERS)],
         env=env,
         capture_output=True,
         text=True,

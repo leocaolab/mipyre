@@ -24,11 +24,7 @@ pub struct Cpus {
 
 impl Cpus {
     pub const fn new(logical: NonZeroUsize, cores: NonZeroUsize) -> Self {
-        let physical = if cores.get() < logical.get() {
-            cores
-        } else {
-            logical
-        };
+        let physical = if cores.get() < logical.get() { cores } else { logical };
         Cpus { logical, physical }
     }
 
@@ -95,8 +91,7 @@ impl CoreGroups {
         let fastest = self.fastest();
         let mut ordered: Vec<&Core> = self.cores.iter().collect();
         ordered.sort_by_key(|c| (c.domain, c.cpus.first()));
-        let (fast, slow): (Vec<&Core>, Vec<&Core>) =
-            ordered.into_iter().partition(|c| c.perf == fastest);
+        let (fast, slow): (Vec<&Core>, Vec<&Core>) = ordered.into_iter().partition(|c| c.perf == fastest);
         let cpus = fast
             .iter()
             .map(|c| c.cpus.first())
@@ -150,11 +145,7 @@ impl Facts {
                 values
             });
         }
-        Some(Facts {
-            siblings,
-            cache,
-            perf,
-        })
+        Some(Facts { siblings, cache, perf })
     }
 
     fn allows(&self, cpu: CoreId) -> bool {
@@ -213,9 +204,7 @@ pub(crate) fn decide(facts: &Facts) -> CoreGroups {
         let domain = match &facts.cache {
             Some(lists) => {
                 let next = domains.len();
-                *domains
-                    .entry(cache_key(facts, &lists[row], cpu))
-                    .or_insert(next)
+                *domains.entry(cache_key(facts, &lists[row], cpu)).or_insert(next)
             }
             None => 0,
         };
@@ -264,17 +253,9 @@ impl std::error::Error for PerfValueError {}
 
 /// Returns a CPU's performance value: on a hybrid host, which lists its P-cores, whether the CPU
 /// is one; elsewhere its `cpu_capacity`.
-pub(crate) fn perf_value(
-    p_cores: Option<&CpuSet>,
-    cpu: CoreId,
-    capacity: Option<u32>,
-) -> Option<u32> {
+pub(crate) fn perf_value(p_cores: Option<&CpuSet>, cpu: CoreId, capacity: Option<u32>) -> Option<u32> {
     match p_cores {
-        Some(p_cores) => Some(if p_cores.contains(cpu) {
-            P_CORE
-        } else {
-            E_CORE
-        }),
+        Some(p_cores) => Some(if p_cores.contains(cpu) { P_CORE } else { E_CORE }),
         None => capacity,
     }
 }
@@ -309,10 +290,7 @@ impl CpuMask {
     /// Refuses a CPU at or past [`MAX_CPUS`], which Linux cannot have.
     pub(crate) fn of_one(cpu: usize) -> Result<Self, CpuMaskError> {
         if cpu >= MAX_CPUS {
-            return Err(CpuMaskError::PastRoom {
-                cpu,
-                room: MAX_CPUS,
-            });
+            return Err(CpuMaskError::PastRoom { cpu, room: MAX_CPUS });
         }
         let mut mask = CpuMask::empty(cpu + 1);
         mask.insert(cpu)?;
@@ -411,20 +389,17 @@ impl CpuSet {
 
     /// Lists the CPUs in ascending order, visiting only set bits.
     pub(crate) fn iter(&self) -> impl Iterator<Item = CoreId> + '_ {
-        self.words[..self.end]
-            .iter()
-            .enumerate()
-            .flat_map(|(w, &word)| {
-                let mut bits = word;
-                std::iter::from_fn(move || {
-                    if bits == 0 {
-                        return None;
-                    }
-                    let bit = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    Some(CoreId { id: w * 64 + bit })
-                })
+        self.words[..self.end].iter().enumerate().flat_map(|(w, &word)| {
+            let mut bits = word;
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                Some(CoreId { id: w * 64 + bit })
             })
+        })
     }
 }
 
@@ -440,11 +415,9 @@ pub(crate) fn parse_cpu_list(text: &str) -> Result<CpuSet, CpuListError> {
         fault,
     };
     let number = |part: &str| {
-        let cpu: usize = part.parse().map_err(|_| {
-            fault(CpuListFault::NotACpu {
-                part: part.to_owned(),
-            })
-        })?;
+        let cpu: usize = part
+            .parse()
+            .map_err(|_| fault(CpuListFault::NotACpu { part: part.to_owned() }))?;
         if cpu >= MAX_CPUS {
             return Err(fault(CpuListFault::PastMaxCpus { cpu }));
         }
@@ -498,15 +471,11 @@ impl std::fmt::Display for CpuListError {
                 write!(f, "{text:?} is not a CPU list: it has an empty part")
             }
             CpuListFault::NotACpu { part } => {
-                write!(
-                    f,
-                    "{text:?} is not a CPU list: {part:?} is not a CPU number"
-                )
+                write!(f, "{text:?} is not a CPU list: {part:?} is not a CPU number")
             }
-            CpuListFault::Reversed { lo, hi } => write!(
-                f,
-                "{text:?} is not a CPU list: the range {lo}-{hi} runs backwards"
-            ),
+            CpuListFault::Reversed { lo, hi } => {
+                write!(f, "{text:?} is not a CPU list: the range {lo}-{hi} runs backwards")
+            }
             CpuListFault::PastMaxCpus { cpu } => write!(
                 f,
                 "{text:?} is not a CPU list: CPU {cpu} is past the {MAX_CPUS} CPUs Linux can have"
@@ -535,25 +504,19 @@ pub(crate) fn parse_cpu_max(text: &str) -> Result<Quota, CpuMaxError> {
     let (Some(quota), Some(period), None) = (parts.next(), parts.next(), parts.next()) else {
         return Err(fault(CpuMaxFault::NotTwoFields));
     };
-    let period: u64 = period
-        .parse()
-        .map_err(|_| fault(CpuMaxFault::PeriodNotANumber))?;
+    let period: u64 = period.parse().map_err(|_| fault(CpuMaxFault::PeriodNotANumber))?;
     if period == 0 {
         return Err(fault(CpuMaxFault::PeriodZero));
     }
     if quota == "max" {
         return Ok(Quota::Unlimited);
     }
-    let quota: u64 = quota
-        .parse()
-        .map_err(|_| fault(CpuMaxFault::QuotaNotANumber))?;
+    let quota: u64 = quota.parse().map_err(|_| fault(CpuMaxFault::QuotaNotANumber))?;
     if quota == 0 {
         return Err(fault(CpuMaxFault::QuotaZero));
     }
     let cores = usize::try_from(quota / period).map_err(|_| fault(CpuMaxFault::PastUsize))?;
-    Ok(Quota::Cores(
-        NonZeroUsize::new(cores).unwrap_or(NonZeroUsize::MIN),
-    ))
+    Ok(Quota::Cores(NonZeroUsize::new(cores).unwrap_or(NonZeroUsize::MIN)))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -627,22 +590,11 @@ pub(crate) mod tests {
     }
 
     fn rows(allowed: &[usize], facts: impl Fn(usize) -> CpuFacts) -> Facts {
-        Facts::new(
-            allowed
-                .iter()
-                .map(|&c| (CoreId { id: c }, facts(c)))
-                .collect(),
-        )
-        .unwrap()
+        Facts::new(allowed.iter().map(|&c| (CoreId { id: c }, facts(c))).collect()).unwrap()
     }
 
     fn order(facts: &Facts, k: Option<usize>) -> Vec<usize> {
-        let cpus: Vec<usize> = decide(facts)
-            .pin_order()
-            .cpus()
-            .iter()
-            .map(|c| c.id)
-            .collect();
+        let cpus: Vec<usize> = decide(facts).pin_order().cpus().iter().map(|c| c.id).collect();
         match k {
             Some(k) => cpus[..k.min(cpus.len())].to_vec(),
             None => cpus,
@@ -659,22 +611,12 @@ pub(crate) mod tests {
 
     /// Returns how many cache domains the cores are in.
     pub(crate) fn domain_count(cores: &CoreGroups) -> usize {
-        cores
-            .cores
-            .iter()
-            .map(|c| c.domain)
-            .collect::<BTreeSet<_>>()
-            .len()
+        cores.cores.iter().map(|c| c.domain).collect::<BTreeSet<_>>().len()
     }
 
     /// Builds a host where CPU n and CPU n+8 are one core, with one L3 and one tier.
     fn smt_pairs_one_l3(allowed: &[usize]) -> Facts {
-        host(
-            allowed,
-            |c| vec![c % 8, c % 8 + 8],
-            |_| (0..16).collect(),
-            |_| 1024,
-        )
+        host(allowed, |c| vec![c % 8, c % 8 + 8], |_| (0..16).collect(), |_| 1024)
     }
 
     /// Builds a cpuset of CPUs 0-31 and 64-95, where CPU n and CPU n+64 are one core, over 16
@@ -686,9 +628,7 @@ pub(crate) mod tests {
             |c| vec![c % 64, c % 64 + 64],
             |c| {
                 let domain = c % 64 / 4;
-                (0..4)
-                    .flat_map(|i| [domain * 4 + i, domain * 4 + i + 64])
-                    .collect()
+                (0..4).flat_map(|i| [domain * 4 + i, domain * 4 + i + 64]).collect()
             },
             |_| 1024,
         )
@@ -771,10 +711,7 @@ pub(crate) mod tests {
         assert_eq!(order(&f, Some(4)), vec![0, 2, 4, 6]);
         assert_eq!(order(&f, Some(8)), vec![0, 2, 4, 6, 8, 10, 12, 14]);
         // With more threads than fast cores, the slow cores come before any sibling.
-        assert_eq!(
-            order(&f, Some(12)),
-            vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 17, 18, 19]
-        );
+        assert_eq!(order(&f, Some(12)), vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 17, 18, 19]);
         let full: Vec<usize> = [0, 2, 4, 6, 8, 10, 12, 14]
             .into_iter()
             .chain(16..32)
@@ -815,34 +752,17 @@ pub(crate) mod tests {
         assert_eq!(parse_cpu_max("400000 100000").unwrap(), Quota::Cores(n(4)));
         assert_eq!(parse_cpu_max("250000 100000").unwrap(), Quota::Cores(n(2)));
         assert_eq!(parse_cpu_max("50000 100000").unwrap(), Quota::Cores(n(1)));
-        for bad in [
-            "", "max", "0 100000", "400000 0", "x 100000", "1 2 3", "max x",
-        ] {
-            assert!(
-                matches!(parse_cpu_max(bad), Err(CpuMaxError { .. })),
-                "{bad:?}"
-            );
+        for bad in ["", "max", "0 100000", "400000 0", "x 100000", "1 2 3", "max x"] {
+            assert!(matches!(parse_cpu_max(bad), Err(CpuMaxError { .. })), "{bad:?}");
         }
     }
 
     #[test]
     fn tightest_takes_the_lower_limit_and_no_limit_defers() {
-        assert_eq!(
-            tightest(Quota::Cores(n(2)), Quota::Unlimited),
-            Quota::Cores(n(2))
-        );
-        assert_eq!(
-            tightest(Quota::Unlimited, Quota::Cores(n(3))),
-            Quota::Cores(n(3))
-        );
-        assert_eq!(
-            tightest(Quota::Cores(n(4)), Quota::Cores(n(2))),
-            Quota::Cores(n(2))
-        );
-        assert_eq!(
-            tightest(Quota::Unlimited, Quota::Unlimited),
-            Quota::Unlimited
-        );
+        assert_eq!(tightest(Quota::Cores(n(2)), Quota::Unlimited), Quota::Cores(n(2)));
+        assert_eq!(tightest(Quota::Unlimited, Quota::Cores(n(3))), Quota::Cores(n(3)));
+        assert_eq!(tightest(Quota::Cores(n(4)), Quota::Cores(n(2))), Quota::Cores(n(2)));
+        assert_eq!(tightest(Quota::Unlimited, Quota::Unlimited), Quota::Unlimited);
     }
 
     #[test]
@@ -1016,10 +936,7 @@ pub(crate) mod tests {
             .into(),
         )
         .unwrap();
-        assert_eq!(
-            facts.cache.as_ref().map(|lists| &lists[0]),
-            Some(&ids(&[0, 1]))
-        );
+        assert_eq!(facts.cache.as_ref().map(|lists| &lists[0]), Some(&ids(&[0, 1])));
         assert_eq!(facts.perf, None);
         assert_eq!(facts.siblings[&CoreId { id: 1 }], ids(&[1]));
     }
@@ -1047,7 +964,10 @@ pub(crate) mod tests {
         assert_eq!(last.members().collect::<Vec<_>>(), vec![MAX_CPUS - 1]);
         assert_eq!(
             CpuMask::of_one(MAX_CPUS),
-            Err(CpuMaskError::PastRoom { cpu: MAX_CPUS, room: MAX_CPUS })
+            Err(CpuMaskError::PastRoom {
+                cpu: MAX_CPUS,
+                room: MAX_CPUS
+            })
         );
     }
 
@@ -1113,11 +1033,7 @@ pub(crate) mod tests {
             cache: None,
             perf: None,
         });
-        cores_of(&f)
-            .cores
-            .iter()
-            .map(|c| c.cpus.cpus.clone())
-            .collect()
+        cores_of(&f).cores.iter().map(|c| c.cpus.cpus.clone()).collect()
     }
 
     #[test]

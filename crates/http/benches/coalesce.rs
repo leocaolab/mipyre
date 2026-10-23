@@ -13,7 +13,8 @@ struct Socket {
 }
 
 const REQUEST: &[u8] = b"GET /plaintext HTTP/1.1\r\nHost: b\r\n\r\n";
-const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 13\r\ndate: Sun, 18 Oct 2026 00:00:00 GMT\r\n\r\n";
+const HEAD: &[u8] =
+    b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 13\r\ndate: Sun, 18 Oct 2026 00:00:00 GMT\r\n\r\n";
 const BODY: &[u8] = b"Hello, World!";
 
 impl tokio::io::AsyncRead for Socket {
@@ -121,11 +122,21 @@ fn coalesce_pipelined_16(n: u64) {
 }
 
 fn coalesce_lone_response_local(n: u64) {
-    coalesce_bench!("coalesce_lone_response_local", mipyre_http::io::coalesce::coalesce_local, n, 1);
+    coalesce_bench!(
+        "coalesce_lone_response_local",
+        mipyre_http::io::coalesce::coalesce_local,
+        n,
+        1
+    );
 }
 
 fn coalesce_pipelined_16_local(n: u64) {
-    coalesce_bench!("coalesce_pipelined_16_local", mipyre_http::io::coalesce::coalesce_local, n, 16);
+    coalesce_bench!(
+        "coalesce_pipelined_16_local",
+        mipyre_http::io::coalesce::coalesce_local,
+        n,
+        16
+    );
 }
 
 fn main() {

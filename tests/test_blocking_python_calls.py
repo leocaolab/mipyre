@@ -18,19 +18,19 @@ import urllib.request
 
 import pytest
 
-from mipyre.testing import TestClient
+from mipyre.engine import ServerFlags
+from mipyre.testing import TestClient, TestServer
 from tests._helpers import bound_port, kill_session, poll_until, read_file
 
 IO_THREADS = 2
 
 
-def test_blocked_main_handlers_past_the_io_thread_count_leave_a_fast_route_answering(monkeypatch):
-    monkeypatch.setenv("MIPYRE_TPC", "0")
-    monkeypatch.setenv("MIPYRE_IO_WORKERS", str(IO_THREADS))
+def test_blocked_main_handlers_past_the_io_thread_count_leave_a_fast_route_answering():
     from tests.apps.blocking_main_handlers import app, entered, release
 
     blocked = IO_THREADS + 2
-    with TestClient(app, transport="tcp") as c:
+    # A test server reads no environment (b/335 M5.6): the multi-thread server and its threads are its config.
+    with TestServer(app, config=ServerFlags(tpc=False, threads=IO_THREADS)) as server, TestClient(server) as c:
         statuses: list[int] = []
 
         def call_slow() -> None:

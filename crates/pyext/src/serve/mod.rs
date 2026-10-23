@@ -26,21 +26,20 @@ mod conn_bench;
 #[cfg(test)]
 mod opening_tests;
 
-pub(crate) use self::multi_thread::serve_multi_thread;
+pub(crate) use self::drain::{drain_timeout, report_drain_timeout, teardown_timeout};
 pub(crate) use self::listener::{
     accept_stopped_error, bind_options, handed_by_systemd, listener_error, print_listening,
 };
+pub(crate) use self::multi_thread::serve_multi_thread;
 pub(crate) use self::on_main::handle_request;
 pub(crate) use self::on_pool::handle_request_subinterp;
 #[cfg(feature = "bench")]
 pub(crate) use self::on_tpc::handle_request_tpc_inline;
 pub(crate) use self::site::{Routes, Site};
-pub(crate) use self::drain::{drain_timeout, report_drain_timeout, teardown_timeout, TEARDOWN_MARGIN};
-pub(crate) use self::stop::{until_stopped, StopSignals};
-pub(crate) use self::tpc::{
-    report_pinning, run_tpc_gil, run_tpc_workers, thread_cpus, tpc_banner, AcceptMode, OffThreadRunners, ServeError,
-    TpcServer, TpcThreads,
-};
+pub(crate) use self::stop::watching_stop_signals;
 #[cfg(feature = "bench")]
 pub(crate) use self::tpc::{drive_conn, serve_on_workers, tpc_accept_loop_inline, TpcThread};
-pub(crate) use self::websocket::{OpenConnections, Upgrades};
+pub(crate) use self::tpc::{
+    log_startup, report_pinning, run_tpc, thread_cpus, tpc_banner, AcceptMode, ServeError, TpcServer, TpcThreads,
+};
+pub(crate) use self::websocket::{upgrade_site, OpenConnections};

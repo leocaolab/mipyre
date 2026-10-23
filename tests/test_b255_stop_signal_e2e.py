@@ -25,7 +25,7 @@ import threading
 import httpx
 import pytest
 
-from tests._helpers import bound_port, poll_until, read_file
+from tests._helpers import bound_port, poll_until, read_file, set_subinterpreters
 
 SCRIPT = r'''
 import os
@@ -35,7 +35,7 @@ import time
 
 from mipyre import Mipyre
 
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 RELEASE = pathlib.Path(os.environ["B255_RELEASE"])
 
 
@@ -55,7 +55,7 @@ def mark():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, workers=2)
+    app.run(host="127.0.0.1", port=0)
 '''
 
 POOL = {"MIPYRE_TPC": "0"}
@@ -71,7 +71,8 @@ def test_a_stop_signal_finishes_the_request_in_flight_runs_on_shutdown_and_exits
     log_path = tmp_path / "app.log"
     log = read_file(str(log_path))
     env = {**os.environ, **runtime, "B255_RELEASE": str(release), "B255_MARKER": str(marker)}
-    env.pop("MIPYRE_RUNTIME", None)
+    env.pop("MIPYRE_TEST_MODE", None)
+    set_subinterpreters(env, "2")
     with open(log_path, "w") as out:
         proc = subprocess.Popen(
             [sys.executable, str(script)], stdout=out, stderr=subprocess.STDOUT,

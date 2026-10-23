@@ -12,7 +12,7 @@ import urllib.request
 import pytest
 
 from mipyre import Mipyre
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 
 from tests.apps.compression_routes import LARGE_JSON, add_routes
 
@@ -43,7 +43,7 @@ def _raw_request(base_url: str, path: str, accept_encoding: str | None):
 def default_client():
     # No enable_compression() call — framework must behave identically to
     # pre-compression build.
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         yield client
 
 
@@ -68,7 +68,7 @@ def compressed_client():
     # compression settings are process-wide.
     from tests.apps.compression_enabled import app as compressed_app
 
-    with TestClient(compressed_app, transport="tcp") as client:
+    with TestServer(compressed_app) as server, TestClient(server) as client:
         yield client
 
 

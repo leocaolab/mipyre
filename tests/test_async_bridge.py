@@ -1,5 +1,5 @@
 """Test: Phase 7.2 async bridge — sleep(1ms) should break the 8k ceiling."""
-from mipyre.engine import MipyreApp
+from mipyre.engine import MipyreApp, RuntimeChoice
 
 app = MipyreApp()
 
@@ -20,9 +20,9 @@ def sync_sleep(req):
     return "ok"
 
 
-app.get("/hello", hello)
-app.get("/async-sleep", async_sleep)
-app.get("/sync-sleep", sync_sleep)
+app.route("GET", "/hello", hello, RuntimeChoice.Worker)
+app.route("GET", "/async-sleep", async_sleep, RuntimeChoice.Worker)
+app.route("GET", "/sync-sleep", sync_sleep, RuntimeChoice.Worker)
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, mode="async")
+    app.run(host="127.0.0.1", port=0)

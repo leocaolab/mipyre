@@ -16,13 +16,15 @@ use pyo3::prelude::*;
 use pyo3::types::PyString;
 
 use crate::exchange::body_stream;
-use crate::exchange::lane_failure::{LaneIndex, LaneDecodeError, WorkerExit, WorkerFailure};
-use mipyre_shm::plan::ring::PeerCounterError;
+use crate::exchange::http_exception::HttpException;
+use crate::exchange::lane_failure::{LaneDecodeError, LaneIndex, WorkerExit, WorkerFailure};
 use mipyre_http::io::body::BodyReadError;
+use mipyre_http::io::request_id::RequestId;
+use mipyre_http::plan::response::HandlerResponse;
+use mipyre_shm::channel::PeerFault;
 use mipyre_tpc::panic_message;
 use mipyre_util::clock;
 use mipyre_util::throttle::LogThrottle;
-use mipyre_http::io::request_id::RequestId;
 
 /// This throttle allows one overload line a minute, since under sustained overload every refused
 /// request would log.
@@ -72,10 +74,7 @@ impl fmt::Display for PyException {
 }
 
 /// Returns the formatting failure itself as the traceback if formatting fails.
-fn format_traceback(
-    py: Python<'_>,
-    value: &Bound<'_, pyo3::exceptions::PyBaseException>,
-) -> String {
+fn format_traceback(py: Python<'_>, value: &Bound<'_, pyo3::exceptions::PyBaseException>) -> String {
     let formatted = py
         .import("traceback")
         .and_then(|tb| tb.call_method1("format_exception", (value,)))
@@ -109,10 +108,7 @@ pub(crate) enum ResponseError {
     #[error("response text is not valid Unicode: {0}")]
     NotUnicode(PyException),
     #[error("str() of the returned {type_name} raised {exception}")]
-    StrRaised {
-        type_name: String,
-        exception: PyException,
-    },
+    StrRaised { type_name: String, exception: PyException },
     #[error(
         "a sub-interpreter handler returned a Stream; a Stream response is only served \
          from the main interpreter, so register the route with runtime='main'"
@@ -186,6 +182,13 @@ pub(crate) enum HandlerError {
     Refused(UnansweredError),
     #[error(transparent)]
     BodyRejected(#[from] BodyReadError),
+    /// The answer its raiser chose: not a server failure, so it is logged at debug, without a
+    /// traceback. Boxed so the error, which every request's `Result` is as large as, stays small.
+    #[error("{stage} raised HTTPException({})", .answer.status.as_u16())]
+    Http {
+        stage: RequestStage,
+        answer: Box<HandlerResponse>,
+    },
     #[error("could not start the thread that runs the handler: {0}")]
     ThreadNotSpawned(#[source] std::io::Error),
     /// The awaitable is not run, because that would mix two interpreters' objects.
@@ -222,12 +225,8 @@ impl fmt::Display for ReplyHolder {
             ReplyHolder::PoolWorker => "the sub-interpreter worker dropped the request",
             ReplyHolder::MainBridge => "the runtime='main' bridge dropped the request",
             ReplyHolder::Lane => "the process lane dropped the request without an answer",
-            ReplyHolder::AsyncEngine => {
-                "the async engine dropped the request without answering it"
-            }
-            ReplyHolder::WebsocketHandler => {
-                "the websocket handler thread exited before the upgrade"
-            }
+            ReplyHolder::AsyncEngine => "the async engine dropped the request without answering it",
+            ReplyHolder::WebsocketHandler => "the websocket handler thread exited before the upgrade",
             ReplyHolder::TaskCancelled => "the handler's task was cancelled",
         })
     }
@@ -312,12 +311,27 @@ pub(crate) enum UnansweredError {
     /// The duration is the app's `request_timeout`.
     #[error("the handler did not answer within {0:?}")]
     TimedOut(Duration),
-    /// The request is answered 502.
-    #[error("the worker running the request (pid {pid}, lane {lane}) died after {ran:?}: {exit}")]
+    /// The request is answered 502. `ran` is how long the host had seen the request running, `None` when the worker
+    /// died before the host looked.
+    #[error(
+        "the worker running the request (pid {pid}, lane {lane}) died{}: {exit}",
+        ran.map(|ran| format!(" after {ran:?}")).unwrap_or_default()
+    )]
     WorkerDied {
         pid: i32,
         lane: LaneIndex,
-        ran: Duration,
+        ran: Option<Duration>,
+        exit: WorkerExit,
+    },
+    /// The request is answered 502 and is not run on another worker: it waited in the lane's ring for a worker that
+    /// died before taking it, and that worker could have rewritten its bytes in the shared memory.
+    #[error(
+        "the worker of process lane {lane} (pid {pid}) died before it took the request ({exit}); the request is not \
+         run on another worker, since the dead one could have changed it"
+    )]
+    WorkerDiedBeforeTaking {
+        pid: i32,
+        lane: LaneIndex,
         exit: WorkerExit,
     },
     /// The request is answered 504.
@@ -334,8 +348,15 @@ pub(crate) enum UnansweredError {
     },
     /// The request is answered 502 and is not run again: its worker wrote a counter it cannot
     /// have written honestly, so whether it ran the request is unknown. The worker is killed.
-    #[error("the worker of process lane {lane} (pid {pid}) corrupted the lane: {fault}")]
-    PeerCorrupted { pid: i32, lane: LaneIndex, fault: PeerCounterError },
+    #[error(
+        "the worker of process lane {lane} (pid {pid}) corrupted the lane: {}",
+        fault_said(fault)
+    )]
+    PeerCorrupted {
+        pid: i32,
+        lane: LaneIndex,
+        fault: PeerFault,
+    },
     /// The request is answered 503 with `Retry-After` from `retry_in`; the other lanes and hosts
     /// keep serving, and a lane that answers ends the wait for good.
     #[error(
@@ -393,6 +414,7 @@ impl UnansweredError {
             | UnansweredError::WorkerLost(_)
             | UnansweredError::TimedOut(_)
             | UnansweredError::WorkerDied { .. }
+            | UnansweredError::WorkerDiedBeforeTaking { .. }
             | UnansweredError::LaneTimedOut { .. }
             | UnansweredError::PeerCorrupted { .. }
             | UnansweredError::LaneCrashLooping { .. }
@@ -415,6 +437,7 @@ impl UnansweredError {
             | UnansweredError::WorkerLost(_)
             | UnansweredError::TimedOut(_)
             | UnansweredError::WorkerDied { .. }
+            | UnansweredError::WorkerDiedBeforeTaking { .. }
             | UnansweredError::LaneTimedOut { .. }
             | UnansweredError::PeerCorrupted { .. }
             | UnansweredError::LaneLost { .. }
@@ -424,16 +447,38 @@ impl UnansweredError {
     }
 }
 
+/// Says what a worker wrote that no correct worker writes: the error the lane's end measured it with.
+fn fault_said(fault: &PeerFault) -> &dyn std::fmt::Display {
+    match fault {
+        PeerFault::Counter(e) => e,
+        PeerFault::Length(e) => e,
+        PeerFault::Wakes(e) => e,
+    }
+}
+
 pub(crate) fn refuse(refusal: UnansweredError) -> HandlerError {
     HandlerError::Refused(refusal)
 }
 
 impl HandlerError {
-    /// Turns a `BodyRejected` from `req.stream` that the handler let through back into that
-    /// rejection, answered 4xx like a buffered body's.
+    /// Turns a `BodyReadError` from `req.stream` that the handler let through back into that
+    /// rejection, answered 4xx like a buffered body's, and an `HTTPException` into the answer it
+    /// asks for.
     pub(crate) fn python(py: Python<'_>, stage: RequestStage, err: &PyErr) -> Self {
         if let Some(reject) = body_stream::rejection_of(py, err) {
             return HandlerError::BodyRejected(reject);
+        }
+        if let Ok(raised) = err.value(py).cast::<HttpException>() {
+            return match raised.get().answer(py, err) {
+                Ok(answer) => HandlerError::Http {
+                    stage,
+                    answer: Box::new(answer),
+                },
+                Err(unanswerable) => HandlerError::Raised {
+                    stage,
+                    exception: PyException::capture(py, &unanswerable),
+                },
+            };
         }
         HandlerError::Raised {
             stage,
@@ -450,15 +495,14 @@ impl HandlerError {
     pub(crate) fn traceback(&self) -> Option<&str> {
         match self {
             HandlerError::Raised { exception, .. } => Some(exception.traceback()),
-            HandlerError::ContextNotExited { exit, handler } => {
-                handler.traceback().or(Some(exit.traceback()))
-            }
+            HandlerError::ContextNotExited { exit, handler } => handler.traceback().or(Some(exit.traceback())),
             HandlerError::LaneWorkerFailed(failure) => failure.traceback.as_deref(),
             HandlerError::Response(e) => e.exception().map(PyException::traceback),
             HandlerError::Refused(refusal) => refusal.traceback(),
             HandlerError::ContextLost { .. }
             | HandlerError::Panicked { .. }
             | HandlerError::BodyRejected(_)
+            | HandlerError::Http { .. }
             | HandlerError::ThreadNotSpawned(_)
             | HandlerError::ForeignEventLoop { .. }
             | HandlerError::LaneAnswerMalformed(_) => None,
@@ -487,6 +531,10 @@ impl HandlerError {
                 target: "mipyre::handler", request_id = %id, method, path,
                 error = %self, "request body rejected"
             ),
+            LogTreatment::Answered => tracing::debug!(
+                target: "mipyre::handler", request_id = %id, method, path,
+                error = %self, "request answered with the HTTPException it raised"
+            ),
             LogTreatment::Error => tracing::error!(
                 target: "mipyre::handler", request_id = %id, method, path,
                 error = %self, traceback = self.traceback(), "request failed"
@@ -509,6 +557,8 @@ enum LogTreatment {
     PeerGone,
     Warn,
     Debug,
+    /// An `HTTPException`'s answer: its raiser decided it, and it is logged at debug.
+    Answered,
     Error,
 }
 
@@ -527,9 +577,8 @@ fn treatment(err: &HandlerError) -> LogTreatment {
             LogTreatment::PeerGone
         }
         HandlerError::BodyRejected(BodyReadError::ConnectionLost(_)) => LogTreatment::Warn,
-        HandlerError::BodyRejected(BodyReadError::TooLarge | BodyReadError::TimedOut(_)) => {
-            LogTreatment::Debug
-        }
+        HandlerError::BodyRejected(BodyReadError::TooLarge | BodyReadError::TimedOut(_)) => LogTreatment::Debug,
+        HandlerError::Http { .. } => LogTreatment::Answered,
         HandlerError::Raised { .. }
         | HandlerError::ContextNotExited { .. }
         | HandlerError::ContextLost { .. }
@@ -588,9 +637,7 @@ impl fmt::Debug for ErrorRecord {
 
 /// Turns a panic in `f` into [`HandlerError::Panicked`]; `f` must leave nothing half-updated that
 /// the caller reads after a panic.
-pub(crate) fn catch_panic<T>(
-    f: impl FnOnce() -> Result<T, HandlerError>,
-) -> Result<T, HandlerError> {
+pub(crate) fn catch_panic<T>(f: impl FnOnce() -> Result<T, HandlerError>) -> Result<T, HandlerError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
         .unwrap_or_else(|payload| Err(HandlerError::panic(payload)))
 }
@@ -654,10 +701,7 @@ pub(crate) mod tests {
             let err = catch_panic::<()>(|| panic!("worker exploded: m4")).unwrap_err();
             let _ = err.log(&label(&id));
         });
-        let line = log
-            .lines()
-            .find(|l| l.contains("worker exploded: m4"))
-            .expect(&log);
+        let line = log.lines().find(|l| l.contains("worker exploded: m4")).expect(&log);
         assert!(line.contains(&id.to_string()), "{line}");
         assert!(line.contains("\"level\":\"ERROR\""), "{line}");
     }
@@ -721,18 +765,13 @@ pub(crate) mod tests {
             &CRASH_LOOP_THROTTLE,
         );
 
-        for rejection in [
-            BodyReadError::TooLarge,
-            BodyReadError::TimedOut(Duration::from_secs(5)),
-        ] {
+        for rejection in [BodyReadError::TooLarge, BodyReadError::TimedOut(Duration::from_secs(5))] {
             let err = HandlerError::BodyRejected(rejection);
             assert!(matches!(treatment(&err), LogTreatment::Debug), "{err}");
         }
 
         for err in [
-            HandlerError::Panicked {
-                payload: "boom".into(),
-            },
+            HandlerError::Panicked { payload: "boom".into() },
             refuse(UnansweredError::TimedOut(Duration::from_secs(30))),
             refuse(UnansweredError::NoWorkers(WorkerGroup::Subinterp)),
             refuse(UnansweredError::WorkersDied {

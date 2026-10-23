@@ -1,6 +1,11 @@
 # Every `cargo test` / `cargo nextest` run in this tree (the merge gate's and a local one) runs each proptest on the
 # same inputs: docs/property-testing.md §5, b/749. A run that sets PROPTEST_RNG_SEED itself keeps its own (the
-# nightly run: random seed, PROPTEST_CASES large). A failure's shrunk input is written to the crate's
-# proptest-regressions/ beside the source, which is committed and replayed first on every run.
+# nightly run: random seed, PROPTEST_CASES large).
+#
+# No run writes a failure's shrunk input to a proptest-regressions/ file beside the source (b/758): on the merge host
+# such a file left the CI home a dirty clone and halted the whole queue. proptest prints the shrunk input with the
+# failure; the fix adds it as an explicit test case, which every run replays. proptest reads the variable's presence,
+# not its value. dev/proptest_gate.py makes a proptest-regressions/ file in the tree red.
 [env]
 PROPTEST_RNG_SEED = "2749"
+PROPTEST_DISABLE_FAILURE_PERSISTENCE = "1"

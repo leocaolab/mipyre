@@ -1,26 +1,24 @@
 //! Dispatches worker routes to the shared sub-interpreter pool when TPC is off;
 //! `runtime="main"` routes and the fallback run on main.
 
-use mipyre_http::plan::limits::ByteLimit;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
+use mipyre_http::plan::limits::ByteLimit;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::exchange;
-use crate::exchange::{
-    refuse, Capacity, HandlerError, ReplyHolder, RequestLabel, UnansweredError, WorkerGroup,
-};
+use crate::exchange::RequestBody;
+use crate::exchange::{refuse, Capacity, HandlerError, ReplyHolder, RequestLabel, UnansweredError, WorkerGroup};
 use crate::runtime::PoolJob;
 use crate::serve::site::Site;
-use mipyre_http::plan::route::{HandlerCall, HandlerKind, RouteId};
-use crate::exchange::RequestBody;
 use mipyre_http::io::body::{collect, BodyGate, ResponseBody};
+use mipyre_http::plan::route::{HandlerCall, HandlerKind, RouteId};
 
 use super::on_main::run_on_main;
 use super::pipeline::{
-    await_reply, fail, finish, preprocess, reply_or_lost, AcceptEncoding, Disposition,
-    HandlerRequest, ResponseSource,
+    await_reply, fail, finish, preprocess, reply_or_lost, AcceptEncoding, Disposition, HandlerRequest, Requester,
+    ResponseSource,
 };
 use super::respond::http_response;
 
@@ -60,11 +58,7 @@ impl BodyGate for Admission<'_> {
     type Error = HandlerError;
     fn admit(&mut self, buffered: usize) -> Result<(), HandlerError> {
         if self.permit.is_none() && self.skip_bytes.is_exceeded_by(buffered as u64) {
-            let permit = self
-                .semaphore
-                .clone()
-                .try_acquire_owned()
-                .map_err(admission_refused)?;
+            let permit = self.semaphore.clone().try_acquire_owned().map_err(admission_refused)?;
             self.permit = Some(permit);
         }
         Ok(())
@@ -91,12 +85,10 @@ pub(crate) async fn handle_request_subinterp(
         Disposition::ForHandler(p) => p,
     };
     let resp = match prepared.call {
-        HandlerCall::Main(target, body) => {
-            run_on_main(&site, prepared, target, body, ResponseSource::Main).await
+        HandlerCall::Main(target, handler) => {
+            run_on_main(&site, prepared, target, handler.body(), ResponseSource::Main).await
         }
-        HandlerCall::Worker(route, kind) => {
-            serve_on_pool(&pool, &site, prepared, route, kind).await
-        }
+        HandlerCall::Worker(route, kind) => serve_on_pool(&pool, &site, prepared, route, kind).await,
         HandlerCall::Lane(route) => super::on_lane::serve_on_lane(&site, prepared, route).await,
     };
     Ok(resp)
@@ -112,6 +104,7 @@ pub(crate) async fn serve_on_pool(
     kind: HandlerKind,
 ) -> Response<ResponseBody> {
     let label = prepared.head.label();
+    let client = prepared.head.client;
     let timer = prepared.timer;
     let origin = prepared.origin.take();
     let resp = run_on_pool(pool, prepared, route, kind, site, &label).await;
@@ -120,6 +113,7 @@ pub(crate) async fn serve_on_pool(
         site,
         &label.method,
         label.uri.path(),
+        Requester::Given(&label.id, &client),
         timer,
         origin,
         ResponseSource::Pool,
@@ -154,10 +148,7 @@ async fn run_on_pool(
         permit: upfront,
     };
     let accept_encoding = AcceptEncoding::of(&head, settings.compression.as_ref());
-    let limits = &settings.limits;
-    let collected = collect(body, limits.max_body.as_usize(), &mut admission, || {
-        limits.body_time()
-    });
+    let collected = collect(body, &mut admission, &settings.limits);
     let body = match collected.await {
         Ok(body) => body,
         Err(e) => return fail(e, label, &site.counters),

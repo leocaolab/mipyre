@@ -1,4 +1,4 @@
-"""App for tests/test_review_m1a.py::test_model_route_also_injects_path_params: `model=`
+"""App for tests/test_review_m1a.py::test_model_route_also_injects_path_params: `body=`
 routes whose handlers also take path parameters. Its own module: a worker serves one
 app per module."""
 
@@ -14,11 +14,11 @@ class Item(BaseModel):
 app = Mipyre(runtime="isolated")
 
 
-@app.put("/items/{item_id}", model=Item)
+@app.put("/items/{item_id}", body=Item)
 def update(req, item: Item, item_id):
     return {"id": item_id, "name": item.name, "path": req.path}
 
 
-@app.post("/tags/{tag}", model=Item)
+@app.post("/tags/{tag}", body=Item)
 async def tag(item: Item, tag):
     return {"tag": tag, "name": item.name}

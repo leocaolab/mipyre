@@ -16,6 +16,7 @@ import pytest
 from mipyre._process_lane.template import (
     LANE,
     MAX_FRAME_BYTES,
+    RUN,
     SETUP,
     CommandFrameError,
     ForkFailureWithoutErrno,
@@ -25,6 +26,7 @@ from mipyre._process_lane.template import (
     forked_frame,
     import_failed_frame,
     lane_fds_missing_frame,
+    parse_run,
     parse_start,
     parse_words,
     split_frame,
@@ -84,6 +86,8 @@ def test_the_template_reads_the_commands_the_server_writes():
                 assert (tag, parse_words(tag, body, 1)) == (LANE, [case["lane"]]), case["what"]
             case "start":
                 assert parse_start(tag, body) == (case["lane"], case["attempt"]), case["what"]
+            case "run":
+                assert (tag, parse_run(body)) == (RUN, case["json"]), case["what"]
 
 
 def test_a_command_frame_is_whole_only_with_its_last_byte():
@@ -166,11 +170,41 @@ def test_a_worker_that_ends_before_ready_fails_the_start_with_its_pid_and_exit(t
     assert "Listening on" not in out, out[-3000:]
 
 
+def test_a_launcher_whose_app_fails_to_import_reports_that_error_alone():
+    """The launcher waits for its template before it removes the run directory: a spawned
+    template still starting would otherwise import `mipyre` from the install and refuse."""
+    app = os.path.join(APPS, "process_lane_app_import_fails.py")
+    r = subprocess.run(
+        [sys.executable, "-m", "mipyre", "run", f"{app}:app", "--port", "0"],
+        capture_output=True, text=True, timeout=120,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out[-3000:]
+    assert "RuntimeError: the app's own import error" in out, out[-3000:]
+    assert "refuses to start" not in out, out[-3000:]
+
+
+def test_a_launcher_whose_start_fails_after_the_template_got_its_lanes_reports_that_error_alone():
+    """The launcher ends its template before it removes the run directory, also once the
+    template got its lanes: a spawned template still starting would otherwise import `mipyre`
+    from the install, or from a half-removed copy, and say so."""
+    app = os.path.join(APPS, "process_lane_startup_hook_fails.py")
+    r = subprocess.run(
+        [sys.executable, "-m", "mipyre", "run", f"{app}:app", "--port", "0"],
+        capture_output=True, text=True, timeout=120,
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out[-3000:]
+    assert "RuntimeError: the app's own startup error" in out, out[-3000:]
+    assert "refuses to start" not in out, out[-3000:]
+    assert "ModuleNotFoundError" not in out, out[-3000:]
+
+
 @pytest.mark.parametrize("start", ["import", "fork"])
-def test_a_spawned_workers_message_gives_it_back_its_setup_lane_and_template(start):
+def test_a_spawned_workers_message_gives_it_back_its_setup_lane_attempt_and_template(start):
     """The setup, and a spawned worker's message, come back as they were sent: the worker
     watches the template its message names, not its parent, which is 1 once the template died."""
-    from mipyre._process_lane import LaneSetup, LaneWorker
+    from mipyre._process_lane.server import LaneSetup, LaneWorker
     from mipyre.engine import StartStrategy
 
     setup = LaneSetup(
@@ -183,7 +217,56 @@ def test_a_spawned_workers_message_gives_it_back_its_setup_lane_and_template(sta
         routers=("app",),
         sys_path=("/srv", ""),
         cwd="/srv",
+        thread_limits={"POLARS_MAX_THREADS": "1"},
+        log_level="WARN",
+        log_format="json",
+        run_dir="/home/app/.cache/mipyre/run/0123456789abcdef",
     )
-    sent = LaneWorker(setup, lane=2, template_pid=4242, fds=(5, 6, 7, 8))
+    sent = LaneWorker(
+        setup,
+        lane=2,
+        template_pid=4242,
+        attempt=7,
+        fds=(5, 6),
+        command_line='{"argv": [], "parsed": false}',
+        build="mipyre-0.0.0+0123456789abcdef",
+    )
     assert LaneSetup.decode(setup.encode()) == setup
     assert LaneWorker.decode(sent.encode()) == sent
+
+
+def _spawned_worker(argv: list[str], setup: bytes | None) -> subprocess.CompletedProcess:
+    """Runs a spawned worker's entry with `argv`; `setup`, when given, is written to the fd it
+    names (`{fd}` in `argv`) and the fd closed, as the template does."""
+    read_end, write_end = os.pipe()
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "mipyre._process_lane.worker", *(a.format(fd=read_end) for a in argv)],
+            pass_fds=(read_end,),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    finally:
+        os.close(read_end)
+    with os.fdopen(write_end, "wb") as w:
+        if setup is not None:
+            w.write(setup)
+    out, err = proc.communicate(timeout=60)
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+def test_a_spawned_worker_without_its_setup_fd_refuses_to_start():
+    from mipyre._process_lane.server import START_REFUSED
+
+    done = _spawned_worker([], None)
+    assert done.returncode == START_REFUSED, done.stderr[-3000:]
+    assert "takes --setup-fd N, got []" in done.stderr, done.stderr[-3000:]
+
+
+def test_a_spawned_worker_whose_setup_is_not_one_refuses_to_start():
+    from mipyre._process_lane.server import START_REFUSED
+
+    done = _spawned_worker(["--setup-fd", "{fd}"], b"{not json")
+    assert done.returncode == START_REFUSED, done.stderr[-3000:]
+    assert "JSONDecodeError" in done.stderr, done.stderr[-3000:]

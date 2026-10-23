@@ -6,6 +6,9 @@ import pytest
 from mipyre.testing import TestClient
 
 
+BIG = bytes(i // 7 % 251 for i in range(20 * 64 * 1024 + 3))
+
+
 @pytest.fixture(scope="module")
 def static_dir():
     """Create a temp directory with test static files."""
@@ -18,6 +21,9 @@ def static_dir():
         f.write('{"key": "value"}')
     with open(os.path.join(d, "readme.txt"), "w") as f:
         f.write("plain text file")
+    # Many chunks of 64 KiB, each different, so a chunk sent twice or out of order shows.
+    with open(os.path.join(d, "big.bin"), "wb") as f:
+        f.write(BIG)
     # Nested directory
     sub = os.path.join(d, "sub")
     os.makedirs(sub)
@@ -142,3 +148,16 @@ def test_static_symlink_out_of_root_refused(static_dir):
             os.unlink(readme)
         except OSError:
             pass
+
+
+def test_a_large_file_is_served_whole_with_its_length_on_get_and_head(client):
+    """A file of many chunks is the whole file on GET, and HEAD says its length with no body,
+    whether the cache keeps it or it is sent from disk a chunk at a time (b/619)."""
+    got = client.get("/static/big.bin")
+    assert got.status_code == 200
+    assert got.body == BIG
+    head = client.head("/static/big.bin")
+    assert head.status_code == 200
+    assert head.headers["content-length"] == str(len(BIG))
+    assert head.body == b""
+    assert head.headers["etag"] == got.headers["etag"]

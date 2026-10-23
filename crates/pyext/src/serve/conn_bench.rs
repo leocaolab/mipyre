@@ -27,7 +27,9 @@ fn requests() -> u32 {
 }
 
 async fn ok(_: hyper::Request<Incoming>) -> Result<hyper::Response<ResponseBody>, hyper::Error> {
-    Ok(hyper::Response::new(ResponseBody::Full(Full::new(Bytes::from_static(b"ok")))))
+    Ok(hyper::Response::new(ResponseBody::Full(Full::new(Bytes::from_static(
+        b"ok",
+    )))))
 }
 
 /// Runs `client` against one connection served by `drive_connection` on a current-thread runtime,
@@ -59,7 +61,7 @@ where
 #[test]
 fn http1_requests() {
     bench(|mut c| async move {
-        const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: t\r\n\r\n";
+        const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
         let mut buf = [0u8; 4096];
         for _ in 0..requests() {
             c.write_all(GET).await.expect("the pipe holds it");
@@ -107,7 +109,9 @@ fn http2_requests() {
                 let (kind, flags) = (head[3], head[4]);
                 let on = u32::from_be_bytes([head[5] & 0x7f, head[6], head[7], head[8]]);
                 if kind == 0x4 && flags & 0x1 == 0 && !acked {
-                    c.write_all(&[0, 0, 0, 0x4, 0x1, 0, 0, 0, 0]).await.expect("the pipe holds it");
+                    c.write_all(&[0, 0, 0, 0x4, 0x1, 0, 0, 0, 0])
+                        .await
+                        .expect("the pipe holds it");
                     acked = true;
                 }
                 // A PING is answered, as a live client does.

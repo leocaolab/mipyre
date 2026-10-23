@@ -4,7 +4,7 @@ worker serves one app per module."""
 from mipyre import Mipyre
 
 app = Mipyre()
-app.enable_request_id(header="X-Trace-Id")
+app.enable_request_id_header(header="X-Trace-Id")
 
 
 @app.get("/")

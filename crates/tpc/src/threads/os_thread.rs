@@ -140,27 +140,18 @@ mod tests {
     #[test]
     fn a_thread_that_ends_is_seen_finished_before_the_deadline() {
         let (release, released) = mpsc::channel::<()>();
-        let thread = spawn(std::thread::Builder::new(), move || {
-            while released.recv().is_ok() {}
-        })
-        .unwrap();
+        let thread = spawn(std::thread::Builder::new(), move || while released.recv().is_ok() {}).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         drop(release);
         assert!(thread.finished_by(deadline));
-        assert!(
-            Instant::now() < deadline,
-            "woken by the end, not the deadline"
-        );
+        assert!(Instant::now() < deadline, "woken by the end, not the deadline");
         thread.handle.join().unwrap();
     }
 
     #[test]
     fn a_thread_still_running_at_the_deadline_is_not_finished() {
         let (release, released) = mpsc::channel::<()>();
-        let thread = spawn(std::thread::Builder::new(), move || {
-            while released.recv().is_ok() {}
-        })
-        .unwrap();
+        let thread = spawn(std::thread::Builder::new(), move || while released.recv().is_ok() {}).unwrap();
         let timeout = Duration::from_millis(10);
         let started = Instant::now();
         assert!(!thread.finished_by(started + timeout));
@@ -177,16 +168,16 @@ mod tests {
             }
         })
         .unwrap();
-        assert_eq!(thread.join_by(Instant::now() + Duration::from_secs(10)), Err(ThreadJoinError::Panicked("boom".into())));
+        assert_eq!(
+            thread.join_by(Instant::now() + Duration::from_secs(10)),
+            Err(ThreadJoinError::Panicked("boom".into()))
+        );
     }
 
     #[test]
     fn a_thread_joined_by_a_passed_deadline_is_still_running() {
         let (release, released) = mpsc::channel::<()>();
-        let thread = spawn(std::thread::Builder::new(), move || {
-            while released.recv().is_ok() {}
-        })
-        .unwrap();
+        let thread = spawn(std::thread::Builder::new(), move || while released.recv().is_ok() {}).unwrap();
         assert_eq!(thread.join_by(Instant::now()), Err(ThreadJoinError::StillRunning));
         drop(release);
     }

@@ -76,10 +76,10 @@ impl PyParam {
             .map_err(unreadable)?
             .ok_or_else(|| ParamError::Unsupported {
                 index,
-                python_type: obj.get_type().name().map_or_else(
-                    |e| format!("<type name unavailable: {e}>"),
-                    |n| n.to_string(),
-                ),
+                python_type: obj
+                    .get_type()
+                    .name()
+                    .map_or_else(|e| format!("<type name unavailable: {e}>"), |n| n.to_string()),
             })
     }
 
@@ -91,11 +91,7 @@ impl PyParam {
         // datetime is a subclass of date, so datetime is checked first.
         if obj.is_instance(types.datetime.bind(py))? {
             let naive = obj.call_method0("utcoffset")?.is_none();
-            let epoch = if naive {
-                &types.pg_epoch
-            } else {
-                &types.pg_epoch_utc
-            };
+            let epoch = if naive { &types.pg_epoch } else { &types.pg_epoch_utc };
             let micros: i64 = obj
                 .sub(epoch.bind(py))?
                 .floor_div(types.one_microsecond.bind(py))?
@@ -115,9 +111,7 @@ impl PyParam {
             return Ok(Some(Self::Uuid(bytes)));
         }
         if obj.is_instance(types.decimal.bind(py))? {
-            return Ok(Some(Self::Decimal(
-                obj.call_method1("__format__", ("f",))?.extract()?,
-            )));
+            return Ok(Some(Self::Decimal(obj.call_method1("__format__", ("f",))?.extract()?)));
         }
         Ok(None)
     }
@@ -140,10 +134,7 @@ impl PyParam {
     }
 }
 
-pub(crate) fn encode_args(
-    declared: &[PgTypeInfo],
-    params: Vec<PyParam>,
-) -> Result<PgArguments, ParamError> {
+pub(crate) fn encode_args(declared: &[PgTypeInfo], params: Vec<PyParam>) -> Result<PgArguments, ParamError> {
     if declared.len() != params.len() {
         return Err(ParamError::WrongCount {
             expected: declared.len(),
@@ -153,25 +144,21 @@ pub(crate) fn encode_args(
     let mut args = PgArguments::default();
     for (index, (ty, param)) in (1..).zip(declared.iter().zip(params)) {
         let wire = to_wire(ty, param, index)?;
-        args.add(PgParam {
-            ty: ty.clone(),
-            wire,
-        })
-        .map_err(|source| ParamError::NotEncodable { index, source })?;
+        args.add(PgParam { ty: ty.clone(), wire })
+            .map_err(|source| ParamError::NotEncodable { index, source })?;
     }
     Ok(args)
 }
 
 /// Returns the binary wire value of `param` as type `ty`, or `None` for SQL NULL.
 fn to_wire(ty: &PgTypeInfo, param: PyParam, index: usize) -> Result<Option<Vec<u8>>, ParamError> {
-    let out_of_range =
-        |value: &dyn std::fmt::Display, pg_type: &'static str| ParamError::ValueDoesNotFit {
-            index,
-            problem: ParamValueError::OutOfRange {
-                value: value.to_string(),
-                pg_type,
-            },
-        };
+    let out_of_range = |value: &dyn std::fmt::Display, pg_type: &'static str| ParamError::ValueDoesNotFit {
+        index,
+        problem: ParamValueError::OutOfRange {
+            value: value.to_string(),
+            pg_type,
+        },
+    };
     // Narrowing a finite float8 to float4 must not overflow to infinity.
     let float4 = |f: f64| {
         let narrowed = f as f32;
@@ -181,10 +168,7 @@ fn to_wire(ty: &PgTypeInfo, param: PyParam, index: usize) -> Result<Option<Vec<u
             Ok(narrowed.to_be_bytes().to_vec())
         }
     };
-    let big_float = |text: &str| {
-        text.parse::<f64>()
-            .map_err(|_| out_of_range(&text, "float8"))
-    };
+    let big_float = |text: &str| text.parse::<f64>().map_err(|_| out_of_range(&text, "float8"));
     let numeric = |text: &str| {
         let mut wire = Vec::new();
         numeric::encode(text, &mut wire)

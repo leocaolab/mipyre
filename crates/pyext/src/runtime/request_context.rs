@@ -27,8 +27,7 @@ pub(crate) enum RequestContext<'py> {
 
 // It must stay one pointer, passed in a register along the chain; `Lost` uses the entry's null
 // niche.
-const _: () =
-    assert!(std::mem::size_of::<RequestContext<'static>>() == std::mem::size_of::<usize>());
+const _: () = assert!(std::mem::size_of::<RequestContext<'static>>() == std::mem::size_of::<usize>());
 
 /// Runs `f` in a new, empty `contextvars.Context` entered on this thread for the call.
 ///
@@ -202,7 +201,7 @@ static RUN: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 fn run(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     RUN.get_or_try_init(py, || {
-        py.import(intern!(py, "mipyre._awaitable"))?
+        py.import(intern!(py, "mipyre._worker.awaitable"))?
             .getattr(intern!(py, "run"))
             .map(Bound::unbind)
     })
@@ -211,7 +210,7 @@ fn run(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 
 /// Wraps `awaitable` in a native coroutine that awaits it.
 fn drive<'py>(py: Python<'py>, awaitable: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-    py.import(intern!(py, "mipyre._awaitable"))?
+    py.import(intern!(py, "mipyre._worker.awaitable"))?
         .getattr(intern!(py, "drive"))?
         .call1((awaitable,))
 }
@@ -222,13 +221,13 @@ pub(super) mod tests {
     use crate::exchange::{captured_log, label};
     use mipyre_http::io::request_id::RequestId;
 
-    /// Registers `mipyre._awaitable` from its source, because importing the `mipyre` package in a
+    /// Registers `mipyre._worker.awaitable` from its source, because importing the `mipyre` package in a
     /// test binary would load the extension module again.
     pub(in crate::runtime) fn register_awaitable_module(py: Python<'_>) {
-        let source = std::ffi::CString::new(include_str!("../../../../python/mipyre/_awaitable.py"))
+        let source = std::ffi::CString::new(include_str!("../../../../python/mipyre/_worker/awaitable.py"))
             .expect("no NUL in the source");
-        let module = PyModule::from_code(py, &source, c"_awaitable.py", c"mipyre._awaitable")
-            .expect("mipyre._awaitable compiles");
+        let module = PyModule::from_code(py, &source, c"awaitable.py", c"mipyre._worker.awaitable")
+            .expect("mipyre._worker.awaitable compiles");
         let modules = py
             .import("sys")
             .and_then(|sys| sys.getattr("modules"))
@@ -238,8 +237,8 @@ pub(super) mod tests {
             modules.set_item("mipyre", package).expect("mipyre registered");
         }
         modules
-            .set_item("mipyre._awaitable", module)
-            .expect("mipyre._awaitable registered");
+            .set_item("mipyre._worker.awaitable", module)
+            .expect("mipyre._worker.awaitable registered");
     }
 
     /// Runs `in_request_context` with an `f` that enters another context and never exits it,
@@ -256,10 +255,7 @@ pub(super) mod tests {
             other = Some(PyContext::new(py).expect("a new context").enter());
             f(py)
         });
-        other
-            .expect("f ran")
-            .exit()
-            .expect("the context f entered is current");
+        other.expect("f ran").exit().expect("the context f entered is current");
         outcome
     }
 
@@ -273,16 +269,20 @@ pub(super) mod tests {
         Python::initialize();
         std::thread::spawn(|| {
             mipyre_subinterp::attach::with_main(|py| {
-                let failed = with_a_context_left_entered::<()>(py, |py| {
-                    Err(raised(py, "the handler's own failure"))
-                })
-                .expect_err("the context could not be left");
+                let failed = with_a_context_left_entered::<()>(py, |py| Err(raised(py, "the handler's own failure")))
+                    .expect_err("the context could not be left");
                 let HandlerError::ContextNotExited { exit, handler } = &failed else {
                     panic!("not ContextNotExited: {failed}");
                 };
                 assert!(exit.to_string().starts_with("RuntimeError: "), "{exit}");
                 assert!(
-                    matches!(**handler, HandlerError::Raised { stage: RequestStage::Handler, .. }),
+                    matches!(
+                        **handler,
+                        HandlerError::Raised {
+                            stage: RequestStage::Handler,
+                            ..
+                        }
+                    ),
                     "{handler}"
                 );
                 assert!(handler.to_string().contains("the handler's own failure"), "{handler}");
@@ -299,7 +299,9 @@ pub(super) mod tests {
                     line.contains("then leaving the request's contextvars.Context raised RuntimeError"),
                     "{line}"
                 );
-                let resp = record.expect("logged").into_response(&crate::telemetry::RunCounters::new(false));
+                let resp = record
+                    .expect("logged")
+                    .into_response(&crate::telemetry::RunCounters::new(false));
                 assert_eq!(resp.status().as_u16(), 500);
             })
         })
@@ -314,7 +316,10 @@ pub(super) mod tests {
             mipyre_subinterp::attach::with_main(|py| {
                 let failed = with_a_context_left_entered(py, |_py| Ok("the response"))
                     .expect_err("the context could not be left");
-                let HandlerError::Raised { stage: RequestStage::ContextExit, exception } = &failed
+                let HandlerError::Raised {
+                    stage: RequestStage::ContextExit,
+                    exception,
+                } = &failed
                 else {
                     panic!("not a ContextExit failure: {failed}");
                 };
@@ -323,8 +328,18 @@ pub(super) mod tests {
                 let mut record = None;
                 let log = captured_log(|| record = Some(failed.log(&label(&id))));
                 assert!(log.contains(&id.to_string()), "{log}");
-                assert!(log.contains("leaving the request's contextvars.Context raised"), "{log}");
-                assert_eq!(record.expect("logged").into_response(&crate::telemetry::RunCounters::new(false)).status().as_u16(), 500);
+                assert!(
+                    log.contains("leaving the request's contextvars.Context raised"),
+                    "{log}"
+                );
+                assert_eq!(
+                    record
+                        .expect("logged")
+                        .into_response(&crate::telemetry::RunCounters::new(false))
+                        .status()
+                        .as_u16(),
+                    500
+                );
             })
         })
         .join()
@@ -348,10 +363,7 @@ mod bench {
     use crate::exchange::error::HandlerError;
 
     fn count() -> u64 {
-        std::env::var("BENCH_N")
-            .ok()
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(1)
+        std::env::var("BENCH_N").ok().and_then(|n| n.parse().ok()).unwrap_or(1)
     }
 
     #[test]
@@ -360,8 +372,7 @@ mod bench {
         mipyre_subinterp::attach::with_main(|py| {
             let mut spare = SpareContext::default();
             for _ in 0..count() {
-                let served =
-                    in_reused_context(py, &mut spare, |_rc| Ok::<_, HandlerError>(black_box(py)));
+                let served = in_reused_context(py, &mut spare, |_rc| Ok::<_, HandlerError>(black_box(py)));
                 assert!(served.is_ok());
             }
             spare.release(py);
@@ -401,8 +412,7 @@ mod bench {
             register_awaitable_module(py);
             let code = c"async def noop():\n    return None\n\nclass Done:\n    def done(self):\n        return True\n    def result(self):\n        return None\n\nclass Loop:\n    _ready = ()\n    _scheduled = ()\n    _stopping = False\n    def _run_forever_setup(self):\n        pass\n    def _run_forever_cleanup(self):\n        pass\n    def _task_factory(self, loop, coro, context):\n        coro.close()\n        return Done()\n    def create_task(self, coro, context):\n        return self._task_factory(self, coro, context=context)\n";
             let globals = pyo3::types::PyDict::new(py);
-            py.run(code, Some(&globals), None)
-                .expect("noop and Loop defined");
+            py.run(code, Some(&globals), None).expect("noop and Loop defined");
             let noop = globals.get_item("noop").expect("lookup").expect("noop");
             let event_loop = globals
                 .get_item("Loop")

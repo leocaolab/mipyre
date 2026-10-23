@@ -16,6 +16,8 @@ import types
 import typing
 from typing import TYPE_CHECKING, Mapping
 
+from mipyre.engine import DeclarationError
+
 if TYPE_CHECKING:
     from pydantic import BaseModel
 
@@ -29,7 +31,7 @@ _SEQUENCES = frozenset({
 _MAPPINGS = frozenset({dict, collections.abc.Mapping, collections.abc.MutableMapping})
 
 
-class QueryDeclarationError(TypeError):
+class QueryDeclarationError(DeclarationError):
     """A ``query=`` model with a field a query string can't carry."""
 
 
@@ -63,7 +65,7 @@ class QueryFields:
                 raise QueryDeclarationError(
                     f"query={model.__name__}: field {name!r} is {e.annotation!r}, which a query "
                     "string can't carry: a key holds text, repeated for a list. Take it in the "
-                    "body (model=) instead"
+                    "body (body=) instead"
                 ) from None
             (sequences if takes_every_value else scalars).update(keys)
         return cls(frozenset(sequences), frozenset(scalars))

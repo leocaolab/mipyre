@@ -103,11 +103,7 @@ impl<T> StartGate<T> {
         self.turns.push(turn_tx);
         self.reports.push(report_rx);
         self.verdicts.push(verdict_tx);
-        StartHandle {
-            turn,
-            report,
-            verdict,
-        }
+        StartHandle { turn, report, verdict }
     }
 
     /// Tells every enlisted thread to end without creating a worker, for when a thread of the set
@@ -206,11 +202,7 @@ pub(crate) fn start_here<W: ThreadResident, T>(
     worker: WorkerIndex,
     create: impl FnOnce() -> Result<W, WorkerStartError>,
 ) -> Option<(W, T)> {
-    let StartHandle {
-        turn,
-        report,
-        verdict,
-    } = handle;
+    let StartHandle { turn, report, verdict } = handle;
     if turn.recv().is_err() {
         return None;
     }
@@ -294,10 +286,7 @@ mod tests {
         assert!(refused.to_string().starts_with("worker 1: "), "{refused}");
         assert_eq!(refused.kind(), "creation_failed");
 
-        let no_routes = WorkerStartError::NoRoutes {
-            worker,
-            expected: 2,
-        };
+        let no_routes = WorkerStartError::NoRoutes { worker, expected: 2 };
         assert_eq!(no_routes.kind(), "prepare_failed");
     }
 
@@ -488,9 +477,8 @@ mod tests {
         let mut gate = StartGate::<()>::new();
         let gone = gate.enlist();
         let kept = gate.enlist();
-        let waiter = std::thread::spawn(move || {
-            start_here(kept, WorkerIndex::new(1), || Ok(None::<Counted>)).is_none()
-        });
+        let waiter =
+            std::thread::spawn(move || start_here(kept, WorkerIndex::new(1), || Ok(None::<Counted>)).is_none());
         drop(gone);
         let aborted = gate.serve_or_abort(vec![(), ()]).expect_err("the start fails");
         assert_eq!(kinds(&aborted), vec!["report_lost"]);

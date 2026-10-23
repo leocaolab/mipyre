@@ -9,7 +9,7 @@ def test_fast_plain():
     # Its own module: a worker serves one app per module.
     from tests.apps.fast_plain import app
 
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         r = c.get("/health")
         assert r.status_code == 200
         assert r.body == b'{"ok":true}'
@@ -27,7 +27,7 @@ def test_fast_status_and_headers():
     # Its own module: a worker serves one app per module.
     from tests.apps.fast_status_and_headers import app
 
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         r = c.get("/maintenance")
         assert r.status_code == 503
         assert r.body == b"we are down"
@@ -40,7 +40,7 @@ def test_fast_does_not_interfere_with_dynamic():
     # Its own module: a worker serves one app per module.
     from tests.apps.fast_beside_dynamic import app
 
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         assert c.get("/health").body == b"ok"
         assert c.get("/users/42").json() == {"id": "42"}
 
@@ -50,7 +50,7 @@ def test_fast_exact_match_only():
     # Its own module: a worker serves one app per module.
     from tests.apps.fast_exact_match import app
 
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         # GET uses fast path
         assert c.get("/health").body == b"ok"
         # POST still goes through the dynamic handler
@@ -64,7 +64,7 @@ def test_bytes_body_fast_path_in_mipyre_response():
     # Its own module: a worker serves one app per module.
     from tests.apps.fast_bytes_body import app
 
-    with TestClient(app, port=None) as c:
+    with TestClient(app) as c:
         r = c.get("/raw")
         assert r.body == b"\x00\x01\x02\xff"
         assert r.headers.get("content-type") == "application/octet-stream"

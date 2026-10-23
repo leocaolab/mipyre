@@ -12,7 +12,7 @@ import http.client
 import pytest
 
 from mipyre import Mipyre
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 
 VAR = contextvars.ContextVar("reuse_var", default="unset")
 
@@ -67,7 +67,7 @@ def later(req):
 
 @pytest.fixture(scope="module")
 def conn():
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         c = http.client.HTTPConnection("127.0.0.1", client.port, timeout=10)
         yield c
         c.close()

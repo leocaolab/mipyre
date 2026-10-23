@@ -1,7 +1,7 @@
 //! Checks a slot's end and begin against interrupting threads over every Loom interleaving.
 //!
 //! Run with
-//! `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_subinterp --lib --release --target-dir target/loom loom_model`.
+//! `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_subinterp --lib --profile model --target-dir target/loom loom_model`.
 //! The thread state is a `loom::cell::UnsafeCell`, so Loom also fails any two host calls that
 //! are in "the GIL" at once. Every interleaving explored shows that an interruption aimed at a
 //! run never stays pending past that run's end or lands in the next run, that nothing touches
@@ -10,111 +10,10 @@
 
 use std::sync::Arc;
 
-use loom::cell::UnsafeCell;
 use loom::thread;
 
-use super::test_gil::{Gil, Held};
-use super::{InterruptError, RunId, UnitHost, UnitPhase, UnitState};
-
-struct ModelHost {
-    gil: Gil,
-    thread: UnsafeCell<ThreadState>,
-}
-
-
-struct ThreadState {
-    alive: bool,
-    /// The run the exception set on the thread and not taken back was aimed at.
-    pending: Option<RunId>,
-    last_ended: Option<RunId>,
-}
-
-
-impl ModelHost {
-    fn new() -> Self {
-        ModelHost {
-            gil: Gil::new(),
-            thread: UnsafeCell::new(ThreadState {
-                alive: true,
-                pending: None,
-                last_ended: None,
-            }),
-        }
-    }
-
-    fn with_thread<R>(&self, _gil: Held<'_>, f: impl FnOnce(&mut ThreadState) -> R) -> R {
-        // SAFETY: The caller holds the model's GIL, so no access is concurrent, and Loom fails
-        // the model if one is.
-        self.thread.with_mut(|state| f(unsafe { &mut *state }))
-    }
-}
-
-impl UnitHost for ModelHost {
-    type Gil<'py> = Held<'py>;
-    type Exception = RunId;
-
-    fn visit<R>(&self, f: impl for<'py> FnOnce(Held<'py>) -> R) -> Option<R> {
-        let gil = self.gil.take();
-        self.with_thread(gil, |state| {
-            assert!(state.alive, "an interruption entered the interpreter after the unit's end returned");
-        });
-        let out = f(gil);
-        self.gil.give();
-        Some(out)
-    }
-
-    fn set_raise(&self, gil: Held<'_>, exc: Option<RunId>) -> bool {
-        self.with_thread(gil, |state| {
-            assert!(state.alive, "SetAsyncExc reached the unit's thread state after its end returned");
-            if let Some(aimed) = exc {
-                assert_ne!(
-                    state.last_ended,
-                    Some(aimed),
-                    "an interruption was set after the end of the run it was aimed at returned"
-                );
-            }
-            state.pending = exc;
-        });
-        true
-    }
-
-    fn without_gil(&self, _gil: Held<'_>, f: impl FnOnce()) {
-        self.gil.give();
-        f();
-        self.gil.take();
-    }
-
-    /// The model's unit thread is never gone, because `set_raise` always finds it.
-    fn thread_gone(&self, _gil: Held<'_>) -> InterruptError {
-        InterruptError::UnitThreadGone { thread: 0, interp: 0 }
-    }
-}
-
-fn new_slot() -> Arc<UnitState<ModelHost>> {
-    Arc::new(UnitState::new(ModelHost::new()))
-}
-
-fn pending(slot: &UnitState<ModelHost>) -> Option<RunId> {
-    let gil = slot.host.gil.take();
-    let pending = slot.host.with_thread(gil, |state| state.pending);
-    slot.host.gil.give();
-    pending
-}
-
-/// Ends `run` in the GIL, as `WorkUnit::end` does, and records that its end returned.
-fn end(slot: &UnitState<ModelHost>, run: RunId) {
-    let gil = slot.host.gil.take();
-    slot.end_attached(gil);
-    slot.host.with_thread(gil, |state| state.last_ended = Some(run));
-    slot.host.gil.give();
-}
-
-/// Marks the worker's thread state gone after its last end.
-fn thread_state_gone(slot: &UnitState<ModelHost>) {
-    let gil = slot.host.gil.take();
-    slot.host.with_thread(gil, |state| state.alive = false);
-    slot.host.gil.give();
-}
+use super::model_host::{end, new_slot, pending, thread_state_gone, ModelHost};
+use super::{RunId, UnitPhase, UnitState};
 
 /// Spawns a thread that interrupts `run` and checks what it reports.
 fn interrupter(slot: &Arc<UnitState<ModelHost>>, run: RunId) -> thread::JoinHandle<()> {

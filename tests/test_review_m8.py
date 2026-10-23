@@ -27,13 +27,16 @@ import pytest
 
 import mipyre.engine
 from mipyre import Mipyre
-from mipyre.testing import TestClient
+from mipyre.engine import ServerFlags
+from mipyre.mcp import MCPServer
+from mipyre.testing import TestClient, TestServer
 
 from tests._helpers import poll_until
 
 HOST = "127.0.0.1"
 
-app = Mipyre()
+# Its runtime is MIPYRE_TEST_MODE's: the default in this process, "main" where a test runs it so.
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 # The main interpreter's record of hook runs, in order.
 LIFECYCLE: list[str] = []
@@ -49,7 +52,9 @@ def _stopped():
     LIFECYCLE.append("shutdown")
 
 
-@app.mcp.tool()
+mcp = MCPServer(app)
+
+@mcp.tool()
 def echo(text: str) -> str:
     return text
 
@@ -59,10 +64,9 @@ def where(req):
     return {"in_worker": mipyre.engine._in_worker()}
 
 
-@pytest.fixture(autouse=True)
-def _two_workers(monkeypatch):
-    # Every start builds its workers by executing this file; two keep the tests quick.
-    monkeypatch.setenv("MIPYRE_WORKERS", "2")
+#: Every start builds its workers by executing this file; two keep the tests quick. A test server
+#: reads no environment (b/335 M5.6), so the size is its config.
+TWO_WORKERS = ServerFlags(threads=2)
 
 
 def _os_threads_down_to(limit: int) -> int:
@@ -162,7 +166,7 @@ def _tcp_ports_this_process_binds() -> set[int]:
 
 
 def _serve_once() -> int:
-    with TestClient(app, transport="tcp") as c:
+    with TestServer(app, config=TWO_WORKERS) as server, TestClient(server) as c:
         assert c.get("/where").status_code == 200
         return c.port
 
@@ -173,13 +177,13 @@ def _serve_once() -> int:
 
 
 def test_default_serves_through_a_sub_interpreter():
-    with TestClient(app) as c:
+    with TestClient(app, config=TWO_WORKERS) as c:
         assert c.get("/where").json() == {"in_worker": True}
 
 
 def test_mode_gil_serves_on_the_main_interpreter():
-    # The same module-level app, on the main interpreter: the deployment's runtime is
-    # read when the app is built, so it is built in a process run with MIPYRE_RUNTIME=main.
+    # The same module-level app, on the main interpreter: the app passes MIPYRE_TEST_MODE as its
+    # runtime when it is built (b/335 D9), so it is built in a process run with it set to main.
     script = (
         "from tests.test_review_m8 import app\n"
         "from mipyre.testing import TestClient\n"
@@ -187,7 +191,7 @@ def test_mode_gil_serves_on_the_main_interpreter():
         "    print('WHERE', c.get('/where').json())\n"
     )
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env = dict(os.environ, MIPYRE_RUNTIME="main")
+    env = dict(os.environ, MIPYRE_TEST_MODE="main")
     r = subprocess.run([sys.executable, "-c", script], cwd=root, env=env,
                        capture_output=True, text=True, timeout=120, check=False)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -213,7 +217,7 @@ def test_an_app_built_in_a_function_names_why_workers_cannot_serve_it(tmp_path, 
         return inner
 
     with pytest.raises(RuntimeError) as err:
-        TestClient(make())
+        TestClient(make(), config=TWO_WORKERS)
     text = "\n".join([str(err.value), *getattr(err.value, "__notes__", ())])
     # The engine's own error, plus what to do about it (as a note on it).
     assert "registered no routes in the worker" in text, text
@@ -238,15 +242,15 @@ def test_an_app_under_python_c_names_why_there_is_no_script_for_the_workers(tmp_
         "    return inner\n"
         "try:\n"
         "    TestClient(make())\n"
-        "except mipyre.engine.NoWorkerScript as err:\n"
-        "    print('RAISED', type(err).__name__, isinstance(err, RuntimeError))\n"
+        "except mipyre.engine.MissingAppFileError as err:\n"
+        "    print('RAISED', type(err).__name__, isinstance(err, mipyre.DeclarationError))\n"
         "    print(err)\n"
     )
     r = subprocess.run([sys.executable, "-c", script], cwd=tmp_path,
                        capture_output=True, text=True, timeout=120, check=False)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
-    assert "RAISED NoWorkerScript True" in r.stdout, out
+    assert "RAISED MissingAppFileError True" in r.stdout, out
     assert "rebuild the app by executing its script" in r.stdout, out
     assert "__main__ is <module '__main__'" in r.stdout, out
     assert "which has no __file__" in r.stdout, out
@@ -271,13 +275,13 @@ def test_a_failed_start_then_a_start_prepares_once():
     start = len(LIFECYCLE)
     try:
         with pytest.raises(OSError):
-            with TestClient(app, port=busy, transport="tcp"):
+            with TestServer(app, port=busy, config=TWO_WORKERS):
                 pass
     finally:
         taken.close()
     assert LIFECYCLE[start:] == ["startup", "shutdown"]
 
-    with TestClient(app, transport="tcp") as c:
+    with TestServer(app, config=TWO_WORKERS) as server, TestClient(server) as c:
         assert c.port != busy
         tools = c.post(
             "/mcp", body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
@@ -313,7 +317,7 @@ def test_close_frees_the_port():
 
 
 def test_close_is_idempotent():
-    c = TestClient(app)
+    c = TestClient(app, config=TWO_WORKERS)
     c.close()
     c.close()
 

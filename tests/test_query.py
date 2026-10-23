@@ -1,17 +1,23 @@
 """b/764: `query=` validates the query string against a pydantic model and hands the handler the
-instance; it fails like `model=` does, with a 422 whose `detail` lists the errors."""
+instance; it fails like `body=` does, with a 422 whose `detail` lists the errors."""
 
 from __future__ import annotations
 
+import dataclasses
+import enum
+import operator
+import types
 from collections.abc import Sequence
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import pydantic
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from mipyre import Mipyre, Router
 from mipyre._query import QueryDeclarationError, QueryFields
-from mipyre._runtime import RuntimeDeclarationError
+from mipyre import RuntimeDeclarationError
 from mipyre.testing import TestClient
 
 
@@ -93,6 +99,111 @@ def test_a_field_a_query_string_cannot_carry_is_refused_when_declared(model):
         QueryFields.of(model)
 
 
+# --- which keys take every value, over any annotation (properties) ----------------------------
+
+
+class Shape(enum.Enum):
+    """How a query string carries a field: one value, every value of its key, or not at all."""
+
+    ONE = enum.auto()
+    EVERY = enum.auto()
+    NONE = enum.auto()
+
+
+@dataclasses.dataclass
+class Point:
+    x: int
+
+
+# An annotation built at run time, and how a query string carries a field annotated so.
+FieldAnnotation = tuple[Any, Shape]
+
+
+def _optional(child: FieldAnnotation) -> FieldAnnotation:
+    annotation, shape = child
+    return annotation | None, shape
+
+
+def _annotated(child: FieldAnnotation) -> FieldAnnotation:
+    annotation, shape = child
+    return operator.getitem(Annotated, (annotation, "note")), shape
+
+
+def _sequence(origin: type, child: FieldAnnotation) -> FieldAnnotation:
+    # A sequence of single values is carried by a repeated key; a sequence of anything else is not.
+    annotation, shape = child
+    args = (annotation, ...) if origin is tuple else (annotation,)
+    return types.GenericAlias(origin, args), Shape.EVERY if shape is Shape.ONE else Shape.NONE
+
+
+def _mapping(child: FieldAnnotation) -> FieldAnnotation:
+    return types.GenericAlias(dict, (str, child[0])), Shape.NONE
+
+
+def _union(left: FieldAnnotation, right: FieldAnnotation) -> FieldAnnotation:
+    # A union is carried only when every arm is carried the same way.
+    shapes = {left[1], right[1]}
+    return left[0] | right[0], shapes.pop() if len(shapes) == 1 else Shape.NONE
+
+
+field_annotations = st.recursive(
+    st.sampled_from([
+        (int, Shape.ONE), (str, Shape.ONE), (float, Shape.ONE), (bool, Shape.ONE),
+        (Literal["book", "film"], Shape.ONE), (Item, Shape.NONE), (Point, Shape.NONE),
+    ]),
+    lambda children: st.one_of(
+        children.map(_optional),
+        children.map(_annotated),
+        st.builds(_sequence, st.sampled_from([list, set, frozenset, Sequence, tuple]), children),
+        children.map(_mapping),
+        st.builds(_union, children, children),
+    ),
+    max_leaves=6,
+)
+
+
+@given(field_annotations)
+def test_a_field_is_carried_as_its_annotation_shape_says(annotated):
+    annotation, shape = annotated
+    model = pydantic.create_model(
+        "Q", __config__=pydantic.ConfigDict(defer_build=True), f=(annotation, None)
+    )
+
+    if shape is Shape.NONE:
+        with pytest.raises(QueryDeclarationError, match="query=Q: field 'f'"):
+            QueryFields.of(model)
+        return
+    fields = QueryFields.of(model)
+    assert (fields.sequences, fields.scalars) == (
+        ({"f"}, set()) if shape is Shape.EVERY else (set(), {"f"})
+    )
+
+
+keys = st.sampled_from(["a", "b", "c", "d"])
+
+
+@given(
+    st.sets(keys), st.sets(keys),
+    st.dictionaries(keys, st.lists(st.text(max_size=3), min_size=1, max_size=3)),
+)
+def test_input_hands_each_key_on_once_either_as_values_or_as_an_error(sequences, scalars, params):
+    fields = QueryFields(frozenset(sequences), frozenset(scalars - sequences))
+
+    values, errors = fields.input(params)
+
+    refused = {e["loc"][1] for e in errors}
+    assert values.keys() | refused == params.keys() and not values.keys() & refused
+    for key, given_values in params.items():
+        if key in fields.sequences:
+            assert values[key] == given_values
+        elif len(given_values) == 1:
+            assert values[key] == given_values[0]
+        elif key in fields.scalars:
+            assert key in refused
+        else:
+            assert values[key] == given_values
+
+
 # --- a served route ---------------------------------------------------------------------------
 
 
@@ -109,7 +220,7 @@ async def shelf(s: Search, shelf: str) -> dict:
     return {"shelf": shelf, "q": s.q}
 
 
-@app.post("/items", model=Item, query=Search)
+@app.post("/items", body=Item, query=Search)
 def create(req, item: Item, s: Search) -> dict:
     return {"name": item.name, "q": s.q}
 
@@ -167,15 +278,28 @@ def test_a_route_with_a_body_and_a_query_gets_both_and_reports_both_failing(clie
 def test_the_route_listing_names_the_query_model():
     [info] = [r for r in app.routes if r.path == "/search"]
 
-    assert (info.query, info.model) == ("Search", None)
+    assert (info.query, info.body) == (Search, None)
 
 
 # --- declaring one ----------------------------------------------------------------------------
 
 
-def test_a_query_route_on_the_sub_interpreters_is_refused_saying_why():
-    with pytest.raises(RuntimeDeclarationError, match=r"GET /s: query= runs on runtime='subinterp'.*pydantic_core"):
-        Mipyre().get("/s", query=Search)(lambda req, s: "")
+def test_a_query_route_on_the_sub_interpreters_is_declared_as_the_decision_says_for_the_installed_pydantic_core():
+    import re
+
+    from mipyre._routes import RouteDeclaration, Runtime
+    from mipyre._routes import _pydantic_core_facts, _pydantic_refusal
+
+    app = Mipyre()
+    declared = RouteDeclaration("GET", "/s", lambda req, s: "", Runtime.SUBINTERP, None, Search, True)
+    expected = _pydantic_refusal(declared, _pydantic_core_facts())
+
+    if expected is None:
+        app.get("/s", query=Search)(lambda req, s: "")
+        assert [r.path for r in app.routes] == ["/s"]
+    else:
+        with pytest.raises(RuntimeDeclarationError, match=re.escape(str(expected))):
+            app.get("/s", query=Search)(lambda req, s: "")
 
 
 @pytest.mark.parametrize("runtime", ["main", "process", "isolated"])
@@ -199,9 +323,9 @@ def test_query_must_be_a_pydantic_model():
 def test_a_handler_with_no_parameter_for_the_query_is_refused_naming_the_forms():
     def handler(item: Item): ...
 
-    with pytest.raises(TypeError, match=r"no parameter for the validated Search query: with model= and query=, "
+    with pytest.raises(TypeError, match=r"no parameter for the validated Search query: with body= and query=, "
                                         r"a handler is fn\(req, body, query, \*\*path_params\)"):
-        Mipyre(runtime="main").post("/s", model=Item, query=Search)(handler)
+        Mipyre(runtime="main").post("/s", body=Item, query=Search)(handler)
 
 
 def test_the_query_model_where_the_request_goes_is_refused():

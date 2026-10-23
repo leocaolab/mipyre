@@ -1,29 +1,23 @@
-"""The chat routes and the session memory they keep. /chat validates its body with
-pydantic, which can't load in a sub-interpreter, and /stream returns a Stream, so they run
-on the main interpreter and only the main interpreter imports this module."""
+"""The chat routes. /chat validates its body with pydantic, which can't load in a
+sub-interpreter, and /stream returns a Stream, which needs the main interpreter; both keep
+the session history in app.state, which a worker process can't reach. So they run on
+runtime="main", and only the main interpreter imports this module."""
 
 import json
 import threading
 import time
+from collections.abc import Iterator
 
 from pydantic import BaseModel
 
 from mipyre import Router, SharedState, Stream
 
+from ai_agent.memory import remember
+
 router = Router(runtime="main")
 
+TOKEN_DELAY_SECONDS = 0.03
 
-def _state() -> SharedState:
-    # ai_agent.main imports this module while it builds its app, so the app is looked up
-    # when a request comes, not at import.
-    from ai_agent.main import app
-
-    return app.state
-
-
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
 
 class ChatRequest(BaseModel):
     prompt: str
@@ -31,80 +25,52 @@ class ChatRequest(BaseModel):
     max_tokens: int = 50
 
 
-# ---------------------------------------------------------------------------
-# Simulated LLM (replace with a real LLM client)
-# ---------------------------------------------------------------------------
-
-def fake_llm_generate(prompt: str, max_tokens: int = 50):
-    """Simulate LLM token generation with realistic latency."""
-    response = f"I received your question about '{prompt}'. "
-    response += "Here is a thoughtful response that demonstrates "
-    response += "streaming capabilities of the Mipyre framework. "
-    response += "Each token is sent individually with realistic delays."
-
-    words = response.split()
-    for word in words[:max_tokens]:
-        time.sleep(0.03)  # ~30ms per token, realistic for LLM
+def fake_llm_generate(prompt: str, max_tokens: int = 50) -> Iterator[str]:
+    """Yield the words of a canned answer, one every TOKEN_DELAY_SECONDS. Replace it with
+    a real model client."""
+    answer = (
+        f"I received your question about '{prompt}'. Here is a thoughtful response that "
+        "demonstrates the streaming capabilities of the Mipyre framework. Each token is "
+        "sent individually with realistic delays."
+    )
+    for word in answer.split()[:max_tokens]:
+        time.sleep(TOKEN_DELAY_SECONDS)
         yield word + " "
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
+def _state() -> SharedState:
+    # ai_agent.main imports this module while it builds the app, so the app is looked up
+    # when a request comes, not at import.
+    from ai_agent.main import app
 
-@router.post("/chat", model=ChatRequest)
-def chat(req, request: ChatRequest):
-    """Synchronous chat — returns full response at once."""
-    state = _state()
-    # Build response from simulated LLM
-    tokens = list(fake_llm_generate(request.prompt, request.max_tokens))
-    response = "".join(tokens)
+    return app.state
 
-    # Store in session memory (SharedState — cross-worker, nanosecond)
-    history = json.loads(state.get(f"session:{request.session_id}") or "[]")
-    history.append({"role": "user", "content": request.prompt})
-    history.append({"role": "assistant", "content": response})
-    state[f"session:{request.session_id}"] = json.dumps(history[-20:])  # Keep last 20
 
-    return {
-        "response": response,
-        "session_id": request.session_id,
-        "tokens": len(tokens),
-    }
+@router.post("/chat", body=ChatRequest)
+def chat(body: ChatRequest):
+    tokens = list(fake_llm_generate(body.prompt, body.max_tokens))
+    answer = "".join(tokens)
+    remember(_state(), body.session_id, body.prompt, answer)
+    return {"response": answer, "session_id": body.session_id, "tokens": len(tokens)}
+
+
+def send_answer(stream: Stream, state: SharedState, prompt: str, session_id: str) -> None:
+    tokens = []
+    try:
+        for token in fake_llm_generate(prompt):
+            stream.send_event(token, event="token")
+            tokens.append(token)
+        stream.send_event(json.dumps({"done": True, "tokens": len(tokens)}), event="done")
+    except ConnectionError:
+        return  # the client went away; the answer it didn't read is not remembered
+    remember(state, session_id, prompt, "".join(tokens))
+    stream.close()
 
 
 @router.get("/stream")
 def stream_chat(req):
-    """SSE streaming — sends tokens one by one (like ChatGPT)."""
-    state = _state()
     prompt = req.query_params.get("prompt", "hello")
     session_id = req.query_params.get("session_id", "default")
-
     stream = Stream()
-
-    def generate():
-        full_response = []
-        for token in fake_llm_generate(prompt):
-            stream.send_event(token, event="token")
-            full_response.append(token)
-
-        # Store in memory
-        response_text = "".join(full_response)
-        history = json.loads(state.get(f"session:{session_id}") or "[]")
-        history.append({"role": "user", "content": prompt})
-        history.append({"role": "assistant", "content": response_text})
-        state[f"session:{session_id}"] = json.dumps(history[-20:])
-
-        stream.send_event(json.dumps({"done": True, "tokens": len(full_response)}), event="done")
-        stream.close()
-
-    threading.Thread(target=generate, daemon=True).start()
+    threading.Thread(target=send_answer, args=(stream, _state(), prompt, session_id), daemon=True).start()
     return stream
-
-
-@router.get("/memory/{session_id}")
-def get_memory(req):
-    """View conversation history for a session."""
-    session_id = req.params["session_id"]
-    history = json.loads(_state().get(f"session:{session_id}") or "[]")
-    return {"session_id": session_id, "messages": history, "count": len(history)}

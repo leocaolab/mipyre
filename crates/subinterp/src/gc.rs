@@ -46,7 +46,9 @@ impl FromStr for GcMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GcPolicy {
     /// Each worker collects every `every` requests; a threshold of 0 is [`GcPolicy::Off`].
-    Count { every: NonZeroU64 },
+    Count {
+        every: NonZeroU64,
+    },
     /// The idle tick collects once a worker ran requests and then none for a whole `tick`.
     ///
     /// A worker also collects after `failsafe` requests, so sustained traffic cannot starve the
@@ -398,21 +400,14 @@ mod tests {
                     .iter()
                     .rposition(|&(event, _)| event == Event::Tick)
                     .map_or(history, |at| &history[at + 1..]);
-                matches!(policy, GcPolicy::Idle { .. })
-                    && requests(since_collect) > 0
-                    && requests(since_tick) == 0
+                matches!(policy, GcPolicy::Idle { .. }) && requests(since_collect) > 0 && requests(since_tick) == 0
             }
         }
     }
 
     /// Checks every sequence of up to `depth` more steps against [`reference_due`], with each
     /// due collection both returning and failing.
-    fn explore(
-        policy: GcPolicy,
-        schedule: GcSchedule,
-        history: &mut Vec<(Event, Option<Outcome>)>,
-        depth: usize,
-    ) {
+    fn explore(policy: GcPolicy, schedule: GcSchedule, history: &mut Vec<(Event, Option<Outcome>)>, depth: usize) {
         if depth == 0 {
             return;
         }

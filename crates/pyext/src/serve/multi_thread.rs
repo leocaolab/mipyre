@@ -18,8 +18,8 @@ use mipyre_tpc::ShutdownDeadline;
 use mipyre_transport::driver::{AcceptError, Peer, TransportDriver};
 
 use crate::serve::conn::{drive_connection, ConnectionTimeouts};
-use crate::serve::websocket::{upgrade_or, Upgrades};
-use crate::serve::{until_stopped, StopSignals};
+use crate::serve::site::Site;
+use crate::serve::websocket::upgrade_or;
 use crate::telemetry::RunCounters;
 
 /// Fixes how many tasks a tokio worker polls from its own queue between looks at the shared one.
@@ -30,31 +30,31 @@ const GLOBAL_QUEUE_INTERVAL: u32 = 61;
 /// Builds the multi-thread server's runtime. Its blocking pool runs main-interpreter handlers,
 /// so every thread gets `PYTHON_THREAD_STACK`: tokio's default is 2 MiB, and C extensions are
 /// written against 8.
-fn io_runtime(io_workers: usize) -> std::io::Result<tokio::runtime::Runtime> {
+fn io_runtime(io_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
     RuntimeBuilder::new_multi_thread()
-        .worker_threads(io_workers)
+        .worker_threads(io_threads)
         .global_queue_interval(GLOBAL_QUEUE_INTERVAL)
         .thread_stack_size(mipyre_subinterp::PYTHON_THREAD_STACK)
         .enable_all()
         .build()
 }
 
-/// Runs the multi-thread (`MIPYRE_TPC=0`) server until SIGINT, SIGTERM or `shutdown()`, then
+/// Runs the multi-thread (`MIPYRE_TPC=0`) server until `stop` (a stop signal or `shutdown()`), then
 /// drains in-flight connections for the drain part of the stop's grace, because dropping the
 /// runtime would abort them mid-request. The runtime's blocking threads get until `deadline` to
 /// end; one still running a handler then is left running.
 ///
 /// # Errors
 ///
-/// Returns a `RuntimeError` when the runtime or the signal handlers cannot be set up, and the
-/// accept error that stopped the server.
+/// Returns a `RuntimeError` when the runtime cannot be set up, and the accept error that stopped
+/// the server.
 pub(crate) fn serve_multi_thread<D, H, Fut>(
     transport: D,
-    io_workers: usize,
+    io_threads: usize,
     stop: CancellationToken,
     deadline: &ShutdownDeadline,
     counters: Arc<RunCounters>,
-    upgrades: Upgrades,
+    ws_site: Option<Arc<Site>>,
     handle: H,
 ) -> PyResult<()>
 where
@@ -62,24 +62,18 @@ where
     H: Fn(Request<Incoming>, Peer) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<Response<ResponseBody>, hyper::Error>> + Send + 'static,
 {
-    let rt = io_runtime(io_workers).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime error: {e}"))
-    })?;
+    let rt = io_runtime(io_threads)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("tokio runtime error: {e}")))?;
     let served = rt.block_on(async move {
-        // The handlers are registered before any accept loop, so a server that cannot watch for
-        // its stop signals does not start.
-        let signals = StopSignals::install().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("stop signal handlers: {e}"))
-        })?;
         let conn_tracker = tokio_util::task::TaskTracker::new();
         // The first accept loop that can take no more connections stops the server.
         let accept_stopped: Arc<std::sync::OnceLock<AcceptError>> = Arc::default();
         for share in transport.into_loops() {
             let mut source = share.register().map_err(crate::serve::listener_error)?;
-            let (token, tracker, upgrades, handle, accept_stopped) = (
+            let (token, tracker, ws_site, handle, accept_stopped) = (
                 stop.clone(),
                 conn_tracker.clone(),
-                upgrades.clone(),
+                ws_site.clone(),
                 handle.clone(),
                 Arc::clone(&accept_stopped),
             );
@@ -90,7 +84,7 @@ where
                             Ok(accepted) => {
                                 tracker.spawn(serve_accepted::<D, _, _>(
                                     accepted,
-                                    upgrades.clone(),
+                                    ws_site.clone(),
                                     handle.clone(),
                                     token.clone(),
                                 ));
@@ -110,7 +104,7 @@ where
             });
         }
 
-        until_stopped(stop, signals).await;
+        stop.cancelled().await;
         let stopped = Instant::now();
         conn_tracker.close();
         drain_connections(&conn_tracker, crate::serve::drain_timeout(deadline, stopped), &counters).await;
@@ -126,8 +120,12 @@ where
 
 /// Sets up an accepted connection, registered and TLS-handshaken when the listener has an
 /// acceptor, and serves its requests with `handle` until it ends or `stop` is cancelled.
-async fn serve_accepted<D, H, Fut>(accepted: D::Connection, upgrades: Upgrades, handle: H, stop: CancellationToken)
-where
+async fn serve_accepted<D, H, Fut>(
+    accepted: D::Connection,
+    ws_site: Option<Arc<Site>>,
+    handle: H,
+    stop: CancellationToken,
+) where
     D: TransportDriver,
     H: Fn(Request<Incoming>, Peer) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Response<ResponseBody>, hyper::Error>> + Send + 'static,
@@ -137,12 +135,12 @@ where
         return;
     };
     let stop = stop.cancelled_owned();
-    match upgrades {
-        Upgrades::WebSocket(site) => {
+    match ws_site {
+        Some(site) => {
             let svc = service_fn(move |req: Request<Incoming>| upgrade_or(req, &site, peer, &handle));
             drive_connection(stream, svc, TokioExecutor::new(), ConnectionTimeouts::DEFAULT, stop).await;
         }
-        Upgrades::Off => {
+        None => {
             let svc = service_fn(move |req: Request<Incoming>| handle(req, peer));
             drive_connection(stream, svc, TokioExecutor::new(), ConnectionTimeouts::DEFAULT, stop).await;
         }
@@ -151,7 +149,11 @@ where
 
 /// Lets the multi-thread server's open connections, on the closed `tracker`, finish for at most
 /// `timeout`; the ones still open then are counted and logged, and closed as their tasks drop.
-async fn drain_connections(tracker: &tokio_util::task::TaskTracker, timeout: std::time::Duration, counters: &RunCounters) {
+async fn drain_connections(
+    tracker: &tokio_util::task::TaskTracker,
+    timeout: std::time::Duration,
+    counters: &RunCounters,
+) {
     if tokio::time::timeout(timeout, tracker.wait()).await.is_err() {
         crate::serve::report_drain_timeout(tracker.len(), timeout, counters);
     }
@@ -172,7 +174,10 @@ mod tests {
                 let (worker, blocking) = rt.block_on(async {
                     let worker = tokio::spawn(async { crate::thread_stack::current() });
                     let blocking = tokio::task::spawn_blocking(crate::thread_stack::current);
-                    (worker.await.expect("on a worker"), blocking.await.expect("on the blocking pool"))
+                    (
+                        worker.await.expect("on a worker"),
+                        blocking.await.expect("on the blocking pool"),
+                    )
                 });
                 assert_eq!((worker, blocking), (python, python));
             },

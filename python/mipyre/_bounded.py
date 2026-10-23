@@ -1,4 +1,4 @@
-"""Running a sync or async callable with a timeout: readiness checks and MCP handlers.
+"""Running a sync or async readiness check with a timeout.
 
 The call runs on a thread of its own, so the caller can stop waiting even when the call
 never returns (a Python thread can't be killed; a hung one is abandoned). A coroutine or
@@ -17,50 +17,35 @@ import contextvars
 import inspect
 import threading
 import time
+from concurrent.futures import Future, wait
 from typing import Any, Callable
 
 
-class _Run:
-    """One call of ``fn`` on a new thread, in a copy of the caller's context."""
+def _start(fn: Callable[[], Any], timeout: float) -> Future:
+    """Start ``fn`` on a new thread, in a copy of the caller's context, and return the
+    future of its value."""
+    future: Future = Future()
+    deadline = time.monotonic() + timeout
 
-    def __init__(self, fn: Callable[[], Any], timeout: float) -> None:
-        self._done = threading.Event()
-        self._value: Any = None
-        self._error: BaseException | None = None
-        deadline = time.monotonic() + timeout
-        context = contextvars.copy_context()
-        thread = threading.Thread(
-            target=context.run,
-            args=(self._run, fn, deadline),
-            name=f"mipyre-bounded:{getattr(fn, '__qualname__', repr(fn))}",
-            daemon=_thread.daemon_threads_allowed(),
-        )
-        thread.start()
-
-    def _run(self, fn: Callable[[], Any], deadline: float) -> None:
+    def run() -> None:
         try:
             result = fn()
             if inspect.isawaitable(result):
                 import asyncio
 
                 result = asyncio.run(_await_by(result, deadline))
-            self._value = result
         except BaseException as e:  # noqa: BLE001 — handed to the waiting caller
-            self._error = e
-        finally:
-            self._done.set()
+            future.set_exception(e)
+        else:
+            future.set_result(result)
 
-    def done(self) -> bool:
-        return self._done.is_set()
-
-    def result(self, timeout: float) -> Any:
-        """The call's value, or its exception re-raised; ``TimeoutError`` when it has not
-        finished within ``timeout``."""
-        if not self._done.wait(timeout):
-            raise TimeoutError(f"did not finish within {timeout:g}s")
-        if self._error is not None:
-            raise self._error
-        return self._value
+    threading.Thread(
+        target=contextvars.copy_context().run,
+        args=(run,),
+        name=f"mipyre-bounded:{getattr(fn, '__qualname__', repr(fn))}",
+        daemon=_thread.daemon_threads_allowed(),
+    ).start()
+    return future
 
 
 async def _await_by(awaitable: Any, deadline: float) -> Any:
@@ -68,12 +53,6 @@ async def _await_by(awaitable: Any, deadline: float) -> Any:
     import asyncio
 
     return await asyncio.wait_for(awaitable, max(0.0, deadline - time.monotonic()))
-
-
-def call_with_timeout(fn: Callable[[], Any], timeout: float) -> Any:
-    """``fn()`` (driven to a value if it returns an awaitable), waited for at most
-    ``timeout`` seconds: ``TimeoutError`` past it. Each call runs on its own thread."""
-    return _Run(fn, timeout).result(timeout)
 
 
 class BoundedCall:
@@ -84,11 +63,15 @@ class BoundedCall:
         self.fn = fn
         self.timeout = timeout
         self._lock = threading.Lock()
-        self._run: _Run | None = None
+        self._run: Future | None = None
 
     def __call__(self) -> Any:
+        """Return ``fn``'s value or raise its exception; raise ``TimeoutError`` when it has not
+        finished within the timeout."""
         with self._lock:
             if self._run is None or self._run.done():
-                self._run = _Run(self.fn, self.timeout)
+                self._run = _start(self.fn, self.timeout)
             run = self._run
-        return run.result(self.timeout)
+        if not wait((run,), self.timeout).done:
+            raise TimeoutError(f"did not finish within {self.timeout:g}s")
+        return run.result()

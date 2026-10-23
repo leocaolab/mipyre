@@ -4,7 +4,8 @@
 mod alloc;
 mod app;
 mod config;
+mod metrics_page;
 mod module;
 mod state;
 
-pub(crate) use self::app::{App, RegistrationSealed, Server};
+pub(crate) use self::app::{is_async_handler, App, LateRegistrationError, PyRuntimeChoice, Server};

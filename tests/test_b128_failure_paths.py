@@ -18,21 +18,3 @@ def test_a_non_callable_handler_fails_the_registration():
 
     assert ok is not None
 
-
-def test_a_worker_engine_without_an_app_fails_its_start():
-    # The main interpreter records no worker app: asking for the worker's handler table
-    # is the startup configuration error (b/135), and says so, rather than returning an
-    # empty table that fails every request with a KeyError.
-    from mipyre import engine
-
-    with pytest.raises(RuntimeError, match="has no app"):
-        engine._worker_app_handlers()
-
-
-def test_a_worker_engine_without_an_app_has_no_hooks_either():
-    # The hooks are read from the same app as the handlers: without one there are no empty hooks,
-    # only the same startup error.
-    from mipyre import engine
-
-    with pytest.raises(RuntimeError, match="has no app"):
-        engine._worker_app_hooks()

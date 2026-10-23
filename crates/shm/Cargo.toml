@@ -1,15 +1,42 @@
 [package]
 name = "mipyre_shm"
-description = "A shared-memory channel between two processes: the ring's counters and their checks, the slot header, the start report and the spin window, as decisions that touch no memory (plan/)"
+description = "A shared-memory channel between two processes: its layout and the checks on what the peer wrote (plan/), the wake-up protocol and its ports (protocol/), the channel over any memory (channel/), and the ports over the OS (adapter/)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 # Only what dev/archcheck.toml E-P15 allows (rustix, libc, thiserror, bytes, mipyre_cpu, and loom under
-# `cfg(sync_model)`): no pyo3, no tokio, no `#[global_allocator]`. plan/ needs only thiserror; the rest come with the
-# code that uses them.
+# `cfg(shm_model)`): no pyo3, no tokio, no `#[global_allocator]`.
 [dependencies]
 thiserror = "2"
+# The host copies each answer into a `BytesMut` of its own, which the engine's decoder slices without another copy.
+bytes = "1"
+# `CacheLine`: each header word on a line of its own, the one definition the workspace shares.
+mipyre_cpu = { path = "../cpu" }
+# The system calls it has safe calls for (os.rs); libc keeps `off_t`, errno on macOS and the tests' fork.
+rustix = { version = "1.1.5", default-features = false, features = ["std", "fs", "mm", "pipe", "shm", "thread", "time"] }
+libc = "0.2"
+
+[dev-dependencies]
+# The reference model of the ring (src/channel/ring_model.rs), on the merge's fixed seed (.cargo/config.toml).
+proptest = "1"
+# The `slot_take` fuzz target (src/channel/slot_fuzz.rs): `cargo test` replays its committed corpus, `cargo bolero
+# test` mutates it under libFuzzer.
+# Exactly 0.13.4: from 0.13.5 on its derive crate pins indexmap to =2.11.2, which would move the workspace's
+# shipping indexmap (h2, sqlx) back from 2.14.
+bolero = "=0.13.4"
+# The counting allocator of tests/allocations.rs.
+mipyre_microbench = { path = "../microbench" }
+
+# The Loom models, built only under `--cfg shm_model`, which swaps `src/sync.rs`'s names for Loom's; the gate's
+# `dev/sync_model_core.sh -p mipyre_shm` builds the core that way, without os.rs and adapter/.
+[target.'cfg(all(shm_model, not(shm_shuttle)))'.dependencies]
+loom = "0.7"
+
+# The Shuttle models (b/744), built only under `--cfg shm_model --cfg shm_shuttle`: the same model memory and kernel
+# as Loom's, under randomly scheduled, seeded runs at a scale Loom cannot enumerate.
+[target.'cfg(all(shm_model, shm_shuttle))'.dependencies]
+shuttle = "0.9.8"
 
 [lints]
 workspace = true

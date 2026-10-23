@@ -1,8 +1,11 @@
 //! Runs TPC's `runtime="main"` routes on the main interpreter, for C extensions that cannot load
 //! in a sub-interpreter.
 //!
-//! There are several bridge threads because a handler doing I/O releases the GIL but still blocks
-//! its thread; with one thread, GIL work would queue behind that I/O while main sits idle.
+//! There are several bridge threads because a `def` handler doing I/O releases the GIL but still
+//! blocks its thread; with one thread, GIL work would queue behind that I/O while main sits idle.
+//! `async def` routes run on one more thread, main's async engine (`_worker/async_engine.py`, as an
+//! async worker runs them): an awaiting handler gives its thread to the others, so how many
+//! await at once is not bounded by the bridge's threads.
 //!
 //! The shared channel is deliberately small: a saturated bridge answers 503 at once instead of
 //! queueing memory behind a path slower than the inbound rate, and sub-interpreter routes keep
@@ -15,13 +18,15 @@ use mipyre_tpc::ShutdownDeadline;
 use pyo3::prelude::*;
 use tokio::sync::oneshot;
 
-use crate::exchange::error::{Capacity, ErrorRecord, UnansweredError, WorkerGroup};
-use crate::exchange::request::Request;
 use super::job_queue::{job_queue, JobReceiver, JobSendError, JobSender};
-use crate::runtime::{call_handler_with_hooks, MainReply};
-use mipyre_http::plan::route::HandlerTarget;
+use super::worker::async_engine::{run_engine_module, EngineFailure, EngineRoutes};
+use super::worker_api::AsyncInbox;
+use crate::exchange::error::{refuse, Capacity, ErrorRecord, UnansweredError, WorkerGroup};
+use crate::exchange::request::Request;
+use crate::runtime::{answer_if_awaited, call_handler_with_hooks, MainReply, PoolJob};
+use mipyre_http::plan::route::{HandlerPlace, HandlerTarget, MainHandler};
 use mipyre_http::plan::site::SiteRules;
-use mipyre_tpc::{ThreadJoinError, OsThread, Spawner};
+use mipyre_tpc::{OsThread, Spawner, ThreadJoinError};
 
 /// Sizes the bridge; `capacity` is the total queue before 503, not a per-thread one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +67,8 @@ impl From<BridgeSpawnError> for PyErr {
 /// Sends work to the bridge; its threads exit once every reference to it is gone.
 pub(crate) struct MainInterpBridge {
     tx: JobSender<BridgeJob>,
+    /// Feeds main's async engine; it is `None` when the table has no `async def` main route.
+    async_tx: Option<JobSender<BridgeJob>>,
 }
 
 /// Owns the bridge's threads; it is apart from [`MainInterpBridge`] because a thread's end signal
@@ -71,7 +78,8 @@ pub(crate) struct BridgeThreads {
 }
 
 impl MainInterpBridge {
-    /// Spawns the bridge threads on one shared channel.
+    /// Spawns the bridge threads on one shared channel, and after them main's async engine when the
+    /// table has an `async def` main route.
     ///
     /// # Errors
     ///
@@ -112,27 +120,124 @@ impl MainInterpBridge {
             }
         }
 
+        let async_tx = match engine_routes(py, rules) {
+            None => None,
+            Some(routes) => {
+                let (async_tx, async_rx) = job_queue::<BridgeJob>(config.capacity.get());
+                let inbox = AsyncInbox::for_main(async_rx.clone(), rules.settings.limits.request_budget);
+                let builder = std::thread::Builder::new()
+                    .name("mipyre-main-async".to_string())
+                    .stack_size(mipyre_subinterp::PYTHON_THREAD_STACK);
+                match spawner.spawn(workers, builder, move || serve_async(inbox, routes, &async_rx)) {
+                    Ok(handle) => threads.push(handle),
+                    Err(source) => {
+                        drop((tx, async_tx));
+                        let started = BridgeThreads { threads };
+                        py.detach(|| started.join(&ShutdownDeadline::new(shutdown_timeout)));
+                        return Err(BridgeSpawnError {
+                            worker: workers,
+                            requested: workers + 1,
+                            source,
+                        });
+                    }
+                }
+                Some(async_tx)
+            }
+        };
+
         tracing::info!(
             target: "mipyre::server",
             workers,
             capacity = config.capacity.get(),
+            async_engine = async_tx.is_some(),
             "main-interp bridge spawned"
         );
-        Ok((Arc::new(MainInterpBridge { tx }), BridgeThreads { threads }))
+        Ok((Arc::new(MainInterpBridge { tx, async_tx }), BridgeThreads { threads }))
     }
 
-    /// Queues `item` without blocking.
+    /// Queues `item` without blocking: a `def` handler's for the bridge threads, an `async def`
+    /// one's for main's async engine.
     ///
     /// # Errors
     ///
-    /// Fails when the queue is full or every bridge thread has exited. The refused item is dropped
-    /// here, and its closed reply channel is what stops the caller's body feeder.
-    pub(crate) fn try_dispatch(&self, item: BridgeJob) -> Result<(), UnansweredError> {
+    /// Fails when the queue is full or every thread taking from it has exited, or for an
+    /// `async def` handler when the table has none, so no engine was started (a bug in building the
+    /// server). The refused item is dropped here, and its closed reply channel is what stops the
+    /// caller's body feeder.
+    pub(crate) fn try_dispatch(&self, item: BridgeJob, handler: MainHandler) -> Result<(), UnansweredError> {
         let group = WorkerGroup::MainBridge;
-        self.tx.try_send(item).map_err(|e| match e {
+        let tx = match handler {
+            MainHandler::Sync(_) => &self.tx,
+            MainHandler::Async => self.async_tx.as_ref().ok_or(UnansweredError::WorkersGone(group))?,
+        };
+        tx.try_send(item).map_err(|e| match e {
             JobSendError::QueueFull => UnansweredError::Overloaded(Capacity::WorkQueue(group)),
             JobSendError::NoReceiverLeft => UnansweredError::WorkersGone(group),
-        })
+        })?;
+        if handler == MainHandler::Async {
+            // The engine's answer counts it completed, as an async worker's does.
+            PoolJob::inc_created();
+        }
+        Ok(())
+    }
+}
+
+/// Returns what main's async engine serves: the `async def` main routes' handlers, indexed by
+/// [`HandlerTarget`] (`None` for any other), and the app's hooks; `None` when there is no such
+/// route.
+fn engine_routes<M>(py: Python<'_>, rules: &SiteRules<Py<PyAny>, M>) -> Option<EngineRoutes> {
+    let routes = &rules.routes;
+    let targets: Vec<HandlerTarget> = routes
+        .routes()
+        .iter()
+        .filter(|route| route.runtime == HandlerPlace::Main(MainHandler::Async))
+        .map(|route| route.handler)
+        .collect();
+    let len = targets.iter().map(|target| target.index() + 1).max()?;
+    let mut handlers: Vec<Option<Py<PyAny>>> = (0..len).map(|_| None).collect();
+    for target in targets {
+        handlers[target.index()] = Some(routes.handler(target).clone_ref(py));
+    }
+    let copy = |hooks: &[Py<PyAny>]| hooks.iter().map(|hook| hook.clone_ref(py)).collect();
+    Some(EngineRoutes {
+        handlers,
+        before: copy(routes.before_hooks()),
+        after: copy(routes.after_hooks()),
+        streams: true,
+    })
+}
+
+/// Runs main's async engine until its inbox closes. An engine that stops on its own is logged, and
+/// every job queued for it from then on is refused at once, so its callers are not left to time
+/// out.
+fn serve_async(inbox: AsyncInbox, routes: EngineRoutes, queued: &JobReceiver<BridgeJob>) {
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mipyre_subinterp::attach::with_main(|py| run_engine_module(py, "main", inbox, routes))
+    }));
+    let cause: Arc<str> = match ended {
+        Ok(Ok(())) => return,
+        Ok(Err(EngineFailure::Setup(exception))) => format!(
+            "main's async engine could not start: {exception}\n{}",
+            exception.traceback()
+        )
+        .into(),
+        Ok(Err(EngineFailure::Raised(exception))) => {
+            format!("main's async engine stopped: {exception}\n{}", exception.traceback()).into()
+        }
+        Err(payload) => format!(
+            "a Rust panic in main's async engine: {}",
+            mipyre_tpc::panic_message(&*payload)
+        )
+        .into(),
+    };
+    tracing::error!(target: "mipyre::server", error = %cause, "main's async engine stopped serving");
+    while let Some(BridgeJob { request, reply, .. }) = queued.recv() {
+        let refused = refuse(UnansweredError::WorkersDied {
+            group: WorkerGroup::MainBridge,
+            cause: Arc::clone(&cause),
+        });
+        answer_if_awaited(reply, Err(refused.log(&request.label())));
+        PoolJob::inc_completed();
     }
 }
 
@@ -188,11 +293,7 @@ fn serve<M>(worker: usize, rx: JobReceiver<BridgeJob>, rules: SiteRules<Py<PyAny
 }
 
 fn dispatch_one<M>(rules: &SiteRules<Py<PyAny>, M>, item: BridgeJob) {
-    let BridgeJob {
-        target,
-        request,
-        reply,
-    } = item;
+    let BridgeJob { target, request, reply } = item;
 
     // The caller already gave up, so the main GIL is not spent on a reply nobody reads.
     if reply.is_closed() {

@@ -44,7 +44,7 @@ def start_server(script_path):
     port = bound_port(read_file(log_path), proc)
     # Phase 1: wait for sync endpoint (confirms Rust accept loop is up), for no length of time (b/441 T2).
     answers(f"http://127.0.0.1:{port}/", proc, read_file(log_path))
-    # Phase 2: wait for async workers (_async_engine.py init: asyncio event
+    # Phase 2: wait for async workers (_worker/async_engine.py init: asyncio event
     # loop + sub-interpreter bootstrap). Workers start lazily; on this hardware
     # initialization can take 30+ seconds. One patient request is better than
     # many short-timeout requests that flood the queue without waiting.
@@ -71,7 +71,6 @@ def stop_server(proc, port):
 
 ASYNC_TIMEOUT_SCRIPT = r'''
 import os
-os.environ["MIPYRE_WORKER"] = ""
 from mipyre import Mipyre
 
 CANCEL_MARK = "%s"

@@ -162,7 +162,10 @@ fn a_connection_without_a_first_request_is_closed_at_the_request_head_timeout() 
             ("part of the HTTP/2 preface", &[&PREFACE[..16]]),
             ("the HTTP/2 preface", &[PREFACE]),
             ("the HTTP/2 handshake", &[PREFACE, SETTINGS, SETTINGS_ACK]),
-            ("part of an HTTP/1 head", &[b"GET / HTTP/1.1\r\nHost: t\r\nX-A: "]),
+            (
+                "part of an HTTP/1 head",
+                &[b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-A: "],
+            ),
         ];
         for (what, sent) in cases {
             let added = counted(HttpEvent::FirstRequestTimedOut, async {
@@ -188,9 +191,15 @@ fn a_slow_first_request_in_time_is_served_and_the_connection_kept() {
     run(async {
         // The head finished one tick before the deadline.
         let mut c = open();
-        c.client.write_all(b"GET /a HTTP/1.1\r\n").await.expect("the pipe holds it");
+        c.client
+            .write_all(b"GET /a HTTP/1.1\r\n")
+            .await
+            .expect("the pipe holds it");
         tokio::time::sleep_until(c.started + TIMEOUTS.request_head - TICK).await;
-        c.client.write_all(b"Host: t\r\n\r\n").await.expect("the pipe holds it");
+        c.client
+            .write_all(b"Host: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("the pipe holds it");
         assert_eq!(read_h1_response(&mut c.client).await, b"/a");
         let answered = Instant::now();
         let past_deadline = c.started + TIMEOUTS.request_head + TICK;
@@ -199,12 +208,15 @@ fn a_slow_first_request_in_time_is_served_and_the_connection_kept() {
             closed_at(&mut c, answered + TIMEOUTS.request_head).await;
         })
         .await;
-        assert!(idle >= 1, "the idle kept-alive connection is counted as no next request head");
+        assert!(
+            idle >= 1,
+            "the idle kept-alive connection is counted as no next request head"
+        );
 
         // A handler that takes twice the timeout.
         let mut c = open();
         let slow = 2 * TIMEOUTS.request_head;
-        let get = format!("GET /slow/{} HTTP/1.1\r\nHost: t\r\n\r\n", slow.as_millis());
+        let get = format!("GET /slow/{} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", slow.as_millis());
         c.client.write_all(get.as_bytes()).await.expect("the pipe holds it");
         let body = read_h1_response(&mut c.client).await;
         assert_eq!(body, format!("/slow/{}", slow.as_millis()).as_bytes());

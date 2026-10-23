@@ -1,6 +1,7 @@
-//! Selects the real atomic and lock in every build and Loom's under `--cfg sync_model`, so the
-//! model checker runs the same slot code; only the names switch, nothing wraps the real types.
-//! The cfg swaps them in every package of the build, so it is set only to run the models.
+//! Selects the real atomic and lock in every build, Loom's under `--cfg sync_model` and Shuttle's
+//! under `--cfg sync_model --cfg sync_shuttle`, so the model checker runs the same slot code; only
+//! the names switch, nothing wraps the real types. The cfg swaps them in every package of the
+//! build, so it is set only to run the models.
 //!
 //! Process-wide state in a `static` (`finalization.rs`, `isolation.rs`) names parking_lot's and
 //! std's types itself: Loom has no `const` constructor, and a static outlives the model's
@@ -11,29 +12,42 @@ pub(crate) use parking_lot::{Condvar, Mutex};
 #[cfg(not(sync_model))]
 pub(crate) use std::sync::atomic::AtomicU64;
 
+/// The model checker whose names a model build takes: Loom's, or Shuttle's under `sync_shuttle`.
+/// The two have std's calls, so one wrapper below serves both.
+#[cfg(all(sync_model, not(sync_shuttle)))]
+use loom as checker;
+#[cfg(all(sync_model, sync_shuttle))]
+use shuttle as checker;
+
 #[cfg(sync_model)]
 pub(crate) use self::model::{Condvar, Mutex};
 #[cfg(sync_model)]
-pub(crate) use loom::sync::atomic::AtomicU64;
+pub(crate) use checker::sync::atomic::AtomicU64;
 
 pub(crate) use std::sync::atomic::Ordering;
 
-/// Wraps Loom's lock and condition variable in parking_lot's signatures: `lock` ignores
+/// The thread's entry word (`ENTRY` in `interp.rs`) is a `const`-initialized thread-local, which Loom's atomic
+/// cannot be, so it is std's in every build.
+pub(crate) use std::sync::atomic::AtomicPtr;
+
+/// Wraps the checker's lock and condition variable in parking_lot's signatures: `lock` ignores
 /// poisoning and `wait` takes the guard by mutable borrow.
 #[cfg(sync_model)]
 mod model {
     use std::sync::PoisonError;
 
+    use super::checker;
+
     #[derive(Debug)]
-    pub(crate) struct Mutex<T>(loom::sync::Mutex<T>);
+    pub(crate) struct Mutex<T>(checker::sync::Mutex<T>);
 
     /// The guard is empty only inside [`Condvar::wait`], between taking it out and putting the
     /// reacquired one back.
-    pub(crate) struct MutexGuard<'a, T>(Option<loom::sync::MutexGuard<'a, T>>);
+    pub(crate) struct MutexGuard<'a, T>(Option<checker::sync::MutexGuard<'a, T>>);
 
     impl<T> Mutex<T> {
         pub(crate) fn new(value: T) -> Self {
-            Mutex(loom::sync::Mutex::new(value))
+            Mutex(checker::sync::Mutex::new(value))
         }
 
         pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
@@ -41,7 +55,10 @@ mod model {
         }
     }
 
-    #[expect(clippy::expect_used, reason = "a Loom model, built only under `--cfg sync_model`: the guard is empty only inside `Condvar::wait`")]
+    #[expect(
+        clippy::expect_used,
+        reason = "a model, built only under `--cfg sync_model`: the guard is empty only inside `Condvar::wait`"
+    )]
     impl<T> std::ops::Deref for MutexGuard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
@@ -49,7 +66,10 @@ mod model {
         }
     }
 
-    #[expect(clippy::expect_used, reason = "a Loom model, built only under `--cfg sync_model`: the guard is empty only inside `Condvar::wait`")]
+    #[expect(
+        clippy::expect_used,
+        reason = "a model, built only under `--cfg sync_model`: the guard is empty only inside `Condvar::wait`"
+    )]
     impl<T> std::ops::DerefMut for MutexGuard<'_, T> {
         fn deref_mut(&mut self) -> &mut T {
             self.0.as_mut().expect("a guard holds its lock outside `wait`")
@@ -57,11 +77,11 @@ mod model {
     }
 
     #[derive(Debug)]
-    pub(crate) struct Condvar(loom::sync::Condvar);
+    pub(crate) struct Condvar(checker::sync::Condvar);
 
     impl Condvar {
         pub(crate) fn new() -> Self {
-            Condvar(loom::sync::Condvar::new())
+            Condvar(checker::sync::Condvar::new())
         }
 
         pub(crate) fn notify_all(&self) {
@@ -70,7 +90,7 @@ mod model {
 
         #[expect(
             clippy::expect_used,
-            reason = "a Loom model, built only under `--cfg sync_model`: the guard is empty only between the take and the put back below"
+            reason = "a model, built only under `--cfg sync_model`: the guard is empty only between the take and the put back below"
         )]
         pub(crate) fn wait<T>(&self, guard: &mut MutexGuard<'_, T>) {
             let held = guard.0.take().expect("a guard holds its lock outside `wait`");

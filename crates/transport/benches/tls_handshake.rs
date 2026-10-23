@@ -110,11 +110,7 @@ const CACHE_SESSIONS: usize = 256;
 
 /// Returns the production config with this variant's resumption state; a shared variant gives every
 /// loop `shared`, and the per-thread variant makes its own per call.
-fn config(
-    variant: ResumptionState,
-    production: &ServerConfig,
-    shared: &ServerConfig,
-) -> Arc<ServerConfig> {
+fn config(variant: ResumptionState, production: &ServerConfig, shared: &ServerConfig) -> Arc<ServerConfig> {
     match variant {
         ResumptionState::PerThreadCache => {
             let mut cfg = production.clone();
@@ -161,9 +157,7 @@ const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: cl
 /// Reads one request, writes [`RESPONSE`] and waits for the client to close. The server closes an
 /// HTTP/1.0 request itself, because `openssl s_time -www` in the `suites` experiment reads until
 /// the server closes.
-async fn answer(
-    inner: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-) -> std::io::Result<()> {
+async fn answer(inner: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>) -> std::io::Result<()> {
     let mut buf = [0u8; 1024];
     let mut seen = 0usize;
     loop {
@@ -224,19 +218,18 @@ fn serve(args: &[String]) {
     let secs: u64 = args.get(2).and_then(|n| n.parse().ok()).must("secs");
 
     let rcgen::CertifiedKey { cert, key_pair } =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .must("make a certificate");
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).must("make a certificate");
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
-    let production = tls::acceptor_from(vec![cert.der().clone()], key, &[b"http/1.1"])
-        .must("build the production acceptor");
+    let production =
+        tls::acceptor_from(vec![cert.der().clone()], key, &[b"http/1.1"]).must("build the production acceptor");
     let production = production.config().as_ref().clone();
     let shared = shared_config(variant, &production);
 
     let copies = NonZeroUsize::new(loops).must("loops must be at least 1");
     let options = BindOptions {
-            backlog: DEFAULT_BACKLOG,
-            defer_accept: Duration::from_secs(10),
-        };
+        backlog: DEFAULT_BACKLOG,
+        defer_accept: Duration::from_secs(10),
+    };
     let bound = Endpoints::bind(
         &ListenerSet::one(ListenerSpec {
             addr: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -248,8 +241,7 @@ fn serve(args: &[String]) {
     .must("bind the reuseport set");
     let port = bound.primary().addr.port();
 
-    let counts: Arc<Vec<LoopCounts>> =
-        Arc::new((0..loops).map(|_| LoopCounts::default()).collect());
+    let counts: Arc<Vec<LoopCounts>> = Arc::new((0..loops).map(|_| LoopCounts::default()).collect());
     for (index, one_loop) in bound.into_loops().into_iter().enumerate() {
         let counts = Arc::clone(&counts);
         let acceptor = TlsAcceptor::from(config(variant, &production, &shared));
@@ -269,8 +261,7 @@ fn serve(args: &[String]) {
                     tokio::task::spawn_local(async move {
                         let mine = &counts[index];
                         serve_one(connection.tcp.stream, &acceptor, mine).await;
-                        mine.allocations
-                            .store(ALLOCATIONS.with(Cell::get), Ordering::Relaxed);
+                        mine.allocations.store(ALLOCATIONS.with(Cell::get), Ordering::Relaxed);
                     });
                 }
             });
@@ -279,9 +270,7 @@ fn serve(args: &[String]) {
     println!("port {port}");
     std::io::stdout().flush().must("print the port");
     std::thread::sleep(Duration::from_secs(secs));
-    let sum = |f: fn(&LoopCounts) -> &AtomicU64| -> u64 {
-        counts.iter().map(|c| f(c).load(Ordering::Relaxed)).sum()
-    };
+    let sum = |f: fn(&LoopCounts) -> &AtomicU64| -> u64 { counts.iter().map(|c| f(c).load(Ordering::Relaxed)).sum() };
     let (full, resumed) = (sum(|c| &c.full), sum(|c| &c.resumed));
     let handshakes = full + resumed;
     let allocations = sum(|c| &c.allocations);
@@ -372,8 +361,7 @@ fn one_request(cfg: &Arc<rustls::ClientConfig>, addr: SocketAddr) -> Option<bool
     let name = rustls::pki_types::ServerName::try_from("localhost").ok()?;
     let mut conn = rustls::ClientConnection::new(Arc::clone(cfg), name).ok()?;
     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
-    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        .ok()?;
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").ok()?;
     let mut buf = [0u8; 256];
     let mut seen = 0usize;
     while seen < RESPONSE.len() {
@@ -385,9 +373,7 @@ fn one_request(cfg: &Arc<rustls::ClientConfig>, addr: SocketAddr) -> Option<bool
     let resumed = conn.handshake_kind() == Some(HandshakeKind::Resumed);
     // Closing with a reset, not a FIN, leaves no TIME_WAIT on either end however many connections
     // a run makes.
-    socket2::SockRef::from(&sock)
-        .set_linger(Some(Duration::ZERO))
-        .ok()?;
+    socket2::SockRef::from(&sock).set_linger(Some(Duration::ZERO)).ok()?;
     Some(resumed)
 }
 
@@ -462,10 +448,7 @@ fn load(args: &[String]) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args()
-        .skip(1)
-        .filter(|a| a != "--bench")
-        .collect();
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--bench").collect();
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]),
         Some("load") => load(&args[1..]),

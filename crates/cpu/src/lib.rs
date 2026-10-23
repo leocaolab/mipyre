@@ -2,16 +2,17 @@
 
 mod os;
 // The topology and cgroup decisions have one caller, the Linux read path in os.rs; they compile
-// everywhere so their tests run on every machine. Registered in dev/arch_waivers.txt (E-S3, P3);
-// it stays on one line, because archcheck reads each line on its own and misses a split one.
-#[cfg_attr(not(target_os = "linux"), expect(dead_code, reason = "their one caller reads Linux's sysfs and cgroups"))]
+// everywhere so their tests run on every machine. Registered in dev/arch_waivers.txt (E-S3, P3).
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "their one caller reads Linux's sysfs and cgroups")
+)]
 mod plan;
 
 pub use core_affinity::CoreId;
 pub use os::{
-    elevate_thread_qos_macos, read_cpu_quota, try_pin_current, CapacityFileError, CpuListFileError,
-    CpuReadError, FileError, HostCpus, PinError, PinFault, PinOrder, PinOrderError, QuotaReadError,
-    TopologyReadError,
+    elevate_thread_qos_macos, read_cpu_quota, try_pin_current, CapacityFileError, CpuListFileError, CpuReadError,
+    FileError, HostCpus, PinError, PinFault, PinOrder, PinOrderError, QuotaReadError, TopologyReadError,
 };
 pub use plan::{CpuMaxError, CpuMaxFault, CpuOrder, Cpus, PerfValueError, Quota, MAX_CPUS};
 

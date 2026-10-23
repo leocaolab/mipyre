@@ -15,6 +15,7 @@ import os
 
 import pytest
 from mipyre import Metrics, Mipyre, get_gil_metrics, reset_peaks
+from mipyre.engine import RunMetrics
 from mipyre.testing import TestClient
 
 
@@ -61,24 +62,29 @@ def test_metrics_shape():
         "gil_wait_total_us",
         "gil_queue_length",
         "gil_hold_peak_us",
-        "dropped_requests",
     ):
         assert isinstance(getattr(m, name), int), name
-    assert m.total_requests is None or isinstance(m.total_requests, int)
     assert m.rss_bytes is None or isinstance(m.rss_bytes, int)
 
 
-def test_degradation_counters_are_exposed():
-    """The degradations the engine took are counted in the same snapshot (b/132): the
-    counters are integers, and the CPU sizing fallback is a reason or None."""
+def test_run_metrics_shape(client):
+    """A server's own counts (``Server.metrics()``, b/335 D15) are a RunMetrics snapshot."""
+    m = client.server.metrics()
+    assert isinstance(m, RunMetrics)
+    assert isinstance(m.dropped_requests, int)
+    assert m.total_requests is None or isinstance(m.total_requests, int)
+
+
+def test_degradation_counters_are_exposed(client):
+    """The degradations the engine took are counted (b/132): the process's in its snapshot, a
+    server's in its own; the counters are integers, and the CPU sizing fallback is a reason or
+    None."""
     m = get_gil_metrics()
     for name in (
-        "workers_serving",
-        "workers_died",
-        "gc_failures",
-        "workers_retired",
         "precompressed_fallbacks",
         "static_unwatched_mounts",
+        "static_answers_cut",
+        "static_bytes_in_flight",
         "db_results_undeliverable",
         "gil_congested_waits",
         "client_disconnects",
@@ -89,17 +95,26 @@ def test_degradation_counters_are_exposed():
         "oversized_request_heads",
         "first_request_timeouts",
         "request_head_timeouts",
+        "forwarded_for_unreadable",
         "quickack_failures",
         "defer_accept_failures",
         "nodelay_failures",
+    ):
+        assert isinstance(getattr(m, name), int), name
+    run = client.server.metrics()
+    for name in (
+        "workers_serving",
+        "workers_died",
+        "gc_failures",
+        "workers_retired",
         "cpu_pin_failures",
         "cpu_qos_failures",
         "cpu_affinity_unreadable",
         "cpu_topology_unreadable",
     ):
-        assert isinstance(getattr(m, name), int), name
-    assert m.cpu_sizing_fallback is None or isinstance(m.cpu_sizing_fallback, str)
-    assert m.last_worker_retirement is None or isinstance(m.last_worker_retirement, str)
+        assert isinstance(getattr(run, name), int), name
+    assert run.last_worker_retirement is None or isinstance(run.last_worker_retirement, str)
+    assert run.cpu_sizing_fallback is None or isinstance(run.cpu_sizing_fallback, str)
 
 
 def test_probe_count_increments(client):

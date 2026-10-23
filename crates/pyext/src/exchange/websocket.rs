@@ -150,11 +150,7 @@ impl Inbox {
         method: &'static str,
         extract: impl FnOnce(WebSocketMessage) -> Result<T, WebSocketMessage>,
     ) -> Result<Option<T>, KindMismatch> {
-        let Some(msg) = self
-            .held
-            .take()
-            .or_else(|| self.rx.blocking_recv().map(|q| q.msg))
-        else {
+        let Some(msg) = self.held.take().or_else(|| self.rx.blocking_recv().map(|q| q.msg)) else {
             return Ok(None);
         };
         extract(msg).map(Some).map_err(|msg| {
@@ -190,16 +186,11 @@ impl Outbox {
             )));
         }
         let budget = self.queue.budget.try_reserve(msg.len()).ok_or_else(|| {
-            PyBlockingIOError::new_err(
-                "WebSocket send buffer full (client is slow); retry after a brief pause",
-            )
+            PyBlockingIOError::new_err("WebSocket send buffer full (client is slow); retry after a brief pause")
         })?;
         self.queue
             .tx
-            .send(QueueEntry {
-                msg,
-                _budget: budget,
-            })
+            .send(QueueEntry { msg, _budget: budget })
             .map_err(|_| PyConnectionError::new_err("WebSocket closed"))
     }
 }
@@ -214,9 +205,7 @@ pub(crate) struct HandlerEnds {
     outbox: Outbox,
 }
 
-pub(crate) fn connection_channels(
-    max_message_bytes: MessageByteLimit,
-) -> (ConnectionEnds, HandlerEnds) {
+pub(crate) fn connection_channels(max_message_bytes: MessageByteLimit) -> (ConnectionEnds, HandlerEnds) {
     let (incoming_tx, incoming_rx) = unbounded_channel::<QueueEntry>();
     let (outgoing_tx, outgoing_rx) = unbounded_channel::<QueueEntry>();
     (
@@ -348,23 +337,13 @@ mod tests {
             WebSocketMessage::Text("hi".into()),
         ] {
             let permit = budget.try_reserve(msg.len()).unwrap();
-            tx.send(QueueEntry {
-                msg,
-                _budget: permit,
-            })
-            .unwrap();
+            tx.send(QueueEntry { msg, _budget: permit }).unwrap();
         }
         let mut inbox = Inbox { rx, held: None };
         let mismatch = inbox.next_text("recv").err().unwrap();
         assert_eq!((mismatch.got, mismatch.len), ("binary", 3));
-        assert_eq!(
-            inbox.next_bytes("recv_bytes").ok().flatten(),
-            Some(vec![1, 2, 3])
-        );
-        assert_eq!(
-            inbox.next_text("recv").ok().flatten(),
-            Some("hi".to_string())
-        );
+        assert_eq!(inbox.next_bytes("recv_bytes").ok().flatten(), Some(vec![1, 2, 3]));
+        assert_eq!(inbox.next_text("recv").ok().flatten(), Some("hi".to_string()));
         drop(tx);
         assert!(inbox.next_text("recv").ok().unwrap().is_none());
     }

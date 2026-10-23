@@ -13,7 +13,7 @@ SERVER = '''
 import os
 from mipyre import Mipyre, Response, redirect
 
-app = Mipyre()
+app = Mipyre(runtime=os.environ["MIPYRE_TEST_MODE"])
 
 @app.get("/__ping")
 def ping(req):
@@ -21,7 +21,7 @@ def ping(req):
 
 @app.get("/")
 def index(req):
-    return {"mode": os.environ["MIPYRE_MODE"]}
+    return {"mode": "gil" if os.environ["MIPYRE_TEST_MODE"] == "main" else "subinterp"}
 
 @app.get("/hello/{name}")
 def hello(req):

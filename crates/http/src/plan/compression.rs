@@ -4,9 +4,7 @@
 //! and logs a failed encoding before sending the body uncompressed.
 
 use bytes::Bytes;
-use http::header::{
-    HeaderMap, HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, VARY,
-};
+use http::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, VARY};
 
 use crate::plan::response::HandlerResponse;
 
@@ -132,9 +130,7 @@ impl EnabledCodecs {
     /// Returns `coding` at this app's level for it, or `None` when the app does not use it.
     pub fn codec(self, coding: Coding) -> Option<Codec> {
         match (self, coding) {
-            (EnabledCodecs::Gzip(level) | EnabledCodecs::Both(level, _), Coding::Gzip) => {
-                Some(Codec::Gzip(level))
-            }
+            (EnabledCodecs::Gzip(level) | EnabledCodecs::Both(level, _), Coding::Gzip) => Some(Codec::Gzip(level)),
             (EnabledCodecs::Brotli(quality) | EnabledCodecs::Both(_, quality), Coding::Brotli) => {
                 Some(Codec::Brotli(quality))
             }
@@ -165,8 +161,7 @@ impl CompressionSettings {
         gzip_level: i64,
         brotli_quality: i64,
     ) -> Result<Self, CompressionSettingsError> {
-        let min_size = u32::try_from(min_size)
-            .map_err(|_| CompressionSettingsError::MinSizeOutOfRange(min_size))?;
+        let min_size = u32::try_from(min_size).map_err(|_| CompressionSettingsError::MinSizeOutOfRange(min_size))?;
         let level = GzipLevel::new(gzip_level)?;
         let quality = BrotliQuality::new(brotli_quality)?;
         let codecs = match (gzip, brotli) {
@@ -295,16 +290,11 @@ fn accepted(accept_encoding: &str) -> CodingWeights {
 fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     let head = s.as_bytes().get(..prefix.len())?;
     // The ASCII prefix matched, so `prefix.len()` is a char boundary of `s`.
-    head.eq_ignore_ascii_case(prefix.as_bytes())
-        .then(|| &s[prefix.len()..])
+    head.eq_ignore_ascii_case(prefix.as_bytes()).then(|| &s[prefix.len()..])
 }
 
 fn is_compressible(content_type: &str) -> bool {
-    let ct = content_type
-        .split(';')
-        .next()
-        .unwrap_or(content_type)
-        .trim();
+    let ct = content_type.split(';').next().unwrap_or(content_type).trim();
     if strip_prefix_ignore_ascii_case(ct, "text/").is_some_and(|subtype| !subtype.is_empty()) {
         return true;
     }
@@ -340,8 +330,10 @@ impl GzipStream {
     ///
     /// Returns an error when zlib fails; `out` may then hold partial output after what it held.
     pub fn encode(&mut self, data: &[u8], level: GzipLevel, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        gzip_compress(self.reset_at(level), data, out)
-            .map_err(|source| EncodeError { codec: Codec::Gzip(level), source })
+        gzip_compress(self.reset_at(level), data, out).map_err(|source| EncodeError {
+            codec: Codec::Gzip(level),
+            source,
+        })
     }
 
     fn reset_at(&mut self, level: GzipLevel) -> &mut flate2::Compress {
@@ -362,7 +354,10 @@ impl GzipStream {
 ///
 /// Returns an error when the encoder fails; `out` may then hold partial output after what it held.
 pub fn brotli(data: &[u8], quality: BrotliQuality, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-    brotli_compress(data, quality, out).map_err(|source| EncodeError { codec: Codec::Brotli(quality), source })
+    brotli_compress(data, quality, out).map_err(|source| EncodeError {
+        codec: Codec::Brotli(quality),
+        source,
+    })
 }
 
 /// Gzip's largest window, 32 KiB, which `GzEncoder` used too.
@@ -386,7 +381,10 @@ fn gzip_compress(stream: &mut flate2::Compress, data: &[u8], out: &mut Vec<u8>) 
     if status == flate2::Status::StreamEnd {
         Ok(())
     } else {
-        Err(CodecError::GzipNotFinished { status, len: data.len() })
+        Err(CodecError::GzipNotFinished {
+            status,
+            len: data.len(),
+        })
     }
 }
 
@@ -395,8 +393,8 @@ fn gzip_compress(stream: &mut flate2::Compress, data: &[u8], out: &mut Vec<u8>) 
 /// every response, nearly half of a small JSON body's encode; the output bytes are the same.
 fn brotli_compress(data: &[u8], quality: BrotliQuality, out: &mut Vec<u8>) -> Result<(), CodecError> {
     use brotli::enc::encode::{
-        BrotliEncoderDestroyInstance, BrotliEncoderMaxCompressedSize, BrotliEncoderOperation,
-        BrotliEncoderParameter, BrotliEncoderStateStruct,
+        BrotliEncoderDestroyInstance, BrotliEncoderMaxCompressedSize, BrotliEncoderOperation, BrotliEncoderParameter,
+        BrotliEncoderStateStruct,
     };
     let mut encoder = BrotliEncoderStateStruct::new(brotli::enc::StandardAlloc::default());
     // The encoder caps the size hint at 1 GiB, so a saturated one loses nothing.
@@ -514,11 +512,7 @@ impl CompressPlan {
 
 /// Returns how to compress `data`, or `None` when it goes out as is; a handler-set
 /// `Content-Encoding` is never compressed again. The cheap checks come first.
-pub fn plan(
-    data: &HandlerResponse,
-    accept_encoding: &str,
-    settings: &CompressionSettings,
-) -> Option<CompressPlan> {
+pub fn plan(data: &HandlerResponse, accept_encoding: &str, settings: &CompressionSettings) -> Option<CompressPlan> {
     let len = data.body.len();
     if accept_encoding.is_empty() || len < settings.min_size as usize {
         return None;
@@ -616,7 +610,12 @@ mod tests {
                 encode(&body, codec, &mut out).unwrap();
                 // From 1 KiB on, a JSON body shrinks; the empty list does not.
                 if items >= 13 {
-                    assert!(out.len() < body.len(), "{codec:?}, {items} items: {} → {}", body.len(), out.len());
+                    assert!(
+                        out.len() < body.len(),
+                        "{codec:?}, {items} items: {} → {}",
+                        body.len(),
+                        out.len()
+                    );
                 }
                 assert_eq!(decode(&out, codec), body, "{codec:?}, {items} items");
             }
@@ -629,7 +628,10 @@ mod tests {
         for items in [1, 13, 64, 211, 843] {
             let body = json_items(items);
             let mut streamed = Vec::new();
-            let params = brotli::enc::BrotliEncoderParams { quality: 4, ..Default::default() };
+            let params = brotli::enc::BrotliEncoderParams {
+                quality: 4,
+                ..Default::default()
+            };
             brotli::BrotliCompress(&mut &body[..], &mut streamed, &params).unwrap();
             let mut out = Vec::new();
             encode(&body, Codec::Brotli(quality), &mut out).unwrap();
@@ -680,26 +682,17 @@ mod tests {
 
     #[test]
     fn negotiate_picks_brotli_over_gzip() {
-        assert_eq!(
-            negotiate("gzip, deflate, br", CodingSet::ALL),
-            Some(Coding::Brotli)
-        );
+        assert_eq!(negotiate("gzip, deflate, br", CodingSet::ALL), Some(Coding::Brotli));
     }
 
     #[test]
     fn negotiate_gzip_only_when_brotli_disabled() {
-        assert_eq!(
-            negotiate("gzip, br", CodingSet::only(Coding::Gzip)),
-            Some(Coding::Gzip)
-        );
+        assert_eq!(negotiate("gzip, br", CodingSet::only(Coding::Gzip)), Some(Coding::Gzip));
     }
 
     #[test]
     fn negotiate_respects_q_zero() {
-        assert_eq!(
-            negotiate("br;q=0, gzip", CodingSet::ALL),
-            Some(Coding::Gzip)
-        );
+        assert_eq!(negotiate("br;q=0, gzip", CodingSet::ALL), Some(Coding::Gzip));
     }
 
     #[test]
@@ -719,10 +712,7 @@ mod tests {
 
     #[test]
     fn negotiate_uppercase_q_param() {
-        assert_eq!(
-            negotiate("br;Q=0, gzip", CodingSet::ALL),
-            Some(Coding::Gzip)
-        );
+        assert_eq!(negotiate("br;Q=0, gzip", CodingSet::ALL), Some(Coding::Gzip));
     }
 
     #[test]
@@ -732,10 +722,7 @@ mod tests {
 
     #[test]
     fn negotiate_malformed_q_disables() {
-        assert_eq!(
-            negotiate("br;q=bad, gzip", CodingSet::ALL),
-            Some(Coding::Gzip)
-        );
+        assert_eq!(negotiate("br;q=bad, gzip", CodingSet::ALL), Some(Coding::Gzip));
     }
 
     #[test]
@@ -805,7 +792,10 @@ mod tests {
         headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
         assert!(accept_encoding(&headers, None).is_none());
         let on = settings(0, true, true);
-        assert_eq!(accept_encoding(&headers, Some(&on)).unwrap(), (&HeaderValue::from_static("gzip"), &on));
+        assert_eq!(
+            accept_encoding(&headers, Some(&on)).unwrap(),
+            (&HeaderValue::from_static("gzip"), &on)
+        );
         assert!(accept_encoding(&HeaderMap::new(), Some(&on)).is_none());
     }
 
@@ -843,10 +833,7 @@ mod tests {
     #[test]
     fn negotiate_non_ascii_param_does_not_panic() {
         // Byte 2 falls inside the 3-byte '€' of the parameter.
-        assert_eq!(
-            negotiate("br;\u{20ac}, gzip", CodingSet::ALL),
-            Some(Coding::Brotli)
-        );
+        assert_eq!(negotiate("br;\u{20ac}, gzip", CodingSet::ALL), Some(Coding::Brotli));
         assert_eq!(
             negotiate("br;q\u{20ac}", CodingSet::only(Coding::Brotli)),
             Some(Coding::Brotli)
@@ -892,10 +879,7 @@ mod tests {
         let s = CompressionSettings::parse(0, false, true, 9, 11).unwrap();
         assert_eq!(s.codecs, EnabledCodecs::Brotli(BrotliQuality(11)));
         let s = CompressionSettings::parse(0, true, true, 1, 11).unwrap();
-        assert_eq!(
-            s.codecs,
-            EnabledCodecs::Both(GzipLevel(1), BrotliQuality(11))
-        );
+        assert_eq!(s.codecs, EnabledCodecs::Both(GzipLevel(1), BrotliQuality(11)));
     }
 
     fn headers_with(pairs: &[(http::header::HeaderName, &'static str)]) -> HeaderMap {

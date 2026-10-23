@@ -1,6 +1,6 @@
-"""BLAS (and polars) thread pools are limited by the process-lane adapters, in worker
-processes only, before the app is imported there; the server process is left alone
-(design §5). A variable the user set is never changed."""
+"""BLAS (and polars) thread pools are limited in process-lane worker processes only, before
+the app is imported there; the server process is left alone (design §5). A pool the user
+sized through any one of its variables is left whole, as the user set it."""
 
 import json
 import os
@@ -43,6 +43,6 @@ def test_workers_import_the_app_with_one_thread_per_pool_and_the_server_is_untou
 def test_a_variable_the_user_set_is_left_alone(tmp_path):
     worker, server = _serve(tmp_path, "import", OPENBLAS_NUM_THREADS="4")
     assert worker["at_import"]["OPENBLAS_NUM_THREADS"] == "4"
-    assert worker["at_import"]["OMP_NUM_THREADS"] == "1"
+    assert worker["at_import"]["OMP_NUM_THREADS"] is None
     assert server["now"]["OPENBLAS_NUM_THREADS"] == "4"
     assert server["now"]["OMP_NUM_THREADS"] is None

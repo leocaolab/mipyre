@@ -21,7 +21,7 @@ LINES = 5000
 FLUSH_THEN_EXIT = f"""
 import logging, os
 from mipyre.engine import flush_logs, init_logger
-from mipyre._log_bridge import install_root_handler
+from mipyre._log.bridge import install_root_handler
 from mipyre.engine import _python_log_level, emit_python_log
 init_logger("INFO", False, "text")
 install_root_handler(emit_python_log, _python_log_level())
@@ -61,14 +61,14 @@ def say_goodbye():
         logging.getLogger("bye").warning("bye-line %d", i)
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, workers=1)
+    app.run(host="127.0.0.1", port=0, threads=1)
 """
 
 
 def test_the_lines_a_server_logs_as_it_stops_are_written_before_it_exits(tmp_path):
     script, log_path = tmp_path / "app.py", tmp_path / "app.log"
     script.write_text(SHUTDOWN_LOGS)
-    env = {k: v for k, v in os.environ.items() if k not in ("MIPYRE_RUNTIME", "MIPYRE_TPC")}
+    env = {k: v for k, v in os.environ.items() if k not in ("MIPYRE_TEST_MODE", "MIPYRE_TPC")}
     with open(log_path, "w") as out:
         proc = subprocess.Popen([sys.executable, str(script)], stdout=out, stderr=subprocess.STDOUT,
                                 start_new_session=True, env=env)

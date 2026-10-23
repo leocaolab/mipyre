@@ -29,21 +29,31 @@ mod tests {
 
     #[test]
     fn a_length_past_the_slot_is_refused_with_both_values() {
-        assert_eq!(decode_len(4093, 4092), Err(SlotLengthError::PastSlot { len: 4093, max: 4092 }));
-        assert_eq!(decode_len(u32::MAX, 0), Err(SlotLengthError::PastSlot { len: u32::MAX, max: 0 }));
+        assert_eq!(
+            decode_len(4093, 4092),
+            Err(SlotLengthError::PastSlot { len: 4093, max: 4092 })
+        );
+        assert_eq!(
+            decode_len(u32::MAX, 0),
+            Err(SlotLengthError::PastSlot { len: u32::MAX, max: 0 })
+        );
     }
 }
 
 #[cfg(kani)]
 mod proofs {
     use super::*;
+    use crate::plan::geometry::proofs::any_geometry;
+    use crate::plan::geometry::SLOT_HEADER;
 
-    /// A length accepted is the header's own value and fits the slot; one refused is reported with both values.
+    /// A length accepted is the header's own value and fits the slot of any geometry, header included; one refused is
+    /// reported with both values.
     #[kani::proof]
     fn a_length_accepted_fits_the_slot() {
-        let (raw, max): (u32, u32) = (kani::any(), kani::any());
+        let g = any_geometry();
+        let (raw, max): (u32, u32) = (kani::any(), g.max_message());
         match decode_len(raw, max) {
-            Ok(len) => assert!(len == raw && len <= max),
+            Ok(len) => assert!(len == raw && len <= max && SLOT_HEADER + len as usize <= g.slot_bytes().get()),
             Err(SlotLengthError::PastSlot { len, max: said }) => assert!(len == raw && said == max && raw > max),
         }
     }

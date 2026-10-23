@@ -8,7 +8,7 @@ import tempfile
 
 import pytest
 
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 from tests._helpers import poll_until
 
 ARENA_ACCEPT = "br;q=1, gzip;q=0.8"
@@ -35,9 +35,8 @@ def root():
 def client(root):
     from tests.apps.static_precompressed import app
 
-    c = TestClient(app, transport="tcp")
-    yield c
-    c.close()
+    with TestServer(app) as server, TestClient(server) as c:
+        yield c
 
 
 def _get(port, path, accept=None, method="GET", extra=None):

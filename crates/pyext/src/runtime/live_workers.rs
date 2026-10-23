@@ -31,7 +31,10 @@ impl std::fmt::Display for ServerStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ServerStop::NoWorkerLeft { kind, first } => {
-                write!(f, "the server stopped: no {kind} is left serving; the first stopped: {first}")
+                write!(
+                    f,
+                    "the server stopped: no {kind} is left serving; the first stopped: {first}"
+                )
             }
             ServerStop::LanesFailed(why) => write!(f, "the process lanes failed, so the server stopped: {why}"),
         }
@@ -136,7 +139,7 @@ impl<S: Cancellable> WorkerLife<S> {
 }
 
 #[cfg(test)]
-#[cfg(sync_model)]
+#[cfg(all(sync_model, not(sync_shuttle)))]
 mod loom_model;
 
 #[cfg(test)]
@@ -147,7 +150,9 @@ mod tests {
     /// Returns the first worker's cause if `stop` was stopped because no worker of `kind` is left.
     fn no_worker_left(stop: &ServerRunStop, kind: WorkerKind) -> Option<Arc<str>> {
         match stop.cause() {
-            Some(StopCause::Caller(ServerStop::NoWorkerLeft { kind: stopped, first })) if stopped == kind => Some(first),
+            Some(StopCause::Caller(ServerStop::NoWorkerLeft { kind: stopped, first })) if stopped == kind => {
+                Some(first)
+            }
             _ => None,
         }
     }
@@ -173,12 +178,10 @@ mod tests {
             .next()
             .expect("worker 1's life")
             .died("worker 1 retired: gc.collect() raised B".into());
-        assert_eq!(
-            first.as_deref(),
-            Some("worker 0 retired: gc.collect() raised A")
-        );
+        assert_eq!(first.as_deref(), Some("worker 0 retired: gc.collect() raised A"));
         assert!(stop.is_stopped());
-        let cause = no_worker_left(&stop, WorkerKind::TpcThread).expect("the run was stopped for no TPC thread worker left");
+        let cause =
+            no_worker_left(&stop, WorkerKind::TpcThread).expect("the run was stopped for no TPC thread worker left");
         assert_eq!(&*cause, "worker 0 retired: gc.collect() raised A");
         let counted = counters.read();
         assert_eq!((counted.workers_serving, counted.workers_died), (0, 2));
@@ -187,7 +190,12 @@ mod tests {
     #[test]
     fn a_worker_stopped_by_the_server_is_no_longer_serving_and_did_not_die() {
         let counters = Arc::new(RunCounters::new(false));
-        let (_, lives) = LiveWorkers::new(WorkerKind::PoolSync, 3, <ServerRunStop>::default(), Arc::clone(&counters));
+        let (_, lives) = LiveWorkers::new(
+            WorkerKind::PoolSync,
+            3,
+            <ServerRunStop>::default(),
+            Arc::clone(&counters),
+        );
         assert_eq!(lives.len(), 3, "one life per worker");
         lives.into_iter().next().expect("a worker's life").stopped();
         let counted = counters.read();
@@ -205,6 +213,11 @@ mod tests {
                 life.died(cause.into());
             }
         }
-        assert_eq!(no_worker_left(&stop, WorkerKind::PoolSync).as_deref(), Some("sync gone"), "{:?}", stop.cause());
+        assert_eq!(
+            no_worker_left(&stop, WorkerKind::PoolSync).as_deref(),
+            Some("sync gone"),
+            "{:?}",
+            stop.cause()
+        );
     }
 }

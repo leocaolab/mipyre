@@ -4,8 +4,8 @@ Every server test runs a real server in a subprocess on the path it names, bound
 0 (the port is read from its "Listening on" line), so it exercises the dispatch code that
 path runs:
 
-  - "gil"     MIPYRE_RUNTIME=main, MIPYRE_TPC=0  → handlers on main (Tokio blocking pool)
-  - "tpc-gil" MIPYRE_RUNTIME=main                  → TPC threads, handlers on main
+  - "gil"     MIPYRE_TEST_MODE=main, MIPYRE_TPC=0  → handlers on main (Tokio blocking pool)
+  - "tpc-gil" MIPYRE_TEST_MODE=main                  → TPC threads, handlers on main
   - "tpc"     default runtime                        → TPC inline sub-interpreters; runtime="main"
                                                        routes go through the main-interp bridge
   - "pool"    default runtime, MIPYRE_TPC=0        → sub-interp pool; runtime="main" routes on main
@@ -34,7 +34,7 @@ import time
 
 import pytest
 
-from tests._helpers import bound_port, poll_until, text_appears
+from tests._helpers import bound_port, metric_count, poll_until, text_appears, set_subinterpreters
 
 
 PYTHON = sys.executable
@@ -51,7 +51,7 @@ PATHS: dict[str, dict[str, str | None]] = {
 
 RUN = """
 import os
-app.run(host="127.0.0.1", port=0, workers=int(os.environ["W2_WORKERS"]))
+app.run(host="127.0.0.1", port=0)
 """
 
 LISTENING = re.compile(r"Listening on http://127\.0\.0\.1:(\d+)")
@@ -91,14 +91,14 @@ class Server:
             f.write(textwrap.dedent(script))
         self.log_path = self.script_path + ".log"
         full_env = dict(os.environ)
-        full_env.pop("MIPYRE_RUNTIME", None)
+        full_env.pop("MIPYRE_TEST_MODE", None)
         if (runtime := PATHS[path]["runtime"]) is not None:
-            full_env["MIPYRE_RUNTIME"] = runtime
-        full_env["W2_WORKERS"] = str(workers)
+            full_env["MIPYRE_TEST_MODE"] = runtime
         full_env.pop("MIPYRE_TPC", None)
         full_env.pop("MIPYRE_LOG", None)
         if (tpc := PATHS[path]["tpc"]) is not None:
             full_env["MIPYRE_TPC"] = tpc
+        set_subinterpreters(full_env, str(workers))
         full_env.update(env or {})
         with open(self.log_path, "w") as log:
             self.proc = subprocess.Popen(
@@ -253,7 +253,7 @@ def ws_request(path: str, **overrides: str | None) -> bytes:
     """A WebSocket opening handshake for `path`; an override of `None` drops the header,
     `request_line` replaces the request line."""
     fields = {
-        "Host": "x",
+        "Host": "127.0.0.1",
         "Upgrade": "websocket",
         "Connection": "Upgrade",
         "Sec-WebSocket-Version": "13",
@@ -284,8 +284,9 @@ def ws_connect(port: int, target: str, headers: dict | None = None):
 
 REQUEST_SCRIPT = """
 import json
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 def echo(req):
     return {
@@ -375,13 +376,14 @@ def test_python_request_constructor_goes_through_the_same_constructor():
 # ---------------------------------------------------------------------------
 
 STREAM_SCRIPT = """
-from mipyre import Mipyre
-from mipyre.engine import BodyRejected
-app = Mipyre()
+import os
+from mipyre import BodyStream, Mipyre
+from mipyre.engine import BodyReadError
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.max_body_size = 1024
 app.request_timeout = REQUEST_BUDGET
 
-@app.post("/reread", runtime="main", stream=True)
+@app.post("/reread", runtime="main", body=BodyStream)
 def reread(req):
     stream = req.stream
     outcomes = []
@@ -389,18 +391,18 @@ def reread(req):
         try:
             stream.read()
             outcomes.append("read")
-        except BodyRejected:
+        except BodyReadError:
             outcomes.append("rejected")
     try:
         next(stream)
         outcomes.append("chunk")
-    except BodyRejected:
+    except BodyReadError:
         outcomes.append("rejected")
     except StopIteration:
         outcomes.append("stop")
     return outcomes
 
-@app.post("/drain-twice", runtime="main", stream=True)
+@app.post("/drain-twice", runtime="main", body=BodyStream)
 def drain_twice(req):
     stream = req.stream
     first = len(stream.read())
@@ -410,7 +412,7 @@ def drain_twice(req):
         second = "RuntimeError: " + str(e)
     return {"first": first, "second": second}
 
-@app.post("/take-twice", runtime="main", stream=True)
+@app.post("/take-twice", runtime="main", body=BodyStream)
 def take_twice(req):
     first = req.stream
     try:
@@ -458,9 +460,10 @@ def test_taking_req_stream_twice_is_an_error_not_none(path):
 # ---------------------------------------------------------------------------
 
 AWAITABLE_SCRIPT = """
+import os
 from mipyre import Mipyre, Response
 from mipyre.context import ctx
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 class Setting:
     # An awaitable that is not a coroutine, like a Cython or mypyc coroutine or a custom
@@ -510,8 +513,9 @@ def test_a_non_coroutine_awaitable_writes_the_request_context(path):
 
 BRIDGE_FULL_SCRIPT = """
 import os, time
-from mipyre import Mipyre, get_gil_metrics
-app = Mipyre(log_config={"level": "WARN"})
+from mipyre import Mipyre
+app = Mipyre(log_config={"level": "WARN"}, runtime=os.environ["W2_APP_RUNTIME"])
+app.enable_metrics()
 
 @app.get("/hold", runtime="main")
 def hold(req):
@@ -523,13 +527,17 @@ def hold(req):
         time.sleep(0.01)
     return "held"
 
-@app.get("/dropped", runtime="main")
-def dropped(req):
-    return {"dropped": get_gil_metrics().dropped_requests}
+# With the app's default runtime "subinterp" this is a route on a sub-interpreter, so the TPC
+# server has workers; with "main" no route needs one and its threads have none. Either way the
+# main routes run on the bridge this test fills.
+@app.get("/ok")
+def ok(req):
+    return "ok"
 """ + RUN
 
 
-def test_a_full_bridge_queue_is_one_counted_logged_refusal(tmp_path):
+@pytest.mark.parametrize("app_runtime", ["subinterp", "main"])
+def test_a_full_bridge_queue_is_one_counted_logged_refusal(tmp_path, app_runtime):
     # One bridge thread, one queue slot: with one request running, of two more exactly one
     # is queued and one refused (503) — counted once, where it is refused, and logged once.
     gate = tmp_path / "gate"
@@ -537,6 +545,7 @@ def test_a_full_bridge_queue_is_one_counted_logged_refusal(tmp_path):
         "MIPYRE_GIL_BRIDGE_WORKERS": "1",
         "MIPYRE_GIL_BRIDGE_CAPACITY": "1",
         "W2_GATE": str(gate),
+        "W2_APP_RUNTIME": app_runtime,
     }
     with serve(BRIDGE_FULL_SCRIPT, "tpc", env=env) as srv:
         with concurrent.futures.ThreadPoolExecutor(3) as pool:
@@ -550,15 +559,59 @@ def test_a_full_bridge_queue_is_one_counted_logged_refusal(tmp_path):
             statuses = sorted(f.result().status for f in contenders)
             assert running.result().status == 200
         assert statuses == [200, 503], statuses
-        assert srv.get("/dropped").json() == {"dropped": 1}
+        assert metric_count(srv.get("/metrics").body.decode(), "mipyre_http_requests_refused_total") == 1
         refused = srv.records_at_exit(lambda rec: "request refused" in _text(rec))
         assert len(refused) == 1, refused
         assert "runtime='main' bridge queue" in _text(refused[0])
 
 
+ASYNC_MAIN_SCRIPT = """
+import asyncio, os
+from mipyre import Mipyre, Response, Stream
+app = Mipyre(runtime="main")
+
+@app.after_request
+def tag(req, resp):
+    headers = dict(resp.headers)
+    headers["x-after"] = "ran"
+    return Response(resp.body, status_code=resp.status_code,
+                    content_type=resp.content_type, headers=headers)
+
+# A `def` route keeps a TPC thread without workers; the `async def` ones run on main's async engine.
+@app.get("/sync")
+def sync(req):
+    return "sync"
+
+@app.get("/json")
+async def as_json(req):
+    await asyncio.sleep(0)
+    return {"ok": True}
+
+@app.get("/stream")
+async def stream(req):
+    await asyncio.sleep(0)
+    out = Stream(content_type="text/plain")
+    out.send("a")
+    out.send("b")
+    out.close()
+    return out
+""" + RUN
+
+
+def test_an_async_main_route_is_answered_by_mains_async_engine_with_its_hooks_and_streams():
+    # Main's async engine answers as main's other paths do: after hooks see a response, and a
+    # returned Stream is streamed with the after hooks unrun.
+    with serve(ASYNC_MAIN_SCRIPT, "tpc") as srv:
+        r = srv.get("/json")
+        assert (r.status, r.json(), r.headers.get("x-after")) == (200, {"ok": True}, "ran")
+        r = srv.get("/stream")
+        assert (r.status, r.body, r.headers.get("x-after")) == (200, b"ab", None)
+        assert srv.get("/sync").headers.get("x-after") == "ran"
+
 WS_ERROR_SCRIPT = """
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
 @app.websocket("/ws-raise")
 def ws_raise(ws):
@@ -593,7 +646,7 @@ def test_a_websocket_handler_error_is_logged_with_its_request(path):
 WS_SCRIPT = """
 import os
 from mipyre import Mipyre, Response
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.max_websocket_connections = 1
 app.request_timeout = REQUEST_BUDGET
 
@@ -649,7 +702,7 @@ def test_upgrade_on_an_ordinary_route_is_routed_normally(path):
     with serve(WS_SCRIPT, path) as srv:
         status, _, body = raw_exchange(
             srv.port,
-            b"GET /plain HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            b"GET /plain HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
             b"Content-Length: 0\r\nConnection: close\r\n\r\n",
         )
         assert status == 200
@@ -862,7 +915,7 @@ def test_a_wrong_method_is_405_with_allow(path):
         r = srv.get("/only-post")
         assert r.status == 405, r.body
         assert r.headers["allow"] == "POST"
-        assert r.json() == {"error": "method not allowed"}
+        assert r.json() == {"detail": "method not allowed"}
         r = srv.request("DELETE", "/plain")
         assert (r.status, r.headers["allow"]) == (405, "GET, HEAD")
         # A path no method has is still 404.
@@ -870,8 +923,9 @@ def test_a_wrong_method_is_405_with_allow(path):
 
 
 SAMPLING_SCRIPT = """
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.enable_access_log(level="info", sample=10)
 
 @app.get("/s")
@@ -901,8 +955,9 @@ def test_access_log_keeps_one_in_n_per_thread():
 
 
 COMPRESSION_SCRIPT = """
+import os
 from mipyre import Mipyre
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.enable_compression(min_size=64)
 
 @app.get("/big")
@@ -916,7 +971,7 @@ def test_no_or_unreadable_accept_encoding_is_not_compressed(path):
     with serve(COMPRESSION_SCRIPT, path) as srv:
         def get(extra: bytes) -> tuple[int, dict]:
             status, headers, _ = raw_exchange(
-                srv.port, b"GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n" + extra + b"\r\n"
+                srv.port, b"GET /big HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n" + extra + b"\r\n"
             )
             return status, headers
 

@@ -3,7 +3,7 @@
 //! lock, condition variable and the stop flag are `crate::sync`'s, Loom's here). A receiver left
 //! asleep with nothing coming to wake it is a deadlock, which Loom reports, so every model keeps
 //! its senders alive until the receivers return unless the close is what it proves. Run with
-//! `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_pyext --lib --release --target-dir target/loom loom_model`.
+//! `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_pyext --lib --profile model --target-dir target/loom loom_model`.
 //!
 //! It proves: a job sent while a receiver sleeps or is about to is taken; two jobs sent to two
 //! receivers that sleep are taken one each, also when the second comes before the first woken

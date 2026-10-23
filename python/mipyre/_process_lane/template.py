@@ -3,15 +3,20 @@ is imported; on the server's request it starts one worker per lane, and reaps th
 
 The launcher below is the one place that matches on `StartStrategy`:
 
-- Import: the template holds no app code; each worker gets the adapters and the app itself
+- Import: the template holds no app code; each worker imports the app itself
   (driver: a fork of this bare template, or a new process on macOS while b/32 lasts);
-- Fork: the template runs the adapters, imports the app, checks it is still
+- Fork: the template imports the app (with the first run's command line), checks it is still
   single-threaded, then forks each worker.
 
+Each run's command line (`sys.argv` and the flag values) comes in a run frame before that run's
+start requests: an import worker installs it before it imports the app, the fork template
+installs it before it forks the run's workers.
+
 `python -m mipyre._process_lane.template --sock FD` is the entry of a template the
-SpawnDriver started, from the launcher's pinned copy of `mipyre` (the first PYTHONPATH entry);
-the ForkDriver's template comes in through `main` in the forked launcher, whose `mipyre`
-packages already import from that copy.
+SpawnDriver started; the ForkDriver's template comes in through `main` in the forked launcher.
+Either starts before the launcher has a copy of `mipyre` to pin it to: the setup names that
+copy's run directory, and the template points its `mipyre` packages there before it imports
+anything else, or refuses to go on.
 """
 
 from __future__ import annotations
@@ -22,15 +27,18 @@ import signal
 import socket
 import sys
 import traceback
+from typing import NoReturn
 
 from mipyre.engine import (
-    LaneSet,
+    BUILD_ID,
     StartStrategy,
     _driver_fork_worker,
+    _driver_name,
     _driver_start_import_worker,
 )
 
-from mipyre._process_lane import LaneSetup, LaneWorker, adapters, pin_env, refuse_unpinned_start, unpin_env, worker
+from mipyre._process_lane import worker
+from mipyre._process_lane.server import LaneSetup, LaneWorker, pin_env, pin_to_run_dir
 from mipyre._process_lane.threads import require_single_threaded
 
 
@@ -43,15 +51,14 @@ class CommandFrameError(RuntimeError):
     """The server sent bytes that are no command frame the template takes: the template ends."""
 
 
-# The template socket's frames (crates/pyext/src/lane/template.rs is the server's side): a 4-byte
+# The template socket's frames (crates/pyext/src/runtime/process/template.rs is the server's side): a 4-byte
 # little-endian length, then that many bytes, the first of which is the tag. Both directions
 # number their tags in one space.
 FRAME_HEADER_BYTES = 4
 MAX_FRAME_BYTES = 64 * 1024
-SETUP, LANE, START, FORKED, EXITED, IMPORT_FAILED, LANE_FDS_MISSING = range(1, 8)
+SETUP, LANE, START, FORKED, EXITED, IMPORT_FAILED, LANE_FDS_MISSING, RUN = range(1, 9)
 # A lane's frame carries the lane's shared memory and its wake-pipe write end.
 LANE_FDS = 2
-LANE_FRAME_BYTES = FRAME_HEADER_BYTES + 1 + 4
 
 
 def frame(tag: int, body: bytes) -> bytes:
@@ -139,12 +146,46 @@ def parse_start(tag: int, body: bytes) -> tuple[int, int]:
     return lane, attempt
 
 
+def recv_commands(sock: socket.socket, n: int = 4096) -> bytes | None:
+    """The next bytes of the server's commands, at most `n`, or None when the server's end is closed.
+
+    A closed end reads as EOF, or on Linux as ECONNRESET: an AF_UNIX stream reports the
+    peer's close as a reset when frames this template wrote were still unread on the server's
+    side (a server that stops kills its workers and exits without reading the reports of
+    their deaths). Both say the server is gone; nothing else resets a socket pair.
+    """
+    try:
+        chunk = sock.recv(n)
+    except ConnectionResetError:
+        return None
+    return chunk or None
+
+
+def send_report(sock: socket.socket, report: bytes) -> bool:
+    """Write `report` to the server; False when the server's end is closed (EPIPE): the server
+    is gone, as when `recv_commands` gives None: a stopping server exits while the deaths of
+    the workers it killed are being reported."""
+    try:
+        sock.sendall(report)
+    except BrokenPipeError:
+        return False
+    return True
+
+
+def parse_run(body: bytes) -> str:
+    """The command line of a run frame, as `CommandLine.encode()` wrote it."""
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise CommandFrameError(f"a run frame whose command line is not UTF-8: {body[:64]!r}") from e
+
+
 def _read_exact(sock: socket.socket, n: int) -> bytes | None:
     """`n` bytes from `sock`, or None when the server closed it first."""
     buf = b""
     while len(buf) < n:
-        more = sock.recv(n - len(buf))
-        if not more:
+        more = recv_commands(sock, n - len(buf))
+        if more is None:
             return None
         buf += more
     return buf
@@ -165,75 +206,83 @@ def _recv_setup(sock: socket.socket) -> LaneSetup | None:
     return LaneSetup.decode(body)
 
 
-# Received fds are close-on-exec until a worker is handed them (Linux has the flag; elsewhere the
-# spawn driver clears the flag on the fds it passes, and a fork keeps them either way).
+# Received fds are close-on-exec on Linux, which has the flag; macOS has none. A worker gets
+# them either way: a fork keeps every fd, and the spawn driver hands a new process the ones it
+# passes.
 if sys.platform == "linux":
     _RECV_FDS_FLAGS = socket.MSG_CMSG_CLOEXEC
 else:
     _RECV_FDS_FLAGS = 0
 
 
-def _recv_lane(sock: socket.socket, lane: int) -> tuple[list[int], bool] | None:
-    """Lane `lane`'s frame: the fds that came on it, and whether the kernel cut them short;
-    None when the server closed the socket first."""
-    data, fds, flags, _addr = socket.recv_fds(sock, LANE_FRAME_BYTES, LANE_FDS, _RECV_FDS_FLAGS)
-    if not data:
+def _recv_command(sock: socket.socket) -> tuple[int, bytes, list[int], bool] | None:
+    """The server's next command frame: its tag, its body, the fds that came on its first byte,
+    and whether the kernel cut them short; None when the server closed the socket first. Read to
+    the byte: a read into the next frame would drop the fds on its first byte."""
+    try:
+        data, fds, flags, _addr = socket.recv_fds(sock, FRAME_HEADER_BYTES, LANE_FDS, _RECV_FDS_FLAGS)
+    except ConnectionResetError:
+        return None  # the server's end is closed, as `recv_commands` reads it
+    head = data and data + (_read_exact(sock, FRAME_HEADER_BYTES - len(data)) or b"")
+    if len(head) < FRAME_HEADER_BYTES:
+        _close(fds)
         return None
-    rest = _read_exact(sock, LANE_FRAME_BYTES - len(data))
+    n = int.from_bytes(head, "little")
+    if not 1 <= n <= MAX_FRAME_BYTES:
+        _close(fds)
+        raise CommandFrameError(f"a frame of {n} bytes from the server: frames are 1 to {MAX_FRAME_BYTES}")
+    rest = _read_exact(sock, n)
     if rest is None:
+        _close(fds)
         return None
-    tag, body = whole_frame(data + rest)
-    if tag != LANE or parse_words(tag, body, 1) != [lane]:
-        raise CommandFrameError(f"a frame with tag {tag} and body {body.hex()} where lane {lane}'s (tag {LANE}) comes")
-    return fds, bool(flags & socket.MSG_CTRUNC)
+    tag, body = whole_frame(head + rest)
+    return tag, body, fds, bool(flags & socket.MSG_CTRUNC)
 
 
-def _recv_lanes(sock: socket.socket, workers: int) -> list[int] | None:
-    """The fds the lanes are mapped with: the shared memory, then each lane's wake-pipe write end.
-    Each lane's frame carries the shared memory again; one copy is kept. A frame short of its
-    fds is reported to the server, and the template ends: it cannot serve that lane."""
-    shm = None
-    wakes = []
-    for lane in range(workers):
-        received = _recv_lane(sock, lane)
-        if received is None:
-            return None
-        fds, cut = received
-        if cut or len(fds) != LANE_FDS:
-            sock.sendall(lane_fds_missing_frame(lane, len(fds)))
-            os._exit(70)
-        if shm is None:
-            shm = fds[0]
-        else:
-            os.close(fds[0])
-        wakes.append(fds[1])
-    if shm is None:
-        raise CommandFrameError("a setup for no lanes: the server makes at least one")
-    return [shm, *wakes]
+def _close(fds) -> None:
+    for fd in fds:
+        os.close(fd)
 
 
-def main(sock: socket.socket, run_dir: str) -> None:
+def spawn_import_worker(one: LaneWorker, run_dir: str) -> int:
+    """Spawns a `start="import"` worker and hands it `one` over a socketpair it inherits
+    (`--setup-fd N`), written after the spawn so a setup larger than the socket's buffer never
+    holds up the template; returns its pid.
+
+    A worker that dies before it read its setup is told by its exit status, which the template
+    reports as for any worker: the setup it was not there to read is not an error of its own.
+    """
+    ours, theirs = socket.socketpair()
+    with ours:
+        with theirs:
+            pid = _driver_start_import_worker(
+                sys.executable,
+                "mipyre._process_lane.worker",
+                ["--setup-fd", str(theirs.fileno())],
+                [*one.fds, theirs.fileno()],
+                pin_env(os.environ, run_dir),
+            )
+        try:
+            ours.sendall(one.encode().encode())
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the worker already exited; its status says why (see above)
+    return pid
+
+
+def main(sock: socket.socket, launcher_build: str | None) -> None:
     """Serve the server's worker requests on `sock` until it goes away.
 
-    `run_dir` holds the launcher's pinned copy of `mipyre`: each spawned worker is pinned to it
-    again, because a spawned template took it off its own PYTHONPATH.
+    The setup's run directory holds the launcher's copy of `mipyre`, in build `launcher_build`:
+    the template imports from it from then on, and each spawned worker is pinned to it.
 
     One loop is the socket's only writer: it answers start requests and, woken through the
     signal wakeup fd, reaps workers and reports them. SIGCHLD itself does nothing, so no frame
     is ever written from inside a signal handler, half-way through another.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # the server stops the template, not a Ctrl-C
-    setup = _recv_setup(sock)
-    if setup is None:
-        os._exit(0)  # the app has no process routes, or the server went away
-    fds = _recv_lanes(sock, setup.workers)
-    if fds is None:
-        os._exit(0)  # the server went away
-    lanes = LaneSet._attach(setup.workers, setup.depth, setup.slot_bytes, setup.worker_spin_us, fds)
-    template_pid = os.getpid()
     children: dict[int, int] = {}
 
-    def stop(_signum=None, _frame=None):
+    def stop(_signum=None, _frame=None, status: int = 0) -> NoReturn:
         # The template's workers go with it: a worker stuck in a handler never looks at
         # its parent, so nobody else would end it.
         for pid in list(children):
@@ -241,15 +290,26 @@ def main(sock: socket.socket, run_dir: str) -> None:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        os._exit(0)
+        os._exit(status)
+
+    # Before it waits for its setup: the launcher may end it at any point (`Template.end`).
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
+    setup = _recv_setup(sock)
+    if setup is None:
+        os._exit(0)  # the app has no process routes, or the server went away
+    pin_to_run_dir(setup.run_dir, launcher_build)
+    # Each lane's channel for the current run, as its frame brought it: the shared memory and the
+    # write end of its host's wake pipe. The template maps none of them; it hands a lane's pair to
+    # each worker it starts for the lane, and closes a run's pair when the next run's comes.
+    lane_fds: dict[int, tuple[int, int]] = {}
+    template_pid = os.getpid()
 
     wake_read, wake_write = os.pipe()
     os.set_blocking(wake_read, False)
     os.set_blocking(wake_write, False)
     signal.set_wakeup_fd(wake_write, warn_on_full_buffer=False)
     signal.signal(signal.SIGCHLD, lambda _signum, _frame: None)
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGHUP, stop)
     selector = selectors.DefaultSelector()
     selector.register(sock, selectors.EVENT_READ)
     selector.register(wake_read, selectors.EVENT_READ)
@@ -266,65 +326,98 @@ def main(sock: socket.socket, run_dir: str) -> None:
             if pid == 0:
                 return
             lane = children.pop(pid, None)
-            if lane is not None:
-                sock.sendall(exited_frame(lane, pid, status))
+            if lane is not None and not send_report(sock, exited_frame(lane, pid, status)):
+                stop()
 
-    def lane_worker(lane: int) -> LaneWorker:
-        return LaneWorker(setup, lane, template_pid, tuple(fds))
+    # The latest run frame's command line; the import of start="fork" happens at the first.
+    run_command_line: str | None = None
+    forked_app = None
 
-    match setup.start:
-        case StartStrategy.Import:
-
-            def start_worker(lane: int) -> int:
-                one = lane_worker(lane)
-                env = [("MIPYRE_LANE_WORKER", one.encode())] + pin_env(os.environ, run_dir)
-                pid = _driver_start_import_worker(sys.executable, "mipyre._process_lane.worker", [], fds, env)
-                if pid == 0:
-                    worker.run(lanes, one, sock, template_fds, lambda: worker.import_app(lanes, one))
-                return pid
-
-        case StartStrategy.Fork:
-            try:
-                adapters.prepare_all(os.environ)
-                app = worker.load_app(setup)
+    def take_run(command_line: str) -> None:
+        nonlocal run_command_line, forked_app
+        run_command_line = command_line
+        if setup.start is not StartStrategy.Fork:
+            return
+        try:
+            worker.install_command_line(command_line)
+            if forked_app is None:
+                forked_app = worker.load_app(setup)
                 require_single_threaded(
                     'the process-lane template (start="fork")',
                     'Use start="import" (the default) for this app: its workers import the app '
                     "themselves, so nothing it starts at import is ever forked.",
                 )
-            except BaseException:  # noqa: BLE001 — reported to the server, which fails the start
-                sock.sendall(import_failed_frame(traceback.format_exc()))
-                os._exit(70)
+        except BaseException:  # noqa: BLE001 — reported to the server, which fails the start
+            sock.sendall(import_failed_frame(traceback.format_exc()))
+            os._exit(70)
 
-            def start_worker(lane: int) -> int:
+    def fds_to_close(lane: int) -> tuple[int, ...]:
+        """What a worker of `lane` closes: the template's own fds and the other lanes'."""
+        others = tuple(fd for other, pair in lane_fds.items() if other != lane for fd in pair)
+        return template_fds + others
+
+    def start_worker(lane: int, attempt: int, command_line: str) -> int:
+        one = LaneWorker(setup, lane, template_pid, attempt, lane_fds[lane], command_line, BUILD_ID)
+        match setup.start:
+            case StartStrategy.Import if _driver_name() == "spawn":
+                pid = spawn_import_worker(one, setup.run_dir)
+            case StartStrategy.Import:
+                pid = _driver_start_import_worker(sys.executable, "mipyre._process_lane.worker", [], [], [])
+                if pid == 0:
+                    worker.run(one, sock, fds_to_close(lane), lambda lanes: worker.import_app(lanes, one))
+            case StartStrategy.Fork:
                 pid = _driver_fork_worker()
                 if pid == 0:
-                    worker.run(lanes, lane_worker(lane), sock, template_fds, lambda: app)
-                return pid
+                    worker.run(one, sock, fds_to_close(lane), lambda _lanes: forked_app)
+        return pid
+
+    def take_lane(lane: int, fds: list[int], cut: bool) -> None:
+        """Keep `lane`'s channel for this run in place of the last run's; a frame short of its
+        fds is reported to the server, and the template ends: it cannot serve that lane."""
+        if not 0 <= lane < setup.workers:
+            _close(fds)
+            raise CommandFrameError(f"a frame for lane {lane}: the server has {setup.workers}")
+        if cut or len(fds) != LANE_FDS:
+            _close(fds)
+            send_report(sock, lane_fds_missing_frame(lane, len(fds)))
+            stop(status=70)
+        _close(lane_fds.pop(lane, ()))
+        lane_fds[lane] = (fds[0], fds[1])
 
     def start(lane: int, attempt: int) -> None:
+        if run_command_line is None:
+            raise CommandFrameError(f"a start request for lane {lane} before any run frame")
+        if lane not in lane_fds:
+            raise CommandFrameError(f"a start request for lane {lane}, whose channel never came")
         sys.stdout.flush()
         sys.stderr.flush()
         try:
-            pid = start_worker(lane)
+            pid = start_worker(lane, attempt, run_command_line)
         except OSError as e:
             print(f"mipyre: the template could not start a worker for lane {lane}: {e}", file=sys.stderr, flush=True)
-            sock.sendall(fork_failure_frame(lane, attempt, e))
+            if not send_report(sock, fork_failure_frame(lane, attempt, e)):
+                stop()
             return
         children[pid] = lane
-        sock.sendall(forked_frame(lane, attempt, pid))
+        if not send_report(sock, forked_frame(lane, attempt, pid)):
+            stop()
 
-    received = bytearray()
     while True:
         for key, _events in selector.select():
             if key.fileobj is sock:
-                chunk = sock.recv(4096)
-                if not chunk:
+                command = _recv_command(sock)
+                if command is None:
                     stop()  # the server is gone: so are its workers
-                received += chunk
-                while (whole := split_frame(received)) is not None:
-                    tag, body, used = whole
-                    del received[:used]
+                tag, body, fds, cut = command
+                if tag == LANE:
+                    take_lane(parse_words(tag, body, 1)[0], fds, cut)
+                    continue
+                _close(fds)
+                if fds:
+                    raise CommandFrameError(f"{len(fds)} fds on a frame with tag {tag}: only a lane's frame carries fds")
+                if tag == RUN:
+                    take_run(parse_run(body))
+                else:
                     start(*parse_start(tag, body))
             else:
                 try:
@@ -337,11 +430,8 @@ def main(sock: socket.socket, run_dir: str) -> None:
 
 if __name__ == "__main__":
     fd = int(sys.argv[sys.argv.index("--sock") + 1])
-    run_dir = os.environ.get("PYTHONPATH", "").split(os.pathsep)[0]
-    refuse_unpinned_start(run_dir, os.environ.get("MIPYRE_BUILD_ID"))
-    unpin_env(os.environ, run_dir)
     try:
-        main(socket.socket(fileno=fd), run_dir)
+        main(socket.socket(fileno=fd), os.environ.get("_MIPYRE_BUILD_ID"))
     except BaseException:  # noqa: BLE001 — printed; the process then exits 70 (the finally below)
         traceback.print_exc()
     finally:

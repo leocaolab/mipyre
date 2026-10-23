@@ -13,7 +13,6 @@ being freed was not allocated" in `remove_all_subclasses`.
 from __future__ import annotations
 
 import http.client
-import ast
 import json
 import os
 import signal
@@ -21,75 +20,23 @@ import subprocess
 import sys
 import threading
 import urllib.request
-from pathlib import Path
 
 import pytest
 
-from tests._helpers import FINALIZE_MARK_SNIPPET, bound_port, finalized, listening_ports, poll_until
+from tests._helpers import FINALIZE_MARK_SNIPPET, bound_port, finalized, listening_ports, poll_until, set_subinterpreters
 
 _supported = pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"),
     reason="isolate() clones via cp -c / cp --reflink (Linux/macOS)",
 )
 
-_BOOTSTRAP = Path(__file__).resolve().parent.parent / "python" / "mipyre" / "_subinterp" / "isolation.py"
-
-
-def _bootstrap_funcs(*names):
-    """The named pure helpers from _bootstrap.py (it runs inside workers and
-    can't be imported as a module)."""
-    ns = {"_os": os}
-    for node in ast.parse(_BOOTSTRAP.read_text()).body:
-        if isinstance(node, ast.FunctionDef) and node.name in names:
-            exec(compile(ast.Module([node], []), str(_BOOTSTRAP), "exec"), ns)  # noqa: S102 — the adapter runs only inside a worker, so the test loads its parts by hand
-    return [ns[n] for n in names]
-
-
-def test_single_phase_check_matches_runtime():
-    """The pre-init binary check agrees with the runtime answer (the def's
-    m_slots) for every extension module numpy and scipy load."""
-    pytest.importorskip("scipy")
-    import ctypes
-    import importlib
-    for m in ("numpy", "scipy.linalg", "scipy.optimize"):
-        importlib.import_module(m)
-    (is_single,) = _bootstrap_funcs("_iso_dynamic_strtab", "_iso_is_single_phase_file")[1:]
-    api = ctypes.pythonapi
-    api.PyModule_GetDef.restype = ctypes.c_void_p
-    api.PyModule_GetDef.argtypes = [ctypes.py_object]
-    base = ctypes.sizeof(ctypes.c_ssize_t) + 4 * ctypes.sizeof(ctypes.c_void_p)
-    seen_single = 0
-    wrong = []
-    for name, mod in list(sys.modules.items()):
-        f = getattr(mod, "__file__", "") or ""
-        if not f.endswith((".so", ".pyd")):
-            continue
-        d = api.PyModule_GetDef(mod)
-        if not d:
-            continue
-        single = not ctypes.c_void_p.from_address(d + base + 4 * ctypes.sizeof(ctypes.c_void_p)).value
-        seen_single += single
-        if is_single(f) != single:
-            wrong.append((name, single))
-    assert seen_single, "expected scipy to load single-phase modules (f2py _fblas)"
-    assert not wrong, f"binary check disagrees with runtime (name, is single-phase): {wrong}"
-
-
-def test_single_phase_check_unreadable_counts_as_single(tmp_path):
-    (is_single,) = _bootstrap_funcs("_iso_dynamic_strtab", "_iso_is_single_phase_file")[1:]
-    junk = tmp_path / "junk.so"
-    junk.write_bytes(b"not a binary")
-    assert is_single(str(junk)) is True
-    assert is_single(str(tmp_path / "missing.so")) is True
-
-
 def _start(script_text, tmp_path, name, workers, env_extra=None):
     """Launches the script on port 0; `_base` reads the port it bound from the log."""
     script = tmp_path / f"{name}.py"
     script.write_text(script_text.replace("{port}", "0"))
     log = tmp_path / f"{name}.log"
-    env = dict(os.environ, MIPYRE_WORKERS=str(workers),
-               MIPYRE_ISOLATE_DIR=str(tmp_path / "copies"), **(env_extra or {}))
+    env = dict(os.environ, MIPYRE_ISOLATE_DIR=str(tmp_path / "copies"), **(env_extra or {}))
+    set_subinterpreters(env, str(workers))
     proc = subprocess.Popen([sys.executable, str(script)],
                             stdout=open(log, "wb"), stderr=subprocess.STDOUT, env=env)
     return proc, log
@@ -159,9 +106,9 @@ def test_shared_single_phase_ext_is_cloned_not_loaded_shared(tmp_path):
     """Before: CPython ran scipy's single-phase init in the main interpreter,
     whose own `import_array()` then hit numpy's "cannot load module more than
     once per process" in main -> every request 500 ("failed to import from
-    subinterpreter due to exception"). Now the shared single-phase file is
-    refused before its init runs, scipy is cloned, and `_fblas` is built in
-    the worker. Finalization (no hard exit) must be clean too."""
+    subinterpreter due to exception"). Now the worker's finder reads scipy's
+    files before any of them loads, judges the package a copy (it has
+    single-phase files), and `_fblas` is built in the worker from the copy. Finalization (no hard exit) must be clean too."""
     pytest.importorskip("scipy")
     proc, log = _start(_SCIPY_LAZY, tmp_path, "scipy_lazy", workers=2)
     try:

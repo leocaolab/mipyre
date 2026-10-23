@@ -11,7 +11,7 @@ import urllib.request
 
 import pytest
 
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 
 
 def _request_with_cors(base: str, path: str, method: str = "GET"):
@@ -31,7 +31,7 @@ def test_404_carries_cors_headers():
     # Its own module: a worker serves one app per module.
     from tests.apps.cors_404 import app
 
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         status, headers = _request_with_cors(client.base_url, "/nonexistent")
         assert status == 404
         lower = {k.lower(): v for k, v in headers.items()}
@@ -47,7 +47,7 @@ def test_options_preflight_on_unknown_path_not_blocked():
     # Its own module: a worker serves one app per module.
     from tests.apps.cors_preflight_unknown_path import app
 
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         # OPTIONS /api/login — route not registered for OPTIONS, falls to 404
         status, headers = _request_with_cors(
             client.base_url, "/api/login", method="OPTIONS"
@@ -72,7 +72,7 @@ def test_static_file_hit_carries_cors():
         try:
             from tests.apps.cors_static import app
 
-            with TestClient(app, transport="tcp") as client:
+            with TestServer(app) as server, TestClient(server) as client:
                 status, headers = _request_with_cors(client.base_url, "/static/reset.css")
                 assert status == 200
                 lower = {k.lower(): v for k, v in headers.items()}
@@ -103,7 +103,7 @@ def test_a_preflight_to_a_route_without_options_is_answered_204():
     preflight to a POST-only route used to get 405."""
     from tests.apps.cors_preflight_unknown_path import app
 
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         for path in ("/api/login", "/nowhere"):
             status, headers = _preflight(client.base_url, path)
             assert status == 204, (path, status)
@@ -120,7 +120,7 @@ def test_any_origin_with_credentials_is_refused_by_the_engine_itself():
     with pytest.raises(ValueError, match="allow_credentials"):
         app.enable_cors(allow_origins=["https://a.example", "*"], allow_credentials=True)
     with pytest.raises(ValueError, match="allow_credentials"):
-        app._engine.set_cors_config("*", "GET", "*", None, True)
+        app._engine.set_cors_config(["*"], "GET", "*", None, True)
 
 
 def _get_from(base: str, origin: str | None):
@@ -134,7 +134,7 @@ def test_of_several_origins_only_the_request_s_own_is_named():
     for no match, so the configured list used to fail for every origin."""
     from tests.apps.cors_several_origins import app
 
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         for origin in ("https://a.example", "https://b.example"):
             status, headers = _get_from(client.base_url, origin)
             assert status == 200

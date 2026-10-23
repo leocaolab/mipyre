@@ -1,6 +1,6 @@
 """Test: after_request hooks work in sub-interpreter mode."""
 from mipyre import Response
-from mipyre.engine import MipyreApp
+from mipyre.engine import MipyreApp, RuntimeChoice
 
 app = MipyreApp()
 
@@ -25,8 +25,8 @@ def json_route(req):
 
 
 app.after_request(add_cors)
-app.get("/fast", fast_route)
-app.get("/json", json_route)
+app.route("GET", "/fast", fast_route, RuntimeChoice.Worker)
+app.route("GET", "/json", json_route, RuntimeChoice.Worker)
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=0)

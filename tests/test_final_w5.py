@@ -10,9 +10,9 @@ import json
 
 import pytest
 
-from mipyre import Mipyre
+from mipyre import Mipyre, rpc
 from mipyre.engine import Request
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 
 httpx = pytest.importorskip("httpx")
 pytest.importorskip("h2")
@@ -41,15 +41,18 @@ def test_authority_is_none_without_host_or_target_authority():
 def h2_client():
     app = Mipyre(runtime="main")
 
-    @app.rpc("/rpc/echo")
+    @rpc(app)
     def echo(data):
         return data
 
-    @app.mcp.tool()
+    from mipyre.mcp import MCPServer
+    mcp = MCPServer(app)
+
+    @mcp.tool()
     def ping() -> str:
         return "pong"
 
-    with TestClient(app, transport="tcp") as c:
+    with TestServer(app) as server, TestClient(server) as c:
         with httpx.Client(http1=False, http2=True, timeout=10) as h2:
             yield c, h2
 

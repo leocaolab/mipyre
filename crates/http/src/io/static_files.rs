@@ -1,40 +1,47 @@
 //! Serves static files from a mount's directory, cached in memory and kept in step with the disk.
 //!
-//! A hit makes no filesystem call; a miss reads the file and its pre-compressed copies in one
-//! trip to the blocking pool.
+//! A hit makes no filesystem call; a miss opens the file and its pre-compressed copies in one
+//! trip to the blocking pool, and reads them whole only when the cache keeps them. A file the
+//! cache does not keep is sent from disk a chunk at a time (`send`), so an answer's memory does
+//! not grow with the file.
 
 mod cache;
-pub mod keyed_log_throttle;
 pub mod degraded;
+pub mod keyed_log_throttle;
 mod read;
+mod send;
 
 use bytes::Bytes;
 use http_body_util::Full;
 use httpdate::HttpDate;
 use hyper::header::{
-    HeaderMap, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE, ETAG, LAST_MODIFIED, SERVER, VARY,
-    X_CONTENT_TYPE_OPTIONS,
+    HeaderMap, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE, ETAG, LAST_MODIFIED, SERVER, VARY, X_CONTENT_TYPE_OPTIONS,
 };
 use hyper::{Response, StatusCode};
 use std::ffi::OsString;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 
-use cache::MountCache;
-pub use cache::MountWatch;
+use crate::io::body::ResponseBody;
 use crate::plan::compression::{Coding, CodingSet};
 use crate::plan::conditional::{not_modified, EntityTag};
 use crate::plan::static_plan::{
-    choose_precompressed, mime_from_ext, Copies, Lookup, StaticLookup, StaticLookups,
-    StaticMountRule, StaticPrefixError,
+    choose_precompressed, mime_from_ext, Copies, Lookup, StaticLookup, StaticLookups, StaticMountRule,
+    StaticPrefixError,
 };
-use mipyre_util::clock;
+pub use cache::{CacheBudget, MountWatch, DEFAULT_CACHE_BUDGET_BYTES};
+use cache::{MissGeneration, MountCache};
 use keyed_log_throttle::{HeldLines, KeyedLogThrottle};
-use read::{file_name, load};
+use mipyre_util::clock;
+use read::{file_name, FileSet};
+use send::{Digest, Fingerprint, HeldBytes};
+pub use send::{FileBody, FileSendError};
 
-/// Larger files are refused with 413, because the whole file is read into memory.
+/// Larger files are refused with 413, because a file the cache keeps is read whole into memory,
+/// and a file sent from disk is read once for its `ETag` before it is sent.
 const MAX_STATIC_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Holds an absolute, symlink-resolved path that was a directory when it was resolved.
@@ -42,9 +49,9 @@ const MAX_STATIC_FILE_BYTES: u64 = 16 * 1024 * 1024;
 struct CanonicalDir(PathBuf);
 
 impl CanonicalDir {
-    fn resolve(dir: &str) -> Result<Self, StaticMountError> {
+    fn resolve(dir: &Path) -> Result<Self, StaticMountError> {
         let path = std::fs::canonicalize(dir).map_err(|source| StaticMountError::Unresolvable {
-            dir: dir.to_string(),
+            dir: dir.display().to_string(),
             source,
         })?;
         if !path.is_dir() {
@@ -59,6 +66,7 @@ impl CanonicalDir {
 pub struct StaticMount {
     rule: StaticMountRule,
     cache: Arc<MountCache>,
+    held: &'static HeldBytes,
 }
 
 impl AsRef<StaticMountRule> for StaticMount {
@@ -80,17 +88,48 @@ pub enum StaticMountError {
 impl StaticMount {
     pub fn new(prefix: &str, dir: &str, copies: Copies) -> Result<Self, StaticMountError> {
         let rule = StaticMountRule::new(prefix, copies)?;
-        let root = CanonicalDir::resolve(dir)?;
+        let configured = std::path::absolute(dir).map_err(|source| StaticMountError::Unresolvable {
+            dir: dir.to_string(),
+            source,
+        })?;
+        let root = CanonicalDir::resolve(&configured)?;
         Ok(Self {
             rule,
-            cache: Arc::new(MountCache::new(root, &cache::PROCESS_BUDGET)),
+            cache: Arc::new(MountCache::new(configured, root)),
+            held: &PROCESS_HELD,
         })
+    }
+
+    /// Caches the mount's files within `budget` from now on; a server hands its budget to each
+    /// mount as its run is sealed. Clones share one cache, so a later run of the same app keeps
+    /// the budget the first one handed.
+    pub fn cache_within(&self, budget: &Arc<CacheBudget>) {
+        self.cache.cache_within(budget);
     }
 
     /// Reports whether a miss is kept now or every request reads the file from disk.
     pub fn watch(&self) -> MountWatch {
         self.cache.watch()
     }
+
+    /// Returns the mount's root and why it is served uncached, or `None` while its file watch
+    /// has not failed.
+    pub fn uncached_because(&self) -> Option<(PathBuf, String)> {
+        self.cache
+            .uncached_because()
+            .map(|why| (self.cache.root().0.clone(), why))
+    }
+
+    /// Starts watching the mount's files in the background, unless that started already; a
+    /// server calls it as it starts and does not wait for it.
+    pub fn start_watching(&self) {
+        self.cache.start_watch();
+    }
+}
+
+/// Returns how many bytes every mount's answers sent from disk hold, read and not yet written out.
+pub fn bytes_in_flight() -> u64 {
+    PROCESS_HELD.get()
 }
 
 /// A missing file is not an error, so that the next mount and then routing can answer.
@@ -105,11 +144,7 @@ enum StaticError {
     TooLarge { path: PathBuf, len: u64 },
     /// The file was within the limit when stat'd and grew past it while read; it is refused, not served cut short.
     #[error("{path:?} grew past the {limit}-byte static file limit while it was read ({stat_len} bytes when stat'd)")]
-    GrewPastLimit {
-        path: PathBuf,
-        stat_len: u64,
-        limit: u64,
-    },
+    GrewPastLimit { path: PathBuf, stat_len: u64, limit: u64 },
     #[error("{path:?}: {source}")]
     PermissionDenied { path: PathBuf, source: io::Error },
     #[error("{path:?} became a symlink after the containment check: {source}")]
@@ -123,9 +158,22 @@ enum StaticError {
     },
 }
 
+/// Counts the bytes every mount's answers sent from disk hold. It is built at the first mount
+/// because Loom's atomics have no `const` constructor.
+static PROCESS_HELD: LazyLock<HeldBytes> = LazyLock::new(HeldBytes::new);
+
+/// Lets one warning a minute through per file whose answer was cut off, since every client of a
+/// file being rewritten meets it.
+static CUT_THROTTLE: KeyedLogThrottle<PathBuf> = KeyedLogThrottle::new(
+    Duration::from_secs(60),
+    std::num::NonZeroUsize::new(256).expect("256 is not zero"),
+);
+
 /// Lets one permission warning a minute through per path, since a scanner asks for the same path over and over.
-static PERMISSION_THROTTLE: KeyedLogThrottle<PathBuf> =
-    KeyedLogThrottle::new(Duration::from_secs(60), std::num::NonZeroUsize::new(256).expect("256 is not zero"));
+static PERMISSION_THROTTLE: KeyedLogThrottle<PathBuf> = KeyedLogThrottle::new(
+    Duration::from_secs(60),
+    std::num::NonZeroUsize::new(256).expect("256 is not zero"),
+);
 
 impl StaticError {
     /// Answers EACCES with 403, as nginx does, because it is an access decision about the file
@@ -133,9 +181,7 @@ impl StaticError {
     fn status(&self) -> StatusCode {
         match self {
             Self::NotUtf8 => StatusCode::BAD_REQUEST,
-            Self::Escape { .. } | Self::PermissionDenied { .. } | Self::SymlinkSwapped { .. } => {
-                StatusCode::FORBIDDEN
-            }
+            Self::Escape { .. } | Self::PermissionDenied { .. } | Self::SymlinkSwapped { .. } => StatusCode::FORBIDDEN,
             Self::TooLarge { .. } | Self::GrewPastLimit { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unreadable { .. } | Self::Unfinished { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -148,15 +194,13 @@ impl StaticError {
                 tracing::error!(error = %self, "static file error")
             }
             // EACCES on a contained file means the deployment is wrong, so it stays a warning.
-            Self::PermissionDenied { path, .. } => {
-                match PERMISSION_THROTTLE.admit(path.as_path(), clock::now()) {
-                    Some(HeldLines::OfKey(held)) => tracing::warn!(error = %self, held, "static file refused"),
-                    Some(HeldLines::OfUnrememberedKeys(held)) => {
-                        tracing::warn!(error = %self, held_among_other_paths = held, "static file refused")
-                    }
-                    None => tracing::debug!(error = %self, "static file refused"),
+            Self::PermissionDenied { path, .. } => match PERMISSION_THROTTLE.admit(path.as_path(), clock::now()) {
+                Some(HeldLines::OfKey(held)) => tracing::warn!(error = %self, held, "static file refused"),
+                Some(HeldLines::OfUnrememberedKeys(held)) => {
+                    tracing::warn!(error = %self, held_among_other_paths = held, "static file refused")
                 }
-            }
+                None => tracing::debug!(error = %self, "static file refused"),
+            },
             Self::SymlinkSwapped { .. } => {
                 tracing::warn!(error = %self, "static file refused")
             }
@@ -174,17 +218,15 @@ struct FileContents {
     modified: Option<SystemTime>,
 }
 
-/// One file as it is sent, the original or a copy, with the validators a client revalidates it
-/// with and the headers of both answers.
+/// The validators a client revalidates one representation with, and the headers of both
+/// answers.
 ///
 /// The validators are the one source: `sent` and `not_modified` are their wire form, built once
-/// in [`Representation::new`] and never changed, so a hit clones a header map instead of
-/// inserting headers.
+/// in [`Head::new`] and never changed, so a hit clones a header map instead of inserting headers.
 #[derive(Clone, Debug)]
-struct Representation {
-    bytes: Bytes,
+struct Head {
     /// It is a hash of the bytes alone, so the same file gets the same tag in every process and
-    /// after a restart.
+    /// after a restart, kept or sent from disk.
     etag: EntityTag,
     /// It is `None` when there is no modification time or no HTTP-date can say it (before 1970,
     /// from the year 10000 on).
@@ -198,20 +240,23 @@ struct Representation {
 /// Seconds since 1970 of 10000-01-01, the first instant an HTTP-date cannot say.
 const HTTP_DATE_END: u64 = 253_402_300_800;
 
-impl Representation {
-    /// Builds the answers for `read` sent in `coding`, or as the original when `coding` is
-    /// `None`; `vary` says the file has copies, so every answer depends on `Accept-Encoding`.
+impl Head {
+    /// Builds the headers of bytes with `digest` sent in `coding`, or as the original when
+    /// `coding` is `None`; `vary` says the file has copies, so every answer depends on
+    /// `Accept-Encoding`.
     #[expect(
         clippy::expect_used,
         reason = "an HTTP-date is visible ASCII: the header-value parse cannot fail"
     )]
-    fn new(read: FileContents, coding: Option<Coding>, content_type: &HeaderValue, vary: bool) -> Self {
-        use std::hash::Hasher;
-        let mut hasher = std::hash::DefaultHasher::new();
-        hasher.write(&read.bytes);
-        let etag = EntityTag::of_digest(hasher.finish());
-        let modified = read
-            .modified
+    fn new(
+        digest: u64,
+        modified: Option<SystemTime>,
+        coding: Option<Coding>,
+        content_type: &HeaderValue,
+        vary: bool,
+    ) -> Self {
+        let etag = EntityTag::of_digest(digest);
+        let modified = modified
             .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
             .filter(|since| since.as_secs() < HTTP_DATE_END)
             .map(|since| HttpDate::from(SystemTime::UNIX_EPOCH + since));
@@ -234,7 +279,6 @@ impl Representation {
         }
         sent.extend(not_modified.iter().map(|(name, value)| (name.clone(), value.clone())));
         Self {
-            bytes: read.bytes,
             etag,
             modified,
             sent,
@@ -242,37 +286,117 @@ impl Representation {
         }
     }
 
-    /// Answers `304` with no body when the `request`'s preconditions say the client has this.
-    fn respond(&self, request: &HeaderMap) -> Response<Full<Bytes>> {
+    /// Answers `304` with no body when the `request`'s preconditions say the client has this,
+    /// else `200` with the body `body` makes.
+    #[inline]
+    fn respond(&self, request: &HeaderMap, body: impl FnOnce() -> ResponseBody) -> Response<ResponseBody> {
         if not_modified(request, &self.etag, self.modified) {
-            let mut resp = Response::new(Full::new(Bytes::new()));
+            let mut resp = Response::new(ResponseBody::empty());
             *resp.status_mut() = StatusCode::NOT_MODIFIED;
             *resp.headers_mut() = self.not_modified.clone();
             return resp;
         }
-        let mut resp = Response::new(Full::new(self.bytes.clone()));
+        let mut resp = Response::new(body());
         *resp.headers_mut() = self.sent.clone();
         resp
     }
 }
 
-/// Cloning shares the bytes instead of copying them.
-#[derive(Clone)]
+/// One file as the cache keeps it, the original or a copy.
+#[derive(Clone, Debug)]
+struct Representation {
+    bytes: Bytes,
+    head: Head,
+}
+
+impl Representation {
+    fn new(read: FileContents, coding: Option<Coding>, content_type: &HeaderValue, vary: bool) -> Self {
+        Self {
+            head: Head::new(Digest::of(&read.bytes), read.modified, coding, content_type, vary),
+            bytes: read.bytes,
+        }
+    }
+
+    fn respond(&self, request: &HeaderMap) -> Response<ResponseBody> {
+        self.head
+            .respond(request, || ResponseBody::Full(Full::new(self.bytes.clone())))
+    }
+}
+
+/// One file the cache does not keep, the original or the copy the client is answered with, open
+/// and read once for its `ETag`; its bytes are read again as they are sent.
+struct DiskRepresentation {
+    head: Head,
+    /// It stands at the file's start.
+    file: File,
+    path: std::path::PathBuf,
+    fingerprint: Fingerprint,
+}
+
+impl DiskRepresentation {
+    fn respond(self, request: &HeaderMap, held: &'static HeldBytes) -> Response<ResponseBody> {
+        let Self {
+            head,
+            file,
+            path,
+            fingerprint,
+        } = self;
+        head.respond(request, || match fingerprint.len {
+            0 => ResponseBody::empty(),
+            len => ResponseBody::File(FileBody::new(file, path, len, fingerprint.digest, held)),
+        })
+    }
+}
+
+/// One file on disk as it is answered, shared by every request path that resolves to it.
 struct StaticFile {
     original: Representation,
     /// It is `None` on a mount that serves no copies, because none were looked for; when it is
     /// `Some`, a copy appearing, changing or going makes the file stale.
     precompressed: Option<PrecompressedCopies<Representation>>,
     copies: CodingSet,
-    /// It is the path under the root before symlinks resolve.
-    requested: PathBuf,
     resolved: PathBuf,
 }
 
-#[derive(Clone, Default)]
+/// A request's path under the root, before symlinks resolve, and what resolving it went through.
+struct RequestPath {
+    path: PathBuf,
+    /// It holds the resolved directory of every symlink met on the way from `path` to the file,
+    /// since retargeting any of them changes what `path` names.
+    link_dirs: Box<[PathBuf]>,
+}
+
+impl RequestPath {
+    /// Tells whether a change at `changed` can make `path` name another file.
+    ///
+    /// A change of any entry in a directory holding one of the symlinks counts, because the event
+    /// names the link as the disk spells it, which on a case-insensitive filesystem need not be
+    /// the request's spelling; the directory is resolved, so it is spelled as the disk does.
+    fn depends_on(&self, changed: &Path) -> bool {
+        self.path.starts_with(changed)
+            || self
+                .link_dirs
+                .iter()
+                .any(|dir| dir.starts_with(changed) || changed.parent() == Some(dir.as_path()))
+    }
+
+    /// Returns the bytes the path holds on the heap: its own and its link directories'.
+    fn heap_len(&self) -> usize {
+        let dirs: usize = self.link_dirs.iter().map(|dir| dir.as_os_str().len()).sum();
+        self.path.as_os_str().len() + dirs + std::mem::size_of_val(&*self.link_dirs)
+    }
+}
+
+#[derive(Clone)]
 struct PrecompressedCopies<T> {
     br: Option<T>,
     gz: Option<T>,
+}
+
+impl<T> Default for PrecompressedCopies<T> {
+    fn default() -> Self {
+        Self { br: None, gz: None }
+    }
 }
 
 impl<T> PrecompressedCopies<T> {
@@ -311,14 +435,9 @@ impl StaticFile {
     fn new(
         original: FileContents,
         precompressed: Option<PrecompressedCopies<FileContents>>,
-        requested: PathBuf,
         resolved: PathBuf,
     ) -> Self {
-        let copies = CodingSet::of(|coding| {
-            precompressed
-                .as_ref()
-                .is_some_and(|found| found.get(coding).is_some())
-        });
+        let copies = CodingSet::of(|coding| precompressed.as_ref().is_some_and(|found| found.get(coding).is_some()));
         let content_type = HeaderValue::from_static(content_type(&resolved));
         let vary = precompressed.as_ref().is_some_and(PrecompressedCopies::any);
         let precompressed = precompressed.map(|found| PrecompressedCopies {
@@ -333,23 +452,18 @@ impl StaticFile {
             original: Representation::new(original, None, &content_type, vary),
             precompressed,
             copies,
-            requested,
             resolved,
         }
     }
 
     fn cached_len(&self) -> u64 {
-        let copies = self
-            .precompressed
-            .as_ref()
-            .map_or(0, PrecompressedCopies::len);
+        let copies = self.precompressed.as_ref().map_or(0, PrecompressedCopies::len);
         (self.original.bytes.len() + copies) as u64
     }
 
     /// Tells whether a change at `changed`, which may be a directory above the file, can make this stale.
     fn depends_on(&self, changed: &Path) -> bool {
-        self.requested.starts_with(changed)
-            || self.resolved.starts_with(changed)
+        self.resolved.starts_with(changed)
             || (self.precompressed.is_some()
                 && Coding::PREFERENCE
                     .iter()
@@ -358,7 +472,7 @@ impl StaticFile {
 
     /// Answers with the first copy, in server preference, that the client accepts, else the
     /// original.
-    fn respond(&self, accept_encoding: Option<&str>, request: &HeaderMap) -> Response<Full<Bytes>> {
+    fn respond(&self, accept_encoding: Option<&str>, request: &HeaderMap) -> Response<ResponseBody> {
         choose_precompressed(accept_encoding, self.copies)
             .and_then(|coding| self.copy(coding))
             .unwrap_or(&self.original)
@@ -382,9 +496,7 @@ fn content_type(path: &Path) -> &'static str {
 }
 
 /// Serves the file from the first mount that has it, or returns `None` so that routing answers.
-pub async fn try_static_file(
-    lookups: StaticLookups<'_, '_, StaticMount>,
-) -> Option<Response<Full<Bytes>>> {
+pub async fn try_static_file(lookups: StaticLookups<'_, '_, StaticMount>) -> Option<Response<ResponseBody>> {
     for lookup in lookups {
         let lookup = match lookup {
             Lookup::File(lookup) => lookup,
@@ -406,9 +518,17 @@ pub async fn try_static_file(
     None
 }
 
-async fn serve(
-    lookup: StaticLookup<'_, '_, StaticMount>,
-) -> Result<Option<Response<Full<Bytes>>>, StaticError> {
+/// Where a miss is answered from: the file the cache now keeps, or the disk.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "moved once per miss, out of the blocking pool: boxing would add an allocation to every miss"
+)]
+enum AnswerSource {
+    Memory(Arc<StaticFile>),
+    Disk(DiskRepresentation),
+}
+
+async fn serve(lookup: StaticLookup<'_, '_, StaticMount>) -> Result<Option<Response<ResponseBody>>, StaticError> {
     let mount = lookup.mount();
     let accept_encoding = lookup.accept_encoding();
     let request = lookup.headers();
@@ -418,40 +538,77 @@ async fn serve(
     }
 
     let key: Box<[u8]> = lookup.into_key().into_owned().into_boxed_slice();
-    let requested = cache.root().join(file_name(&key)?);
+    let root = cache.root();
+    let requested = root.0.join(file_name(&key)?);
     let loader = Arc::clone(cache);
     let loading = requested.clone();
     let copies = mount.rule.copies();
-    let loaded = tokio::task::spawn_blocking(move || {
-        // Kept only while the watcher follows the disk: before it is up, and for a mount it
-        // could not follow, the file is served and not kept.
+    // The blocking pool needs it owned; it is `Some` only on a mount that serves copies.
+    let accepted = accept_encoding.map(str::to_owned);
+    let source = tokio::task::spawn_blocking(move || {
+        // Taken before the open, so an event on the file from here on stops it being kept.
         let ticket = loader.begin_miss();
-        let file = load(loader.root(), loading, copies)?;
-        if let (Some(ticket), Some(file)) = (ticket, &file) {
-            loader.keep(key, ticket, file.clone());
+        let Some((name, opened)) = read::open(&root.0, loading, copies)? else {
+            return Ok(None);
+        };
+        if let Some(kept) = read_and_keep(&loader, key, ticket, name, &opened)? {
+            return Ok(Some(AnswerSource::Memory(kept)));
         }
-        Ok::<_, StaticError>(file)
+        Ok::<_, StaticError>(opened.into_disk(accepted.as_deref())?.map(AnswerSource::Disk))
     })
     .await
     .map_err(|source| StaticError::Unfinished {
         path: requested,
         source,
     })??;
-    Ok(loaded.map(|file| file.respond(accept_encoding, request)))
+    Ok(source.map(|source| match source {
+        AnswerSource::Memory(file) => file.respond(accept_encoding, request),
+        AnswerSource::Disk(file) => file.respond(request, mount.held),
+    }))
+}
+
+/// Keeps `requested` as an alias of the file the cache holds for another path, else reads
+/// `opened` whole and keeps it, and returns the file the cache keeps there. Only bytes the cache
+/// holds are read whole, so the bytes a miss holds in memory are bounded by the cache's budget,
+/// not by how many clients are being answered.
+///
+/// It keeps nothing while the watcher does not follow the disk (before it is up, and for a mount
+/// it could not follow), when the mount has no budget or the budget cannot hold the file, when an
+/// event arrived during the read, or when the file changed between its `fstat` and its read.
+fn read_and_keep(
+    cache: &MountCache,
+    key: Box<[u8]>,
+    ticket: Option<MissGeneration>,
+    requested: RequestPath,
+    opened: &FileSet,
+) -> Result<Option<Arc<StaticFile>>, StaticError> {
+    let Some(ticket) = ticket else {
+        return Ok(None);
+    };
+    if let Some(held) = cache.held(opened.resolved()) {
+        return Ok(cache.keep_held(key, ticket, requested, held));
+    }
+    let Some(reserved) = cache.reserve(opened.len()) else {
+        return Ok(None);
+    };
+    let Some(file) = opened.read()? else {
+        return Ok(None);
+    };
+    Ok(cache.keep_read(key, ticket, requested, reserved, Arc::new(file)))
 }
 
 const SERVER_VALUE: HeaderValue = HeaderValue::from_static(crate::plan::response::SERVER_HEADER);
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 
 /// Builds a body that says no more than the status, so file paths and OS errors stay in the server log.
-fn error_response(status: StatusCode) -> Response<Full<Bytes>> {
+fn error_response(status: StatusCode) -> Response<ResponseBody> {
     let text = match status {
         StatusCode::BAD_REQUEST => "bad request",
         StatusCode::FORBIDDEN => "forbidden",
         StatusCode::PAYLOAD_TOO_LARGE => "payload too large",
         _ => "internal server error",
     };
-    let mut resp = Response::new(Full::new(Bytes::from_static(text.as_bytes())));
+    let mut resp = Response::new(ResponseBody::Full(Full::new(Bytes::from_static(text.as_bytes()))));
     *resp.status_mut() = status;
     *resp.headers_mut() = ERROR_HEADERS.clone();
     resp

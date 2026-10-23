@@ -43,7 +43,12 @@ fn route_decide(name: &str, method: Method, path: &'static str, n: u64) {
     let routes = bench_routes();
     let headers = HeaderMap::new();
     measure(name, n, |_| {
-        match decide(black_box(&method), black_box(path), black_box(&headers), black_box(&routes)) {
+        match decide(
+            black_box(&method),
+            black_box(path),
+            black_box(&headers),
+            black_box(&routes),
+        ) {
             RequestDecision::Route { call, params } => {
                 black_box((call, params));
             }
@@ -88,19 +93,12 @@ fn route_static(n: u64) {
     route_decide("route_static", Method::GET, "/static/a.js", n);
 }
 
-/// Decides `get /json`, a standard method in lowercase.
-fn route_lowercase(n: u64) {
-    let get = Method::from_bytes(b"get").must("a token is a method");
-    route_decide("route_lowercase", get, "/json", n);
-}
-
 fn main() {
-    let cases: [Case; 5] = [
+    let cases: [Case; 4] = [
         ("route_hit", route_hit),
         ("route_head", route_head),
         ("route_notfound", route_notfound),
         ("route_static", route_static),
-        ("route_lowercase", route_lowercase),
     ];
     run(&cases);
 }

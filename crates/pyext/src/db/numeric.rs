@@ -132,9 +132,7 @@ pub(crate) fn encode(text: &str, out: &mut Vec<u8>) -> Result<(), NumericError> 
     let significant = groups[leading_zeros..]
         .iter()
         .rposition(|&g| g != 0)
-        .map_or(&[][..], |last| {
-            &groups[leading_zeros..=leading_zeros + last]
-        });
+        .map_or(&[][..], |last| &groups[leading_zeros..=leading_zeros + last]);
     let too_large = || NumericError::TooLarge(text.to_owned());
     let weight = if significant.is_empty() {
         0
@@ -257,12 +255,8 @@ mod proptests {
 
     /// Generates plain decimal text as `decode` writes it, with no leading zeros and no `-0`.
     fn canonical_decimal() -> impl Strategy<Value = String> {
-        (
-            any::<bool>(),
-            "0|[1-9][0-9]{0,40}",
-            proptest::option::of("[0-9]{1,40}"),
-        )
-            .prop_map(|(negative, integer, fraction)| {
+        (any::<bool>(), "0|[1-9][0-9]{0,40}", proptest::option::of("[0-9]{1,40}")).prop_map(
+            |(negative, integer, fraction)| {
                 let unsigned = match fraction {
                     Some(fraction) => format!("{integer}.{fraction}"),
                     None => integer,
@@ -273,7 +267,8 @@ mod proptests {
                 } else {
                     unsigned
                 }
-            })
+            },
+        )
     }
 
     /// Strips leading integer zeros and the sign of a zero, as `decode` writes a wire in

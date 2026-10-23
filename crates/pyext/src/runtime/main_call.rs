@@ -5,11 +5,11 @@ use bytes::Bytes;
 use pyo3::prelude::*;
 
 use crate::exchange::error::{catch_panic, ErrorRecord, HandlerError, RequestStage, ResponseError};
-use crate::runtime::hook_chain::{main_response, Chain, EventLoopProvider, ExceptionMapping};
 use crate::exchange::request::Request;
-use crate::runtime::request_context::{in_request_context, RequestContext};
 use crate::exchange::stream::ResponseStream;
 use crate::exchange::to_response::extract_response_data;
+use crate::runtime::hook_chain::{main_response, Chain, EventLoopProvider, ExceptionMapping};
+use crate::runtime::request_context::{in_request_context, RequestContext};
 use mipyre_http::plan::response::HandlerResponse;
 use mipyre_http::plan::route::HandlerTarget;
 use mipyre_http::plan::site::SiteRules;
@@ -43,9 +43,7 @@ impl Drop for LoopGuard {
             // SAFETY: `Py_IsInitialized` may be called at any time. Tokio's blocking pool can
             // tear threads down after `Py_Finalize`, when attaching would be a use-after-free.
             if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
-                mipyre_subinterp::attach::with_interpreter(interp, move |py| {
-                    close_loop(py, loop_obj)
-                });
+                mipyre_subinterp::attach::with_interpreter(interp, move |py| close_loop(py, loop_obj));
             } else {
                 // Dropping the loop would `Py_DECREF` on a finalized interpreter and crash, and
                 // the process is exiting anyway.
@@ -90,12 +88,8 @@ impl EventLoopProvider for ThreadLoop {
             let (loop_obj, loop_interp) = match &mut guard.0 {
                 Some(existing) => &*existing,
                 empty @ None => {
-                    let new_loop = new_event_loop(py)
-                        .map_err(|e| HandlerError::python(py, RequestStage::Setup, &e))?;
-                    &*empty.insert((
-                        new_loop.unbind(),
-                        pyo3::sync::InterpreterHandle::current(py),
-                    ))
+                    let new_loop = new_event_loop(py).map_err(|e| HandlerError::python(py, RequestStage::Setup, &e))?;
+                    &*empty.insert((new_loop.unbind(), pyo3::sync::InterpreterHandle::current(py)))
                 }
             };
             // Running the loop from another interpreter would mix two interpreters' objects.
@@ -111,10 +105,7 @@ impl EventLoopProvider for ThreadLoop {
     }
 }
 
-pub(crate) fn main_chain<'a, 'py>(
-    py: Python<'py>,
-    rc: &'a mut RequestContext<'py>,
-) -> Chain<'a, 'py, ThreadLoop> {
+pub(crate) fn main_chain<'a, 'py>(py: Python<'py>, rc: &'a mut RequestContext<'py>) -> Chain<'a, 'py, ThreadLoop> {
     Chain {
         py,
         rc,
@@ -140,24 +131,19 @@ pub(crate) fn call_handler_with_hooks<M>(
     target: HandlerTarget,
     sky_req: Request,
 ) -> Result<MainReply, ErrorRecord> {
-    use crate::sync::Ordering::Relaxed;
-
-    crate::telemetry::GIL_QUEUE_LENGTH.fetch_add(1, Relaxed);
+    let gil = &crate::telemetry::MAIN_GIL;
+    gil.queued();
     let gil_wait_start = std::time::Instant::now();
 
     let label = sky_req.label();
 
     mipyre_subinterp::attach::with_main(|py| {
-        crate::telemetry::GIL_QUEUE_LENGTH.fetch_sub(1, Relaxed);
-        crate::telemetry::record_gil_wait(gil_wait_start.elapsed().as_micros() as u64);
+        gil.acquired(gil_wait_start.elapsed().as_micros() as u64);
         let hold_start = std::time::Instant::now();
 
-        let result = catch_panic(|| {
-            in_request_context(py, |rc| run_with_hooks(py, rc, rules, target, sky_req))
-        });
+        let result = catch_panic(|| in_request_context(py, |rc| run_with_hooks(py, rc, rules, target, sky_req)));
 
-        crate::telemetry::GIL_HOLD_MAX_US
-            .fetch_max(hold_start.elapsed().as_micros() as u64, Relaxed);
+        gil.released(hold_start.elapsed().as_micros() as u64);
         result.map_err(|e| e.log(&label))
     })
 }
@@ -171,8 +157,7 @@ pub(crate) fn run_with_hooks<'py, M>(
 ) -> Result<MainReply, HandlerError> {
     let routes = &rules.routes;
     let mut chain = main_chain(py, rc);
-    let req =
-        Bound::new(py, sky_req).map_err(|e| HandlerError::python(py, RequestStage::Setup, &e))?;
+    let req = Bound::new(py, sky_req).map_err(|e| HandlerError::python(py, RequestStage::Setup, &e))?;
 
     if let Some(short_circuit) = chain.before(routes.before_hooks(), &req)? {
         return Ok(MainReply::Response(short_circuit));
@@ -186,6 +171,15 @@ pub(crate) fn run_with_hooks<'py, M>(
     let data = extract_response_data(py, value)?;
     let data = chain.after(routes.after_hooks(), &req, data)?;
     Ok(MainReply::Response(data))
+}
+
+/// Maps what a main-interpreter handler or hook returned: a `Stream` is streamed, anything else is
+/// a response.
+pub(crate) fn main_reply(value: Bound<'_, PyAny>) -> Result<MainReply, ResponseError> {
+    if value.is_instance_of::<ResponseStream>() {
+        return Ok(MainReply::Stream(stream_info(&value)?));
+    }
+    main_response(value).map(MainReply::Response)
 }
 
 fn stream_info(bound: &Bound<'_, PyAny>) -> Result<StreamReply, ResponseError> {

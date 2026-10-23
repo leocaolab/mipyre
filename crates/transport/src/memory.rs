@@ -5,9 +5,9 @@
 //! accept loop on, it is served exactly as a TCP connection, but it has no peer address, no TLS
 //! and no TCP options.
 
+use crate::sync::{AtomicUsize, Ordering};
 use std::num::NonZeroUsize;
 use std::os::unix::net::UnixStream;
-use crate::sync::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -31,10 +31,7 @@ impl MemoryInbox {
     }
 
     /// Polls for the next connection, giving `Ready(None)` once every connector is gone.
-    pub fn poll_accept(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<UnixStream>> {
+    pub fn poll_accept(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<UnixStream>> {
         self.rx.poll_recv(cx)
     }
 }
@@ -187,9 +184,7 @@ impl MemoryConnector {
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         let (client, mut server) = UnixStream::pair().map_err(MemoryConnectError::Socketpair)?;
         // Tokio takes a socket only in non-blocking mode.
-        server
-            .set_nonblocking(true)
-            .map_err(MemoryConnectError::Socketpair)?;
+        server.set_nonblocking(true).map_err(MemoryConnectError::Socketpair)?;
         let mut full = false;
         for k in 0..n {
             let inbox = &self.inboxes[start.wrapping_add(k) % n];
@@ -228,7 +223,10 @@ mod tests {
         let accepted = MemorySource::accept(&mut source).await.expect("the connection");
         assert_eq!(MemorySource::peer(&accepted), Peer::InMemory);
         drop(connector);
-        assert!(matches!(MemorySource::accept(&mut source).await, Err(AcceptError::ConnectorsGone)));
+        assert!(matches!(
+            MemorySource::accept(&mut source).await,
+            Err(AcceptError::ConnectorsGone)
+        ));
     }
 
     #[tokio::test]

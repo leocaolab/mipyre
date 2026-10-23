@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -14,7 +15,7 @@ import urllib.request
 
 import pytest
 
-from tests._helpers import answers, bound_port, read_file
+from tests._helpers import answers, bound_port, lines_with, read_file
 
 APP = os.path.join(os.path.dirname(__file__), "apps", "process_lane_fault_app.py")
 
@@ -59,7 +60,7 @@ class FaultServer:
 
 def two_hosts(**extra) -> dict:
     # Two TPC threads (hosts) and two lanes: lane 0 is host 0's, lane 1 is host 1's.
-    return dict(MIPYRE_WORKERS=2, MIPYRE_PROCESS_WORKERS=2, MIPYRE_PROCESS_TIMEOUT_MS=1500, **extra)
+    return dict(MIPYRE_THREADS=2, MIPYRE_PROCESS_WORKERS=2, MIPYRE_PROCESS_TIMEOUT=1.5, **extra)
 
 
 @pytest.fixture
@@ -79,3 +80,62 @@ def test_with_the_template_gone_every_lane_breaks_and_the_server_exits_non_zero_
     assert code != 0, out[-3000:]
     assert "the process lanes failed, so the server stopped" in out, out[-3000:]
     assert "respawn failed" in out, out[-3000:]
+
+
+def fd_kinds(pid: int) -> list[str]:
+    """What each fd of `pid` past the standard streams is: a lane's shared memory (`shm`), a `pipe`, a `socket` or
+    `other`; on Linux by the link /proc gives, on macOS by the type lsof lists."""
+    if sys.platform == "linux":
+        links = [os.readlink(f"/proc/{pid}/fd/{fd}") for fd in os.listdir(f"/proc/{pid}/fd") if int(fd) > 2]
+        prefixes = {"/memfd:mipyre-shm": "shm", "pipe:": "pipe", "socket:": "socket"}
+        return [next((kind for p, kind in prefixes.items() if link.startswith(p)), "other") for link in links]
+    listed = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "3-9999"], capture_output=True, text=True, check=True)
+    types = {"PSXSHM": "shm", "PIPE": "pipe", "unix": "socket", "IPv4": "socket", "IPv6": "socket"}
+    return [types.get(line.split()[4], "other") for line in listed.stdout.splitlines()[1:]]
+
+
+def lane_memory_fds(pid: int) -> int:
+    """How many fds of `pid` are a lane's shared memory: on Linux the memfds mipyre_shm names, on macOS the POSIX
+    shared memory objects lsof lists."""
+    return fd_kinds(pid).count("shm")
+
+
+def test_the_template_holds_each_lanes_channel_and_maps_none(server):
+    # The template hands each lane's channel to the lane's workers and never maps one (b/761): it holds one shared
+    # memory object per lane (the current run's), and on Linux, where the mappings can be listed, none is mapped.
+    status, body = server.get("/lanes/template")
+    assert status == 200, (status, body)
+    pid = json.loads(body)["pid"]
+    assert lane_memory_fds(pid) == 2, server.read()[-3000:]
+    if sys.platform == "linux":
+        with open(f"/proc/{pid}/maps") as maps:
+            mapped = [line for line in maps if "mipyre-shm" in line]
+        assert mapped == [], mapped
+
+
+def test_a_worker_holds_only_its_own_lanes_bell_and_hands_no_channel_fd_to_a_program_it_runs(server):
+    # A worker maps its lane and closes the shared memory; of the run's fds it keeps only its own lane's wake pipe
+    # end, and neither another lane's channel nor the template's socket. Its pipes and sockets past the standard
+    # streams are close-on-exec, so a program its app runs gets none of them (b/761).
+    status, body = server.get("/lanes/worker-fds")
+    assert status == 200, (status, body)
+    worker = json.loads(body)
+    kinds = fd_kinds(worker["pid"])
+    assert [kind for kind in kinds if kind != "other"] == ["pipe"], kinds
+    assert worker["inheritable"] == [], worker
+
+
+def test_a_killed_worker_is_logged_once_with_its_exit_and_counted_on_the_metrics_page(server):
+    status, body = server.get("/hello")
+    assert status == 200, (status, body)
+    pid = json.loads(body)["pid"]
+
+    os.kill(pid, signal.SIGKILL)
+
+    [line] = lines_with(server.read, f"worker {pid} died", timeout=30)
+    assert "killed by signal 9" in line, line
+    assert "after serving" in line, line
+    status, page = server.get("/metrics")
+    assert status == 200, (status, page)
+    assert re.search(r'^mipyre_workers_died_total\{runtime="process"\} 1$', page.decode(), re.MULTILINE), page
+    assert re.search(r'^mipyre_workers_died_total\{runtime="subinterp"\} 0$', page.decode(), re.MULTILINE), page

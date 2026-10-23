@@ -22,8 +22,16 @@ fn a_keys_logged_line_carries_its_held_count() {
     assert_eq!(throttles.admit("a", at(0)), Some(HeldLines::OfKey(0)));
     assert_eq!(throttles.admit("a", at(1)), None);
     assert_eq!(throttles.admit("a", just_before(60)), None);
-    assert_eq!(throttles.admit("a", at(60)), Some(HeldLines::OfKey(2)), "both held lines are counted in the next one");
-    assert_eq!(throttles.admit("a", at(120)), Some(HeldLines::OfKey(0)), "and only once");
+    assert_eq!(
+        throttles.admit("a", at(60)),
+        Some(HeldLines::OfKey(2)),
+        "both held lines are counted in the next one"
+    );
+    assert_eq!(
+        throttles.admit("a", at(120)),
+        Some(HeldLines::OfKey(0)),
+        "and only once"
+    );
 }
 
 #[test]
@@ -51,8 +59,14 @@ fn the_least_recently_seen_key_is_forgotten_past_capacity() {
     assert!(throttles.admit(&2, at(0)).is_some());
     assert!(throttles.admit(&1, at(1)).is_none(), "1 is still remembered");
     assert!(throttles.admit(&3, at(1)).is_some());
-    assert!(throttles.admit(&2, at(2)).is_none(), "2 was not forgotten while in its period");
-    assert!(throttles.admit(&3, at(2)).is_none(), "3's overflow gate already logged this period");
+    assert!(
+        throttles.admit(&2, at(2)).is_none(),
+        "2 was not forgotten while in its period"
+    );
+    assert!(
+        throttles.admit(&3, at(2)).is_none(),
+        "3's overflow gate already logged this period"
+    );
 }
 
 #[test]
@@ -65,7 +79,11 @@ fn a_new_key_takes_the_place_of_one_whose_period_is_over() {
         Some(HeldLines::OfUnrememberedKeys(0)),
         "no place yet: the overflow line"
     );
-    assert_eq!(throttles.admit(&3, at(60)), Some(HeldLines::OfKey(0)), "3 takes 1's place");
+    assert_eq!(
+        throttles.admit(&3, at(60)),
+        Some(HeldLines::OfKey(0)),
+        "3 takes 1's place"
+    );
     assert!(throttles.admit(&3, at(61)).is_none(), "and is remembered");
     assert!(throttles.admit(&2, at(61)).is_none(), "2 kept its place");
 }
@@ -75,7 +93,11 @@ fn a_forgotten_keys_held_lines_go_out_with_the_next_overflow_line() {
     let mut throttles: PerKeyThrottles<String> = PerKeyThrottles::new(PERIOD, capacity(1));
     assert_eq!(throttles.admit("a", at(0)), Some(HeldLines::OfKey(0)));
     assert_eq!(throttles.admit("a", at(1)), None);
-    assert_eq!(throttles.admit("b", at(60)), Some(HeldLines::OfKey(0)), "b takes the place of a, whose period is over");
+    assert_eq!(
+        throttles.admit("b", at(60)),
+        Some(HeldLines::OfKey(0)),
+        "b takes the place of a, whose period is over"
+    );
     assert_eq!(
         throttles.admit("c", at(61)),
         Some(HeldLines::OfUnrememberedKeys(1)),
@@ -158,7 +180,11 @@ impl KeyList {
         let open_at = at.saturating_add(self.period_ns);
         if let Some(i) = self.keys.iter().position(|k| k.0 == key) {
             let (_, over_at, held) = self.keys.remove(i);
-            let (entry, admitted) = if at >= over_at { ((key, open_at, 0), Some(held)) } else { ((key, over_at, held + 1), None) };
+            let (entry, admitted) = if at >= over_at {
+                ((key, open_at, 0), Some(held))
+            } else {
+                ((key, over_at, held + 1), None)
+            };
             self.keys.push(entry);
             return admitted.map(HeldLines::OfKey);
         }

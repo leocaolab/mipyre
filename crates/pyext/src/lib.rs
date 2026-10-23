@@ -1,4 +1,5 @@
-#[cfg(not(feature = "bench"))]
+/// Miri runs no C, so under it the extension keeps Rust's own allocator (b/719).
+#[cfg(not(any(feature = "bench", miri)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -12,9 +13,8 @@ mod bench;
 mod boot;
 mod db;
 mod exchange;
-mod runtime;
-mod lane;
 mod pyapi;
+mod runtime;
 mod serve;
 mod sync;
 mod telemetry;
@@ -24,6 +24,7 @@ mod thread_stack;
 /// Checks that the extension allocates through mimalloc in both builds; the bench counter passes
 /// every call on to mimalloc.
 #[cfg(test)]
+#[cfg(not(miri))]
 mod allocator_tests {
     #[test]
     fn a_box_lives_in_mimallocs_heap() {
@@ -31,7 +32,10 @@ mod allocator_tests {
         // SAFETY: only asks whether the address lies in memory mimalloc manages; nothing is read
         // through it.
         let in_heap = unsafe { libmimalloc_sys::mi_is_in_heap_region(boxed.as_ptr().cast()) };
-        assert!(in_heap, "a Box is not in mimalloc's heap: the global allocator is not mimalloc");
+        assert!(
+            in_heap,
+            "a Box is not in mimalloc's heap: the global allocator is not mimalloc"
+        );
     }
 
     /// Shows the check above can fail: memory from another allocator does not read as mimalloc's.
@@ -46,6 +50,9 @@ mod allocator_tests {
         let in_heap = unsafe { libmimalloc_sys::mi_is_in_heap_region(block.cast()) };
         // SAFETY: `block` came from `System.alloc(layout)` and is freed once.
         unsafe { System.dealloc(block, layout) };
-        assert!(!in_heap, "a system-allocated block reads as mimalloc's: the check above proves nothing");
+        assert!(
+            !in_heap,
+            "a system-allocated block reads as mimalloc's: the check above proves nothing"
+        );
     }
 }

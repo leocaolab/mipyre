@@ -13,7 +13,7 @@ use crate::telemetry::RunCounters;
 /// The part of a server's shutdown grace a stopped thread keeps for after its connections
 /// drained, to drop its runtime and end its worker. That takes tens of milliseconds, and nears a
 /// second when a higher-priority task holds the thread's pinned CPU.
-pub(crate) const TEARDOWN_MARGIN: Duration = Duration::from_secs(1);
+const TEARDOWN_MARGIN: Duration = Duration::from_secs(1);
 
 /// Returns how much of `grace` a stopped thread keeps for its teardown: [`TEARDOWN_MARGIN`], or
 /// half a grace under twice the margin.
@@ -99,6 +99,9 @@ mod tests {
         assert_eq!(drain_timeout(&deadline, late), Duration::from_millis(2_500));
         assert_eq!(teardown_timeout(&deadline, late), Duration::from_millis(3_500));
         let past = stopped + Duration::from_secs(6);
-        assert_eq!((drain_timeout(&deadline, past), teardown_timeout(&deadline, past)), (Duration::ZERO, Duration::ZERO));
+        assert_eq!(
+            (drain_timeout(&deadline, past), teardown_timeout(&deadline, past)),
+            (Duration::ZERO, Duration::ZERO)
+        );
     }
 }

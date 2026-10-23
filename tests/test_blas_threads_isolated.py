@@ -14,12 +14,13 @@ import pytest
 _PROBE = r"""
 import json, os, sys
 import numpy  # loaded BEFORE the limit, like an app that imports numpy at the top
-from mipyre._subinterp import _limit_blas_threads, _BLAS_THREAD_VARS
+from mipyre._isolated.blas import _limit_blas_threads
+from mipyre._thread_pools import BLAS
 from threadpoolctl import threadpool_info
 done = _limit_blas_threads()
 print(json.dumps({
     "done": done,
-    "env": {v: os.environ.get(v) for v in _BLAS_THREAD_VARS},
+    "env": {v: os.environ.get(v) for v in BLAS.variables},
     "blas": [i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas"],
 }))
 """

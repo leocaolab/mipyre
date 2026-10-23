@@ -1,8 +1,10 @@
 //! Decides how one server serves: thread-per-core or multi-thread, with or without
-//! sub-interpreter workers, how many threads and accept loops.
+//! sub-interpreter workers, how many threads and accept loops. The thread-per-core server
+//! starts workers exactly when a route runs on one; its main-interpreter routes go to the
+//! bridge either way.
 //!
-//! Every decision here is pure: it reads the interpreter mode the code gave, the settings
-//! [`EnvConfig`] parsed, the sizes `run()` was given and the CPUs [`super::cpus`] read.
+//! Every decision here is pure: it reads the interpreter mode the route table implies, the settings
+//! the server's flags settled ([`ServerRecipe`]) and the CPUs [`super::cpus`] read.
 
 use std::num::NonZeroUsize;
 
@@ -10,53 +12,34 @@ use pyo3::prelude::*;
 
 use mipyre_cpu::Cpus;
 
-use super::config::{EnvConfig, EnvVar, GivenSize, ServerKind, ServerSizes, SizeArg};
+use super::config::{FlagError, ServerKind, ServerRecipe};
+use super::settings::{FlagUse, ServerFlagValues};
 use crate::runtime::RouteKinds;
 use crate::serve::AcceptMode;
 use mipyre_subinterp::gc::GcMode;
 
-/// Says where handlers without `runtime="main"` run; Python sees it as `mipyre.engine.Mode`.
-#[pyclass(module = "mipyre.engine", name = "Mode", eq, eq_int, frozen, hash)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Says whether the multi-thread server runs a pool of sub-interpreter workers: it does exactly
+/// when a route of its sealed table runs on one, so one table is always served by one topology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InterpreterMode {
+    /// Runs every handler on the main interpreter or a process lane.
     Gil,
-    /// Runs handlers in sub-interpreter workers, except `runtime="main"` routes.
+    /// Runs handlers in sub-interpreter workers, except `runtime="main"` and process routes.
     Subinterp,
 }
 
 impl InterpreterMode {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            InterpreterMode::Gil => "gil",
-            InterpreterMode::Subinterp => "subinterp",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("mode {0:?} is not a serving mode; expected \"gil\" (or \"default\") or \"subinterp\" (or \"auto\")")]
-pub(crate) struct UnknownInterpreterMode(String);
-
-impl From<UnknownInterpreterMode> for PyErr {
-    fn from(e: UnknownInterpreterMode) -> Self {
-        pyo3::exceptions::PyValueError::new_err(e.to_string())
-    }
-}
-
-impl std::str::FromStr for InterpreterMode {
-    type Err = UnknownInterpreterMode;
-
-    fn from_str(name: &str) -> Result<Self, UnknownInterpreterMode> {
-        match name {
-            "gil" | "default" => Ok(InterpreterMode::Gil),
-            "subinterp" | "auto" => Ok(InterpreterMode::Subinterp),
-            _ => Err(UnknownInterpreterMode(name.to_string())),
+    pub(crate) fn of(routes: &crate::serve::Routes) -> Self {
+        if routes.uses_workers() {
+            InterpreterMode::Subinterp
+        } else {
+            InterpreterMode::Gil
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{}={mode} is not supported by {topology}", EnvVar::GcMode)]
+#[error("gc_mode={mode} is not supported by {topology}")]
 pub(crate) struct UnsupportedGcMode {
     mode: GcMode,
     topology: Topology,
@@ -72,14 +55,9 @@ impl From<UnsupportedGcMode> for PyErr {
 /// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Topology {
-    /// Runs thread-per-core with every handler on the main interpreter.
-    TpcGil { threads: NonZeroUsize },
-    /// Runs thread-per-core with one sub-interpreter per thread, taking connections as `accept`
-    /// says.
-    TpcWorkers {
-        threads: NonZeroUsize,
-        accept: AcceptMode,
-    },
+    /// Runs thread-per-core, taking connections as `accept` says: with one sub-interpreter per
+    /// thread when a route runs on one, and with none otherwise.
+    Tpc { threads: NonZeroUsize, accept: AcceptMode },
     /// Runs a multi-thread Tokio runtime, for `MIPYRE_TPC=0` in GIL mode.
     MultiThreadGil {
         io_threads: NonZeroUsize,
@@ -95,7 +73,8 @@ pub(crate) enum Topology {
 }
 
 impl Topology {
-    /// Picks the topology for `mode` and `env`, sized from `sizing` or else `cpus`.
+    /// Picks the topology for `env`, and for `mode` when the server is multi-thread, sized from
+    /// `sizing` or else `cpus`.
     ///
     /// TPC defaults to one thread per physical core, because two TPC threads on SMT siblings
     /// run the same code and thrash their shared L1 (-50% on a 7840HS). The multi-thread
@@ -106,20 +85,13 @@ impl Topology {
     ///
     /// Returns [`UnsupportedGcMode`] when the topology cannot run the configured GC mode, before
     /// anything is bound.
-    pub(crate) fn resolve(
-        mode: InterpreterMode,
-        env: &EnvConfig,
-        sizing: ServerSizes,
-        cpus: Cpus,
-    ) -> Result<Self, UnsupportedGcMode> {
-        let topology = if let ServerKind::Tpc(accept) = env.server {
-            let threads = sizing.workers.map_or(cpus.physical(), |g| g.value);
-            match mode {
-                InterpreterMode::Gil => Topology::TpcGil { threads },
-                InterpreterMode::Subinterp => Topology::TpcWorkers { threads, accept },
-            }
+    pub(crate) fn resolve(mode: InterpreterMode, recipe: &ServerRecipe, cpus: Cpus) -> Result<Self, UnsupportedGcMode> {
+        let sizing = &recipe.sizes;
+        let topology = if let ServerKind::Tpc(accept) = recipe.server {
+            let threads = sizing.threads.as_ref().map_or(cpus.physical(), |g| *g.value());
+            Topology::Tpc { threads, accept }
         } else {
-            let io_threads = sizing.io_workers.map_or(cpus.logical(), |g| g.value);
+            let io_threads = sizing.threads.as_ref().map_or(cpus.logical(), |g| *g.value());
             let accept_loops = multi_thread_accept_loops(io_threads, cpus.logical());
             match mode {
                 InterpreterMode::Gil => Topology::MultiThreadGil {
@@ -127,13 +99,13 @@ impl Topology {
                     accept_loops,
                 },
                 InterpreterMode::Subinterp => Topology::Pool {
-                    workers: sizing.workers.map_or(cpus.logical(), |g| g.value),
+                    workers: sizing.subinterpreters.as_ref().map_or(cpus.logical(), |g| *g.value()),
                     io_threads,
                     accept_loops,
                 },
             }
         };
-        let gc = env.tuning.gc.mode();
+        let gc = recipe.tuning.gc.mode();
         if topology.supports(gc) {
             Ok(topology)
         } else {
@@ -141,104 +113,34 @@ impl Topology {
         }
     }
 
-    /// Drops the sub-interpreters when no route runs on one, since each would execute the
-    /// app's code and load its extensions for nothing.
-    pub(crate) fn without_workers(self) -> Self {
-        match self {
-            Topology::Pool {
-                io_threads,
-                accept_loops,
-                ..
-            } => Topology::MultiThreadGil {
-                io_threads,
-                accept_loops,
-            },
-            other => other,
-        }
-    }
-
-    /// Returns one line per size this server does not use, naming where it was given and why.
-    /// It is not an error because one script runs under several `MIPYRE_TPC` / `MIPYRE_RUNTIME`
-    /// settings and its size is right for one of them.
-    pub(crate) fn unused_sizes(self, sizing: ServerSizes) -> Vec<String> {
-        let thread_per_core = match self {
-            Topology::TpcGil { .. } | Topology::TpcWorkers { .. } => true,
-            Topology::MultiThreadGil { .. } | Topology::Pool { .. } => false,
-        };
-        let line = |size: SizeArg, given: GivenSize, why: &str| {
-            format!(
-                "{arg}={value} is ignored: it was given as {origin}, and {self} does not use it: {why}.",
-                arg = size.arg(),
-                value = given.value,
-                origin = given.origin.describe(size),
-            )
-        };
-        let mut notes = Vec::new();
-        if let (true, Some(given)) = (thread_per_core, sizing.io_workers) {
-            notes.push(line(
-                SizeArg::IoWorkers,
-                given,
-                "each thread-per-core thread does its own IO, so there are no IO threads to size \
-                 (workers= sizes the TPC threads)",
-            ));
-        }
-        if let (Topology::MultiThreadGil { .. }, Some(given)) = (self, sizing.workers) {
-            notes.push(line(
-                SizeArg::Workers,
-                given,
-                "every handler runs on the main interpreter, or no route needs a sub-interpreter, \
-                 so no sub-interpreter worker starts (io_workers= sizes its IO threads)",
-            ));
-        }
-        notes
-    }
-
-    /// Returns one line per environment setting this server does not use, in the form of
-    /// [`unused_sizes`][Self::unused_sizes].
-    pub(crate) fn unused_settings(self, env: &EnvConfig) -> Vec<String> {
-        match (self, env.server) {
-            #[cfg(target_os = "macos")]
-            (Topology::TpcGil { .. }, ServerKind::Tpc(AcceptMode::Fanout)) => vec![format!(
-                "{}=fanout is ignored: it was given in the environment, and {self} \
-                 does not use it: in GIL mode every TPC thread accepts on its own listeners; the \
-                 fanout acceptor is for the sub-interpreter TPC server only.",
-                EnvVar::TpcDarwin
-            )],
-            _ => Vec::new(),
-        }
-    }
-
     /// Counts the accept loops, each of which opens its own socket per listener.
     pub(crate) fn accept_loops(self) -> NonZeroUsize {
         match self {
-            Topology::TpcGil { threads }
-            | Topology::TpcWorkers {
+            Topology::Tpc {
                 threads,
                 accept: AcceptMode::PerThreadListener,
             } => threads,
             #[cfg(target_os = "macos")]
-            Topology::TpcWorkers {
+            Topology::Tpc {
                 accept: AcceptMode::Fanout,
                 ..
             } => NonZeroUsize::MIN,
-            Topology::MultiThreadGil { accept_loops, .. } | Topology::Pool { accept_loops, .. } => {
-                accept_loops
-            }
+            Topology::MultiThreadGil { accept_loops, .. } | Topology::Pool { accept_loops, .. } => accept_loops,
         }
     }
 
     /// Says whether this topology can schedule `mode`'s collections. Only the per-thread TPC
-    /// listener has the idle tick; GIL topologies run no workers and accept every mode.
+    /// listener has the idle tick; the multi-thread GIL server runs no workers and accepts every
+    /// mode.
     pub(crate) fn supports(self, mode: GcMode) -> bool {
         match self {
-            Topology::TpcGil { .. }
-            | Topology::TpcWorkers {
+            Topology::Tpc {
                 accept: AcceptMode::PerThreadListener,
                 ..
-            } => true,
-            Topology::MultiThreadGil { .. } => true,
+            }
+            | Topology::MultiThreadGil { .. } => true,
             #[cfg(target_os = "macos")]
-            Topology::TpcWorkers {
+            Topology::Tpc {
                 accept: AcceptMode::Fanout,
                 ..
             } => matches!(mode, GcMode::Count | GcMode::Off),
@@ -247,16 +149,77 @@ impl Topology {
     }
 }
 
+/// What decides which of the given flags a server uses: its topology, what its routes need
+/// and how it takes connections (design §8.5).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServerLayout {
+    pub(crate) topology: Topology,
+    /// Some route runs on a sub-interpreter worker: the thread-per-core server then gives each
+    /// thread one.
+    pub(crate) worker_routes: bool,
+    /// Some route runs on the main interpreter.
+    pub(crate) main_routes: bool,
+    /// Some route on a sub-interpreter worker is `async def`.
+    pub(crate) async_worker_routes: bool,
+    /// Some route has `runtime="process"`.
+    pub(crate) process_routes: bool,
+    /// The server takes TCP connections (not only in-memory ones).
+    pub(crate) tcp: bool,
+}
+
+impl ServerLayout {
+    /// Says whether this server uses a value of a flag that is used as `used` says.
+    pub(crate) fn uses(&self, used: FlagUse) -> bool {
+        match used {
+            FlagUse::Always => true,
+            FlagUse::Pool => matches!(self.topology, Topology::Pool { .. }),
+            FlagUse::MacosTpc => cfg!(target_os = "macos") && matches!(self.topology, Topology::Tpc { .. }),
+            FlagUse::SubinterpreterWorkers => self.workers() > 0,
+            FlagUse::MainBridge => self.main_routes && !matches!(self.topology, Topology::MultiThreadGil { .. }),
+            FlagUse::PoolAsyncRoutes => matches!(self.topology, Topology::Pool { .. }) && self.async_worker_routes,
+            FlagUse::ProcessRoutes => self.process_routes,
+            FlagUse::TcpTransport => self.tcp,
+            // A server flag is never used by entry point; the entry checks those.
+            FlagUse::ReloadingEntry => true,
+        }
+    }
+
+    /// Counts the sub-interpreter workers: one per thread-per-core thread when a route runs on
+    /// one, the pool's size, or none.
+    pub(crate) fn workers(&self) -> usize {
+        match self.topology {
+            Topology::Tpc { threads, .. } if self.worker_routes => threads.get(),
+            Topology::Pool { workers, .. } => workers.get(),
+            Topology::Tpc { .. } | Topology::MultiThreadGil { .. } => 0,
+        }
+    }
+
+    /// Returns one error per flag `values` gives (from the deployment or from code, not the
+    /// default) that this server does not use (D19).
+    pub(crate) fn unused(&self, values: &ServerFlagValues) -> Vec<FlagError> {
+        values
+            .given()
+            .into_iter()
+            .filter(|(flag, _)| !self.uses(flag.used))
+            .map(|(flag, given)| FlagError::UnusedByTopology {
+                flag: flag.name,
+                given,
+                user: self.topology.to_string(),
+                needs: flag.used.users(),
+            })
+            .collect()
+    }
+}
+
 impl std::fmt::Display for Topology {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Topology::TpcGil { .. } => "the thread-per-core GIL server",
-            Topology::TpcWorkers {
+            Topology::Tpc {
                 accept: AcceptMode::PerThreadListener,
                 ..
-            } => "the thread-per-core sub-interpreter server",
+            } => "the thread-per-core server",
             #[cfg(target_os = "macos")]
-            Topology::TpcWorkers {
+            Topology::Tpc {
                 accept: AcceptMode::Fanout,
                 ..
             } => "the Darwin fanout TPC topology (MIPYRE_TPC_DARWIN=fanout)",
@@ -278,7 +241,7 @@ fn multi_thread_accept_loops(_io_threads: NonZeroUsize, _logical: NonZeroUsize) 
     NonZeroUsize::MIN
 }
 
-/// Counts the async-engine workers for a TPC sub-interpreter server's `async def` routes: one
+/// Counts the async-engine workers for a TPC server's `async def` routes: one
 /// per TPC thread, or half as many (at least one) when `def` routes share the cores.
 pub(crate) fn tpc_async_workers(threads: NonZeroUsize, kinds: RouteKinds) -> NonZeroUsize {
     if kinds.has_sync() {
@@ -288,89 +251,82 @@ pub(crate) fn tpc_async_workers(threads: NonZeroUsize, kinds: RouteKinds) -> Non
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boot::config::tests::parse as parse_env;
-    use crate::boot::config::SizeOrigin;
+    use std::ffi::OsString;
 
-    #[test]
-    fn mode_names_parse_and_a_typo_is_an_error() {
-        assert_eq!("gil".parse(), Ok(InterpreterMode::Gil));
-        assert_eq!("default".parse(), Ok(InterpreterMode::Gil));
-        assert_eq!("subinterp".parse(), Ok(InterpreterMode::Subinterp));
-        assert_eq!("auto".parse(), Ok(InterpreterMode::Subinterp));
-        for typo in ["subinterpreter", "async", "GIL", "", "hybrid"] {
-            assert_eq!(
-                typo.parse::<InterpreterMode>(),
-                Err(UnknownInterpreterMode(typo.into()))
-            );
-        }
-        let text = "subinterpter"
-            .parse::<InterpreterMode>()
-            .unwrap_err()
-            .to_string();
-        assert!(
-            text.contains("\"subinterpter\"") && text.contains("\"gil\""),
-            "{text}"
-        );
-    }
-
-    fn run_sized(value: usize) -> GivenSize {
-        GivenSize {
-            value: n(value),
-            origin: SizeOrigin::RunArg,
-        }
-    }
+    use crate::boot::config::ServerFlagsError;
+    use crate::boot::settings::{CodeCall, Deployment, EntryPoint, ServerFlags};
 
     fn n(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap()
     }
 
-    const CPUS: Cpus = Cpus::new(
-        NonZeroUsize::new(16).unwrap(),
-        NonZeroUsize::new(8).unwrap(),
-    );
+    const CPUS: Cpus = Cpus::new(NonZeroUsize::new(16).unwrap(), NonZeroUsize::new(8).unwrap());
+
+    /// The recipe of a server whose environment is `vars` and whose code gives `code`
+    /// (`run(...)`'s keywords).
+    fn recipe(vars: &[(&str, &str)], code: &[(&str, &str)], entry: EntryPoint) -> ServerRecipe {
+        let env: Vec<(OsString, OsString)> = vars
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
+        let mut flags = ServerFlags::default();
+        for (keyword, raw) in code {
+            flags
+                .give(CodeCall::Run, keyword, raw)
+                .map_err(|e: ServerFlagsError| e.to_string())
+                .unwrap();
+        }
+        ServerRecipe::of(Deployment::resolve(&env, &[], None, entry).unwrap().over(&flags)).unwrap()
+    }
 
     fn resolve(
         mode: InterpreterMode,
-        vars: &[(&'static str, &str)],
-        sizing: ServerSizes,
+        vars: &[(&str, &str)],
+        code: &[(&str, &str)],
     ) -> Result<Topology, UnsupportedGcMode> {
-        Topology::resolve(mode, &parse_env(vars).unwrap(), sizing, CPUS)
+        Topology::resolve(mode, &recipe(vars, code, EntryPoint::Script), CPUS)
     }
 
     #[test]
     fn tpc_threads_default_to_what_a_cpu_quota_runs_at_once_not_the_cores_in_the_mask() {
         // With `docker --cpus=2` on a 32-core cpuset, 32 threads would share 2 CPUs of time.
         let quota = Cpus::new(n(2), n(32));
-        let env = parse_env(&[]).unwrap();
-        let t = Topology::resolve(InterpreterMode::Gil, &env, ServerSizes::default(), quota);
-        assert_eq!(t.unwrap(), Topology::TpcGil { threads: n(2) });
+        let t = Topology::resolve(InterpreterMode::Gil, &recipe(&[], &[], EntryPoint::Script), quota);
+        assert_eq!(
+            t.unwrap(),
+            Topology::Tpc {
+                threads: n(2),
+                accept: AcceptMode::PerThreadListener
+            }
+        );
     }
 
     #[test]
     fn tpc_defaults_to_one_thread_per_physical_core() {
-        let t = resolve(InterpreterMode::Subinterp, &[], ServerSizes::default()).unwrap();
+        let t = resolve(InterpreterMode::Subinterp, &[], &[]).unwrap();
         assert_eq!(
             t,
-            Topology::TpcWorkers {
+            Topology::Tpc {
                 threads: n(8),
                 accept: AcceptMode::PerThreadListener
             }
         );
         assert_eq!(t.accept_loops(), n(8));
-        let t = resolve(InterpreterMode::Gil, &[], ServerSizes::default()).unwrap();
-        assert_eq!(t, Topology::TpcGil { threads: n(8) });
-        let sized = ServerSizes {
-            workers: Some(run_sized(3)),
-            io_workers: Some(run_sized(99)),
-        };
-        let t = resolve(InterpreterMode::Subinterp, &[], sized).unwrap();
+        // Without a sub-interpreter route the TPC server is the same one, with no workers.
+        let gil = resolve(InterpreterMode::Gil, &[], &[]).unwrap();
+        assert_eq!(gil, t);
+        let t = resolve(
+            InterpreterMode::Subinterp,
+            &[],
+            &[("threads", "3"), ("subinterpreters", "99")],
+        )
+        .unwrap();
         assert_eq!(
             t,
-            Topology::TpcWorkers {
+            Topology::Tpc {
                 threads: n(3),
                 accept: AcceptMode::PerThreadListener
             }
@@ -378,55 +334,129 @@ mod tests {
         assert_eq!(t.accept_loops(), n(3));
     }
 
+    /// A layout of `topology` with none of the route facts, taking TCP connections.
+    fn layout(topology: Topology) -> ServerLayout {
+        let worker_routes = !matches!(topology, Topology::MultiThreadGil { .. });
+        ServerLayout {
+            topology,
+            worker_routes,
+            main_routes: false,
+            async_worker_routes: false,
+            process_routes: false,
+            tcp: true,
+        }
+    }
+
+    /// The thread-per-core server of a table with no sub-interpreter route: its threads have no
+    /// workers.
+    fn tpc_without_workers() -> ServerLayout {
+        ServerLayout {
+            worker_routes: false,
+            ..layout(TPC)
+        }
+    }
+
+    fn unused_names(layout: &ServerLayout, recipe: &ServerRecipe) -> Vec<&'static str> {
+        layout
+            .unused(&recipe.values)
+            .iter()
+            .map(|e| match e {
+                FlagError::UnusedByTopology { flag, .. } => *flag,
+                other => panic!("{other}"),
+            })
+            .collect()
+    }
+
+    const TPC: Topology = Topology::Tpc {
+        threads: NonZeroUsize::MIN,
+        accept: AcceptMode::PerThreadListener,
+    };
+    const POOL: Topology = Topology::Pool {
+        workers: NonZeroUsize::MIN,
+        io_threads: NonZeroUsize::MIN,
+        accept_loops: NonZeroUsize::MIN,
+    };
+    const MULTI_GIL: Topology = Topology::MultiThreadGil {
+        io_threads: NonZeroUsize::MIN,
+        accept_loops: NonZeroUsize::MIN,
+    };
+
     #[test]
-    fn a_size_the_server_does_not_use_is_named_with_its_source_and_why() {
-        // TPC has no IO threads to size, so the size is named rather than refused.
-        let io = ServerSizes {
-            workers: None,
-            io_workers: Some(GivenSize {
-                value: n(99),
-                origin: SizeOrigin::EnvVar,
-            }),
-        };
-        let topology = resolve(InterpreterMode::Subinterp, &[], io).unwrap();
-        let notes = topology.unused_sizes(io);
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        let note = &notes[0];
+    fn a_size_the_server_does_not_use_is_an_error_with_its_source_and_who_uses_it() {
+        let given = recipe(&[("MIPYRE_SUBINTERPRETERS", "99")], &[], EntryPoint::Script);
+        assert!(layout(POOL).unused(&given.values).is_empty());
+        let errors = layout(TPC).unused(&given.values);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let line = errors[0].to_string();
         assert!(
-            note.contains("io_workers=99")
-                && note.contains("MIPYRE_IO_WORKERS")
-                && note.contains("does not use it")
-                && note.contains("thread-per-core"),
-            "{note}"
+            line.starts_with("subinterpreters is given (MIPYRE_SUBINTERPRETERS")
+                && line.contains("the thread-per-core server does not use it")
+                && line.contains("sized by threads"),
+            "{line}"
         );
-        let sized = ServerSizes {
-            workers: Some(run_sized(3)),
-            io_workers: None,
-        };
-        let topology = resolve(InterpreterMode::Subinterp, &[], sized).unwrap();
-        assert!(topology.unused_sizes(sized).is_empty());
-        // The pool has no workers to size once no route runs on a sub-interpreter.
-        let off = [("MIPYRE_TPC", "0")];
-        let workers = ServerSizes {
-            workers: Some(run_sized(2)),
-            io_workers: None,
-        };
-        let served = resolve(InterpreterMode::Subinterp, &off, workers)
-            .unwrap()
-            .without_workers();
-        let notes = served.unused_sizes(workers);
-        assert_eq!(notes.len(), 1, "{notes:?}");
+        // From code too; the default is never named.
+        let code = recipe(&[], &[("subinterpreters", "2")], EntryPoint::Script);
+        assert_eq!(unused_names(&layout(MULTI_GIL), &code), ["subinterpreters"]);
+        assert!(layout(TPC)
+            .unused(&recipe(&[], &[], EntryPoint::Script).values)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_size_given_by_a_command_line_flag_is_named_as_that_flag() {
+        let env: Vec<(OsString, OsString)> = Vec::new();
+        let deployment =
+            Deployment::resolve(&env, &[("subinterpreters", "3".to_string())], None, EntryPoint::CliRun).unwrap();
+        let pool = ServerRecipe::of(deployment.over(&ServerFlags::default())).unwrap();
+        let errors = layout(TPC).unused(&pool.values);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let line = errors[0].to_string();
         assert!(
-            notes[0].contains("workers=2") && notes[0].contains("run(workers=)"),
-            "{}",
-            notes[0]
+            line.contains("mipyre run --subinterpreters") && !line.contains("run(subinterpreters=)"),
+            "{line}"
         );
+    }
+
+    #[test]
+    fn each_kind_of_flag_is_used_by_its_servers_only() {
+        // (flag given, a layout that uses it, one that does not)
+        let mut main = tpc_without_workers();
+        main.main_routes = true;
+        let mut main_multi = layout(MULTI_GIL);
+        main_multi.main_routes = true;
+        let mut pool_async = layout(POOL);
+        pool_async.async_worker_routes = true;
+        let mut tpc_async = layout(TPC);
+        tpc_async.async_worker_routes = true;
+        let mut lanes = layout(TPC);
+        lanes.process_routes = true;
+        let mut memory = layout(TPC);
+        memory.tcp = false;
+        let pairs: [(&str, &str, ServerLayout, ServerLayout); 7] = [
+            ("MIPYRE_GC_MODE", "idle", layout(TPC), tpc_without_workers()),
+            ("MIPYRE_ISOLATE_DIR", "/srv/iso", layout(POOL), layout(MULTI_GIL)),
+            ("MIPYRE_GIL_BRIDGE_WORKERS", "2", main, main_multi),
+            ("MIPYRE_ASYNC_QUEUE_CAPACITY", "100", pool_async, tpc_async),
+            ("MIPYRE_PROCESS_WORKERS", "2", lanes, layout(TPC)),
+            ("MIPYRE_PORT", "8001", layout(TPC), memory),
+            ("MIPYRE_THREADS", "2", layout(MULTI_GIL), layout(MULTI_GIL)),
+        ];
+        for (variable, value, using, not_using) in pairs {
+            let given = recipe(&[(variable, value)], &[], EntryPoint::Script);
+            assert!(using.unused(&given.values).is_empty(), "{variable}");
+            if variable == "MIPYRE_THREADS" {
+                // Every server uses its threads.
+                assert!(not_using.unused(&given.values).is_empty());
+            } else {
+                assert_eq!(not_using.unused(&given.values).len(), 1, "{variable}");
+            }
+        }
     }
 
     #[test]
     fn tpc_off_sizes_from_the_logical_count() {
         let off = [("MIPYRE_TPC", "0")];
-        let t = resolve(InterpreterMode::Subinterp, &off, ServerSizes::default()).unwrap();
+        let t = resolve(InterpreterMode::Subinterp, &off, &[]).unwrap();
         let loops = if cfg!(target_os = "linux") { 16 } else { 1 };
         assert_eq!(
             t,
@@ -437,11 +467,12 @@ mod tests {
             }
         );
         assert_eq!(t.accept_loops(), n(loops));
-        let sized = ServerSizes {
-            workers: Some(run_sized(2)),
-            io_workers: Some(run_sized(4)),
-        };
-        let t = resolve(InterpreterMode::Gil, &off, sized).unwrap();
+        let t = resolve(
+            InterpreterMode::Gil,
+            &off,
+            &[("threads", "4"), ("subinterpreters", "2")],
+        )
+        .unwrap();
         let loops = if cfg!(target_os = "linux") { 4 } else { 1 };
         assert_eq!(
             t,
@@ -456,20 +487,10 @@ mod tests {
     fn the_pool_runs_count_and_off_but_not_idle() {
         let off = ("MIPYRE_TPC", "0");
         for mode in ["count", "off"] {
-            assert!(resolve(
-                InterpreterMode::Subinterp,
-                &[off, ("MIPYRE_GC_MODE", mode)],
-                ServerSizes::default()
-            )
-            .is_ok());
+            assert!(resolve(InterpreterMode::Subinterp, &[off, ("MIPYRE_GC_MODE", mode)], &[]).is_ok());
         }
         let mode = "idle";
-        let err = resolve(
-            InterpreterMode::Subinterp,
-            &[off, ("MIPYRE_GC_MODE", mode)],
-            ServerSizes::default(),
-        )
-        .unwrap_err();
+        let err = resolve(InterpreterMode::Subinterp, &[off, ("MIPYRE_GC_MODE", mode)], &[]).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -481,27 +502,14 @@ mod tests {
             "{err:?}"
         );
         let text = err.to_string();
-        assert!(
-            text.contains(mode) && text.contains("MIPYRE_TPC=0"),
-            "{text}"
-        );
-        assert!(resolve(
-            InterpreterMode::Gil,
-            &[off, ("MIPYRE_GC_MODE", "idle")],
-            ServerSizes::default()
-        )
-        .is_ok());
+        assert!(text.contains(mode) && text.contains("MIPYRE_TPC=0"), "{text}");
+        assert!(resolve(InterpreterMode::Gil, &[off, ("MIPYRE_GC_MODE", "idle")], &[]).is_ok());
     }
 
     #[test]
     fn per_thread_tpc_runs_every_gc_mode() {
         for mode in ["count", "idle", "off"] {
-            assert!(resolve(
-                InterpreterMode::Subinterp,
-                &[("MIPYRE_GC_MODE", mode)],
-                ServerSizes::default()
-            )
-            .is_ok());
+            assert!(resolve(InterpreterMode::Subinterp, &[("MIPYRE_GC_MODE", mode)], &[]).is_ok());
         }
     }
 
@@ -509,54 +517,34 @@ mod tests {
     #[test]
     fn darwin_fanout_has_one_accept_loop_and_no_idle_mode() {
         let fanout = ("MIPYRE_TPC_DARWIN", "fanout");
-        let t = resolve(
-            InterpreterMode::Subinterp,
-            &[fanout],
-            ServerSizes::default(),
-        )
-        .unwrap();
+        let t = resolve(InterpreterMode::Subinterp, &[fanout], &[]).unwrap();
         assert_eq!(
             t,
-            Topology::TpcWorkers {
+            Topology::Tpc {
                 threads: n(8),
                 accept: AcceptMode::Fanout
             }
         );
         assert_eq!(t.accept_loops(), NonZeroUsize::MIN);
         assert!(t.supports(GcMode::Off));
-        let err = resolve(
-            InterpreterMode::Subinterp,
-            &[fanout, ("MIPYRE_GC_MODE", "idle")],
-            ServerSizes::default(),
-        )
-        .unwrap_err();
+        let err = resolve(InterpreterMode::Subinterp, &[fanout, ("MIPYRE_GC_MODE", "idle")], &[]).unwrap_err();
         assert!(err.to_string().contains("idle") && err.to_string().contains("fanout"));
-        // Fanout is a sub-interpreter topology, so GIL mode stays per-thread.
-        let t = resolve(InterpreterMode::Gil, &[fanout], ServerSizes::default()).unwrap();
-        assert_eq!(t, Topology::TpcGil { threads: n(8) });
+        // A table without a sub-interpreter route is served by the same fanout server.
+        let gil = resolve(InterpreterMode::Gil, &[fanout], &[]).unwrap();
+        assert_eq!(gil, t);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn a_fanout_setting_the_gil_tpc_server_does_not_use_is_named_with_why() {
-        let fanout = [("MIPYRE_TPC_DARWIN", "fanout")];
-        let env = parse_env(&fanout).unwrap();
-        let gil = resolve(InterpreterMode::Gil, &fanout, ServerSizes::default()).unwrap();
-        let notes = gil.unused_settings(&env);
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        let note = &notes[0];
-        assert!(
-            note.starts_with("MIPYRE_TPC_DARWIN=fanout is ignored")
-                && note.contains("given in the environment")
-                && note.contains("the thread-per-core GIL server does not use it")
-                && note.contains("sub-interpreter TPC server only"),
-            "{note}"
-        );
-        let workers = resolve(InterpreterMode::Subinterp, &fanout, ServerSizes::default()).unwrap();
-        assert!(workers.unused_settings(&env).is_empty(), "the fanout server uses it");
-        let unset = parse_env(&[]).unwrap();
-        let gil = resolve(InterpreterMode::Gil, &[], ServerSizes::default()).unwrap();
-        assert!(gil.unused_settings(&unset).is_empty(), "nothing given, nothing named");
+    fn an_accept_mode_is_used_only_by_the_macos_tpc_server() {
+        let given = recipe(&[("MIPYRE_TPC_DARWIN", "listener")], &[], EntryPoint::Script);
+        for on in [layout(TPC), tpc_without_workers()] {
+            if cfg!(target_os = "macos") {
+                assert!(unused_names(&on, &given).is_empty());
+            } else {
+                assert_eq!(unused_names(&on, &given), ["tpc_accept"]);
+            }
+        }
+        assert_eq!(unused_names(&layout(POOL), &given), ["tpc_accept"]);
     }
 
     #[test]
@@ -567,5 +555,4 @@ mod tests {
         assert_eq!(tpc_async_workers(n(1), RouteKinds::Both), n(1));
         assert_eq!(tpc_async_workers(n(1), RouteKinds::Async), n(1));
     }
-
 }

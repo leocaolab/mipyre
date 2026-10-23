@@ -10,12 +10,13 @@ use mipyre_transport::driver::TransportDriver;
 
 use super::conn::{serve_accepted, TpcThread};
 use super::inline::{connections_stop, retired, stopped_accepting};
-use super::startup::log_startup;
-use super::threads::{drain_connections, join_run, serve_on_this_thread, settle, spawn_worker_threads, stopped_error, left_running, with_stop_watcher};
-use super::{hybrid_mode, AcceptMode, ServeError, TpcServer};
+use super::threads::{
+    drain_connections, join_run, left_running, serve_on_this_thread, settle, spawn_worker_threads, stopped_error,
+};
+use super::{topology_label, AcceptMode, ServeError, TpcServer};
 use crate::runtime::ServerRunStop;
 use crate::serve::on_tpc::handle_request_tpc_inline;
-use crate::serve::websocket::Upgrades;
+use crate::serve::websocket::upgrade_site;
 
 /// Serves through one acceptor thread that hands connections round-robin to the worker threads
 /// over bounded queues, at one cross-thread wake per connection. It has no idle tick, so it takes
@@ -27,61 +28,67 @@ use crate::serve::websocket::Upgrades;
 pub(super) fn run_fanout<D: TransportDriver>(
     transport: D,
     server: TpcServer,
-    banner: &str,
+    announce: impl FnOnce(&'static str, &[String]),
     run: &ServerRunStop,
     deadline: &ShutdownDeadline,
+    spawner: &mut impl mipyre_tpc::Spawner,
 ) -> Result<(), ServeError> {
     // Past this many queued connections the acceptor drops new ones (RST), so open file
     // descriptors stay bounded at threads × this.
     const WORKER_INBOX_CAP: usize = 1024;
 
+    let label = topology_label(&server.threads, AcceptMode::Fanout);
     let TpcServer {
         threads,
-        runners,
+        main_bridge,
+        async_pool,
         cpus,
         counters,
         ..
     } = server;
-    let threads = threads.into_setups();
-    with_stop_watcher(run, Arc::clone(&counters), deadline, || {
-        let (txs, threads): (Vec<_>, Vec<_>) = threads
-            .into_iter()
-            .map(|setup| {
-                let (tx, rx) = tokio::sync::mpsc::channel::<D::Connection>(WORKER_INBOX_CAP);
-                let retirement = setup.plan.as_ref().map(|plan| Arc::clone(&plan.retired));
-                (FanoutInbox { tx, retirement }, (setup, rx))
-            })
-            .unzip();
-        // The acceptor shares the threads' run, so whichever fails first is the run's cause.
-        let mut handles = spawn_worker_threads(
-            threads,
-            &cpus,
-            &runners,
-            run,
-            deadline,
-            &counters,
-            |tpc_thread, rx, stop, deadline| fanout_worker_loop::<D>(rx, tpc_thread, stop, deadline),
-        )?;
-        log_startup(hybrid_mode(AcceptMode::Fanout), &transport.listening(), banner);
+    let threads = threads.into_setups(main_bridge, async_pool);
+    let (txs, threads): (Vec<_>, Vec<_>) = threads
+        .into_iter()
+        .map(|setup| {
+            let (tx, rx) = tokio::sync::mpsc::channel::<D::Connection>(WORKER_INBOX_CAP);
+            let retirement = setup.plan.as_ref().map(|plan| Arc::clone(&plan.retired));
+            (FanoutInbox { tx, retirement }, (setup, rx))
+        })
+        .unzip();
+    // The acceptor shares the threads' run, so whichever fails first is the run's cause.
+    let mut handles = spawn_worker_threads(
+        spawner,
+        threads,
+        &cpus,
+        run,
+        deadline,
+        &counters,
+        |tpc_thread, rx, stop, deadline| fanout_worker_loop::<D>(rx, tpc_thread, stop, deadline),
+    )?;
+    announce(label, &transport.listening());
 
-        // The acceptor has its own thread and runtime so polling accept does not contend with any
-        // worker. It runs unpinned because macOS has no CPU pinning.
-        let (acceptor_counters, acceptor_deadline) = (Arc::clone(&counters), deadline.clone());
-        let spawned = mipyre_tpc::spawn_in_run("mipyre-acceptor", mipyre_subinterp::PYTHON_THREAD_STACK, run, move |own| {
+    // The acceptor has its own thread and runtime so polling accept does not contend with any
+    // worker. It runs unpinned because macOS has no CPU pinning.
+    let (acceptor_counters, acceptor_deadline) = (Arc::clone(&counters), deadline.clone());
+    let spawned = mipyre_tpc::spawn_in_run(
+        "mipyre-acceptor",
+        mipyre_subinterp::PYTHON_THREAD_STACK,
+        run,
+        move |own| {
             serve_on_this_thread(None, &acceptor_counters, own, &acceptor_deadline, || {
                 fanout_accept_loop(transport, txs, own.token())
             })
-        });
-        match spawned {
-            Ok(handle) => handles.push(handle),
-            // The refusal stopped the run.
-            Err(not_spawned) => {
-                let joined = join_run(handles, run, deadline, &counters);
-                return Err(stopped_error(Some(not_spawned.into()), left_running(&joined)));
-            }
+        },
+    );
+    match spawned {
+        Ok(handle) => handles.push(handle),
+        // The refusal stopped the run.
+        Err(not_spawned) => {
+            let joined = join_run(handles, run, deadline, &counters);
+            return Err(stopped_error(Some(not_spawned.into()), left_running(&joined)));
         }
-        settle(join_run(handles, run, deadline, &counters), run.cause())
-    })
+    }
+    settle(join_run(handles, run, deadline, &counters), run.cause())
 }
 
 /// The acceptor's end of one thread's inbox; the worker thread registers each connection with its
@@ -165,15 +172,16 @@ async fn fanout_worker_loop<D: TransportDriver>(
     shutdown: CancellationToken,
     deadline: ShutdownDeadline,
 ) -> Result<(), ServeError> {
-    let upgrades = Upgrades::of(&tpc_thread.site);
+    let ws_site = upgrade_site(&tpc_thread.site);
     let stop = LocalStop::follow(&shutdown);
     let stopped = stop.stopped();
     tokio::pin!(stopped);
     let (retiring, conn_stop) = connections_stop(&shutdown);
-    let worker = tpc_thread.slot.worker();
-    let thread = tpc_thread.slot.index().get();
-    let lane_host = crate::lane::host_tpc_thread(tpc_thread.site.process.as_ref(), &tpc_thread.site.rules, thread)
-        .map_err(ServeError::LaneHost)?;
+    let worker = tpc_thread.worker.as_ref();
+    let thread = tpc_thread.index.get();
+    let lane_host =
+        crate::runtime::process::host_tpc_thread(tpc_thread.site.process.as_ref(), &tpc_thread.site.rules, thread)
+            .map_err(ServeError::LaneHost)?;
     let tracker = LocalTasks::new();
     let mut accepting = true;
     loop {
@@ -192,7 +200,7 @@ async fn fanout_worker_loop<D: TransportDriver>(
                 Some(connection) => {
                     tracker.spawn_local(serve_accepted::<D, _, _>(
                         connection,
-                        upgrades.clone(),
+                        ws_site.clone(),
                         {
                             let tpc_thread = Rc::clone(&tpc_thread);
                             move |req, peer| handle_request_tpc_inline(req, Rc::clone(&tpc_thread), peer)

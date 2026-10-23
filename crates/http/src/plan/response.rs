@@ -4,18 +4,27 @@ use std::fmt::Display;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::{
-    HeaderMap, HeaderName, HeaderValue, ALLOW, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER, SERVER,
-};
+use http::header::{HeaderMap, HeaderName, HeaderValue, ALLOW, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER, SERVER};
 use http::{Response, StatusCode};
 
-use crate::plan::reject::RouteMiss;
+use crate::plan::header::MAX_HEADER_LINES;
+use crate::plan::reject::{RouteMiss, SiteMiss};
 
 pub const SERVER_HEADER: &str = concat!("Mipyre/", env!("CARGO_PKG_VERSION"));
 
 pub const JSON: HeaderValue = HeaderValue::from_static("application/json");
 pub const TEXT: HeaderValue = HeaderValue::from_static("text/plain; charset=utf-8");
 pub const OCTET_STREAM: HeaderValue = HeaderValue::from_static("application/octet-stream");
+/// Room for the lines the server puts on a handler's response besides the handler's own:
+/// `content-type`, `server`, `content-length`, `content-encoding`, `vary`, a stream's
+/// `cache-control` and `connection`, the request-id header and the CORS lines (five names).
+const SERVER_LINES: usize = 16;
+
+/// The most header lines a handler's response carries (`Response`, a stream, an `HTTPException`,
+/// a route's fast response), so that with the server's own lines the response's header map stays
+/// within [`MAX_HEADER_LINES`]; past it the handler gets an error, never a panic (b/927).
+pub const MAX_HANDLER_LINES: usize = MAX_HEADER_LINES - SERVER_LINES;
+
 /// The `Retry-After` of an overload 503, in seconds.
 const OVERLOAD_RETRY_AFTER_SECS: HeaderValue = HeaderValue::from_static("1");
 
@@ -59,22 +68,35 @@ pub struct HandlerResponse {
     content_type: HeaderValue,
     /// It never holds `content-type`, so it cannot disagree with `content_type`.
     headers: HeaderMap,
+    /// The handler refused the request as invalid (a `body=` model or `query=` string), with
+    /// this many errors: the server counts it in the run that served it.
+    validation_errors: Option<std::num::NonZeroU32>,
 }
 
 impl HandlerResponse {
     #[inline]
-    pub fn new(
-        status: StatusCode,
-        body: Bytes,
-        content_type: HeaderValue,
-        headers: HeaderLines,
-    ) -> Self {
+    pub fn new(status: StatusCode, body: Bytes, content_type: HeaderValue, headers: HeaderLines) -> Self {
         HandlerResponse {
             body,
             status,
             content_type,
             headers: headers.0,
+            validation_errors: None,
         }
+    }
+
+    /// Marks this answer as the refusal of a request that failed validation with `errors`
+    /// errors.
+    pub fn failed_validation(mut self, errors: std::num::NonZeroU32) -> Self {
+        self.validation_errors = Some(errors);
+        self
+    }
+
+    /// How many errors the request this answer refuses failed validation with, or `None` for an
+    /// answer that is no such refusal.
+    #[inline]
+    pub fn validation_errors(&self) -> Option<std::num::NonZeroU32> {
+        self.validation_errors
     }
 
     pub fn content_type(&self) -> &HeaderValue {
@@ -103,9 +125,7 @@ pub fn build_response(data: HandlerResponse) -> Response<Bytes> {
         headers.reserve(2);
     }
     headers.insert(CONTENT_TYPE, data.content_type);
-    headers
-        .entry(SERVER)
-        .or_insert(HeaderValue::from_static(SERVER_HEADER));
+    headers.entry(SERVER).or_insert(HeaderValue::from_static(SERVER_HEADER));
     let mut resp = Response::new(data.body);
     *resp.status_mut() = data.status;
     *resp.headers_mut() = headers;
@@ -115,16 +135,13 @@ pub fn build_response(data: HandlerResponse) -> Response<Bytes> {
 /// Returns a 500 carrying the request id, which the client can quote to an operator to find
 /// the real error in the log.
 pub fn error_response(msg: &str, request_id: &impl Display) -> Response<Bytes> {
-    json_error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        server_error_body(msg, request_id),
-    )
+    json_error(StatusCode::INTERNAL_SERVER_ERROR, server_error_body(msg, request_id))
 }
 
 /// Escapes `msg`, because it may carry client input.
 fn error_json_body(msg: &str) -> Vec<u8> {
     let mut body = Vec::with_capacity(ERROR_BODY_ROOM + msg.len());
-    body.extend_from_slice(b"{\"error\":\"");
+    body.extend_from_slice(b"{\"detail\":\"");
     escape_json_into(&mut body, msg);
     body.extend_from_slice(b"\"}");
     body
@@ -140,7 +157,7 @@ fn error_json_body(msg: &str) -> Vec<u8> {
 fn server_error_body(msg: &str, request_id: &impl Display) -> Vec<u8> {
     use std::fmt::Write as _;
     let mut body = Vec::with_capacity(ERROR_BODY_ROOM + msg.len());
-    body.extend_from_slice(b"{\"error\":\"");
+    body.extend_from_slice(b"{\"detail\":\"");
     escape_json_into(&mut body, msg);
     body.extend_from_slice(b"\",\"request_id\":\"");
     write!(JsonEscaper(&mut body), "{request_id}").expect("a Display impl does not fail on its own");
@@ -180,7 +197,14 @@ fn escape_json_into(out: &mut Vec<u8>, s: &str) {
         };
         out.extend_from_slice(&bytes[plain..i]);
         if short.is_empty() {
-            out.extend_from_slice(&[b'\\', b'u', b'0', b'0', HEX[usize::from(b >> 4)], HEX[usize::from(b & 0xf)]]);
+            out.extend_from_slice(&[
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                HEX[usize::from(b >> 4)],
+                HEX[usize::from(b & 0xf)],
+            ]);
         } else {
             out.extend_from_slice(short);
         }
@@ -192,12 +216,8 @@ fn escape_json_into(out: &mut Vec<u8>, s: &str) {
 /// Returns a 503 for a request no queue slot or permit was free for.
 #[inline]
 pub fn overloaded_response(msg: &str, request_id: &impl Display) -> Response<Bytes> {
-    let mut resp = json_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        server_error_body(msg, request_id),
-    );
-    resp.headers_mut()
-        .insert(RETRY_AFTER, OVERLOAD_RETRY_AFTER_SECS);
+    let mut resp = json_error(StatusCode::SERVICE_UNAVAILABLE, server_error_body(msg, request_id));
+    resp.headers_mut().insert(RETRY_AFTER, OVERLOAD_RETRY_AFTER_SECS);
     resp
 }
 
@@ -211,10 +231,7 @@ pub fn retry_after_secs(wait: Duration) -> u64 {
 /// Returns a 503 for a request whose workers come back after `wait`.
 #[inline]
 pub fn retry_later_response(msg: &str, request_id: &impl Display, wait: Duration) -> Response<Bytes> {
-    let mut resp = json_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        server_error_body(msg, request_id),
-    );
+    let mut resp = json_error(StatusCode::SERVICE_UNAVAILABLE, server_error_body(msg, request_id));
     resp.headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from(retry_after_secs(wait)));
     resp
@@ -223,10 +240,7 @@ pub fn retry_later_response(msg: &str, request_id: &impl Display, wait: Duration
 /// Returns a 503 for a request whose workers are gone because the server is shutting down.
 #[inline]
 pub fn unavailable_response(msg: &str, request_id: &impl Display) -> Response<Bytes> {
-    json_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        server_error_body(msg, request_id),
-    )
+    json_error(StatusCode::SERVICE_UNAVAILABLE, server_error_body(msg, request_id))
 }
 
 #[inline]
@@ -236,10 +250,7 @@ pub fn bad_request_response(msg: &str) -> Response<Bytes> {
 
 #[inline]
 pub fn request_timeout_response() -> Response<Bytes> {
-    json_error(
-        StatusCode::REQUEST_TIMEOUT,
-        error_json_body("request body timeout"),
-    )
+    json_error(StatusCode::REQUEST_TIMEOUT, error_json_body("request body timeout"))
 }
 
 fn json_error(status: StatusCode, body: impl Into<Bytes>) -> Response<Bytes> {
@@ -255,7 +266,7 @@ fn json_error(status: StatusCode, body: impl Into<Bytes>) -> Response<Bytes> {
 pub fn payload_too_large_response() -> Response<Bytes> {
     json_error(
         StatusCode::PAYLOAD_TOO_LARGE,
-        Bytes::from_static(b"{\"error\":\"payload too large\"}"),
+        Bytes::from_static(b"{\"detail\":\"payload too large\"}"),
     )
 }
 
@@ -283,18 +294,53 @@ pub fn reject_response(reject: RouteMiss) -> Response<Bytes> {
     }
 }
 
+/// The most bytes of a refused request's own text that its answer quotes.
+const QUOTED_MAX: usize = 256;
+
+/// Answers a request [`SiteMiss`] turns away: `421` for a host that is none of this server's
+/// names, `403` for a page from a site it does not trust. The body is `{"detail": …}`, the shape
+/// FastAPI answers its own refusals in; it quotes what the request sent,
+/// cut to [`QUOTED_MAX`] bytes, and names the setting that would let it through.
+pub fn site_miss_response(miss: SiteMiss<'_>) -> Response<Bytes> {
+    let (status, before, quoted, after): (_, &[u8], _, &[u8]) = match miss {
+        SiteMiss::UnknownHost(host) => (
+            StatusCode::MISDIRECTED_REQUEST,
+            b"this server does not answer to host \\\"",
+            host,
+            b"\\\"; list the name in allowed_hosts",
+        ),
+        SiteMiss::CrossSite(Some(origin)) => (
+            StatusCode::FORBIDDEN,
+            b"cross-site request from origin \\\"",
+            origin,
+            b"\\\" refused; list the origin in enable_cors(allow_origins=...)",
+        ),
+        SiteMiss::CrossSite(None) => (
+            StatusCode::FORBIDDEN,
+            b"",
+            &[][..],
+            b"cross-site request without an Origin refused; a page's request must carry an Origin listed in enable_cors(allow_origins=...)",
+        ),
+    };
+    let quoted = String::from_utf8_lossy(&quoted[..quoted.len().min(QUOTED_MAX)]);
+    let mut body = Vec::with_capacity(ERROR_BODY_ROOM + before.len() + 2 * quoted.len() + after.len());
+    body.extend_from_slice(b"{\"detail\":\"");
+    body.extend_from_slice(before);
+    escape_json_into(&mut body, &quoted);
+    body.extend_from_slice(after);
+    body.extend_from_slice(b"\"}");
+    json_error(status, body)
+}
+
 #[inline]
 fn not_found_response() -> Response<Bytes> {
-    json_error(
-        StatusCode::NOT_FOUND,
-        Bytes::from_static(b"{\"error\":\"not found\"}"),
-    )
+    json_error(StatusCode::NOT_FOUND, Bytes::from_static(b"{\"detail\":\"not found\"}"))
 }
 
 fn method_not_allowed_response(allow: HeaderValue) -> Response<Bytes> {
     let mut resp = json_error(
         StatusCode::METHOD_NOT_ALLOWED,
-        Bytes::from_static(b"{\"error\":\"method not allowed\"}"),
+        Bytes::from_static(b"{\"detail\":\"method not allowed\"}"),
     );
     resp.headers_mut().insert(ALLOW, allow);
     resp
@@ -309,9 +355,7 @@ pub fn head_headers(headers: &mut HeaderMap, status: StatusCode, body_len: Optio
         return;
     }
     if let Some(len) = body_len {
-        headers
-            .entry(CONTENT_LENGTH)
-            .or_insert_with(|| HeaderValue::from(len));
+        headers.entry(CONTENT_LENGTH).or_insert_with(|| HeaderValue::from(len));
     }
 }
 
@@ -320,6 +364,34 @@ mod tests {
     use super::*;
     fn body_bytes(resp: Response<Bytes>) -> Vec<u8> {
         resp.into_body().to_vec()
+    }
+
+    #[test]
+    fn a_site_miss_quotes_what_was_sent_cut_and_escaped_and_names_the_setting() {
+        let resp = site_miss_response(SiteMiss::UnknownHost(b"evil.example:8000"));
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(resp.headers()[CONTENT_TYPE], JSON);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(
+            body["detail"],
+            "this server does not answer to host \"evil.example:8000\"; list the name in allowed_hosts"
+        );
+        let resp = site_miss_response(SiteMiss::CrossSite(Some(b"https://e\"vil")));
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        let detail = body["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("\"https://e\"vil\"") && detail.contains("enable_cors(allow_origins=...)"),
+            "{detail}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(site_miss_response(SiteMiss::CrossSite(None)).body()).unwrap();
+        assert!(body["detail"].as_str().unwrap().contains("without an Origin"));
+        let long = [b'a'; 1000];
+        let body: serde_json::Value =
+            serde_json::from_slice(site_miss_response(SiteMiss::UnknownHost(&long)).body()).unwrap();
+        let quoted = body["detail"].as_str().unwrap().matches('a').count();
+        assert!((QUOTED_MAX..QUOTED_MAX + 10).contains(&quoted), "{quoted}");
     }
 
     #[test]
@@ -339,11 +411,8 @@ mod tests {
         let resp = not_found_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(resp.headers()["content-type"], "application/json");
-        assert!(resp.headers()["server"]
-            .to_str()
-            .unwrap()
-            .starts_with("Mipyre/"));
-        assert_eq!(body_bytes(resp), b"{\"error\":\"not found\"}");
+        assert!(resp.headers()["server"].to_str().unwrap().starts_with("Mipyre/"));
+        assert_eq!(body_bytes(resp), b"{\"detail\":\"not found\"}");
     }
 
     #[test]
@@ -353,13 +422,13 @@ mod tests {
         for msg in ["server overloaded", "", nasty.as_str()] {
             assert_eq!(
                 error_json_body(msg),
-                serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap(),
+                serde_json::to_vec(&serde_json::json!({ "detail": msg })).unwrap(),
                 "{msg:?}"
             );
             for id in [REQUEST_ID, nasty.as_str()] {
                 assert_eq!(
                     server_error_body(msg, &id),
-                    serde_json::to_vec(&serde_json::json!({ "error": msg, "request_id": id })).unwrap(),
+                    serde_json::to_vec(&serde_json::json!({ "detail": msg, "request_id": id })).unwrap(),
                     "{msg:?} {id:?}"
                 );
             }
@@ -387,7 +456,7 @@ mod tests {
         let resp = error_response("back\\slash\nnewline\ttab", &REQUEST_ID);
         let body = String::from_utf8(body_bytes(resp)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("must parse");
-        assert_eq!(parsed["error"], "back\\slash\nnewline\ttab");
+        assert_eq!(parsed["detail"], "back\\slash\nnewline\ttab");
     }
 
     #[test]
@@ -506,8 +575,7 @@ mod tests {
             }
         }
         assert_eq!(handed, ["t", "u", "v"]);
-        let want = [("x-a", "1"), ("x-a", "3"), ("x-b", "2")]
-            .map(|(n, v)| (n.to_string(), v.to_string()));
+        let want = [("x-a", "1"), ("x-a", "3"), ("x-b", "2")].map(|(n, v)| (n.to_string(), v.to_string()));
         assert_eq!(lines(headers.as_map()), want);
     }
 
@@ -515,14 +583,11 @@ mod tests {
     fn repeated_header_lines_stay_separate() {
         let mut headers = HeaderLines::new();
         let cookie = HeaderName::from_static("set-cookie");
-        assert!(headers.append(cookie.clone(), HeaderValue::from_static("a=1")).is_none());
+        assert!(headers
+            .append(cookie.clone(), HeaderValue::from_static("a=1"))
+            .is_none());
         assert!(headers.append(cookie, HeaderValue::from_static("b=2")).is_none());
-        let resp = build_response(HandlerResponse::new(
-            StatusCode::OK,
-            Bytes::new(),
-            TEXT,
-            headers,
-        ));
+        let resp = build_response(HandlerResponse::new(StatusCode::OK, Bytes::new(), TEXT, headers));
         let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
         assert_eq!(cookies, ["a=1", "b=2"]);
     }

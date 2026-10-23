@@ -87,7 +87,10 @@ mod tests {
     #[test]
     fn an_exact_size_over_the_limit_is_refused() {
         assert_eq!(BodySizeLimit::start(1024, 0, Some(1025)), Err(TooLarge));
-        assert_eq!(BodySizeLimit::start(1024, 0, Some(1024)).map(|l| l.expected()), Ok(Some(1024)));
+        assert_eq!(
+            BodySizeLimit::start(1024, 0, Some(1024)).map(|l| l.expected()),
+            Ok(Some(1024))
+        );
     }
 
     #[test]
@@ -117,7 +120,11 @@ mod tests {
         assert_eq!(limit.take(usize::MAX - 1, 2), Err(TooLarge));
         let unlimited = BodySizeLimit::start(usize::MAX, 0, None).unwrap();
         assert_eq!(unlimited.take(usize::MAX - 1, 0), Ok(usize::MAX - 1));
-        assert_eq!(unlimited.take(usize::MAX - 1, 2), Err(TooLarge), "past what usize counts");
+        assert_eq!(
+            unlimited.take(usize::MAX - 1, 2),
+            Err(TooLarge),
+            "past what usize counts"
+        );
     }
 
     #[test]

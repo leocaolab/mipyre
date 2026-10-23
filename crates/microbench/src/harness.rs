@@ -40,7 +40,9 @@ pub fn calls(default: u64) -> u64 {
 #[inline]
 pub fn run(cases: &[Case]) {
     if !allocations_counted() {
-        eprintln!("the bench's #[global_allocator] is not mipyre_microbench::AllocationCounter: no allocation is counted");
+        eprintln!(
+            "the bench's #[global_allocator] is not mipyre_microbench::AllocationCounter: no allocation is counted"
+        );
         std::process::exit(2);
     }
     let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--bench").collect();
@@ -66,7 +68,10 @@ pub fn run(cases: &[Case]) {
 /// case it is only part of: the gate counts one case per process, and a second case in the same
 /// process would be counted into the first one's calls.
 fn selected<'a>(cases: &'a [Case], name: Option<&str>) -> Vec<&'a Case> {
-    cases.iter().filter(|(case, _)| name.is_none_or(|name| name == *case)).collect()
+    cases
+        .iter()
+        .filter(|(case, _)| name.is_none_or(|name| name == *case))
+        .collect()
 }
 
 /// Whether an allocation reaches `ALLOCATIONS`, that is whether `AllocationCounter` is the global allocator.

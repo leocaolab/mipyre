@@ -25,7 +25,7 @@ def test_numpy_at_the_top_of_a_sub_interpreter_app_is_a_start_error_saying_what_
         def mean(req):
             return {"v": float(np.mean([1.0, 2.0]))}
         """))
-    env = dict(os.environ, MIPYRE_WORKERS="2")
+    env = dict(os.environ, MIPYRE_THREADS="2")
     r = subprocess.run([sys.executable, "-m", "mipyre", "run", f"{app}:app", "--port", "0"],
                        capture_output=True, text=True, timeout=120, env=env, cwd=tmp_path)
     out = r.stdout + r.stderr

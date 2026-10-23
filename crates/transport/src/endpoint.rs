@@ -18,7 +18,6 @@ use crate::tcp::listener::{BindOptions, BoundListeners, Listener, ListenerError,
 use crate::tcp::loops::PollTurn;
 use crate::tls;
 
-
 // One IO type lets the accept loop hand the protocol above a connection whichever listener it came on.
 pin_project! {
     #[project = ConnectionStreamProj]
@@ -29,11 +28,7 @@ pin_project! {
 }
 
 impl AsyncRead for ConnectionStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         match self.project() {
             ConnectionStreamProj::Plain { inner } => inner.poll_read(cx, buf),
             ConnectionStreamProj::Tls { inner } => inner.poll_read(cx, buf),
@@ -42,11 +37,7 @@ impl AsyncRead for ConnectionStream {
 }
 
 impl AsyncWrite for ConnectionStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         match self.project() {
             ConnectionStreamProj::Plain { inner } => inner.poll_write(cx, buf),
             ConnectionStreamProj::Tls { inner } => inner.poll_write(cx, buf),
@@ -83,7 +74,6 @@ impl AsyncWrite for ConnectionStream {
         }
     }
 }
-
 
 #[derive(Clone)]
 pub struct ListenerSpec {
@@ -313,12 +303,7 @@ impl EndpointSource {
             self.turn.served(index, self.slots.len());
             let (tcp_acceptor, tls) = &self.slots[index];
             match accepted {
-                Ok(tcp) => {
-                    return Ok(EndpointConnection {
-                        tcp,
-                        tls: tls.clone(),
-                    })
-                }
+                Ok(tcp) => return Ok(EndpointConnection { tcp, tls: tls.clone() }),
                 Err(e) => tcp_acceptor.recover(e).await.map_err(AcceptError::ListenerBroken)?,
             }
         }
@@ -350,7 +335,9 @@ impl TransportDriver for Endpoints {
     }
 
     #[inline]
-    fn accept(source: &mut EndpointSource) -> impl std::future::Future<Output = Result<EndpointConnection, AcceptError>> + Send {
+    fn accept(
+        source: &mut EndpointSource,
+    ) -> impl std::future::Future<Output = Result<EndpointConnection, AcceptError>> + Send {
         source.accept()
     }
 
@@ -431,7 +418,6 @@ mod tests {
         assert!(twice_zero.is_ok(), "each port 0 is its own kernel pick");
     }
 
-
     #[test]
     fn a_bound_endpoint_names_its_scheme_and_the_port_the_kernel_picked() {
         let specs = ListenerSet::one(ListenerSpec {
@@ -462,10 +448,7 @@ mod tests {
         };
         assert!(stream.is_write_vectored());
 
-        let bufs = [
-            std::io::IoSlice::new(b"head "),
-            std::io::IoSlice::new(b"body"),
-        ];
+        let bufs = [std::io::IoSlice::new(b"head "), std::io::IoSlice::new(b"body")];
         let written = stream.write_vectored(&bufs).await.unwrap();
         assert_eq!(written, 9);
         let mut got = [0u8; 9];

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use mipyre_subinterp::isolation;
+use mipyre_subinterp::isolation::{self, LibCopy};
 use pyo3::prelude::*;
 
 /// Lists the libraries for which the line advises `runtime='process'`; isolation itself treats
@@ -42,12 +42,13 @@ fn advice(libs: &[&str]) -> String {
     }
 }
 
-/// Records a library a worker isolated, once per process, and announces it at once if the startup
-/// line is already out.
+/// Records a library a worker isolated and why, once per process, and announces it at once if
+/// the startup line is already out.
 #[pyfunction]
-pub(crate) fn _note_isolated(lib: String, bytes: u64) {
-    if isolation::note_isolated(lib.clone(), bytes) {
-        announce(&late_line(&lib, bytes));
+pub(crate) fn _note_isolated(lib: String, bytes: u64, why: String) {
+    let copy = LibCopy { bytes, why };
+    if isolation::note_isolated(lib.clone(), copy.clone()) {
+        announce(&late_line(&lib, &copy));
     }
 }
 
@@ -58,22 +59,25 @@ pub(crate) fn report_startup(workers: usize) {
     }
 }
 
-fn late_line(lib: &str, bytes: u64) -> String {
+fn late_line(lib: &str, copy: &LibCopy) -> String {
     format!(
         "runtime='isolated' (a compatibility option, not recommended): each worker now \
-         loads its own copy of {lib} ({}), with CPython's multi-interpreter check off{}",
-        mib(bytes),
+         loads its own copy of {lib} ({}: {}), with CPython's multi-interpreter check off{}",
+        mib(copy.bytes),
+        copy.why,
         advice(&[lib]),
     )
 }
 
-fn startup_line(libs: &BTreeMap<String, u64>, workers: usize) -> String {
+fn startup_line(libs: &BTreeMap<String, LibCopy>, workers: usize) -> String {
     let names: Vec<&str> = libs.keys().map(String::as_str).collect();
     let listed = if libs.is_empty() {
-        "none yet (a library is isolated when a worker first fails to import it)".to_string()
+        "none yet (a worker copies a library when it first imports it and one of its extension \
+         files can't load in a sub-interpreter)"
+            .to_string()
     } else {
         libs.iter()
-            .map(|(name, bytes)| format!("{name} ({})", mib(*bytes)))
+            .map(|(name, copy)| format!("{name} ({}: {})", mib(copy.bytes), copy.why))
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -97,16 +101,27 @@ mod tests {
 
     #[test]
     fn the_startup_line_lists_each_copy_and_points_a_process_library_at_runtime_process() {
-        let libs = BTreeMap::from([("numpy".to_string(), 3 << 20), ("orjson".to_string(), 1 << 19)]);
+        let copy = |bytes, why: &str| LibCopy {
+            bytes,
+            why: why.to_string(),
+        };
+        let libs = BTreeMap::from([
+            ("numpy".to_string(), copy(3 << 20, "a.so is single-phase")),
+            (
+                "orjson".to_string(),
+                copy(1 << 19, "b.so does not declare per-interpreter GIL support"),
+            ),
+        ]);
         let line = startup_line(&libs, 4);
         assert!(
-            line.contains("numpy (3.0 MiB), orjson (0.5 MiB), in each of 4"),
+            line.contains(
+                "numpy (3.0 MiB: a.so is single-phase), orjson (0.5 MiB: b.so does not declare \
+                 per-interpreter GIL support), in each of 4"
+            ),
             "{line}"
         );
         assert!(
-            line.ends_with(
-                "; for numpy, runtime='process' is the better fit (worker processes, no copies)"
-            ),
+            line.ends_with("; for numpy, runtime='process' is the better fit (worker processes, no copies)"),
             "{line}"
         );
     }
@@ -120,8 +135,17 @@ mod tests {
 
     #[test]
     fn a_late_line_names_its_library() {
-        let line = late_line("orjson", 1 << 20);
-        assert!(line.contains("its own copy of orjson (1.0 MiB)"), "{line}");
+        let line = late_line(
+            "orjson",
+            &LibCopy {
+                bytes: 1 << 20,
+                why: "b.so is single-phase".to_string(),
+            },
+        );
+        assert!(
+            line.contains("its own copy of orjson (1.0 MiB: b.so is single-phase)"),
+            "{line}"
+        );
         assert!(line.ends_with("check off"), "{line}");
     }
 }

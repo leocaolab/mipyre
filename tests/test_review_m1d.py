@@ -253,16 +253,15 @@ def static_tree():
 
 @pytest.fixture(scope="module")
 def static_server(static_tree):
-    from mipyre.testing import TestClient
+    from mipyre.testing import TestClient, TestServer
 
     _, root = static_tree
     # The app's module reads its root from here, in main and in every worker.
     os.environ["MIPYRE_TEST_M1D_STATIC_ROOT"] = root
     from tests.apps.m1d_static import app
 
-    c = TestClient(app, transport="tcp")
-    yield c
-    c.close()
+    with TestServer(app) as server, TestClient(server) as c:
+        yield c
     del os.environ["MIPYRE_TEST_M1D_STATIC_ROOT"]
 
 
@@ -314,7 +313,7 @@ def test_static_prefix_must_start_with_slash(static_tree):
 _BRIDGE = """
 import logging
 from mipyre.engine import flush_logs, init_logger
-from mipyre._log_bridge import install_root_handler
+from mipyre._log.bridge import install_root_handler
 from mipyre.engine import _python_log_level, emit_python_log
 """
 
@@ -359,18 +358,22 @@ except ValueError as e:
     assert "ValueError:" in r.stdout and "yaml" in r.stdout, (r.stdout, r.stderr)
 
 
-def test_logging_second_init_reconfigures_instead_of_silently_keeping_the_first():
-    """cced8c2 printed 'already set' and kept filtering at the first level."""
-    r = _run_script(_BRIDGE + """
+def test_logging_second_init_with_another_config_is_refused_and_names_both():
+    """cced8c2 printed 'already set' and kept filtering at the first level. One process has one
+    log (b/335 D14): a second, different configuration is an error naming both, not a silent
+    keep or a silent switch."""
+    r = _run_script("""
+from mipyre.engine import init_logger
 init_logger("ERROR", False, "text")
-init_logger("INFO", False, "json")
-install_root_handler(emit_python_log, _python_log_level())
-logging.getLogger("m1d").info("after-reinit")
-flush_logs()  # every line logged above is on stderr now (b/441 L6)
+try:
+    init_logger("INFO", False, "json")
+except RuntimeError as e:
+    print("RuntimeError:", e)
 """)
     assert r.returncode == 0, r.stderr
-    line = next(ln for ln in r.stderr.splitlines() if "after-reinit" in ln)
-    assert line.startswith("{"), line  # the json format took effect too
+    assert "RuntimeError:" in r.stdout, (r.stdout, r.stderr)
+    assert "level error, access log off, format text" in r.stdout, r.stdout
+    assert "level info, access log off, format json" in r.stdout, r.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -381,10 +384,9 @@ flush_logs()  # every line logged above is on stderr now (b/441 L6)
 def test_metrics_is_named_and_reading_does_not_reset_peaks():
     """cced8c2 returned an anonymous 9-tuple and zeroed the peaks on every read."""
     r = _run_script("""
-import os
-os.environ["MIPYRE_METRICS"] = "1"
 from mipyre import Mipyre, get_gil_metrics, reset_peaks
-from mipyre.testing import TestClient
+from mipyre.engine import ServerFlags
+from mipyre.testing import TestClient, TestServer
 
 app = Mipyre(runtime="main")
 
@@ -394,13 +396,13 @@ def heavy(req):
 
 # Main interpreter: this measures the main GIL, and workers would re-run this unguarded
 # script (TestClient included).
-c = TestClient(app)
+c = TestClient(app, config=ServerFlags(metrics=True))
 assert c.get("/heavy").status_code == 200
 first = get_gil_metrics()
 second = get_gil_metrics()
 assert first.gil_hold_peak_us > 0, first
 assert second.gil_hold_peak_us == first.gil_hold_peak_us, (first, second)
-assert second.total_requests >= 1, second
+assert c.server.metrics().total_requests == 1, c.server.metrics()
 reset_peaks()
 third = get_gil_metrics()
 assert third.gil_hold_peak_us == 0 and third.gil_wait_peak_us == 0, third

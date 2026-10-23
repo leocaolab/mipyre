@@ -9,12 +9,12 @@ use tokio_util::sync::CancellationToken;
 
 use mipyre_cpu::CoreId;
 use mipyre_tpc::{
-    CoreSlot, Leftover, LocalTasks, OsSpawner, ShutdownDeadline, Spawner, StopCause, StopWatcher,
-    ThreadError, ThreadFailure, ThreadHandle, ThreadHooks, ThreadJoinError, ThreadResults, ThreadStop,
+    CoreSlot, Leftover, LocalTasks, ShutdownDeadline, Spawner, StopCause, ThreadError, ThreadFailure, ThreadHandle,
+    ThreadHooks, ThreadResults, ThreadStop,
 };
 
+use super::conn::{ThreadWorker, TpcThread};
 use super::startup::{report_placement, with_cores};
-use super::conn::{OffThreadRunners, ThreadWorker, TpcThread, WorkerSlot};
 use super::{ServeError, TpcServer, TpcThreadSetup};
 use crate::runtime::{start_here, ServerRunStop, ServerStop, StartGate, StartHandle, SubInterpreterWorker, SyncRunner};
 use crate::serve::{drain_timeout, report_drain_timeout, teardown_timeout};
@@ -22,48 +22,6 @@ use crate::telemetry::RunCounters;
 
 /// One TPC thread's part in the server's stop.
 pub(super) type TpcThreadStop = ThreadStop<ServerStop>;
-
-/// Runs `run` while a thread stops the server on SIGINT or SIGTERM, and ends that thread by the
-/// stop's `deadline` however `run` returns; a watcher that did not end cleanly is logged and
-/// counted in `counters`.
-pub(super) fn with_stop_watcher(
-    stop: &ServerRunStop,
-    counters: Arc<RunCounters>,
-    deadline: &ShutdownDeadline,
-    run: impl FnOnce() -> Result<(), ServeError>,
-) -> Result<(), ServeError> {
-    let watcher = spawn_stop_watcher(stop)?;
-    let ran = run();
-    if let Err(failure) = watcher.finish(deadline.fix(Instant::now())) {
-        report_stop_watcher_failure(&failure, &counters);
-    }
-    ran
-}
-
-/// The name of the thread that stops a TPC server on SIGINT or SIGTERM.
-const STOP_WATCHER: &str = "mipyre-stop";
-
-/// Starts the thread that stops a TPC server on SIGINT or SIGTERM.
-fn spawn_stop_watcher(stop: &ServerRunStop) -> Result<StopWatcher<ServerStop>, ServeError> {
-    Ok(mipyre_tpc::spawn_stop_watcher(
-        STOP_WATCHER,
-        stop,
-        crate::serve::StopSignals::install,
-        crate::serve::until_stopped,
-    )?)
-}
-
-/// Logs and counts a stop watcher that panicked or was left running at its join deadline; the run's
-/// stop was cancelled either way.
-fn report_stop_watcher_failure(failure: &ThreadJoinError, counters: &RunCounters) {
-    counters.stop_watcher_failure();
-    tracing::error!(
-        target: "mipyre::server",
-        thread = STOP_WATCHER,
-        error = %failure,
-        "the stop watcher thread did not end cleanly"
-    );
-}
 
 pub(super) type ServeThread = ThreadHandle<(), ServeError>;
 
@@ -121,7 +79,10 @@ pub(super) fn join_run(
 /// run, if `cause` (the run's) says one did. The other failures were logged at the join; when no thread's failure stopped
 /// the run they are named in [`ServeError::FailedWhileStopping`]. A thread that left something
 /// running is abandoned: what it runs may hold Python, so the process must not finalize.
-pub(super) fn settle(joined: ThreadResults<(), ServeError>, cause: Option<StopCause<ServerStop>>) -> Result<(), ServeError> {
+pub(super) fn settle(
+    joined: ThreadResults<(), ServeError>,
+    cause: Option<StopCause<ServerStop>>,
+) -> Result<(), ServeError> {
     if joined.is_clean() {
         return Ok(());
     }
@@ -189,12 +150,12 @@ impl ThreadHooks for TpcThreadHooks {
     /// Spins on this thread's process lanes before detaching its interpreter, since an answer
     /// arriving then keeps the thread from parking.
     fn on_park(&self) {
-        crate::lane::enter_idle();
+        crate::runtime::process::enter_idle();
         mipyre_subinterp::detach_for_idle();
     }
 
     fn on_unpark(&self) {
-        crate::lane::resume_from_idle();
+        crate::runtime::process::resume_from_idle();
     }
 
     /// Runs once the thread's tasks and the `Rc`s they hold are gone; the caller ends the worker
@@ -248,12 +209,14 @@ fn report_blocking_calls_left(thread: &str, calls: usize, counters: &RunCounters
 
 /// Serves `serve` on `server`'s threads, thread `i` handed `payloads[i]`, and runs `meanwhile` on
 /// this thread once every thread has started; then waits until the run stops and joins the threads
-/// by its stop `deadline`. The bench serves through this too, so its threads are the server's.
+/// by its stop `deadline`. `spawner` starts the threads. The bench serves through this too, so its
+/// threads are the server's.
 pub(crate) fn serve_on_workers<T, F, Fut, R>(
     server: TpcServer,
     payloads: Vec<T>,
     run: &ServerRunStop,
     deadline: &ShutdownDeadline,
+    spawner: &mut impl Spawner,
     serve: F,
     meanwhile: impl FnOnce() -> R,
 ) -> Result<R, ServeError>
@@ -264,22 +227,23 @@ where
 {
     let TpcServer {
         threads,
-        runners,
+        main_bridge,
+        async_pool,
         cpus,
         counters,
         ..
     } = server;
-    let threads = threads.into_setups();
+    let threads = threads.into_setups(main_bridge, async_pool);
     // Both are sized by `Topology::accept_loops`; a zip would drop the extra ones unserved.
     assert_eq!(payloads.len(), threads.len(), "one payload per TPC thread");
     let threads = threads.into_iter().zip(payloads).collect();
-    let handles = spawn_worker_threads(threads, &cpus, &runners, run, deadline, &counters, serve)?;
+    let handles = spawn_worker_threads(spawner, threads, &cpus, run, deadline, &counters, serve)?;
     let meant = meanwhile();
     settle(join_run(handles, run, deadline, &counters), run.cause())?;
     Ok(meant)
 }
 
-/// Starts one thread per entry of `threads`, thread `i` pinned to `cpus[i]` or unpinned past its
+/// Starts one thread per entry of `threads` with `spawner`, thread `i` pinned to `cpus[i]` or unpinned past its
 /// end and handed its payload. The threads create their workers one at a time in thread order and
 /// serve only once every thread has started ([`StartGate`]). A failed start aborts the rest: the
 /// workers already created end on their own threads and the error is returned. A failed spawn
@@ -289,9 +253,9 @@ where
 ///
 /// Panics unless `payloads` has one entry per thread.
 pub(super) fn spawn_worker_threads<T, F, Fut>(
+    spawner: &mut impl Spawner,
     threads: Vec<(TpcThreadSetup, T)>,
     cpus: &[CoreId],
-    runners: &OffThreadRunners,
     run: &ServerRunStop,
     deadline: &ShutdownDeadline,
     counters: &RunCounters,
@@ -315,15 +279,15 @@ where
         enlisted.push(((setup, gate.enlist()), core));
         payloads.push(payload);
     }
-    let (runners, thread_deadline) = (runners.clone(), deadline.clone());
+    let thread_deadline = deadline.clone();
     let handles = start_tpc_threads(
-        &mut OsSpawner,
+        spawner,
         enlisted,
         run,
         deadline,
         counters,
         move |slot, (setup, start_handle), stop| {
-            run_tpc_thread(slot, setup, start_handle, &runners, stop, &thread_deadline, &serve)
+            run_tpc_thread(slot, setup, start_handle, stop, &thread_deadline, &serve)
         },
         // The spawned threads wait for their turn, not for the run's stop, so they must be told to end
         // before they are joined; no turn was handed out yet, so none of them made a worker.
@@ -351,7 +315,6 @@ fn run_tpc_thread<T, F, Fut>(
     slot: CoreSlot,
     setup: TpcThreadSetup,
     start_handle: StartHandle<T>,
-    runners: &OffThreadRunners,
     stop: &TpcThreadStop,
     deadline: &ShutdownDeadline,
     serve: &F,
@@ -360,29 +323,29 @@ where
     F: Fn(Rc<TpcThread>, T, CancellationToken, ShutdownDeadline) -> Fut,
     Fut: Future<Output = Result<(), ServeError>> + 'static,
 {
-    let TpcThreadSetup { index, site, plan } = setup;
-    let started = start_here(
-        start_handle,
+    let TpcThreadSetup {
         index,
-        || match plan {
-            Some(plan) => {
-                let created = SubInterpreterWorker::<SyncRunner>::create(index, &plan.recipe.spec())?;
-                Ok(Some(ThreadWorker::new(created, plan.life, plan.retired)))
-            }
-            None => Ok(None),
-        },
-    );
+        site,
+        plan,
+        main_bridge,
+        async_pool,
+    } = setup;
+    let started = start_here(start_handle, index, || match plan {
+        Some(plan) => {
+            let created = SubInterpreterWorker::<SyncRunner>::create(index, &plan.recipe.spec())?;
+            Ok(Some(ThreadWorker::new(created, plan.life, plan.retired)))
+        }
+        None => Ok(None),
+    });
     let Some((worker, payload)) = started else {
         return Ok(());
     };
-    let worker_slot = match worker {
-        Some(worker) => WorkerSlot::Filled(Box::new(worker)),
-        None => WorkerSlot::Empty(index),
-    };
     let tpc_thread = Rc::new(TpcThread {
-        slot: worker_slot,
+        index,
+        worker,
         site,
-        runners: runners.clone(),
+        main_bridge,
+        async_pool,
     });
     let counters = Arc::clone(&tpc_thread.site.counters);
     let served = serve_on_this_thread(slot.core(), &counters, stop, deadline, || {
@@ -429,6 +392,7 @@ where
 #[cfg(test)]
 mod stop_tests {
     use super::*;
+    use mipyre_tpc::OsSpawner;
     use std::sync::mpsc;
     use std::sync::Mutex;
 
@@ -528,30 +492,14 @@ mod stop_tests {
             interp.end_on_own_thread();
             Ok((served, attached_while_served.get(), detached_after))
         });
-        let [(served, attached_while_served, detached_after)] = <[_; 1]>::try_from(joined.ended)
-            .unwrap_or_else(|_| panic!("the test thread failed"));
+        let [(served, attached_while_served, detached_after)] =
+            <[_; 1]>::try_from(joined.ended).unwrap_or_else(|_| panic!("the test thread failed"));
         assert!(
             matches!(&served, Err(ThreadError::Panicked(payload)) if payload == "injected panic in serve"),
             "the panic is the serve's failure"
         );
         assert!(attached_while_served, "the interpreter was attached while served");
         assert!(detached_after, "no thread state is current after the panic");
-    }
-
-    /// Checks that a stop watcher that did not end cleanly is logged with its own error and counted.
-    #[test]
-    fn a_stop_watcher_that_did_not_end_cleanly_is_said_and_counted() {
-        let counters = RunCounters::new(false);
-        let failure = ThreadJoinError::StillRunning;
-        let log = crate::exchange::captured_log(|| report_stop_watcher_failure(&failure, &counters));
-        assert_eq!(counters.read().stop_watcher_failures, 1);
-        let line = log
-            .lines()
-            .find(|l| l.contains("stop watcher thread did not end cleanly"))
-            .unwrap_or_else(|| panic!("the failure was not said:\n{log}"));
-        assert!(line.contains("\"thread\":\"mipyre-stop\""), "{line}");
-        assert!(line.contains("still running at the join deadline"), "{line}");
-        assert!(line.contains("\"level\":\"ERROR\""), "{line}");
     }
 
     /// Checks that a blocking call that never returns is given up on at the limit, logged and
@@ -573,14 +521,20 @@ mod stop_tests {
                 let held = Arc::clone(&held);
                 let (entered, in_pool) = mpsc::channel::<()>();
                 // A zero grace leaves no time to the teardown, so the shutdown gives up at once.
-                serve_on_this_thread(None, &thread_counters, own, &ShutdownDeadline::new(Duration::ZERO), || async move {
-                    drop(tokio::task::spawn_blocking(move || {
-                        entered.send(()).expect("the serve waits for this");
-                        held.lock().unwrap().recv().expect("released by the test");
-                    }));
-                    in_pool.recv().expect("the call started");
-                    Ok(())
-                })
+                serve_on_this_thread(
+                    None,
+                    &thread_counters,
+                    own,
+                    &ShutdownDeadline::new(Duration::ZERO),
+                    || async move {
+                        drop(tokio::task::spawn_blocking(move || {
+                            entered.send(()).expect("the serve waits for this");
+                            held.lock().unwrap().recv().expect("released by the test");
+                        }));
+                        in_pool.recv().expect("the call started");
+                        Ok(())
+                    },
+                )
             },
         )
         .ok()
@@ -605,9 +559,7 @@ mod stop_tests {
     #[test]
     fn blocking_calls_left_running_are_said_with_the_thread_and_how_many() {
         let counters = RunCounters::new(false);
-        let log = crate::exchange::captured_log(|| {
-            report_blocking_calls_left("mipyre-tpc-3", 2, &counters)
-        });
+        let log = crate::exchange::captured_log(|| report_blocking_calls_left("mipyre-tpc-3", 2, &counters));
         assert_eq!(counters.read().blocking_calls_left, 2);
         let line = log
             .lines()
@@ -673,10 +625,7 @@ mod stop_tests {
                 ));
                 assert_eq!(abandoned, vec!["mipyre-tpc-1".to_string()]);
             }
-            other => panic!(
-                "expected both, got {:?}",
-                other.err().map(|e| e.to_string())
-            ),
+            other => panic!("expected both, got {:?}", other.err().map(|e| e.to_string())),
         }
     }
 
@@ -703,10 +652,12 @@ mod stop_tests {
         };
         match settle(joined, None) {
             Err(ServeError::FailedWhileStopping { threads }) => assert_eq!(threads, ["mipyre-tpc-0"]),
-            other => panic!("expected the threads named, got {:?}", other.err().map(|e| e.to_string())),
+            other => panic!(
+                "expected the threads named, got {:?}",
+                other.err().map(|e| e.to_string())
+            ),
         }
     }
-
 
     /// A drain that gives up is counted with the connections it closes; a drain that completes
     /// counts nothing.
@@ -726,10 +677,7 @@ mod stop_tests {
             drain_connections(tracker, &deadline(), &run).await;
         });
         let timed_out = run.read();
-        assert_eq!(
-            (timed_out.drain_timeouts, timed_out.drain_closed_connections),
-            (1, 2)
-        );
+        assert_eq!((timed_out.drain_timeouts, timed_out.drain_closed_connections), (1, 2));
         let run = RunCounters::new(false);
         tokio::task::LocalSet::new().block_on(&rt, async {
             let tracker = LocalTasks::new();
@@ -769,7 +717,11 @@ mod stop_tests {
 
     #[test]
     fn a_drain_gives_up_at_the_timeout_and_counts_the_connections_still_open() {
-        let lasting = [Duration::from_millis(4_999), Duration::from_millis(5_001), Duration::MAX];
+        let lasting = [
+            Duration::from_millis(4_999),
+            Duration::from_millis(5_001),
+            Duration::MAX,
+        ];
         assert_eq!(drained_for_5s(&lasting), (1, 2));
     }
 }

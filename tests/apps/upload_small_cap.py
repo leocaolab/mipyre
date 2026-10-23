@@ -2,7 +2,7 @@
 tests/test_upload_streaming.py. max_body_size is process-wide, so the suite imports
 this module only inside its test."""
 
-from mipyre import Mipyre
+from mipyre import BodyStream, Mipyre
 
 app = Mipyre()
 app.max_body_size = 1024
@@ -13,7 +13,7 @@ def root(req):
     return "ok"
 
 
-@app.post("/up", runtime="main", stream=True)
+@app.post("/up", runtime="main", body=BodyStream)
 def up(req):
     try:
         total = 0

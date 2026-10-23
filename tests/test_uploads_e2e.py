@@ -9,7 +9,7 @@ import os
 from mipyre import Mipyre
 from mipyre.uploads import parse_multipart
 
-app = Mipyre()
+app = Mipyre(runtime=os.environ["MIPYRE_TEST_MODE"])
 
 @app.get("/__ping")
 def ping(req):

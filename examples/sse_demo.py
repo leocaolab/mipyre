@@ -1,20 +1,30 @@
-"""SSE streaming demo — simulates AI Agent token-by-token output."""
-import time
+"""Server-Sent Events: a stream of tokens, the way a chat model's answer arrives.
+
+Run:
+  python examples/sse_demo.py
+
+Open http://127.0.0.1:8000/ in a browser, or:
+  curl -N http://127.0.0.1:8000/stream
+"""
+
 import threading
-from mipyre import Mipyre, Stream
+import time
+
+from mipyre import Mipyre, Response, Stream
 
 app = Mipyre()
 
+TOKENS = "Hello! I am Mipyre, a Python web framework whose HTTP server is written in Rust.".split()
+TOKEN_DELAY_SECONDS = 0.05
 
-@app.get("/")
-def index(req):
-    return """<html><body>
+PAGE = """<!DOCTYPE html>
+<html><body>
 <h1>Mipyre SSE Demo</h1>
 <pre id="output"></pre>
 <script>
 const source = new EventSource('/stream');
 const output = document.getElementById('output');
-source.onmessage = (e) => { output.textContent += e.data; };
+source.onmessage = (e) => { output.textContent += e.data + ' '; };
 source.addEventListener('done', () => {
     output.textContent += '\\n[DONE]';
     source.close();
@@ -23,21 +33,26 @@ source.addEventListener('done', () => {
 </body></html>"""
 
 
+@app.get("/")
+def index(req):
+    return Response(PAGE, content_type="text/html; charset=utf-8")
+
+
+def send_tokens(stream: Stream) -> None:
+    try:
+        for n, token in enumerate(TOKENS):
+            stream.send_event(token, id=str(n))
+            time.sleep(TOKEN_DELAY_SECONDS)
+        stream.send_event("[DONE]", event="done")
+    except ConnectionError:
+        return  # the client went away; nobody is left to read the rest
+    stream.close()
+
+
 @app.get("/stream", runtime="main")
 def stream_tokens(req):
-    """Simulate LLM streaming: emit tokens one by one."""
     stream = Stream()
-
-    def generate():
-        tokens = "Hello! I am Mipyre, a high-performance Python web framework powered by Rust. ".split()
-        for token in tokens:
-            stream.send_event(token + " ")
-            time.sleep(0.05)  # Simulate LLM token generation delay
-        stream.send_event("[DONE]", event="done")
-        stream.close()
-
-    # Start generation in background thread
-    threading.Thread(target=generate, daemon=True).start()
+    threading.Thread(target=send_tokens, args=(stream,), daemon=True).start()
     return stream
 
 
@@ -47,4 +62,4 @@ def fast(req):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8000)
+    app.run()

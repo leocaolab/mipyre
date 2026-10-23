@@ -19,7 +19,7 @@ import sys
 import threading
 
 from mipyre import Mipyre, Stream
-from mipyre.testing import TestClient
+from mipyre.testing import TestClient, TestServer
 
 from tests._helpers import bound_port, kill_session, lines_with, read_file
 
@@ -60,9 +60,9 @@ def test_a_streamed_response_whose_client_hangs_up_tells_its_producer_and_stops(
         threading.Thread(target=produce, name="feed-producer", daemon=True).start()
         return stream
 
-    with TestClient(app, transport="tcp") as client:
+    with TestServer(app) as server, TestClient(server) as client:
         sock = socket.create_connection(("127.0.0.1", client.port), timeout=EVENT_TIMEOUT_S)
-        sock.sendall(b"GET /feed HTTP/1.1\r\nHost: t\r\n\r\n")
+        sock.sendall(b"GET /feed HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
         _read_until(sock, b"chunk 1\n")
         sock.close()
 
@@ -77,7 +77,6 @@ def test_a_streamed_response_whose_client_hangs_up_tells_its_producer_and_stops(
 
 IN_FLIGHT_SCRIPT = r'''
 import asyncio, os
-os.environ["MIPYRE_WORKER"] = ""
 from mipyre import Mipyre
 
 GATE = int(os.environ["MIPYRE_TEST_GATE_PORT"])
@@ -97,7 +96,7 @@ async def held(req):
     return {"answered": "after the client left"}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, workers=1)
+    app.run(host="127.0.0.1", port=0, subinterpreters=1)
 '''
 
 
@@ -121,7 +120,7 @@ def test_a_request_whose_client_hangs_up_mid_handler_is_dropped_at_debug_and_the
     try:
         port = bound_port(read_file(log_path), proc)
         client = socket.create_connection(("127.0.0.1", port), timeout=EVENT_TIMEOUT_S)
-        client.sendall(b"GET /held HTTP/1.1\r\nHost: t\r\n\r\n")
+        client.sendall(b"GET /held HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
         handler, _ = gate.accept()  # the handler is running
         # The client hangs up its side. The server ends the connection while the handler
         # still runs (the client reads EOF: the connection, and the caller waiting on the
@@ -137,7 +136,7 @@ def test_a_request_whose_client_hangs_up_mid_handler_is_dropped_at_debug_and_the
 
         # The same (only) worker answers the next request.
         probe = socket.create_connection(("127.0.0.1", port), timeout=EVENT_TIMEOUT_S)
-        probe.sendall(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        probe.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
         assert _read_until(probe, b"\r\n").startswith(b"HTTP/1.1 200"), read_file(log_path)()
         probe.close()
 

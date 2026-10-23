@@ -18,7 +18,7 @@ from tests._helpers import bound_port, poll_until, read_file
 
 SERVER_SCRIPT = """
 import os
-from mipyre.engine import MipyreApp
+from mipyre.engine import MipyreApp, RuntimeChoice
 
 app = MipyreApp()
 ENTERED, GATE = os.environ["ISOLATION_ENTERED"], os.environ["ISOLATION_GATE"]
@@ -34,8 +34,8 @@ def fast(req):
     open(GATE, "x").close()
     return "fast"
 
-app.get("/slow", slow)
-app.get("/fast", fast)
+app.route("GET", "/slow", slow, RuntimeChoice.Worker)
+app.route("GET", "/fast", fast, RuntimeChoice.Worker)
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=0)

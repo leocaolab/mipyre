@@ -5,10 +5,9 @@ Each test fails on cced8c2 and passes after the fix it names.
 
 from __future__ import annotations
 
-import ast
 import json
-import logging
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -18,11 +17,12 @@ from pathlib import Path
 import pytest
 
 from mipyre import Mipyre
-from mipyre.cookies import set_cookie
+from mipyre.cookies import Cookie
 from mipyre.engine import Response
 from mipyre.mcp import MCPServer
 from mipyre.testing import TestClient
 from mipyre.uploads import parse_multipart
+from tests._helpers import isolation_adapter_ns
 
 
 # ---------------------------------------------------------------------------
@@ -77,32 +77,36 @@ def test_multipart_truncated_body_raises():
 # ---------------------------------------------------------------------------
 
 
-def test_set_cookie_expires_takes_datetime_and_formats_http_date():
+def _set_cookie_line(**attributes) -> str:
+    line = Response(body="ok", headers={"set-cookie": Cookie("sid", "v", **attributes)}).headers["set-cookie"]
+    assert isinstance(line, str), line
+    return line
+
+
+def test_cookie_expires_takes_datetime_and_formats_http_date():
     when = datetime(2026, 10, 21, 7, 28, 0, tzinfo=timezone.utc)
-    header = set_cookie(Response(body="ok"), "sid", "v", expires=when).headers["set-cookie"]
+    header = _set_cookie_line(expires=when)
     assert "Expires=Wed, 21 Oct 2026 07:28:00 GMT" in header
 
 
-def test_set_cookie_expires_converts_to_gmt():
+def test_cookie_expires_converts_to_gmt():
     when = datetime(2026, 10, 21, 9, 28, 0, tzinfo=timezone(timedelta(hours=2)))
-    header = set_cookie(Response(body="ok"), "sid", "v", expires=when).headers["set-cookie"]
+    header = _set_cookie_line(expires=when)
     assert "Expires=Wed, 21 Oct 2026 07:28:00 GMT" in header
 
 
-def test_set_cookie_expires_rejects_naive_datetime():
+def test_cookie_expires_rejects_naive_datetime():
     with pytest.raises(ValueError, match="timezone"):
-        set_cookie(Response(body="ok"), "sid", "v", expires=datetime(2026, 10, 21))
+        Cookie("sid", "v", expires=datetime(2026, 10, 21))
 
 
-def test_set_cookie_samesite_is_an_enum():
+def test_cookie_samesite_is_an_enum():
     from mipyre.cookies import SameSite
 
-    header = set_cookie(
-        Response(body="ok"), "sid", "v", samesite=SameSite.STRICT
-    ).headers["set-cookie"]
+    header = _set_cookie_line(samesite=SameSite.STRICT)
     assert "SameSite=Strict" in header
     with pytest.raises(ValueError, match="Sideways"):
-        set_cookie(Response(body="ok"), "sid", "v", samesite="Sideways")
+        Cookie("sid", "v", samesite="Sideways")
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +121,10 @@ class _FakeProc:
     def poll(self):
         return self.returncode
 
-    def terminate(self):
-        pass
+    def send_signal(self, signum):
+        # A server stops on a stop signal and exits 0.
+        if self.returncode is None:
+            self.returncode = 0
 
     def kill(self):
         pass
@@ -164,7 +170,9 @@ def test_dev_reloader_reexecs_the_real_command_and_watches_the_app_dir(
 
     def _watch(path, **kw):
         watched.append(path)
-        raise KeyboardInterrupt
+        # Ctrl-C to the reloader: it ends the watch with no change.
+        os.kill(os.getpid(), signal.SIGINT)
+        return iter(())
 
     monkeypatch.setattr(watchfiles, "watch", _watch)
 
@@ -208,11 +216,11 @@ def test_reload_under_python_c_names_what_main_is_instead_of_guessing(tmp_path):
     # watch (b/375). The error is typed and says what `__main__` and `sys.argv[0]` are.
     script = (
         "from mipyre import Mipyre\n"
-        "from mipyre.app import NoReloadScript\n"
+        "from mipyre import DeclarationError, MissingAppFileError\n"
         "try:\n"
         "    Mipyre().run(reload=True)\n"
-        "except NoReloadScript as err:\n"
-        "    print('RAISED', type(err).__name__, isinstance(err, RuntimeError))\n"
+        "except MissingAppFileError as err:\n"
+        "    print('RAISED', type(err).__name__, isinstance(err, DeclarationError))\n"
         "    print(err)\n"
     )
     env = {k: v for k, v in os.environ.items() if k not in ("_MIPYRE_RELOAD_CHILD", "MIPYRE_RELOAD")}
@@ -220,7 +228,7 @@ def test_reload_under_python_c_names_what_main_is_instead_of_guessing(tmp_path):
                        capture_output=True, text=True, timeout=120, check=False)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
-    assert "RAISED NoReloadScript True" in r.stdout, out
+    assert "RAISED MissingAppFileError True" in r.stdout, out
     assert "reload watches the directory of the app's source file" in r.stdout, out
     assert "__main__ is <module '__main__'" in r.stdout, out
     assert "which has no __file__" in r.stdout, out
@@ -233,21 +241,14 @@ def test_reload_under_python_c_names_what_main_is_instead_of_guessing(tmp_path):
 # M1a-5 / M1a-6: isolation clone dir
 # ---------------------------------------------------------------------------
 
-_BOOTSTRAP = Path(__file__).resolve().parent.parent / "python" / "mipyre" / "_subinterp" / "isolation.py"
+def _bootstrap_ns(isolate_dir=None):
+    """The isolation adapter's namespace, as a worker's bootstrap holds it (`isolation_adapter_ns`), with
+    `isolate_dir` the server's (by default the engine's: `mipyre` in this user's cache dir)."""
+    if isolate_dir is None:
+        from mipyre.engine import _user_cache_dir
 
-
-def _bootstrap_ns():
-    """The top-level functions and classes of the isolation adapter (it runs inside
-    workers and can't be imported as a module), in a fresh namespace."""
-    from mipyre import _clone
-
-    # The engine runs mipyre/_clone.py in the same namespace first.
-    ns = {name: value for name, value in vars(_clone).items() if not name.startswith("__")}
-    ns.update({"_os": os, "_logging": logging, "_ISO": {"worker_dir": None, "path_inserted": False, "isolated": set()}})
-    for node in ast.parse(_BOOTSTRAP.read_text()).body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-            exec(compile(ast.Module([node], []), str(_BOOTSTRAP), "exec"), ns)  # noqa: S102 — the adapter runs only inside a worker, so the test loads its parts by hand
-    return ns
+        isolate_dir = os.path.join(_user_cache_dir(), "mipyre")
+    return isolation_adapter_ns(isolate_dir)
 
 
 _unix_only = pytest.mark.skipif(
@@ -274,12 +275,11 @@ def test_isolate_clone_failure_raises_with_cp_stderr(tmp_path):
 
 @_unix_only
 def test_isolate_default_root_is_private_to_this_user(tmp_path, monkeypatch):
-    monkeypatch.delenv("MIPYRE_ISOLATE_DIR", raising=False)
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     ns = _bootstrap_ns()
 
-    worker_dir = ns["_iso_worker_dir"](seed_libs=())
+    worker_dir = ns["_iso_worker_dir"]()
 
     assert worker_dir.startswith(str(tmp_path) + os.sep)
     root = Path(ns["_iso_root"]())
@@ -294,25 +294,28 @@ def test_an_isolate_dir_others_can_write_names_the_override(tmp_path, monkeypatc
     shared = tmp_path / "shared"
     shared.mkdir()
     shared.chmod(0o777)
-    monkeypatch.setenv("MIPYRE_ISOLATE_DIR", str(shared))
-    ns = _bootstrap_ns()
+    ns = _bootstrap_ns(shared)
 
     with pytest.raises(ns["_IsoError"], match="writable by other users.*set MIPYRE_ISOLATE_DIR to a directory you own") as raised:
-        ns["_iso_worker_dir"](seed_libs=())
+        ns["_iso_worker_dir"]()
     assert isinstance(raised.value.__cause__, ns["PrivateCopyError"])
 
 
 @pytest.mark.parametrize(
-    ("platform", "xdg", "want"),
+    ("xdg", "want_linux", "want_darwin"),
     [
-        ("linux", "XDG", "XDG/mipyre"),
-        ("linux", None, "HOME/.cache/mipyre"),
-        ("linux", "relative/cache", "HOME/.cache/mipyre"),
-        ("darwin", "XDG", "HOME/Library/Caches/mipyre"),
+        ("XDG", "XDG", "HOME/Library/Caches"),
+        (None, "HOME/.cache", "HOME/Library/Caches"),
+        ("relative/cache", "HOME/.cache", "HOME/Library/Caches"),
     ],
 )
-def test_isolate_default_root_is_the_user_cache_dir(tmp_path, monkeypatch, platform, xdg, want):
-    monkeypatch.delenv("MIPYRE_ISOLATE_DIR", raising=False)
+def test_the_user_cache_dir_follows_the_os_convention(tmp_path, monkeypatch, xdg, want_linux, want_darwin):
+    # The default isolate dir is `mipyre` in this directory; the engine reads it (b/659), on the
+    # platform it was built for. Its rule on the other platform is unit-tested beside it
+    # (`boot::config::tests::the_cache_directory_follows_the_os_convention`), as is the flag
+    # overriding the default (`the_isolate_dir_is_the_flag_else_a_directory_in_the_cache_directory`).
+    from mipyre.engine import _user_cache_dir
+
     monkeypatch.setenv("HOME", str(tmp_path / "HOME"))
     if xdg is None:
         monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
@@ -320,16 +323,9 @@ def test_isolate_default_root_is_the_user_cache_dir(tmp_path, monkeypatch, platf
         monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "XDG"))
     else:
         monkeypatch.setenv("XDG_CACHE_HOME", xdg)
-    monkeypatch.setattr(sys, "platform", platform)
 
-    assert _bootstrap_ns()["_iso_root"]() == str(tmp_path / want)
-
-
-def test_isolate_dir_env_overrides_the_cache_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIPYRE_ISOLATE_DIR", str(tmp_path / "mine"))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "XDG"))
-
-    assert _bootstrap_ns()["_iso_root"]() == str(tmp_path / "mine")
+    want = want_darwin if sys.platform == "darwin" else want_linux
+    assert _user_cache_dir() == tmp_path / want
 
 
 @_unix_only
@@ -337,14 +333,13 @@ def test_isolate_root_writable_by_others_is_refused(tmp_path, monkeypatch):
     shared = tmp_path / "shared"
     shared.mkdir()
     shared.chmod(0o777)
-    monkeypatch.setenv("MIPYRE_ISOLATE_DIR", str(shared))
-    ns = _bootstrap_ns()
+    ns = _bootstrap_ns(shared)
     with pytest.raises(Exception, match="writable"):
-        ns["_iso_worker_dir"](seed_libs=())
+        ns["_iso_worker_dir"]()
 
 
 # ---------------------------------------------------------------------------
-# M1a-7: model= composes with path-param injection
+# M1a-7: body= composes with path-param injection
 # ---------------------------------------------------------------------------
 
 
@@ -378,13 +373,13 @@ def test_model_route_signature_checked_at_registration():
         return oops
 
     with pytest.raises(ValueError, match="oops"):
-        app.post("/items/{item_id}", bad, model=Item)
+        app.post("/items/{item_id}", bad, body=Item)
 
 
 def test_model_must_be_a_pydantic_model():
     app = Mipyre()
     with pytest.raises(TypeError, match="dict"):
-        app.post("/items", lambda req, body: body, model=dict)
+        app.post("/items", lambda req, body: body, body=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +389,7 @@ def test_model_must_be_a_pydantic_model():
 
 @pytest.fixture
 def mcp():
-    server = MCPServer()
+    server = MCPServer(Mipyre())
 
     @server.tool(description="Add two numbers")
     def add(a: int, b: int) -> int:
@@ -413,7 +408,7 @@ def mcp():
 
 def _rpc(server, method, params):
     body = json.dumps({"jsonrpc": "2.0", "id": 7, "method": method, "params": params})
-    return json.loads(server.handle_request(body))
+    return server.answer(json.loads(body))
 
 
 def test_mcp_invalid_params_is_32602_with_the_validation_message(mcp):
@@ -441,9 +436,12 @@ def test_mcp_unexpected_exception_is_32603_internal_error(mcp):
     assert resp["error"] == {"code": -32603, "message": "Internal error"}
 
 
-def test_mcp_undecodable_body_is_a_parse_error(mcp):
-    resp = json.loads(mcp.handle_request(b"\xff\xfe{"))
-    assert resp["error"]["code"] == -32700
+def test_mcp_undecodable_body_is_a_parse_error():
+    app = Mipyre(runtime="main")
+    MCPServer(app).tool(lambda: "pong", name="ping")
+    with TestClient(app) as c:
+        r = c.post("/mcp", body=b"\xff\xfe{", headers={"Content-Type": "application/json"})
+    assert r.json()["error"]["code"] == -32700
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +450,7 @@ def test_mcp_undecodable_body_is_a_parse_error(mcp):
 
 
 def test_mcp_schema_with_unresolvable_hint_fails_at_registration():
-    server = MCPServer()
+    server = MCPServer(Mipyre())
 
     def tool(x) -> str:
         return x

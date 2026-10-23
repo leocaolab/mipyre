@@ -7,8 +7,8 @@ use hyper::Response;
 
 use crate::exchange::{ErrorRecord, HandlerError, UnansweredError};
 use crate::telemetry::RunCounters;
-use mipyre_http::plan::response;
 use mipyre_http::io::body::BodyReadError;
+use mipyre_http::plan::response;
 
 pub(crate) const GENERIC_500: &str = "Internal Server Error";
 
@@ -22,9 +22,7 @@ impl ErrorRecord {
             HandlerError::Refused(refusal) => {
                 counters.count_refused();
                 match refusal {
-                    UnansweredError::Overloaded(_) => {
-                        response::overloaded_response("server overloaded", &request_id)
-                    }
+                    UnansweredError::Overloaded(_) => response::overloaded_response("server overloaded", &request_id),
                     UnansweredError::WorkersGone(_) => {
                         response::unavailable_response("server shutting down", &request_id)
                     }
@@ -37,37 +35,31 @@ impl ErrorRecord {
                         response::unavailable_response("server lanes unavailable", &request_id)
                     }
                     // The lane comes back once its wait is over, so the client is told when.
-                    UnansweredError::LaneCrashLooping { retry_in, .. } => response::retry_later_response(
-                        "server lane restarting",
-                        &request_id,
-                        retry_in,
-                    ),
+                    UnansweredError::LaneCrashLooping { retry_in, .. } => {
+                        response::retry_later_response("server lane restarting", &request_id, retry_in)
+                    }
                     UnansweredError::WorkerRetired(_) => {
                         response::unavailable_response("server worker retired", &request_id)
                     }
-                    UnansweredError::TimedOut(_) | UnansweredError::Overran { .. } | UnansweredError::Interrupted { .. } => {
-                        response::gateway_timeout_response(&request_id)
-                    }
-                    UnansweredError::WorkerLost(_) | UnansweredError::NoWorkers(_) | UnansweredError::NotOnWorker(_) => {
-                        response::error_response(GENERIC_500, &request_id)
-                    }
+                    UnansweredError::TimedOut(_)
+                    | UnansweredError::Overran { .. }
+                    | UnansweredError::Interrupted { .. } => response::gateway_timeout_response(&request_id),
+                    UnansweredError::WorkerLost(_)
+                    | UnansweredError::NoWorkers(_)
+                    | UnansweredError::NotOnWorker(_) => response::error_response(GENERIC_500, &request_id),
                     UnansweredError::WorkerDied { .. }
+                    | UnansweredError::WorkerDiedBeforeTaking { .. }
                     | UnansweredError::PeerCorrupted { .. }
-                    | UnansweredError::LaneLost { .. } => {
-                        response::bad_gateway_response(&request_id)
-                    }
+                    | UnansweredError::LaneLost { .. } => response::bad_gateway_response(&request_id),
                     UnansweredError::LaneTimedOut { .. } => response::gateway_timeout_response(&request_id),
                 }
             }
-            HandlerError::BodyRejected(BodyReadError::TooLarge) => {
-                response::payload_too_large_response()
-            }
-            HandlerError::BodyRejected(BodyReadError::TimedOut(_)) => {
-                response::request_timeout_response()
-            }
+            HandlerError::BodyRejected(BodyReadError::TooLarge) => response::payload_too_large_response(),
+            HandlerError::BodyRejected(BodyReadError::TimedOut(_)) => response::request_timeout_response(),
             HandlerError::BodyRejected(reject @ BodyReadError::ConnectionLost(_)) => {
                 response::bad_request_response(&reject.to_string())
             }
+            HandlerError::Http { answer, .. } => response::build_response(*answer),
             HandlerError::Raised { .. }
             | HandlerError::ContextNotExited { .. }
             | HandlerError::ContextLost { .. }
@@ -76,9 +68,7 @@ impl ErrorRecord {
             | HandlerError::ThreadNotSpawned(_)
             | HandlerError::LaneWorkerFailed(_)
             | HandlerError::LaneAnswerMalformed(_)
-            | HandlerError::ForeignEventLoop { .. } => {
-                response::error_response(GENERIC_500, &request_id)
-            }
+            | HandlerError::ForeignEventLoop { .. } => response::error_response(GENERIC_500, &request_id),
         };
         resp.map(Full::new)
     }
@@ -93,9 +83,7 @@ mod tests {
 
     fn body(resp: Response<Full<Bytes>>) -> serde_json::Value {
         use http_body_util::BodyExt;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let bytes = rt.block_on(resp.into_body().collect()).unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
     }
@@ -117,9 +105,7 @@ mod tests {
                 GENERIC_500,
             ),
             (
-                refuse(UnansweredError::Overloaded(Capacity::WorkQueue(
-                    WorkerGroup::Subinterp,
-                ))),
+                refuse(UnansweredError::Overloaded(Capacity::WorkQueue(WorkerGroup::Subinterp))),
                 503,
                 "server overloaded",
             ),
@@ -136,7 +122,11 @@ mod tests {
                 503,
                 "server lanes unavailable",
             ),
-            (refuse(UnansweredError::TimedOut(std::time::Duration::from_secs(30))), 504, "request timeout"),
+            (
+                refuse(UnansweredError::TimedOut(std::time::Duration::from_secs(30))),
+                504,
+                "request timeout",
+            ),
             (
                 refuse(UnansweredError::Overran {
                     handler: "slow".into(),
@@ -161,13 +151,13 @@ mod tests {
             ),
         ];
         for (err, status, text) in cases {
-            let resp = captured_log_value(|| err.log(&label(&id)).into_response(&crate::telemetry::RunCounters::new(false)));
+            let resp = captured_log_value(|| {
+                err.log(&label(&id))
+                    .into_response(&crate::telemetry::RunCounters::new(false))
+            });
             assert_eq!(resp.status().as_u16(), status);
             let body = body(resp);
-            assert_eq!(
-                body,
-                serde_json::json!({"error": text, "request_id": id.to_string()})
-            );
+            assert_eq!(body, serde_json::json!({"detail": text, "request_id": id.to_string()}));
         }
     }
 
@@ -177,14 +167,17 @@ mod tests {
     fn process_lane_failures_answer_502_and_504() {
         use crate::exchange::WorkerExit;
         let id = RequestId::mint();
-        let exit = WorkerExit::Signaled { signal: 9, name: "Killed".to_owned() };
+        let exit = WorkerExit::Signaled {
+            signal: 9,
+            name: "Killed".to_owned(),
+        };
         let ran = std::time::Duration::from_millis(7);
         let cases = [
             (
                 UnansweredError::WorkerDied {
                     pid: 4242,
                     lane: LaneIndex(1),
-                    ran,
+                    ran: Some(ran),
                     exit: exit.clone(),
                 },
                 502,
@@ -193,6 +186,14 @@ mod tests {
                 UnansweredError::LaneLost {
                     lane: LaneIndex(1),
                     cause: "respawn failed".into(),
+                },
+                502,
+            ),
+            (
+                UnansweredError::WorkerDiedBeforeTaking {
+                    pid: 4242,
+                    lane: LaneIndex(1),
+                    exit: exit.clone(),
                 },
                 502,
             ),
@@ -208,7 +209,11 @@ mod tests {
             ),
         ];
         for (refusal, status) in cases {
-            let resp = captured_log_value(|| refuse(refusal).log(&label(&id)).into_response(&crate::telemetry::RunCounters::new(false)));
+            let resp = captured_log_value(|| {
+                refuse(refusal)
+                    .log(&label(&id))
+                    .into_response(&crate::telemetry::RunCounters::new(false))
+            });
             assert_eq!(resp.status().as_u16(), status);
             assert!(!body(resp).to_string().contains("4242"));
         }
@@ -225,7 +230,11 @@ mod tests {
             exit: crate::exchange::WorkerExit::Exited(3),
             retry_in: std::time::Duration::from_millis(1200),
         };
-        let resp = captured_log_value(|| refuse(refusal).log(&label(&id)).into_response(&crate::telemetry::RunCounters::new(false)));
+        let resp = captured_log_value(|| {
+            refuse(refusal)
+                .log(&label(&id))
+                .into_response(&crate::telemetry::RunCounters::new(false))
+        });
         assert_eq!(resp.status().as_u16(), 503);
         assert_eq!(resp.headers()["retry-after"], "2");
         let body = body(resp).to_string();
@@ -241,19 +250,52 @@ mod tests {
                 .into_response(&crate::telemetry::RunCounters::new(false))
         });
         assert_eq!(resp.status().as_u16(), 413);
-        assert_eq!(
-            body(resp),
-            serde_json::json!({"error": "payload too large"})
-        );
+        assert_eq!(body(resp), serde_json::json!({"detail": "payload too large"}));
         let resp = captured_log_value(|| {
             HandlerError::BodyRejected(BodyReadError::TimedOut(std::time::Duration::from_secs(30)))
                 .log(&label(&id))
                 .into_response(&crate::telemetry::RunCounters::new(false))
         });
         assert_eq!(resp.status().as_u16(), 408);
-        assert_eq!(
-            body(resp),
-            serde_json::json!({"error": "request body timeout"})
+        assert_eq!(body(resp), serde_json::json!({"detail": "request body timeout"}));
+    }
+
+    #[test]
+    fn an_http_exception_is_its_own_status_headers_and_body_logged_at_debug() {
+        use mipyre_http::plan::response::{HandlerResponse, HeaderLines, JSON};
+        let id = RequestId::mint();
+        let mut lines = HeaderLines::new();
+        assert!(lines
+            .append(
+                hyper::header::WWW_AUTHENTICATE,
+                hyper::header::HeaderValue::from_static("Bearer")
+            )
+            .is_none());
+        let err = HandlerError::Http {
+            stage: crate::exchange::RequestStage::BeforeHook,
+            answer: Box::new(HandlerResponse::new(
+                hyper::StatusCode::UNAUTHORIZED,
+                Bytes::from_static(b"{\"detail\":\"login required\"}"),
+                JSON,
+                lines,
+            )),
+        };
+        let counters = RunCounters::new(true);
+        let mut resp = None;
+        let log = crate::exchange::captured_log_from(tracing::Level::DEBUG, || {
+            resp = Some(err.log(&label(&id)).into_response(&counters));
+        });
+        let resp = resp.unwrap();
+        assert_eq!(resp.status().as_u16(), 401);
+        assert_eq!(resp.headers()["www-authenticate"], "Bearer");
+        assert_eq!(resp.headers()["content-type"], "application/json");
+        assert_eq!(body(resp), serde_json::json!({"detail": "login required"}));
+        assert_eq!(counters.read().refused, 0);
+        let lines: Vec<_> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(
+            lines[0].contains("\"level\":\"DEBUG\"") && !lines[0].contains("traceback"),
+            "{log}"
         );
     }
 
@@ -296,7 +338,12 @@ mod tests {
             UnansweredError::WorkerDied {
                 pid: 1,
                 lane: LaneIndex(0),
-                ran: std::time::Duration::from_secs(1),
+                ran: Some(std::time::Duration::from_secs(1)),
+                exit: crate::exchange::lane_failure::WorkerExit::Exited(1),
+            },
+            UnansweredError::WorkerDiedBeforeTaking {
+                pid: 1,
+                lane: LaneIndex(0),
                 exit: crate::exchange::lane_failure::WorkerExit::Exited(1),
             },
             UnansweredError::LaneTimedOut {
@@ -313,11 +360,13 @@ mod tests {
             UnansweredError::PeerCorrupted {
                 pid: 1,
                 lane: LaneIndex(0),
-                fault: mipyre_shm::plan::ring::PeerCounterError::AnswersPastSent {
-                    read: mipyre_shm::plan::ring::Seq::new(0),
-                    sent: mipyre_shm::plan::ring::Seq::new(1),
-                    published: mipyre_shm::plan::ring::Seq::new(2),
-                },
+                fault: mipyre_shm::channel::PeerFault::Counter(
+                    mipyre_shm::plan::ring::PeerCounterError::AnswersPastSent {
+                        read: mipyre_shm::plan::ring::Seq::new(0),
+                        sent: mipyre_shm::plan::ring::Seq::new(1),
+                        published: mipyre_shm::plan::ring::Seq::new(2),
+                    },
+                ),
             },
             UnansweredError::LaneCrashLooping {
                 lane: LaneIndex(0),
@@ -330,9 +379,7 @@ mod tests {
             assert_eq!(answered(refuse(refusal)), 1);
         }
         for err in [
-            HandlerError::Panicked {
-                payload: "boom".into(),
-            },
+            HandlerError::Panicked { payload: "boom".into() },
             HandlerError::BodyRejected(BodyReadError::TooLarge),
         ] {
             assert_eq!(answered(err), 0);
@@ -353,7 +400,7 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 500);
         assert_eq!(
             body(resp),
-            serde_json::json!({"error": GENERIC_500, "request_id": id.to_string()})
+            serde_json::json!({"detail": GENERIC_500, "request_id": id.to_string()})
         );
     }
 

@@ -4,14 +4,16 @@ imports nothing a sub-interpreter can't load (pydantic lives in fullstack.valida
 import json
 
 from mipyre import Mipyre, Response
-from mipyre.cookies import delete_cookie, get_cookie
+from mipyre.cookies import Cookie, get_cookie
 from mipyre.uploads import parse_multipart
 
 from fullstack.auth import require_auth
 
 app = Mipyre(routers=["fullstack.validated:router"])
-app.enable_cors()
+app.enable_cors(allow_origins="*")
 app.enable_access_log()
+
+MAX_PER_PAGE = 100
 
 
 # ---------------------------------------------------------------------------
@@ -40,8 +42,11 @@ def logout(req):
     token = get_cookie(req, "session_token")
     if token:
         app.state.delete(f"session:{token}")
-    resp = Response(body=json.dumps({"status": "logged out"}), content_type="application/json")
-    return delete_cookie(resp, "session_token")
+    return Response(
+        body=json.dumps({"status": "logged out"}),
+        content_type="application/json",
+        headers={"set-cookie": Cookie.expired("session_token", httponly=True)},
+    )
 
 
 @app.post("/auth/avatar")
@@ -80,9 +85,13 @@ def list_items(req):
     items_json = app.state.get("items_db")
     items = json.loads(items_json) if items_json else []
 
-    # Pagination
-    page = int(req.query_params.get("page", "1"))
-    per_page = int(req.query_params.get("per_page", "10"))
+    try:
+        page = int(req.query_params.get("page", "1"))
+        per_page = int(req.query_params.get("per_page", "10"))
+    except ValueError:
+        return Response({"error": "page and per_page must be integers"}, status_code=400)
+    if page < 1 or not 1 <= per_page <= MAX_PER_PAGE:
+        return Response({"error": f"page must be >= 1 and per_page in 1..{MAX_PER_PAGE}"}, status_code=400)
     start = (page - 1) * per_page
     end = start + per_page
 
@@ -95,24 +104,24 @@ def list_items(req):
 
 
 @app.get("/items/{item_id}")
-def get_item(req):
-    item_id = int(req.params["item_id"])
+def get_item(req, item_id):
     items = json.loads(app.state.get("items_db") or "[]")
     for item in items:
-        if item["id"] == item_id:
+        if str(item["id"]) == item_id:
             return item
     return Response(body=json.dumps({"error": "not found"}), status_code=404,
                        content_type="application/json")
 
 
 @app.delete("/items/{item_id}")
-def delete_item(req):
+def delete_item(req, item_id):
     auth = require_auth(req, app.state)
     if isinstance(auth, Response):
         return auth
 
-    item_id = int(req.params["item_id"])
     items = json.loads(app.state.get("items_db") or "[]")
-    items = [i for i in items if i["id"] != item_id]
-    app.state["items_db"] = json.dumps(items)
-    return {"status": "deleted", "id": item_id}
+    kept = [i for i in items if str(i["id"]) != item_id]
+    if len(kept) == len(items):
+        return Response({"error": "not found"}, status_code=404)
+    app.state["items_db"] = json.dumps(kept)
+    return {"status": "deleted", "id": int(item_id)}

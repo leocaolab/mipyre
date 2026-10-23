@@ -18,8 +18,16 @@ fn one_line_per_period_then_the_held_count() {
     assert_eq!(throttle.admit(at(0)), Some(0), "the first line goes out");
     assert_eq!(throttle.admit(at(1)), None);
     assert_eq!(throttle.admit(just_before(60)), None, "the period is not over");
-    assert_eq!(throttle.admit(at(60)), Some(2), "the period is over: both held lines counted");
-    assert_eq!(throttle.admit(just_before(120)), None, "a new period from the last line");
+    assert_eq!(
+        throttle.admit(at(60)),
+        Some(2),
+        "the period is over: both held lines counted"
+    );
+    assert_eq!(
+        throttle.admit(just_before(120)),
+        None,
+        "a new period from the last line"
+    );
     assert_eq!(throttle.admit(at(120)), Some(1), "and only the lines held since");
 }
 
@@ -57,7 +65,9 @@ fn racing_threads_let_one_line_out_per_period_and_lose_no_held_line() {
                 })
             })
             .collect();
-        runs.into_iter().flat_map(|run| run.join().expect("a counting thread does not panic")).collect()
+        runs.into_iter()
+            .flat_map(|run| run.join().expect("a counting thread does not panic"))
+            .collect()
     });
 
     let mut times: Vec<u64> = admitted.iter().map(|(now, _)| *now).collect();
@@ -66,16 +76,20 @@ fn racing_threads_let_one_line_out_per_period_and_lose_no_held_line() {
         assert!(pair[1] - pair[0] >= 1_000_000, "two lines within one period: {pair:?}");
     }
     let reported: u64 = admitted.iter().map(|(_, held)| held).sum();
-    let residual = throttle.admit(Duration::MAX).expect("no line is open at the end of time");
+    let residual = throttle
+        .admit(Duration::MAX)
+        .expect("no line is open at the end of time");
     assert_eq!(admitted.len() as u64 + reported + residual, THREADS * CALLS);
 }
-
 
 /// Throttles one key-less line as a plain value, as a reference for the atomic throttle.
 fn throttled(times: &[u64], period_ns: u64) -> Vec<Option<u64>> {
     let mut state = ThrottleState::new();
     let period = ThrottlePeriod::new(Duration::from_nanos(period_ns));
-    times.iter().map(|at| state.admit(Duration::from_nanos(*at), period)).collect()
+    times
+        .iter()
+        .map(|at| state.admit(Duration::from_nanos(*at), period))
+        .collect()
 }
 
 proptest! {
