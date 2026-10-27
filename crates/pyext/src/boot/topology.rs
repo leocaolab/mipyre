@@ -99,7 +99,10 @@ impl Topology {
                     accept_loops,
                 },
                 InterpreterMode::Subinterp => Topology::Pool {
-                    workers: sizing.subinterpreters.as_ref().map_or(cpus.logical(), |g| *g.value()),
+                    workers: sizing
+                        .subinterpreters
+                        .as_ref()
+                        .map_or(cpus.logical().max(POOL_DEFAULT_MIN), |g| *g.value()),
                     io_threads,
                     accept_loops,
                 },
@@ -228,6 +231,10 @@ impl std::fmt::Display for Topology {
         })
     }
 }
+
+/// The fewest sub-interpreters the pool defaults to: `def` and `async def` handlers each need one
+/// of their own, and a one-CPU host must still start an app that has both.
+const POOL_DEFAULT_MIN: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
 
 /// Counts the async-engine workers for a TPC server's `async def` routes: one
 /// per TPC thread, or half as many (at least one) when `def` routes share the cores.
@@ -491,6 +498,24 @@ mod tests {
             let t = resolve(InterpreterMode::Gil, &off, &[("threads", threads)]).unwrap();
             assert_eq!(t.accept_loops(), n(loops), "threads={threads}");
         }
+    }
+
+    #[test]
+    fn the_pool_defaults_to_two_sub_interpreters_on_one_cpu_but_takes_one_when_given() {
+        let off = [("MIPYRE_TPC", "0")];
+        let one = Cpus::new(n(1), n(1));
+        let pool_workers = |code: &[(&str, &str)]| match Topology::resolve(
+            InterpreterMode::Subinterp,
+            &recipe(&off, code, EntryPoint::Script),
+            one,
+        )
+        .unwrap()
+        {
+            Topology::Pool { workers, .. } => workers,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(pool_workers(&[]), n(2));
+        assert_eq!(pool_workers(&[("subinterpreters", "1")]), n(1));
     }
 
     #[test]

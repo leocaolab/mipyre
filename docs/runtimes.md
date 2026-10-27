@@ -83,7 +83,7 @@ The server imports the app module and every router. A sub-interpreter imports th
 
 ## `subinterp`
 
-One own-GIL sub-interpreter per server thread, and one thread per physical core (per performance core on Apple silicon), set with `threads=` / `--threads` / `MIPYRE_THREADS`. A request is accepted, parsed and answered on the same core. With `MIPYRE_TPC=0` the server is instead a multi-thread one: I/O threads (`threads=`) hand requests to a pool of sub-interpreters (`subinterpreters=` / `--subinterpreters` / `MIPYRE_SUBINTERPRETERS`, by default one per logical CPU).
+One own-GIL sub-interpreter per server thread, and one thread per physical core (per performance core on Apple silicon), set with `threads=` / `--threads` / `MIPYRE_THREADS`. A request is accepted, parsed and answered on the same core. With `MIPYRE_TPC=0` the server is instead a multi-thread one: I/O threads (`threads=`) hand requests to a pool of sub-interpreters (`subinterpreters=` / `--subinterpreters` / `MIPYRE_SUBINTERPRETERS`, by default one per logical CPU, at least 2).
 
 Limits:
 

@@ -733,7 +733,7 @@ flags! {
         code: [server_flags("subinterpreters")],
         shape: FlagShape::Positive,
         used: Pool,
-        default: "one per logical CPU",
+        default: "one per logical CPU, at least 2",
         doc: "the sub-interpreter pool's size, with tpc off; thread-per-core runs one per thread",
     },
     tpc: bool = {

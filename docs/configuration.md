@@ -332,7 +332,7 @@ Each server setting, by its three names. A `[tool.mipyre]` key is written in `py
 | Setting | `mipyre run` / `mipyre dev` | Environment | `pyproject.toml` | Default | What it is |
 |---|---|---|---|---|---|
 | `threads` | `--threads` | `MIPYRE_THREADS` | `[tool.mipyre] threads` | one per physical core (thread-per-core); with tpc off, one per logical CPU | the server's threads: thread-per-core threads, or with tpc off the I/O threads |
-| `subinterpreters` | `--subinterpreters` | `MIPYRE_SUBINTERPRETERS` | `[tool.mipyre] subinterpreters` | one per logical CPU | the sub-interpreter pool's size, with tpc off; thread-per-core runs one per thread |
+| `subinterpreters` | `--subinterpreters` | `MIPYRE_SUBINTERPRETERS` | `[tool.mipyre] subinterpreters` | one per logical CPU, at least 2 | the sub-interpreter pool's size, with tpc off; thread-per-core runs one per thread |
 | `tpc` | `--tpc` | `MIPYRE_TPC` | `[tool.mipyre] tpc` | on | thread-per-core; off runs the multi-thread server |
 | `tpc_accept` | `--tpc-accept` | `MIPYRE_TPC_ACCEPT` | `[tool.mipyre] tpc_accept` | listener | how thread-per-core threads take connections on macOS: an accept loop each on one shared socket, or one fanout acceptor |
 | `gc_mode` | `--gc-mode` | `MIPYRE_GC_MODE` | `[tool.mipyre] gc_mode` | count | when a sub-interpreter worker runs gc.collect() |
