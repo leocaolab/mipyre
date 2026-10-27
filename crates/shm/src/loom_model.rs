@@ -32,7 +32,7 @@ type Peer = PeerEnd<ModelMemory, PipeModel, FutexModel>;
 /// An answer as the host read it: the channel, the request's number and the answer's one byte.
 type Answer = (usize, Seq, u8);
 
-/// Runs `model` over every interleaving within three preemptions (design §4.3: the bound is part of what is proved).
+/// Runs `model` over every interleaving within three preemptions; the bound is part of what is proved.
 fn check(model: impl Fn() + Sync + Send + 'static) {
     let mut builder = loom::model::Builder::new();
     builder.preemption_bound = Some(3);
@@ -136,7 +136,7 @@ fn a_published_request_is_always_taken() {
 }
 
 /// The host sleeps whenever it finds no answer, so an answer published past its `sleep_all` is read only if the
-/// peer sees the flag and writes the pipe (b/781); it writes at most one byte per answer.
+/// peer sees the flag and writes the pipe; it writes at most one byte per answer.
 #[test]
 fn a_published_answer_always_wakes_a_sleeping_host() {
     check(|| {
@@ -323,7 +323,7 @@ fn a_report_state_published_relaxed_lets_the_host_read_a_note_being_written() {
     });
 }
 
-/// The check itself: the host's look before it sleeps without the fence, as it was before b/781 (the flag stored
+/// The check itself: the host's look before it sleeps without the fence (the flag stored
 /// `SeqCst`, the counter read `Acquire`), loses a wake in some interleaving, and the models report it. It runs a
 /// copy of the shape on bare words, not the shipping code.
 #[test]

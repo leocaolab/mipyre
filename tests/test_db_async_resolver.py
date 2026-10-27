@@ -1,4 +1,4 @@
-"""`PgPool.*_async` result delivery (Layer 2 M1, C9): results, errors, concurrency,
+"""`PgPool.*_async` result delivery: results, errors, concurrency,
 cancellation and a closed loop.
 
 Each case runs in a fresh interpreter so a stuck delivery shows up as a timeout, not as a
@@ -98,7 +98,7 @@ def test_no_running_loop_is_an_error_not_a_hang():
     assert "NO_LOOP_OK" in out
 
 
-# The advisory lock the in-flight query of the cancel case waits on (b/494). Per database, and each xdist worker has its own.
+# The advisory lock the in-flight query of the cancel case waits on. Per database, and each xdist worker has its own.
 _CANCEL_LOCK = 4410802
 
 _CANCEL_IN_FLIGHT = PRELUDE + """
@@ -148,9 +148,7 @@ def test_cancel_while_query_in_flight(tmp_path):
 
     The query waits on an advisory lock another process holds until the case is over: it is in
     flight while the server lists it waiting, and it cannot finish before the cancel or before
-    its task lets go of the future, so both are seen while the query could not have ended. Until
-    b/494 this guessed: 0.3 s for the query to be in flight, 1 s for the cancel, 3.5 s past a
-    `pg_sleep(3)` for a late result to show."""
+    its task lets go of the future, so both are seen while the query could not have ended."""
     env = dict(os.environ, RUST_BACKTRACE="0", MIPYRE_LOG="1")
     key = str(_CANCEL_LOCK)
     holder_out = tmp_path / "holder.log"
@@ -173,7 +171,7 @@ def test_cancel_while_query_in_flight(tmp_path):
     assert "InvalidStateError" not in text, text[-2000:]
 
 
-# The advisory lock the closed-loop case's query waits on (b/441 L8). Per database, and each xdist worker has its own.
+# The advisory lock the closed-loop case's query waits on. Per database, and each xdist worker has its own.
 _CLOSED_LOOP_LOCK = 4410801
 
 _LOCK_HOLDER = """
@@ -209,7 +207,7 @@ def test_closed_loop_drops_the_result_and_says_so(tmp_path):
 
     The query waits on an advisory lock another process holds, and that process ends only after
     the loop is closed: the result arrives after the loop is gone by construction, not by a sleep
-    outlasting a `pg_sleep` (b/441 L8; on a fast machine that race could deliver first)."""
+    outlasting a `pg_sleep`, which on a fast machine could deliver first."""
     env = dict(os.environ, RUST_BACKTRACE="0", MIPYRE_LOG="1")
     key = str(_CLOSED_LOOP_LOCK)
     holder_out, out_path = tmp_path / "holder.log", tmp_path / "closed_loop.log"

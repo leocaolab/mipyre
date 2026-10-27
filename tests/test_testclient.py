@@ -148,7 +148,7 @@ def test_binary_response_preserved(cors_client):
 
 
 # ---------------------------------------------------------------------------
-# b/845: a TestClient serves as the real server does (moved from the breaker pass)
+# A TestClient serves as the real server does
 # ---------------------------------------------------------------------------
 
 

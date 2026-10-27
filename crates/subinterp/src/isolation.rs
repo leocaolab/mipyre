@@ -4,6 +4,7 @@
 //! `dlopen`s each copy with CPython's multi-interpreter check switched off. `dlopen` state is
 //! process-wide, so the record is too.
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
 use parking_lot::Mutex;
@@ -43,13 +44,14 @@ impl LibCopies {
         }
     }
 
-    /// Returns whether `name` is new and came after the startup report, so nothing lists it yet.
-    fn note(&mut self, name: String, copy: LibCopy) -> bool {
-        if self.libs.contains_key(&name) {
-            return false;
-        }
-        self.libs.insert(name, copy);
-        self.reported
+    /// Returns `name` and its copy when it is new and came after the startup report, so nothing
+    /// lists it yet.
+    fn note(&mut self, name: String, copy: LibCopy) -> Option<(String, LibCopy)> {
+        let Entry::Vacant(vacant) = self.libs.entry(name) else {
+            return None;
+        };
+        let noted = vacant.insert_entry(copy);
+        self.reported.then(|| (noted.key().clone(), noted.get().clone()))
     }
 
     fn take_startup_report(&mut self) -> Option<BTreeMap<String, LibCopy>> {
@@ -65,9 +67,9 @@ static ISOLATED: Mutex<LibCopies> = Mutex::new(LibCopies::new());
 
 /// Records that a worker isolated `name` with `copy`, once per process.
 ///
-/// Returns `true` only when the library is new since the startup report was taken, so no report
-/// lists it.
-pub fn note_isolated(name: String, copy: LibCopy) -> bool {
+/// Returns the library and its copy only when it is new since the startup report was taken, so
+/// no report lists it.
+pub fn note_isolated(name: String, copy: LibCopy) -> Option<(String, LibCopy)> {
     ISOLATED.lock().note(name, copy)
 }
 
@@ -91,9 +93,17 @@ mod tests {
     #[test]
     fn a_library_is_noted_once_and_listed_by_the_report_taken_after_it() {
         let mut copies = LibCopies::new();
-        assert!(!copies.note("numpy".into(), copy(30)), "the report to come lists it");
-        assert!(!copies.note("numpy".into(), copy(31)), "already listed");
-        assert!(!copies.note("orjson".into(), copy(2)), "the report to come lists it");
+        assert_eq!(
+            copies.note("numpy".into(), copy(30)),
+            None,
+            "the report to come lists it"
+        );
+        assert_eq!(copies.note("numpy".into(), copy(31)), None, "already listed");
+        assert_eq!(
+            copies.note("orjson".into(), copy(2)),
+            None,
+            "the report to come lists it"
+        );
         assert_eq!(
             copies.take_startup_report(),
             Some(BTreeMap::from([
@@ -114,11 +124,12 @@ mod tests {
     fn a_library_noted_after_the_report_is_not_in_it_and_says_so() {
         let mut copies = LibCopies::new();
         assert_eq!(copies.take_startup_report(), Some(BTreeMap::new()));
-        assert!(
+        assert_eq!(
             copies.note("polars".into(), copy(40)),
+            Some(("polars".to_string(), copy(40))),
             "after the report: nothing lists it"
         );
-        assert!(!copies.note("polars".into(), copy(40)), "already listed");
+        assert_eq!(copies.note("polars".into(), copy(40)), None, "already listed");
         assert_eq!(copies.take_startup_report(), None);
     }
 }

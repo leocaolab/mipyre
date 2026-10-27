@@ -3,8 +3,7 @@
 Proves that sub-interpreter async mode truly runs concurrent coroutines: a sync route answers
 while an async one is in its await. The async request waits for a gate only the sync request
 opens, after it said it is in its await; were it blocking the sync route, the sync request
-would never run and the async one would end in its 504 instead of "released". Until b/441 this
-slept 0.1 s to give the slow request a head start and checked the fast one took < 0.5 s.
+would never run and the async one would end in its 504 instead of "released".
 """
 import os
 import signal
@@ -18,7 +17,7 @@ from tests._helpers import bound_port, poll_until, read_file
 
 SERVER_SCRIPT = """
 import os
-from mipyre.engine import MipyreApp, RuntimeChoice
+from mipyre.engine import MipyreApp, RuntimeChoice, ServerFlags
 
 app = MipyreApp()
 ENTERED, GATE = os.environ["ISOLATION_ENTERED"], os.environ["ISOLATION_GATE"]
@@ -38,7 +37,7 @@ app.route("GET", "/slow", slow, RuntimeChoice.Worker)
 app.route("GET", "/fast", fast, RuntimeChoice.Worker)
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0)
+    app.run(ServerFlags(host="127.0.0.1", port=0))
 """
 
 

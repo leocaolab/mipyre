@@ -44,7 +44,7 @@ mipyre --version
 **Checkpoint:**
 
 ```text
-mipyre 2.0.0
+mipyre 3.0.0
 ```
 
 The server doesn't need `websockets`; the test clients in this guide do.
@@ -87,15 +87,15 @@ def index(req):
 
 
 @app.websocket("/ws")
-def echo(ws):
+async def echo(ws):
     try:
-        while (msg := ws.recv_message()) is not None:
+        async for msg in ws:
             if isinstance(msg, bytes):
-                ws.send_bytes(msg)
+                await ws.send_bytes(msg)
             else:
-                ws.send(f"echo: {msg}")
-    except (ConnectionError, BlockingIOError):
-        ws.close()  # the client left, or stopped reading what we send
+                await ws.send(f"echo: {msg}")
+    except ConnectionError:
+        pass  # the client left
 
 
 if __name__ == "__main__":
@@ -104,12 +104,12 @@ if __name__ == "__main__":
 
 A `str` body goes out as `text/plain` unless you name the content type, so `index` returns a `Response` with `text/html`; a browser would show the page's source otherwise.
 
-The WebSocket handler gets the connection and owns it until it returns:
+A WebSocket handler is an `async def`: it gets the connection and owns it until it returns, and every receive and send is awaited.
 
-- `recv_message()` returns the next message, `str` for a text frame and `bytes` for a binary one, and `None` once the connection has ended. `recv()` and `recv_bytes()` read one kind only and raise `TypeError` if the next message is the other kind, so a client sending a binary frame to a `recv()` loop ends the handler with an error in the log.
-- `send()` and `send_bytes()` queue a message and never block. They raise `ConnectionError` once the connection is closed, and `BlockingIOError` when the send buffer is full because the client isn't reading. The handler treats both as the end of the conversation.
+- `async for msg in ws` yields each message, `str` for a text frame and `bytes` for a binary one, until the connection ends. `await ws.recv_message()` reads one message the same way and returns `None` once the connection has ended; `recv()` and `recv_bytes()` read one kind only and raise `TypeError` if the next message is the other kind, so a client sending a binary frame to a `recv()` loop ends the handler with an error in the log.
+- `await ws.send(...)` and `await ws.send_bytes(...)` queue a message. While a client that isn't reading has let the send buffer fill, the await lasts until there is room. They raise `ConnectionError` once the connection is closed, which this handler takes as the end of the conversation.
 
-WebSocket handlers always run on the main interpreter, each connection on a thread of its own, whatever the app's runtime. `recv_message()` releases the GIL while it waits, so idle connections don't hold up the others, but every handler shares the main interpreter's one GIL. Keep the work per message small, and move heavy computation to a route on another runtime.
+A WebSocket route runs where the app's runtime says, like any other route: on the default `subinterp` runtime each connection is a task on one of the sub-interpreter workers' event loops, so handlers on different workers run in parallel and a connection waiting for a message holds no thread. Module globals are per worker, as for every `subinterp` route; share state through `app.state`. `@app.websocket("/ws", runtime="main")` runs the handler on the main interpreter's event loop instead, where every connection sees the same globals and shares one GIL; `runtime="process"` is refused. Write the `before_request` hooks of an app with WebSocket routes as `async def`: a `def` hook that blocks holds up every connection on its event loop.
 
 Start the server:
 
@@ -202,7 +202,9 @@ Two app attributes bound what WebSocket clients can take:
 | `max_websocket_message_size` | 1 MiB | the connection is closed with code `1009` (message too big) |
 | `max_websocket_connections` | 1024 | the upgrade is answered `503` |
 
-Set them after `app = Mipyre()`, for example `app.max_websocket_message_size = 64 * 1024`. Each open connection holds a thread, which is what the connection limit protects.
+Set them after `app = Mipyre()`, for example `app.max_websocket_message_size = 64 * 1024`.
+
+A client that goes quiet is checked as well: after `app.websocket_ping_interval` (20 s) without a frame from it the server sends a ping, and a client that sends nothing within `app.websocket_ping_timeout` (20 s) after it is closed with `1011` and counted in `mipyre_websocket_keepalive_timeouts_total`. A browser or the `websockets` client answers the ping by itself, so an idle but live connection stays open. A client that stops reading what the server sends is cut off after 10 s without progress, as an HTTP client is.
 
 With the server from step 3 running, create `big_message.py`, which sends a 2 MB message:
 
@@ -233,10 +235,10 @@ The server closed the connection without handing the message to the handler. Sto
 Server-Sent Events are one-way: the server keeps a response open and writes events to it. A browser reads them with `EventSource`, and any HTTP client can. Create `sse_demo.py`:
 
 ```python
-import threading
 import time
+from collections.abc import Iterator
 
-from mipyre import Mipyre, Response, Stream
+from mipyre import EventSourceResponse, Mipyre, Response, ServerSentEvent
 
 app = Mipyre()
 
@@ -264,22 +266,16 @@ def index(req):
     return Response(PAGE, content_type="text/html; charset=utf-8")
 
 
-def send_tokens(stream: Stream) -> None:
-    try:
-        for n, token in enumerate(TOKENS):
-            stream.send_event(token, id=str(n))
-            time.sleep(TOKEN_DELAY_SECONDS)
-        stream.send_event("[DONE]", event="done")
-    except ConnectionError:
-        return  # the client went away; nobody is left to read the rest
-    stream.close()
+def token_events() -> Iterator[ServerSentEvent]:
+    for n, token in enumerate(TOKENS):
+        yield ServerSentEvent(token, id=str(n))
+        time.sleep(TOKEN_DELAY_SECONDS)
+    yield ServerSentEvent("[DONE]", event="done")
 
 
 @app.get("/stream", runtime="main")
 def stream_tokens(req):
-    stream = Stream()
-    threading.Thread(target=send_tokens, args=(stream,), daemon=True).start()
-    return stream
+    return EventSourceResponse(token_events())
 
 
 @app.get("/fast")
@@ -291,14 +287,14 @@ if __name__ == "__main__":
     app.run()
 ```
 
-A handler that returns a `Stream` sends the headers at once and the body as it's written. `Stream()` defaults to `text/event-stream`; pass `content_type=` for another streamed body. `send_event(data, event=..., id=...)` writes one event: an `id:` and an `event:` line if you pass them, and a `data:` line for each line of `data`. `close()` ends the response.
+`EventSourceResponse` returns a `Stream`, which sends the headers at once and the body as it's written, as `text/event-stream`. Each `ServerSentEvent(data, event=..., id=...)` the generator yields is one event: an `id:` and an `event:` line if you pass them, and a `data:` line for each line of `data`. The response ends when the generator does.
 
 Where each route runs:
 
-- `/stream` declares `runtime="main"` because a `Stream` works only on the main interpreter. The handler returns at once and a thread writes the events, so the stream doesn't hold one of the main interpreter's workers while it sleeps between tokens.
+- `/stream` declares `runtime="main"` because a `Stream` works only on the main interpreter. The handler returns at once and a thread of its own reads the generator, so the stream doesn't hold one of the main interpreter's workers while it sleeps between tokens. At most 256 generators are read at once; a request for one more is answered `503`.
 - `/` and `/fast` are pure Python on the default `subinterp` runtime, answered in parallel on every core while streams are open.
 
-When the client disconnects, the next `send_event` raises `ConnectionError`, and the thread stops producing tokens for nobody. As with WebSockets, `send_event` raises `BlockingIOError` when a slow client lets the buffer fill; a real app should retry after a pause or give up.
+When the client disconnects, the generator is closed at its `yield`, so it stops producing tokens for nobody. While a slow client lets the buffer fill, the generator is not read until the client takes more. To write a `Stream` yourself, `send_event` raises `BlockingIOError` when the buffer is full; wait for room with `stream.wait_writable()` (`await stream.wait_writable_async()` in an `async def` producer) and send it again.
 
 Stop the WebSocket server if it is still running, and start this one:
 
@@ -309,7 +305,7 @@ python sse_demo.py
 The banner counts `/stream` as a route on the main interpreter:
 
 ```text
-  Routes: 2 sub-interp + 1 GIL + 0 process + 0 async
+  Routes: 2 sub-interp + 1 main + 0 process + 0 async
 ```
 
 In the second terminal:
@@ -323,10 +319,10 @@ curl -s localhost:8000/fast; echo
 
 ```text
 HTTP/1.1 200 OK
-content-type: text/event-stream
 cache-control: no-cache
+content-type: text/event-stream
 connection: keep-alive
-server: Mipyre/2.0.0
+server: Mipyre/3.0.0
 transfer-encoding: chunked
 date: ...
 
@@ -345,14 +341,13 @@ Stop the server with Ctrl-C.
 
 ## What you've built
 
-- A WebSocket echo server that reads text and binary messages, ends cleanly when a client leaves or stops reading, refuses pages from other sites, and is bounded by mipyre's message size and connection limits.
+- A WebSocket echo server that reads text and binary messages, ends cleanly when a client leaves, refuses pages from other sites, and is bounded by mipyre's message size and connection limits and its keepalive.
 - A Server-Sent Events stream that stops when its client leaves, beside routes that keep answering in parallel.
 - Each route on the runtime it needs:
 
   | Route | Runtime | Why |
   |---|---|---|
-  | `GET /`, `GET /fast` | `subinterp` | pure Python: parallel on every core |
-  | `/ws` | main interpreter | always: WebSocket handlers run there, one thread per connection |
+  | `GET /`, `GET /fast`, `/ws` | `subinterp` | pure Python: parallel on every core; a WebSocket connection is a task on a worker's event loop |
   | `GET /stream` | `main` | `Stream` works only on the main interpreter |
 
 The [AI agent codelab](ai-agent.md) streams a model's answer and remembers each session; the [trading codelab](trading.md) adds a WebSocket price feed to an API that runs numpy and pandas in worker processes.

@@ -268,6 +268,11 @@ def test_metrics_counts_a_request_a_before_hook_answered():
     assert metric_count(text, "mipyre_http_requests_total", status_class="4xx", method="GET") >= 1
 
 
+def _requests_grew(before: str, after: str, **labels: str) -> int:
+    name = "mipyre_http_requests_total"
+    return metric_count(after, name, **labels) - metric_count(before, name, **labels)
+
+
 def test_metrics_counts_what_the_engine_answers_by_itself():
     """A 404, a 405 and a fast route are answered without Python, and each is counted."""
     app = Mipyre(runtime="main")
@@ -285,12 +290,68 @@ def test_metrics_counts_what_the_engine_answers_by_itself():
         assert c.get("/fast").status_code == 200
         after = c.get("/metrics").text
 
-    def grew(**labels: str) -> int:
-        name = "mipyre_http_requests_total"
-        return metric_count(after, name, **labels) - metric_count(before, name, **labels)
-
     # The 2xx are /fast and the scrape `before` came from.
-    assert (grew(status_class="2xx"), grew(status_class="4xx")) == (2, 2)
+    assert (_requests_grew(before, after, status_class="2xx"), _requests_grew(before, after, status_class="4xx")) == (2, 2)
+
+
+def test_metrics_counts_a_static_file(tmp_path):
+    (tmp_path / "site.css").write_bytes(b"body { color: red; }\n")
+    app = Mipyre(runtime="main")
+    app.enable_metrics()
+    app.static("/static", str(tmp_path))
+
+    with TestClient(app) as c:
+        before = c.get("/metrics").text
+        assert c.get("/static/site.css").status_code == 200
+        after = c.get("/metrics").text
+
+    # The scrape `before` came from and the file.
+    assert _requests_grew(before, after) == 2
+    assert _requests_grew(before, after, method="GET", status_class="2xx") == 2
+
+
+def test_metrics_counts_a_body_over_the_limit():
+    app = Mipyre(runtime="main")
+    app.enable_metrics()
+    app.max_body_size = 1000
+
+    @app.post("/len")
+    def length(req):
+        return {"len": len(req.body)}
+
+    with TestClient(app) as c:
+        before = c.get("/metrics").text
+        assert c.post("/len", body=b"x" * 5000).status_code == 413
+        after = c.get("/metrics").text
+
+    # The scrape `before` came from and the refused body.
+    assert _requests_grew(before, after) == 2
+    assert _requests_grew(before, after, method="POST", status_class="4xx") == 1
+
+
+def test_metrics_counts_a_websocket_upgrade_past_the_cap():
+    import websockets
+
+    app = Mipyre(runtime="main")
+    app.enable_metrics()
+    app.max_websocket_connections = 1
+
+    @app.websocket("/echo")
+    async def echo(ws):
+        while (msg := await ws.recv()) is not None:
+            await ws.send(msg)
+
+    with TestClient(app) as c:
+        before = c.get("/metrics").text
+        with c.websocket_connect("/echo") as only:
+            only.send("held")
+            assert only.recv(timeout=5) == "held"
+            with pytest.raises(websockets.InvalidStatus) as refused:
+                c.websocket_connect("/echo")
+            assert refused.value.response.status_code == 503
+            after = c.get("/metrics").text
+
+    assert _requests_grew(before, after, method="GET", status_class="5xx") == 1
 
 
 def test_metrics_page_is_guarded_by_the_apps_hooks():
@@ -354,7 +415,7 @@ def test_an_apps_own_route_at_the_metrics_path_fails_the_start():
 
 
 def test_metrics_exposes_the_engine_degradation_counters():
-    """The engine's degradation counters (b/132) are on the same page, with HELP and TYPE, and
+    """The engine's degradation counters are on the same page, with HELP and TYPE, and
     the per-kind families carry their labels."""
     from tests.apps.obs_metrics_format import app
 
@@ -387,8 +448,8 @@ def test_metrics_exposes_the_engine_degradation_counters():
 
 
 def test_metrics_renders_the_drain_counters():
-    """The drain counters (b/175: a drain that ran out of time, and the connections it closed)
-    are on /metrics with HELP and TYPE, as counters."""
+    """The drain counters (a drain that ran out of time, and the connections it closed) are
+    on /metrics with HELP and TYPE, as counters."""
     from tests.apps.obs_metrics_format import app
 
     with TestClient(app) as c:
@@ -400,7 +461,7 @@ def test_metrics_renders_the_drain_counters():
 
 
 def test_metrics_renders_the_stop_watcher_failuresmetric_count():
-    """The stop watchers that did not end cleanly (b/634) are on /metrics with HELP and TYPE, as a
+    """The stop watchers that did not end cleanly are on /metrics with HELP and TYPE, as a
     counter, with the engine's own count."""
     from tests.apps.obs_metrics_format import app
 
@@ -414,7 +475,7 @@ def test_metrics_renders_the_stop_watcher_failuresmetric_count():
 
 
 def test_metrics_renders_the_blocking_calls_leftmetric_count():
-    """The blocking calls a stopping TPC thread left running (b/634) are on /metrics with HELP
+    """The blocking calls a stopping TPC thread left running are on /metrics with HELP
     and TYPE, as a counter, with the engine's own count."""
     from tests.apps.obs_metrics_format import app
 
@@ -427,9 +488,23 @@ def test_metrics_renders_the_blocking_calls_leftmetric_count():
     assert metric_count(body, family) == counted
 
 
+def test_metrics_renders_the_websocket_keepalive_timeouts_count():
+    """The WebSocket clients closed with 1011 for not answering a ping are on /metrics
+    with HELP and TYPE, as a counter, with the engine's own count."""
+    from tests.apps.obs_metrics_format import app
+
+    with TestClient(app) as c:
+        body = c.get("/metrics").text
+        counted = c.server.metrics().ws_keepalive_timeouts
+    family = "mipyre_websocket_keepalive_timeouts_total"
+    assert f"# HELP {family} " in body
+    assert f"# TYPE {family} counter" in body
+    assert metric_count(body, family) == counted
+
+
 def test_metrics_shows_the_unpinned_starts_by_cause():
     """A start whose TPC threads ran unpinned because the CPUs to pin to could not be read
-    (b/148) is on /metrics under its cause, with the engine's own count."""
+    is on /metrics under its cause, with the engine's own count."""
     from tests.apps.obs_metrics_format import app
 
     with TestClient(app) as c:

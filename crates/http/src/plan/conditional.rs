@@ -34,6 +34,7 @@ impl EntityTag {
 /// `If-None-Match`, when present, alone decides, by weak comparison. A list that does not parse
 /// matches nothing past where it stops, so a malformed header never earns a `304`. Without it,
 /// an `If-Modified-Since` that does not parse is ignored.
+#[inline]
 pub fn not_modified(request: &HeaderMap, etag: &EntityTag, modified: Option<HttpDate>) -> bool {
     let mut lines = request.get_all(IF_NONE_MATCH).iter().peekable();
     if lines.peek().is_some() {
@@ -87,6 +88,9 @@ fn trim_list_start(list: &[u8]) -> &[u8] {
         .unwrap_or(list.len());
     list.get(start..).unwrap_or_default()
 }
+
+#[cfg(test)]
+mod fuzz;
 
 #[cfg(test)]
 mod tests {

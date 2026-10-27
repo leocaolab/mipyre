@@ -1,4 +1,4 @@
-//! A request's round trip through the channel allocates nothing (design `shm-channel.md` §4.4, b/752): the binary's
+//! A request's round trip through the channel allocates nothing: the binary's
 //! global allocator counts every allocation, and the count does not move across many round trips, the host's sleep
 //! and wake among them.
 //!

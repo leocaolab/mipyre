@@ -19,9 +19,8 @@ import re
 import typing
 from typing import TYPE_CHECKING, Callable, Sequence
 
-from mipyre._bind import DETAIL_LIMIT
 from mipyre._json_schema import NoJsonForm, hint_schema
-from mipyre.engine import BodyStream, Response, _route_params
+from mipyre.engine import VALIDATION_DETAIL_LIMIT, BodyStream, Response, _route_params
 
 if TYPE_CHECKING:
     from mipyre import FastRoute, Mipyre, Request, Route
@@ -42,7 +41,7 @@ _VALIDATION_FAILED_CONTENT = {
         "schema": {
             "type": "object",
             "properties": {
-                "detail": {"type": "array", "items": {"type": "object"}, "maxItems": DETAIL_LIMIT},
+                "detail": {"type": "array", "items": {"type": "object"}, "maxItems": VALIDATION_DETAIL_LIMIT},
                 "error_count": {"type": "integer", "minimum": 1},
             },
             "required": ["detail", "error_count"],

@@ -131,7 +131,7 @@ def test_multiple_shutdown_hooks_registered():
     assert len(app._shutdown_hooks) == 2
 
 
-# b/370 (#30/#31), b/845: how a server run (`mipyre._server_run.ServerRun`) treats hooks that
+# How a server run (`mipyre._server_run.ServerRun`) treats hooks that
 # raise. Each test serves a main-runtime app on a real in-memory server.
 
 

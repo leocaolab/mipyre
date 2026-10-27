@@ -1,4 +1,4 @@
-"""The `runtime="isolated"` finder (`python/mipyre/_isolated/isolation.py`, design `docs/design/isolation-finder.md`),
+"""The `runtime="isolated"` finder (`python/mipyre/_isolated/isolation.py`),
 driven directly: the package verdict, when it reads what, where the copy comes from, and what a failure says.
 
 On the main interpreter, so only up to the spec a worker would load: loading itself (CPython's check switched per

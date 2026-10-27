@@ -1,4 +1,4 @@
-"""isojson 0.2 E2E-3 (CUJ-2): each worker serializes numpy from its own copy.
+"""Each worker serializes numpy from its own copy.
 
 Four sub-interpreter workers of a runtime="isolated" app each clone numpy (on
 the bare `import numpy`). A handler
@@ -20,7 +20,7 @@ import os
 import sys
 import urllib.request
 
-# plain imports: a missing dependency fails E2E-3 instead of skipping it
+# plain imports: a missing dependency fails the test instead of skipping it
 import isojson
 import numpy as np
 import orjson
@@ -79,7 +79,8 @@ def s(req):
             "np_file": os.path.realpath(np.__file__), "copies": _D}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={port})
+    from mipyre import ServerFlags
+    app.run(ServerFlags(host="127.0.0.1", port={port}))
 '''.replace("PAYLOAD_SRC", PAYLOAD).replace("MEET_SRC", MEET)
 
 SCRIPT = '''

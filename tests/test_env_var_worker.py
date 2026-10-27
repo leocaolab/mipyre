@@ -2,7 +2,7 @@
 without AST filtering. Covers decorator syntax, multi-file imports,
 custom variable names, and middleware."""
 
-from mipyre import Mipyre, Response
+from mipyre import Mipyre, Response, ServerFlags
 
 # Custom variable name (not "app" — old AST filter would miss this)
 my_server = Mipyre()
@@ -43,4 +43,4 @@ def compute_route(req):
     return {"result": compute_value(10)}
 
 if __name__ == "__main__":
-    my_server.run(host="127.0.0.1", port=0)
+    my_server.run(ServerFlags(host="127.0.0.1", port=0))

@@ -12,14 +12,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
 use notify::event::{AccessKind, AccessMode, ModifyKind};
 use notify::{EventKind, RecursiveMode, Watcher};
 
 use super::degraded::{self, StaticDegradation};
 use super::{CanonicalDir, RequestPath, StaticFile};
-use crate::sync::{AtomicU64, Mutex, Ordering};
+use crate::sync::{AtomicU64, DashMap, Entry, Mutex, Ordering};
 
 /// The cap a server's static mounts are cached under, 128 MiB: enough for any reasonable static
 /// site without letting a misconfigured root blow the RSS budget.
@@ -184,9 +182,12 @@ pub(super) fn alias_cost(key: &[u8], requested: &RequestPath) -> u64 {
 
 impl std::fmt::Debug for MountCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The watch is let go before the entries are counted: an insert takes the watch while it
+        // holds its key's shard, so holding the watch across the count deadlocks with a miss.
+        let watch = self.watch();
         f.debug_struct("MountCache")
             .field("root", &self.root().0)
-            .field("watch", &*self.state.watch.lock())
+            .field("watch", &watch)
             .field("entries", &self.state.files.len())
             .finish()
     }
@@ -271,7 +272,7 @@ impl MountCache {
     }
 
     /// Starts the watcher in the background unless it was started already: a server does this
-    /// as it starts (q/55 B'), without waiting for it, so a watch that cannot be set up is
+    /// as it starts, without waiting for it, so a watch that cannot be set up is
     /// reported before the first request rather than at the first miss.
     pub(super) fn start_watch(&self) {
         if self
@@ -400,6 +401,7 @@ impl MountCache {
     }
 
     #[cfg(test)]
+    #[cfg(not(sync_model))]
     pub(super) fn contains(&self, key: &[u8]) -> bool {
         self.state.files.contains_key(key)
     }
@@ -598,9 +600,11 @@ mod loom_model;
 
 #[cfg(test)]
 #[cfg(unix)]
+#[cfg(not(sync_model))]
 mod cache_model;
 
 #[cfg(test)]
+#[cfg(not(sync_model))]
 mod tests {
     use super::super::FileContents;
     use super::*;

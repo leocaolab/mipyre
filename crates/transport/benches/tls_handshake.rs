@@ -18,9 +18,7 @@
 //!       one request per connection. Every reconnect comes from a new source port, so
 //!       `SO_REUSEPORT` may hand it to any loop. The client does not verify the certificate:
 //!       its cost is not what is measured, and the cheaper it is the fewer cores it needs.
-//!
-//! `benchmarks/tls_handshake/run.sh` runs the scaling curve, the hit rates and the per-handshake
-//! counts (perf stat / perf trace / perf c2c) with server and client on separate cores.
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::io::{Read, Write};

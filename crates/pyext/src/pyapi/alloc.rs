@@ -4,8 +4,8 @@
 //! default) and only when the freeing thread allocates again, so a thread that goes idle after
 //! a burst keeps closed connections' buffers resident (about 150 MiB after 4096 connections).
 //! `MIMALLOC_PURGE_DELAY=0` returns them at once but puts an `madvise` on the request path,
-//! which cost 28% more kernel instructions per GET and 15% of one thread's throughput
-//! (docs/memory-per-worker.md 5.1). The engine therefore keeps the default, and a service that
+//! which cost 28% more kernel instructions per GET and 15% of one thread's throughput.
+//! The engine therefore keeps the default, and a service that
 //! wants memory back after bursts sets the variable itself.
 
 use libmimalloc_sys::{mi_option_get, mi_option_t};

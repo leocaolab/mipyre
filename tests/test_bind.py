@@ -19,8 +19,8 @@ from hypothesis import strategies as st
 from pydantic import BaseModel, field_validator
 
 from mipyre import Mipyre
-from mipyre._bind import bind_handler
-from mipyre.engine import Response
+from mipyre._bind import _is_str_annotation, bind_handler
+from mipyre.engine import VALIDATION_DETAIL_LIMIT, Response
 from mipyre.testing import TestClient
 from tests._helpers import bound_port, lines_with, read_file
 
@@ -81,6 +81,50 @@ def test_a_parameter_missing_from_the_template_is_a_registration_error():
         bind_handler(show, "/u/{id}", None)
 
 
+def test_a_first_parameter_named_as_a_path_param_is_a_registration_error():
+    def hello(name):
+        return f"Hello, {name}!"
+
+    with pytest.raises(TypeError, match=r"'name' receives the request.*'/hello/{name}'.*def hello\(req, name\)"):
+        bind_handler(hello, "/hello/{name}", None)
+
+
+def test_a_first_parameter_named_as_no_path_param_takes_the_request():
+    def hello(name):
+        return name
+
+    assert bind_handler(hello, "/hello/{who}", None) is hello
+
+
+@pytest.mark.parametrize(
+    ("annotation", "taken"),
+    [(inspect.Parameter.empty, True), (str, True), ("str", True), (int, False), ("int", False), (str | None, False)],
+)
+def test_a_path_param_takes_no_annotation_or_str(annotation, taken):
+    assert _is_str_annotation(annotation) is taken
+
+
+def test_a_path_param_annotated_other_than_str_is_refused_at_registration_naming_handler_and_param():
+    def q(req, id: int):
+        return {"id": id}
+
+    with pytest.raises(TypeError) as err:
+        Mipyre().get("/q/{id}", q)
+
+    assert str(err.value) == (
+        "handler 'q': path param 'id' is annotated int, but a path param is passed as the str the "
+        "URL holds; annotate it str and convert it in the handler"
+    )
+
+
+def test_a_validated_routes_path_param_annotated_other_than_str_is_refused_at_registration():
+    def update(body: Item, id: float):
+        return {"id": id}
+
+    with pytest.raises(TypeError, match=r"handler 'update': path param 'id' is annotated float"):
+        Mipyre().put("/items/{id}", update, body=Item)
+
+
 def test_a_valid_body_is_passed_validated_and_an_invalid_one_is_422():
     def create(body, id):
         return (body.n, id)
@@ -110,6 +154,14 @@ def test_a_422_lists_the_first_twenty_errors_and_counts_them_all(failing, listed
 
     assert answer["error_count"] == failing
     assert [e["loc"] for e in answer["detail"]] == [["xs", i] for i in range(listed)]
+
+
+def test_a_422_lists_at_most_the_engines_detail_limit():
+    bound = bind_handler(lambda body: body, "/n", Numbers)
+
+    answer = json.loads(bound(_request(_numbers(VALIDATION_DETAIL_LIMIT + 1))).body)
+
+    assert len(answer["detail"]) == VALIDATION_DETAIL_LIMIT
 
 
 def test_a_route_with_a_body_and_a_query_counts_the_errors_of_both_and_lists_the_body_first():

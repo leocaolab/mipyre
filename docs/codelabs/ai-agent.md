@@ -45,7 +45,7 @@ mipyre --version
 **Checkpoint:**
 
 ```text
-mipyre 2.0.0
+mipyre 3.0.0
 ```
 
 ## 2. Serve the first route
@@ -91,10 +91,10 @@ python ai_agent_server.py
 **Checkpoint:** the server prints its address. The thread and CPU counts depend on your machine:
 
 ```text
-  Mipyre v2.0.0 [TPC mode, hybrid-inline]
+  Mipyre v3.0.0
   Listening on http://127.0.0.1:8000
   TPC threads: 6 (CPUs: 18, not pinned: this platform has no CPU pinning)
-  Routes: 1 sub-interp + 0 GIL + 0 process + 0 async
+  Routes: 1 sub-interp + 0 main + 0 process + 0 async
 ```
 
 In a second terminal:
@@ -212,7 +212,7 @@ curl -s localhost:8000/mcp -H 'content-type: application/json' -d '{"jsonrpc": "
 ```text
 {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"20"}],"isError":false}}
 {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"not arithmetic: open('/etc/passwd').read()"}],"isError":true}}
-{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"invalid params: argument 'expression': expected string, got integer"}}
+{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"invalid params: arguments.expression: expected string, got integer"}}
 ```
 
 `/mcp` acts on what a POST body asks for, so it refuses a request a web page could make a browser send behind the user's back. A `POST` from another site's page gets `403` from the engine before `/mcp` runs, unless that site is in `enable_cors(allow_origins=...)`; this app's `"*"` trusts every site, so list your front end's origins when it has one. Requests without an `Origin`, such as curl's or an agent's, are admitted. A body that isn't `application/json` gets `415`, which a page can't get around by choosing a form's content type:
@@ -321,17 +321,18 @@ With `body=ChatRequest`, the handler receives the validated model instead of the
 In `ai_agent/main.py`, list the router and turn on the access log. Change the two lines after the imports to:
 
 ```python
-app = Mipyre(routers=["ai_agent.chat:router"])
+app = Mipyre()
+app.include_router("ai_agent.chat:router")
 app.enable_cors(allow_origins="*")
 app.enable_access_log()
 ```
 
 The app names the router by import string, not by object, so each runtime imports only the routers it serves: the main interpreter imports `ai_agent.chat`, and the sub-interpreters never do.
 
-Run `python ai_agent_server.py`. The banner now counts the two routes on the main interpreter as `GIL`:
+Run `python ai_agent_server.py`. The banner now counts the two routes on the main interpreter as `main`:
 
 ```text
-  Routes: 1 sub-interp + 2 GIL + 0 process + 0 async
+  Routes: 1 sub-interp + 2 main + 0 process + 0 async
 ```
 
 In the second terminal, send a chat request and an invalid one:
@@ -360,47 +361,43 @@ Stop the server.
 
 **Goal:** send the answer token by token as it is generated.
 
-Add these imports at the top of `ai_agent/chat.py`:
+Add this import at the top of `ai_agent/chat.py`:
 
 ```python
 import json
-import threading
 ```
 
-and add `Stream` to the mipyre import:
+and add `EventSourceResponse`, `ServerSentEvent` and `Stream` to the mipyre import:
 
 ```python
-from mipyre import Router, SharedState, Stream
+from mipyre import EventSourceResponse, Router, ServerSentEvent, SharedState, Stream
 ```
 
 Then add to the end of `ai_agent/chat.py`:
 
 ```python
-def send_answer(stream: Stream, state: SharedState, prompt: str, session_id: str) -> None:
+def answer_events(state: SharedState, prompt: str, session_id: str) -> Iterator[ServerSentEvent]:
+    """Yield the answer's tokens, then a ``done`` event, then remember the answer. A client
+    that leaves closes the generator at a ``yield``, so an answer it didn't read is not
+    remembered."""
     tokens = []
-    try:
-        for token in fake_llm_generate(prompt):
-            stream.send_event(token, event="token")
-            tokens.append(token)
-        stream.send_event(json.dumps({"done": True, "tokens": len(tokens)}), event="done")
-    except ConnectionError:
-        return  # the client went away; the answer it didn't read is not remembered
+    for token in fake_llm_generate(prompt):
+        yield ServerSentEvent(token, event="token")
+        tokens.append(token)
+    yield ServerSentEvent(json.dumps({"done": True, "tokens": len(tokens)}), event="done")
     remember(state, session_id, prompt, "".join(tokens))
-    stream.close()
 
 
 @router.get("/stream")
-def stream_chat(req):
+def stream_chat(req) -> Stream:
     prompt = req.query_params.get("prompt", "hello")
     session_id = req.query_params.get("session_id", "default")
-    stream = Stream()
-    threading.Thread(target=send_answer, args=(stream, _state(), prompt, session_id), daemon=True).start()
-    return stream
+    return EventSourceResponse(answer_events(_state(), prompt, session_id))
 ```
 
-A route that returns a `Stream` sends the response headers at once and the body as the handler writes it; `Stream()` defaults to `text/event-stream`. `send_event(data, event=...)` writes one SSE event, and `close()` ends the response. The handler returns right away and a thread writes the tokens, so no worker of the main interpreter is held for the length of the answer.
+`EventSourceResponse` returns a `Stream`, which sends the response headers at once and the body as it is written, as `text/event-stream`. Each `ServerSentEvent(data, event=...)` the generator yields is one SSE event, and the response ends when the generator does. The handler returns right away and a thread of its own reads the generator, so no worker of the main interpreter is held for the length of the answer.
 
-`Stream` works only on the main interpreter, which is one more reason this router is on `main`. When the client disconnects, the next `send_event` raises `ConnectionError`; the thread catches it and stops generating for nobody. A slow client that lets the buffer fill makes `send_event` raise `BlockingIOError`; this demo doesn't handle that, and a real one should retry after a pause or give up.
+`Stream` works only on the main interpreter, which is one more reason this router is on `main`. When the client disconnects, the generator is closed at its `yield` and stops generating for nobody. While a slow client lets the buffer fill, the generator is not read until the client takes more.
 
 Run `python ai_agent_server.py` and stream an answer:
 

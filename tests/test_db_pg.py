@@ -147,7 +147,7 @@ def test_unsupported_param_type_raises(pool):
 
 def test_connect_is_idempotent(pool):
     """Calling connect() again with the same DSN in one run returns a handle to the same pool
-    (b/335 D17: the run's pool for the DSN). One connection, so both see one backend."""
+    (the run's pool for the DSN). One connection, so both see one backend."""
     # A DSN of its own: the module's pool already fixed this DSN's size.
     dsn = PG_DSN + ("&" if "?" in PG_DSN else "?") + "application_name=idempotent"
     one = PgPool.connect(dsn, max_connections=1)
@@ -177,11 +177,10 @@ sys.stdin.read()
 
 
 def test_an_async_query_in_flight_when_a_run_takes_its_handle_still_answers():
-    """b/968: a handle that queried before a run opened a pool of its own; when the run seals it
-    binds the handle to the run's pool (b/335 D17), and a query already running on the old pool
-    still gets its answer. The query waits on a lock held across the seal, so it is in flight
-    then; before the fix the seal dropped the old pool's runtime and the query failed with
-    "the runtime shut down"."""
+    """A handle that queried before a run opened a pool of its own; when the run seals it binds
+    the handle to the run's pool, and a query already running on the old pool still gets its
+    answer, not "the runtime shut down". The query waits on a lock held across the seal, so it is
+    in flight then."""
     import asyncio
     import concurrent.futures
     import threading
@@ -398,8 +397,7 @@ def rendezvous(pool):
 
 def test_async_concurrent_queries(pool, rendezvous):
     """Four async queries on the pool's tokio runtime are in Postgres at once: each waits for
-    the other three to arrive and answers how many had. Until b/441 this was four
-    `pg_sleep(0.1)` under 0.3 s, which three at a time also passed."""
+    the other three to arrive and answers how many had."""
     import asyncio
 
     async def run():
@@ -426,15 +424,15 @@ def test_the_rendezvous_sees_queries_run_one_at_a_time(pool, rendezvous):
 
 
 # ---------------------------------------------------------------------------
-# A query that finds every pooled connection held (b/373)
+# A query that finds every pooled connection held
 # ---------------------------------------------------------------------------
 #
 # Whoever holds the pool's connections, a query waiting for one gives up at
 # `acquire_timeout_secs` with a `DatabaseError` whose `sqlstate` is None (the server never saw
 # it), and the wait takes nothing: once the holder lets go of it (its result read to the end),
 # the same one connection serves the next query, so the pool is back where it was, with no
-# connection leaked or opened twice. A cursor dropped mid-result closes its connection instead
-# (b/462); that case is `test_cursor_connection_returns_after_a_full_read_and_closes_after_a_drop`.
+# connection leaked or opened twice. A cursor dropped mid-result closes its connection instead;
+# that case is `test_cursor_connection_returns_after_a_full_read_and_closes_after_a_drop`.
 #
 # The error's mapping is unit-tested in `crates/pyext/src/db/error.rs`. The case runs in its own
 # process: a process has one pool, and this one needs a pool of one connection (this module's
@@ -494,14 +492,14 @@ def test_a_full_pool_times_out_without_sqlstate_and_the_connection_comes_back():
 
 
 # ---------------------------------------------------------------------------
-# What a cursor's connection does when the cursor ends (b/462)
+# What a cursor's connection does when the cursor ends
 # ---------------------------------------------------------------------------
 
 # A one-connection pool in its own process (a process has one pool, and this one must
 # have a single connection, so the query after the cursor needs the cursor's own). The
-# abandoned query never ends: before b/462 the pool read the rest of a dropped cursor's
-# result before handing the connection out again, so the next query waited until the
-# pool's acquire timeout. Then it waits for the abandoned backend to be gone from the
+# abandoned query never ends, so a pool that read the rest of a dropped cursor's result before
+# handing the connection out again would keep the next query waiting until the pool's acquire
+# timeout. Then it waits for the abandoned backend to be gone from the
 # server (an event, polled; the subprocess timeout is the only bound).
 _CURSOR_RELEASE_SCRIPT = r"""
 import json, sys, time

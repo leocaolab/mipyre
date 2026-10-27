@@ -5,7 +5,7 @@ use std::hint::black_box;
 
 use bytes::Bytes;
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
-use mipyre_http::io::request_id::RequestId;
+use mipyre_http::plan::request_id::RequestId;
 use mipyre_microbench::{measure, run, AllocationCounter, Case, Must};
 
 #[global_allocator]

@@ -25,7 +25,7 @@ disallowed-types = [
   # A normal build has no loom, hence `allow-invalid`.
   { path = "loom::sync::atomic::AtomicU32", reason = "plan/ takes the values the counters held, never the counters", allow-invalid = true },
   { path = "loom::sync::atomic::AtomicU64", reason = "plan/ takes the values the counters held, never the counters", allow-invalid = true },
-  # Shuttle's, under `--cfg shm_model --cfg shm_shuttle` (b/744), for the same reason.
+  # Shuttle's, under `--cfg shm_model --cfg shm_shuttle`, for the same reason.
   { path = "shuttle::sync::atomic::AtomicU32", reason = "plan/ takes the values the counters held, never the counters", allow-invalid = true },
   { path = "shuttle::sync::atomic::AtomicU64", reason = "plan/ takes the values the counters held, never the counters", allow-invalid = true },
 ]

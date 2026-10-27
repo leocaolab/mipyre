@@ -65,7 +65,7 @@ pub fn run(cases: &[Case]) {
 }
 
 /// The case named exactly `name`, or every case when no name is given. A name never selects a
-/// case it is only part of: the gate counts one case per process, and a second case in the same
+/// case it is only part of: instructions are counted one case per process, and a second case in the same
 /// process would be counted into the first one's calls.
 fn selected<'a>(cases: &'a [Case], name: Option<&str>) -> Vec<&'a Case> {
     cases

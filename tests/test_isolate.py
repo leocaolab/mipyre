@@ -25,7 +25,7 @@ _supported = pytest.mark.skipif(
 )
 
 _SERVER = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
 import numpy   # loaded by every worker at start
 
@@ -43,7 +43,7 @@ def np_op(req):
              "isolated": np.__file__.startswith(_ISO_DIR)}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0)
+    app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
 
 
@@ -108,7 +108,7 @@ def test_isolate_numpy_across_workers(isolate_server):
 # finds single-phase ones, and resolves numpy to that worker's own copy.
 
 _SERVER_AUTO = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
 
 import os as _os
@@ -130,7 +130,7 @@ def np_op(req):
              "isolated": np.__file__.startswith(_ISO_DIR)}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0)
+    app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
 
 
@@ -217,7 +217,7 @@ def _start_server(script_text, tmp_path, name, workers=4, isolate_dir=None, env_
 def _wait_ready(path, proc, log):
     """GETs `path` on the server once it listens; its JSON body. Waits for the "Listening on"
     line (or the server exiting first, which fails with its output) and then for the answer,
-    for no length of time (b/325)."""
+    for no length of time."""
     try:
         port = bound_port(read_file(str(log)), proc)
     except RuntimeError as e:
@@ -236,7 +236,7 @@ def _stop(proc):
 
 
 _SERVER_WARM = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
 import os as _o
 _D = _o.environ.get("MIPYRE_ISOLATE_DIR", "/tmp/mipyre-isolate")
@@ -245,7 +245,7 @@ import numpy as np   # top-level: each worker resolves numpy to its own copy
 def h(req):
     return {{"v": np.__version__, "isolated": np.__file__.startswith(_D)}}
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={port})
+    app.run(ServerFlags(host="127.0.0.1", port={port}))
 '''
 
 
@@ -269,7 +269,7 @@ def test_auto_isolate_survives_warm_restart(tmp_path):
 
 
 _SERVER_SHUTDOWN = FINALIZE_MARK_SNIPPET + '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
 import os as _o
 _MARK = _o.environ["SHUTDOWN_MARK"]
@@ -282,7 +282,7 @@ def _bye():
 def h(req):
     return {{"v": np.__version__}}
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={port})
+    app.run(ServerFlags(host="127.0.0.1", port={port}))
 '''
 
 
@@ -323,9 +323,8 @@ def test_graceful_sigint_no_abort_and_hooks_run(tmp_path):
 
 @pytest.mark.parametrize("ending, finalizes", [("pass", True), ("_os._exit(0)", False)])
 def test_the_finalize_mark_is_written_only_by_a_finalizing_exit(tmp_path, ending, finalizes):
-    """The check the graceful-stop tests use (b/402): a script that ends normally leaves the
-    mark; one that ends with `os._exit(0)` (what 5c886025 put after a graceful stop) exits 0
-    too, and leaves none."""
+    """The check the graceful-stop tests use: a script that ends normally leaves the mark; one
+    that ends with `os._exit(0)` exits 0 too, and leaves none."""
     mark = tmp_path / "finalize.mark"
     rc = subprocess.run([sys.executable, "-c", FINALIZE_MARK_SNIPPET + ending],
                         env=dict(os.environ, FINALIZE_MARK=str(mark)), timeout=60).returncode
@@ -334,7 +333,7 @@ def test_the_finalize_mark_is_written_only_by_a_finalizing_exit(tmp_path, ending
 
 
 _SERVER_BUILTIN = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
 import faulthandler   # built-in single-phase ext; top-level -> runs in every worker
 @app.get("/fh")
@@ -342,7 +341,7 @@ def h(req):
     import faulthandler as f
     return {{"loaded": f.__name__ == "faulthandler"}}
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={port})
+    app.run(ServerFlags(host="127.0.0.1", port={port}))
 '''
 
 
@@ -381,8 +380,7 @@ def _toml_section_text(path, header):
 def test_fixture_pyo3_pins_match_root():
     """tests/fixtures/pyo3_mp is a standalone crate, so it repeats the root's pyo3 fork pin ([patch.crates-io] in
     Cargo.toml) and resolves it in its own Cargo.lock. Both must name the same fork rev as the root, or the fixture
-    would silently test a different PyO3 than the engine ships. Remove this once the fixture lives in the workspace
-    (arc archcheck 测试夹具包 category)."""
+    would silently test a different PyO3 than the engine ships."""
     import tomllib
     root_toml = _ROOT / "Cargo.toml"
     fixture_toml = _FIXTURE_DIR / "Cargo.toml"
@@ -419,7 +417,7 @@ def test_fixture_pyo3_pins_match_root():
 
 
 _SERVER_EXT = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
 import os as _os
 _ISO_DIR = _os.environ["MIPYRE_ISOLATE_DIR"]
@@ -428,7 +426,7 @@ def h(req):
     import {mod} as m
     return {{"isolated": m.__file__.startswith(_ISO_DIR), "ok": m.ping() == 7}}
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={{port}})
+    app.run(ServerFlags(host="127.0.0.1", port={{port}}))
 '''
 
 
@@ -467,20 +465,20 @@ def test_isolated_multiphase_ext_declaring_subinterp_loads_shared(pyo3_fixture_d
 
 
 _SERVER_POLARS = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
 import polars as pl   # polars/_plr.py tries its runtimes under `except ImportError: pass`
 @app.get("/pl")
 def h(req):
     return {{"ok": int(pl.Series([1, 2]).sum())}}
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={port})
+    app.run(ServerFlags(host="127.0.0.1", port={port}))
 '''
 
 
 @_supported
 def test_polars_works_in_isolated_workers_without_importing_its_runtime_first(tmp_path):
-    """b/755: polars tries `_polars_runtime_32` under `except ImportError: pass`. The finder copies the runtime when
+    """Polars tries `_polars_runtime_32` under `except ImportError: pass`. The finder copies the runtime when
     polars first resolves it, so no ImportError ever reaches polars, and the startup line says why it was copied."""
     proc, log = _start_server(_SERVER_POLARS, tmp_path, "srv_polars", workers=2, isolate_dir=tmp_path / "copies")
     try:
@@ -494,7 +492,7 @@ def test_polars_works_in_isolated_workers_without_importing_its_runtime_first(tm
 
 
 _SERVER_FALLBACK = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
 import os as _os
 import fallbacklib
@@ -503,7 +501,7 @@ def h(req):
     import {mod} as m
     return {{"fallback": fallbacklib.FALLBACK, "isolated": m.__file__.startswith(_os.environ["MIPYRE_ISOLATE_DIR"])}}
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={port})
+    app.run(ServerFlags(host="127.0.0.1", port={port}))
 '''
 
 
@@ -527,7 +525,7 @@ def test_a_library_that_falls_back_on_import_error_gets_its_extension_from_a_cop
 
 
 _SERVER_UNUSABLE_DIR = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
 @app.get("/up")
 def up(req):
@@ -542,13 +540,13 @@ def h(req):
         return {{"caught": type(e).__name__, "said": str(e)}}
     return {{"caught": None}}
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={port})
+    app.run(ServerFlags(host="127.0.0.1", port={port}))
 '''
 
 
 @_supported
 def test_a_copy_that_cannot_be_made_is_an_isolation_error_no_import_error_handler_hides(pyo3_fixture_dirs, tmp_path):
-    # The directory is checked when the server starts (b/335 M7.1), so it turns unusable after
+    # The directory is checked when the server starts, so it turns unusable after
     # that: the copy made at the first isolated import is what fails.
     shared = tmp_path / "copies"
     script = _SERVER_UNUSABLE_DIR.replace("{mod}", _FIXTURE_MODULE)

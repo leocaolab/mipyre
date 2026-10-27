@@ -1,5 +1,5 @@
 """This process's OS threads other than the calling one, by name; the single-thread rule a
-fork needs (design §11.3: the fallback for libraries without an adapter)."""
+fork needs (the fallback for libraries without an adapter)."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def _other_threads() -> list[str]:
         return names
     if sys.platform == "darwin":
         return _darwin_other_threads()
-    raise ThreadedTemplateError(f"process lanes: counting threads is not implemented on {sys.platform}")
+    raise NotImplementedError(f"process lanes: counting threads is not implemented on {sys.platform}")
 
 
 def _darwin_other_threads() -> list[str]:
@@ -79,14 +79,14 @@ def _darwin_other_threads() -> list[str]:
     return names
 
 
-def refusal(others: list[str], what: str, how_to_fix: str) -> ThreadedTemplateError | None:
-    """The error a fork is refused with when the process runs the threads named in ``others``
+def refusal(others: list[str], what: str, how_to_fix: str) -> str | None:
+    """Return why a fork is refused when the process runs the threads named in ``others``
     besides the calling one ("" for an unnamed one); None when it runs none. `what` says which
     fork this is for, `how_to_fix` what the user can do."""
     if not others:
         return None
     named = ", ".join(n or "<unnamed>" for n in others)
-    return ThreadedTemplateError(
+    return (
         f"{what} must be single-threaded when it forks (a fork copies only the calling "
         f"thread, so a pool these threads belong to would be missing in every worker), but "
         f"it runs {len(others)} other thread(s): {named}. {how_to_fix}"
@@ -94,7 +94,8 @@ def refusal(others: list[str], what: str, how_to_fix: str) -> ThreadedTemplateEr
 
 
 def require_single_threaded(what: str, how_to_fix: str) -> None:
-    """Raise `refusal`'s error for this process's threads, if there is one."""
-    error = refusal(_other_threads(), what, how_to_fix)
-    if error is not None:
-        raise error
+    """Raise ThreadedTemplateError with `refusal`'s reason when this process runs other
+    threads, and NotImplementedError on a platform where they cannot be counted."""
+    reason = refusal(_other_threads(), what, how_to_fix)
+    if reason is not None:
+        raise ThreadedTemplateError(reason)

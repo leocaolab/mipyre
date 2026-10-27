@@ -3,7 +3,7 @@ the app serves it, and the declaration methods :class:`Router` and ``Mipyre`` sh
 
 A route's runtime is, most specific first: its decorator's ``runtime=``, its
 :class:`~mipyre.Router`'s, the app's ``Mipyre(runtime=...)``, else ``"subinterp"``. It is the
-code's alone (b/335 D9): an app that wants a deployment to choose it reads its own flag and
+code's alone: an app that wants a deployment to choose it reads its own flag and
 passes the value in, ``Mipyre(runtime=MY_RUNTIME.value)``.
 """
 
@@ -11,15 +11,16 @@ from __future__ import annotations
 
 import enum
 import functools
-import importlib
 import sys
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable
 
-from mipyre._target import split_target
+from mipyre._target import import_target, parse_target
 from mipyre.engine import BodyStream, DeclarationError, RuntimeChoice
 
 if TYPE_CHECKING:
+    from types import ModuleType
+
     from mipyre._worker.extension_support import ExtensionFacts
 
 
@@ -71,50 +72,20 @@ _ENGINE_RUNTIME = {
 
 def app_runtime(written: Runtime | str | None, where: str) -> Runtime:
     """The app's runtime: what its code declares, else ``SUBINTERP``. It is the code's: no
-    deployment value replaces it (b/335 D9); code that wants it set from outside reads its own
+    deployment value replaces it; code that wants it set from outside reads its own
     flag and passes it in."""
     return Runtime.SUBINTERP if written is None else Runtime.parse(written, where)
 
 
-_REMOVED_RUNTIME_ARGS = {"gil": Runtime.MAIN, "process": Runtime.PROCESS}
+def _is_route_path(path: str) -> bool:
+    """Return whether ``path`` can match a request: every request path starts with ``/``."""
+    return path.startswith("/")
 
 
-def _replacement(name: str, value: object) -> tuple[str, str] | None:
-    """The argument that replaced the removed route argument ``name=value``, and how to write
-    it; None when ``name`` was never a route argument."""
-    if name in _REMOVED_RUNTIME_ARGS:
-        new = f"runtime={_REMOVED_RUNTIME_ARGS[name].value!r}"
-        return new, new + ("" if value else ", or leave runtime unset")
-    if name == "model":
-        return "body=", f"body={getattr(value, '__name__', repr(value))}"
-    if name == "stream":
-        return "body=", "body=BodyStream (from mipyre import BodyStream)" if value else "leave body unset"
-    return None
-
-
-def reject_removed_route_args(where: str, removed: dict) -> None:
-    """Raise for an argument a route no longer takes — ``gil=`` / ``process=``, which
-    ``runtime=`` replaced, and ``model=`` / ``stream=``, which ``body=`` replaced — quoting
-    what was written and the new spelling; nothing is mapped silently."""
-    for name, value in removed.items():
-        replaced = _replacement(name, value)
-        if replaced is None:
-            raise TypeError(f"{where}: unexpected keyword argument {name!r}")
-        by, write = replaced
-        raise TypeError(f"{where}: {name}={value!r} was replaced by {by}. Write: {write}")
-
-
-def reject_removed_serve_args(where: str, removed: dict) -> None:
-    """Raise for ``mode=`` on ``run()`` / ``TestClient``, which the app's runtime replaced,
-    quoting what was written and the new spelling."""
-    for name, value in removed.items():
-        if name == "mode":
-            raise TypeError(
-                f"{where}: mode={value!r} was removed. Where handlers run is the "
-                f"app's runtime: Mipyre(runtime='main') serves every route on the main "
-                f"interpreter (was mode='gil'); the default, 'subinterp', was mode='subinterp'."
-            )
-        raise TypeError(f"{where}: unexpected keyword argument {name!r}")
+def _is_prefix(prefix: str) -> bool:
+    """Return whether ``prefix`` can go before a route path: none, or one that starts with ``/``
+    and does not end with one, so that the joined path is a route path with no ``//`` in it."""
+    return prefix == "" or (_is_route_path(prefix) and not prefix.endswith("/"))
 
 
 @dataclass(frozen=True)
@@ -220,10 +191,10 @@ class _RouteVerbs:
         runtime: Runtime | str | None,
         in_openapi: bool,
         streams: bool,
-        removed: dict,
     ) -> Callable:
+        if not _is_route_path(path):
+            raise ValueError(f'{method} {path!r}: a route path starts with "/"')
         where = f"{method} {path}"
-        reject_removed_route_args(where, removed)
         declared = None if runtime is None else Runtime.parse(runtime, where)
         if body is BodyStream and not streams:
             raise TypeError(
@@ -236,29 +207,29 @@ class _RouteVerbs:
 
         return register(handler) if handler is not None else register
 
-    def get(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True, **removed: object) -> Callable:
-        return self._declare("GET", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=False, removed=removed)
+    def get(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True) -> Callable:
+        return self._declare("GET", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=False)
 
-    def post(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True, **removed: object) -> Callable:
-        return self._declare("POST", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=True, removed=removed)
+    def post(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True) -> Callable:
+        return self._declare("POST", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=True)
 
-    def put(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True, **removed: object) -> Callable:
-        return self._declare("PUT", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=True, removed=removed)
+    def put(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True) -> Callable:
+        return self._declare("PUT", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=True)
 
-    def delete(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True, **removed: object) -> Callable:
-        return self._declare("DELETE", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=False, removed=removed)
+    def delete(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True) -> Callable:
+        return self._declare("DELETE", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=False)
 
-    def patch(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True, **removed: object) -> Callable:
-        return self._declare("PATCH", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=True, removed=removed)
+    def patch(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True) -> Callable:
+        return self._declare("PATCH", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=True)
 
-    def options(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True, **removed: object) -> Callable:
-        return self._declare("OPTIONS", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=False, removed=removed)
+    def options(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True) -> Callable:
+        return self._declare("OPTIONS", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=False)
 
-    def head(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True, **removed: object) -> Callable:
-        return self._declare("HEAD", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=False, removed=removed)
+    def head(self, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True) -> Callable:
+        return self._declare("HEAD", path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=False)
 
-    def route(self, method: str, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True, **removed: object) -> Callable:
-        return self._declare(method.upper(), path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=True, removed=removed)
+    def route(self, method: str, path: str, handler: Callable | None = None, *, body: type | None = None, query: type | None = None, runtime: Runtime | str | None = None, in_openapi: bool = True) -> Callable:
+        return self._declare(method.upper(), path, handler, body=body, query=query, runtime=runtime, in_openapi=in_openapi, streams=True)
 
 
 class Router(_RouteVerbs):
@@ -271,7 +242,7 @@ class Router(_RouteVerbs):
         @router.get("/report")
         def report(req): ...
 
-    The app lists routers by import string (``Mipyre(routers=["myapp.analytics:router"])``),
+    The app includes a router by import string (``app.include_router("myapp.analytics:router")``),
     never by object: each runtime imports only the routers that have routes it serves, so
     polars above is imported by the process workers (and the server), never by a
     sub-interpreter. A route neither it nor the router names a runtime for gets the app's."""
@@ -287,13 +258,8 @@ class Router(_RouteVerbs):
         return declaration.handler
 
 
-def import_router(target: str) -> Router:
-    module_name, attr = split_target(target)
-    module = importlib.import_module(module_name)
-    try:
-        router = getattr(module, attr)
-    except AttributeError:
-        raise AttributeError(f"router {target!r}: module {module_name!r} has no attribute {attr!r}") from None
+def import_router(target: str) -> tuple[ModuleType, Router]:
+    module, router = import_target(parse_target(target))
     if not isinstance(router, Router):
         raise TypeError(f"router {target!r} is a {type(router).__name__}, expected mipyre.Router")
-    return router
+    return module, router

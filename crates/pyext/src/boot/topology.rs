@@ -14,8 +14,8 @@ use mipyre_cpu::Cpus;
 
 use super::config::{FlagError, ServerKind, ServerRecipe};
 use super::settings::{FlagUse, ServerFlagValues};
-use crate::runtime::RouteKinds;
-use crate::serve::AcceptMode;
+use mipyre_runtime::RouteKinds;
+use mipyre_server::AcceptMode;
 use mipyre_subinterp::gc::GcMode;
 
 /// Says whether the multi-thread server runs a pool of sub-interpreter workers: it does exactly
@@ -29,7 +29,7 @@ pub(crate) enum InterpreterMode {
 }
 
 impl InterpreterMode {
-    pub(crate) fn of(routes: &crate::serve::Routes) -> Self {
+    pub(crate) fn of(routes: &mipyre_runtime::Routes) -> Self {
         if routes.uses_workers() {
             InterpreterMode::Subinterp
         } else {
@@ -92,7 +92,7 @@ impl Topology {
             Topology::Tpc { threads, accept }
         } else {
             let io_threads = sizing.threads.as_ref().map_or(cpus.logical(), |g| *g.value());
-            let accept_loops = multi_thread_accept_loops(io_threads, cpus.logical());
+            let accept_loops = io_threads.min(cpus.logical());
             match mode {
                 InterpreterMode::Gil => Topology::MultiThreadGil {
                     io_threads,
@@ -150,7 +150,7 @@ impl Topology {
 }
 
 /// What decides which of the given flags a server uses: its topology, what its routes need
-/// and how it takes connections (design §8.5).
+/// and how it takes connections.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ServerLayout {
     pub(crate) topology: Topology,
@@ -175,7 +175,7 @@ impl ServerLayout {
             FlagUse::Pool => matches!(self.topology, Topology::Pool { .. }),
             FlagUse::MacosTpc => cfg!(target_os = "macos") && matches!(self.topology, Topology::Tpc { .. }),
             FlagUse::SubinterpreterWorkers => self.workers() > 0,
-            FlagUse::MainBridge => self.main_routes && !matches!(self.topology, Topology::MultiThreadGil { .. }),
+            FlagUse::MainRoutes => self.main_routes,
             FlagUse::PoolAsyncRoutes => matches!(self.topology, Topology::Pool { .. }) && self.async_worker_routes,
             FlagUse::ProcessRoutes => self.process_routes,
             FlagUse::TcpTransport => self.tcp,
@@ -195,7 +195,7 @@ impl ServerLayout {
     }
 
     /// Returns one error per flag `values` gives (from the deployment or from code, not the
-    /// default) that this server does not use (D19).
+    /// default) that this server does not use.
     pub(crate) fn unused(&self, values: &ServerFlagValues) -> Vec<FlagError> {
         values
             .given()
@@ -222,23 +222,11 @@ impl std::fmt::Display for Topology {
             Topology::Tpc {
                 accept: AcceptMode::Fanout,
                 ..
-            } => "the Darwin fanout TPC topology (MIPYRE_TPC_DARWIN=fanout)",
+            } => "the Darwin fanout TPC topology (MIPYRE_TPC_ACCEPT=fanout)",
             Topology::MultiThreadGil { .. } => "the multi-thread GIL server (MIPYRE_TPC=0)",
             Topology::Pool { .. } => "the sub-interpreter pool (MIPYRE_TPC=0)",
         })
     }
-}
-
-/// Counts the multi-thread server's accept loops; macOS gets one because its `SO_REUSEPORT`
-/// does not load-balance connections the way Linux's does.
-#[cfg(target_os = "linux")]
-fn multi_thread_accept_loops(io_threads: NonZeroUsize, logical: NonZeroUsize) -> NonZeroUsize {
-    io_threads.min(logical)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn multi_thread_accept_loops(_io_threads: NonZeroUsize, _logical: NonZeroUsize) -> NonZeroUsize {
-    NonZeroUsize::MIN
 }
 
 /// Counts the async-engine workers for a TPC server's `async def` routes: one
@@ -266,7 +254,7 @@ mod tests {
     const CPUS: Cpus = Cpus::new(NonZeroUsize::new(16).unwrap(), NonZeroUsize::new(8).unwrap());
 
     /// The recipe of a server whose environment is `vars` and whose code gives `code`
-    /// (`run(...)`'s keywords).
+    /// (`ServerFlags(...)`'s keywords).
     fn recipe(vars: &[(&str, &str)], code: &[(&str, &str)], entry: EntryPoint) -> ServerRecipe {
         let env: Vec<(OsString, OsString)> = vars
             .iter()
@@ -275,7 +263,7 @@ mod tests {
         let mut flags = ServerFlags::default();
         for (keyword, raw) in code {
             flags
-                .give(CodeCall::Run, keyword, raw)
+                .give(CodeCall::ServerFlags, keyword, raw)
                 .map_err(|e: ServerFlagsError| e.to_string())
                 .unwrap();
         }
@@ -412,7 +400,7 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         let line = errors[0].to_string();
         assert!(
-            line.contains("mipyre run --subinterpreters") && !line.contains("run(subinterpreters=)"),
+            line.contains("mipyre run --subinterpreters") && !line.contains("ServerFlags(subinterpreters=)"),
             "{line}"
         );
     }
@@ -422,8 +410,6 @@ mod tests {
         // (flag given, a layout that uses it, one that does not)
         let mut main = tpc_without_workers();
         main.main_routes = true;
-        let mut main_multi = layout(MULTI_GIL);
-        main_multi.main_routes = true;
         let mut pool_async = layout(POOL);
         pool_async.async_worker_routes = true;
         let mut tpc_async = layout(TPC);
@@ -435,7 +421,7 @@ mod tests {
         let pairs: [(&str, &str, ServerLayout, ServerLayout); 7] = [
             ("MIPYRE_GC_MODE", "idle", layout(TPC), tpc_without_workers()),
             ("MIPYRE_ISOLATE_DIR", "/srv/iso", layout(POOL), layout(MULTI_GIL)),
-            ("MIPYRE_GIL_BRIDGE_WORKERS", "2", main, main_multi),
+            ("MIPYRE_BRIDGE_WORKERS", "2", main, layout(MULTI_GIL)),
             ("MIPYRE_ASYNC_QUEUE_CAPACITY", "100", pool_async, tpc_async),
             ("MIPYRE_PROCESS_WORKERS", "2", lanes, layout(TPC)),
             ("MIPYRE_PORT", "8001", layout(TPC), memory),
@@ -454,33 +440,57 @@ mod tests {
     }
 
     #[test]
+    fn the_main_thread_sizes_are_used_by_every_server_with_main_routes() {
+        let given = recipe(
+            &[("MIPYRE_BRIDGE_WORKERS", "2"), ("MIPYRE_BRIDGE_CAPACITY", "8")],
+            &[],
+            EntryPoint::Script,
+        );
+        for topology in [TPC, POOL, MULTI_GIL] {
+            let with_main = ServerLayout {
+                main_routes: true,
+                ..layout(topology)
+            };
+            assert!(with_main.unused(&given.values).is_empty(), "{topology:?}");
+            assert_eq!(layout(topology).unused(&given.values).len(), 2, "{topology:?}");
+        }
+    }
+
+    #[test]
     fn tpc_off_sizes_from_the_logical_count() {
         let off = [("MIPYRE_TPC", "0")];
         let t = resolve(InterpreterMode::Subinterp, &off, &[]).unwrap();
-        let loops = if cfg!(target_os = "linux") { 16 } else { 1 };
         assert_eq!(
             t,
             Topology::Pool {
                 workers: n(16),
                 io_threads: n(16),
-                accept_loops: n(loops),
+                accept_loops: n(16),
             }
         );
-        assert_eq!(t.accept_loops(), n(loops));
+        assert_eq!(t.accept_loops(), n(16));
         let t = resolve(
             InterpreterMode::Gil,
             &off,
             &[("threads", "4"), ("subinterpreters", "2")],
         )
         .unwrap();
-        let loops = if cfg!(target_os = "linux") { 4 } else { 1 };
         assert_eq!(
             t,
             Topology::MultiThreadGil {
                 io_threads: n(4),
-                accept_loops: n(loops),
+                accept_loops: n(4),
             }
         );
+    }
+
+    #[test]
+    fn multi_thread_accept_loops_stop_at_the_logical_count() {
+        let off = [("MIPYRE_TPC", "0")];
+        for (threads, loops) in [("16", 16), ("17", 16)] {
+            let t = resolve(InterpreterMode::Gil, &off, &[("threads", threads)]).unwrap();
+            assert_eq!(t.accept_loops(), n(loops), "threads={threads}");
+        }
     }
 
     #[test]
@@ -516,7 +526,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn darwin_fanout_has_one_accept_loop_and_no_idle_mode() {
-        let fanout = ("MIPYRE_TPC_DARWIN", "fanout");
+        let fanout = ("MIPYRE_TPC_ACCEPT", "fanout");
         let t = resolve(InterpreterMode::Subinterp, &[fanout], &[]).unwrap();
         assert_eq!(
             t,
@@ -536,7 +546,7 @@ mod tests {
 
     #[test]
     fn an_accept_mode_is_used_only_by_the_macos_tpc_server() {
-        let given = recipe(&[("MIPYRE_TPC_DARWIN", "listener")], &[], EntryPoint::Script);
+        let given = recipe(&[("MIPYRE_TPC_ACCEPT", "listener")], &[], EntryPoint::Script);
         for on in [layout(TPC), tpc_without_workers()] {
             if cfg!(target_os = "macos") {
                 assert!(unused_names(&on, &given).is_empty());

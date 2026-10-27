@@ -437,7 +437,7 @@ server {
 }
 ```
 
-nginx sends the upstream's name (`mipyre.devex:8000`) as `Host`, so start the server with `--allowed-host mipyre.devex` (or `MIPYRE_ALLOWED_HOSTS`); otherwise every proxied request is answered `421 Misdirected Request`.
+nginx sends the upstream's name (`mipyre.devex:8000`) as `Host`, so start the server with `--allowed-hosts mipyre.devex` (or `MIPYRE_ALLOWED_HOSTS`); otherwise every proxied request is answered `421 Misdirected Request`.
 
 and a handler returning `{"client_ip": req.client_ip, "x_forwarded_for": req.headers.get("x-forwarded-for")}`, a client at `10.244.0.52` got this through nginx (at `10.244.0.62`) and directly, on Kubernetes:
 
@@ -448,7 +448,7 @@ directly       {"client_ip":"10.244.0.52","x_forwarded_for":null}
 
 The local runs, with nginx in Docker, gave the same picture on all three runtimes: `"client_ip":"127.0.0.1"` (Docker's port forwarder) and `"x_forwarded_for":"172.18.0.1"`.
 
-To have the client's address in `req.client_ip`, list the proxy's address or block: `MIPYRE_TRUSTED_PROXIES=10.244.0.0/16` (or `run(trusted_proxies=[...])`, `mipyre run --trusted-proxy ADDR`, repeatable). A request whose peer is in the list takes its client from `X-Forwarded-For`, read from the right: each listed proxy's entry is skipped, and the first address that is not a listed proxy is the client. With the configuration above that is the `$remote_addr` nginx appended; whatever the client sent in its own `X-Forwarded-For` sits left of it and is never read. A request from an address not in the list keeps the peer as its client, whatever headers it sends, so a client that reaches the port directly cannot claim an address.
+To have the client's address in `req.client_ip`, list the proxy's address or block: `MIPYRE_TRUSTED_PROXIES=10.244.0.0/16` (or `ServerFlags(trusted_proxies=[...])`, `mipyre run --trusted-proxies ADDR`, repeatable). A request whose peer is in the list takes its client from `X-Forwarded-For`, read from the right: each listed proxy's entry is skipped, and the first address that is not a listed proxy is the client. With the configuration above that is the `$remote_addr` nginx appended; whatever the client sent in its own `X-Forwarded-For` sits left of it and is never read. A request from an address not in the list keeps the peer as its client, whatever headers it sends, so a client that reaches the port directly cannot claim an address.
 
 Only `X-Forwarded-For` is read, since it is the header nginx, HAProxy, Envoy and the cloud load balancers write by default; `Forwarded` (RFC 7239) is not. If the proxy writes an entry that is not a bare IP address where the client is looked for (`unknown`, an address with a port), the header is ignored, the proxy is the client, and `mipyre_forwarded_for_unreadable_total` counts it; a log line once a minute shows the header's value. The access log's `client_ip` is the TCP peer, the proxy, whatever `trusted_proxies` says.
 

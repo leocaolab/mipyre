@@ -1,9 +1,9 @@
-"""The sub-interpreter loading adapter of `runtime="isolated"` (design §14): a
+"""The sub-interpreter loading adapter of `runtime="isolated"`: a
 compatibility option, not the recommended way. A package whose extensions can't load
 shared in an own-GIL sub-interpreter is given to each worker as a private copy, loaded with
 CPython's multi-interpreter check switched off for that load.
 
-When it decides (`docs/design/isolation-finder.md`): the first time a worker resolves a
+When it decides: the first time a worker resolves a
 top-level name, before any of the package's code runs. `_IsolatingFinder.find_spec` reads
 the package's extension files (`extension_support`): if one of them can't load shared, the
 spec it returns points at this worker's copy of the package, so the import never fails
@@ -31,9 +31,11 @@ TYPE_CHECKING = False  # the bare-name form type checkers honour, so a worker im
 if TYPE_CHECKING:  # the engine runs these files in this namespace first
     from mipyre._clone import PrivateCopyError, _remove_copy, claim_name, clone_tree, ensure_private_dir
     from mipyre._worker.extension_support import (
+        CPYTHON_REFUSAL,
         ExtensionProbeError,
         MultiPhaseUnread,
         Unsupported,
+        _is_module_def,
         per_interpreter_support,
         probe_slot,
         static_facts,
@@ -274,11 +276,7 @@ def _iso_create_here(spec):
     if not ptr:
         raise SystemError(f"PyInit_{short} returned NULL without an exception")
     api = ctypes.pythonapi
-    api.PyObject_Type.restype = ctypes.c_void_p      # new ref to the TYPE; the object is untouched
-    api.PyObject_Type.argtypes = [ctypes.c_void_p]
-    ob_type = api.PyObject_Type(ptr)
-    api.Py_DecRef(ctypes.c_void_p(ob_type))
-    if ob_type == ctypes.addressof(ctypes.c_char.in_dll(api, "PyModuleDef_Type")):
+    if _is_module_def(ptr):
         # multi-phase: CPython's own next step, here instead of after its switch
         # to main (it also enforces Py_mod_multiple_interpreters under the
         # current override). The def stays borrowed, as CPython keeps it.
@@ -597,7 +595,7 @@ class _IsolatingExtensionLoader:
             except ImportError as e:
                 # CPython's own refusal, in its words (import.c); any other ImportError (a
                 # missing library, say) is the library's to handle.
-                if "does not support loading in subinterpreters" not in str(e):
+                if CPYTHON_REFUSAL not in str(e):
                     raise
                 raise IsolationError(
                     self._package, _SharedLoadRefused(spec.name, self._finder.shared_basis(self._package))

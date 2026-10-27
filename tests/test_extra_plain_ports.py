@@ -1,4 +1,4 @@
-"""`extra_plain_ports` / MIPYRE_PLAIN_PORTS: more plain listeners on one server.
+"""`extra_plain_ports` / MIPYRE_EXTRA_PLAIN_PORTS: more plain listeners on one server.
 
 A plain listener answers HTTP/1.1 and HTTP/2 with prior knowledge (h2c), which is what
 a cleartext h2 port (HttpArena baseline-h2c / json-h2c on 8082) needs.
@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import textwrap
@@ -16,7 +15,7 @@ import urllib.request
 
 import pytest
 
-from tests._helpers import bound_port, poll_until, read_file, set_subinterpreters
+from tests._helpers import bound_port, free_port_below_ephemeral, poll_until, read_file, set_subinterpreters
 
 HOST = "127.0.0.1"
 
@@ -30,7 +29,7 @@ _RUN_PATHS = [
 _APP = """
     import sys
     import os
-    from mipyre import Mipyre
+    from mipyre import Mipyre, ServerFlags
 
     app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
@@ -40,19 +39,13 @@ _APP = """
 
     if __name__ == "__main__":
         port, extra = sys.argv[1:3]
-        app.run(host="127.0.0.1", port=int(port), extra_plain_ports=[int(extra)])
+        app.run(ServerFlags(host="127.0.0.1", port=int(port), extra_plain_ports=[int(extra)]))
 """
-
-
-def _unused_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, 0))
-        return s.getsockname()[1]
 
 
 def _get(url: str) -> bytes:
     """The body `url` answers, once it does: a refused or reset attempt is a port not serving yet, looked at
-    again, for no length of time (b/441 T2)."""
+    again, for no length of time."""
 
     def body() -> tuple[bytes] | None:
         try:
@@ -68,8 +61,8 @@ def _get(url: str) -> bytes:
 def test_an_extra_plain_port_serves_http1_and_h2c(tmp_path, label, mode, env):
     script = tmp_path / "plain_app.py"
     script.write_text(textwrap.dedent(_APP))
-    # `extra_plain_ports` refuses 0, so the extra port is one the kernel just handed out.
-    extra = _unused_port()
+    # `extra_plain_ports` refuses 0, so the extra port is a free one below the ephemeral range.
+    extra = free_port_below_ephemeral()
     log_path = tmp_path / "server.log"
     # The "gil" paths serve every handler on the main interpreter: the app's runtime "main".
     full_env = {k: v for k, v in os.environ.items() if k != "MIPYRE_TEST_MODE"}

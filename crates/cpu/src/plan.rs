@@ -1079,7 +1079,7 @@ pub(crate) mod tests {
         assert_eq!(d.pin_order().cpus().len(), 16);
     }
 
-    /// Builds slow cores 0-11 and fast cores 12-17, one CPU each, in one L3 (b/262).
+    /// Builds slow cores 0-11 and fast cores 12-17, one CPU each, in one L3.
     fn slow_cores_numbered_first() -> Facts {
         host(
             &(0..18).collect::<Vec<_>>(),
@@ -1090,7 +1090,7 @@ pub(crate) mod tests {
     }
 
     /// Builds two sockets with interleaved CPUs: even CPUs share socket 0's L3 and odd ones socket
-    /// 1's; eight cores, no SMT (b/262).
+    /// 1's; eight cores, no SMT.
     fn two_sockets_interleaved_even_odd() -> Facts {
         host(
             &(0..8).collect::<Vec<_>>(),

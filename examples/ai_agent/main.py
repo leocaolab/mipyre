@@ -12,7 +12,8 @@ from mipyre.mcp import MCPServer, ToolError
 
 from ai_agent.memory import SESSION_PREFIX, history
 
-app = Mipyre(routers=["ai_agent.chat:router"])
+app = Mipyre()
+app.include_router("ai_agent.chat:router")
 app.enable_cors(allow_origins="*")
 app.enable_access_log()
 

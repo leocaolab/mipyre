@@ -1,10 +1,8 @@
-"""Regression for the CORS-404 short-circuit bug.
+"""CORS headers on the early answers: an unmatched route and a static-file hit.
 
-Before the fix, early-return paths in `handle_request` / `handle_request_subinterp`
-(unmatched route, static-file hit) bypassed `apply_cors`. Browsers doing a
-CORS preflight (OPTIONS) against an unknown path got a bare 404 with no
-Access-Control-* headers, blocking the follow-up real request with an
-opaque CORS policy error.
+A CORS preflight (OPTIONS) against an unknown path that gets a bare 404 with no
+Access-Control-* headers blocks the follow-up real request with an opaque CORS
+policy error in the browser.
 """
 
 import urllib.request
@@ -121,6 +119,18 @@ def test_any_origin_with_credentials_is_refused_by_the_engine_itself():
         app.enable_cors(allow_origins=["https://a.example", "*"], allow_credentials=True)
     with pytest.raises(ValueError, match="allow_credentials"):
         app._engine.set_cors_config(["*"], "GET", "*", None, True)
+
+
+def test_each_cors_setting_takes_a_str_or_a_list_or_tuple_of_str():
+    from mipyre.app import _cors_values
+
+    assert _cors_values("allow_methods", "GET, POST") == ["GET, POST"]
+    assert _cors_values("allow_methods", ("GET", "POST")) == ["GET", "POST"]
+    assert _cors_values("allow_origins", []) == []
+    for name in ("allow_origins", "allow_methods", "allow_headers", "expose_headers"):
+        for bad in (["GET", None], [8080], ("a", b"b"), None, 3, {"GET"}):
+            with pytest.raises(TypeError, match=f"CORS: {name} must be"):
+                _cors_values(name, bad)
 
 
 def _get_from(base: str, origin: str | None):

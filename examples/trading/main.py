@@ -10,7 +10,9 @@ from mipyre import Mipyre, Response, rpc
 
 from trading.market import TICKERS, get_live_price
 
-app = Mipyre(routers=["trading.orders:router", "trading.analytics:router"])
+app = Mipyre()
+app.include_router("trading.orders:router")
+app.include_router("trading.analytics:router")
 app.enable_cors(allow_origins="*")
 app.enable_access_log()
 
@@ -73,15 +75,14 @@ def get_signals(data):
 
 
 @app.websocket("/ws/prices")
-def price_stream(ws):
+async def price_stream(ws):
     """Answer each text message, a comma-separated list of tickers or "all", with their
     quotes."""
-    while (msg := ws.recv_message()) is not None:
+    async for msg in ws:
         if isinstance(msg, bytes):
             continue
         wanted = TICKERS if msg.strip().lower() == "all" else [t.strip().upper() for t in msg.split(",")]
         try:
-            ws.send(json.dumps({t: get_live_price(t) for t in wanted if t in TICKERS}))
-        except (ConnectionError, BlockingIOError):
-            ws.close()  # the client left, or stopped reading what we send
-            return
+            await ws.send(json.dumps({t: get_live_price(t) for t in wanted if t in TICKERS}))
+        except ConnectionError:
+            return  # the client left

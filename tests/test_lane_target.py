@@ -1,6 +1,5 @@
-"""b/845 E: the target a process-lane worker imports to rebuild the app, as `lane_target`
-finds it among the loaded modules (it replaced b/847's `_run_target`, which named the
-`mipyre run` command an `app.run()` with process routes was refused with)."""
+"""The target a process-lane worker imports to rebuild the app, as `lane_target` finds it among
+the loaded modules."""
 
 from __future__ import annotations
 

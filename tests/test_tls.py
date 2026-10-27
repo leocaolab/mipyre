@@ -17,14 +17,14 @@ import http.client
 import shutil
 import ssl
 import subprocess
-import threading
 
 import pytest
 
 from tests._helpers import poll_until
 
 from mipyre import Mipyre
-from mipyre._server_run import runs_of
+from mipyre.engine import ServerFlags
+from mipyre.testing import TestServer
 
 
 if shutil.which("openssl") is None:
@@ -64,17 +64,6 @@ def tls_server(cert_key):
     def echo(req):
         return {"name": req.params["name"]}
 
-    t = threading.Thread(
-        target=lambda: app.run(
-            host="127.0.0.1", port=0,
-            tls_cert=str(cert), tls_key=str(key),
-        ),
-        daemon=True,
-    )
-    t.start()
-    # Bound on port 0: the app's server reports the port it got.
-    port = poll_until(lambda: [run.port for run in runs_of(app).serving()], what="TLS bind")[0]
-
     # Wait for TLS listener. Plain TCP connect succeeds the instant the
     # listener binds; we need to actually complete a TLS handshake to
     # know the server is serving.
@@ -91,9 +80,10 @@ def tls_server(cert_key):
         except (OSError, http.client.HTTPException):
             return False
 
-    poll_until(served, timeout=None, what="a TLS request answered")
-
-    yield port, ctx
+    with TestServer(app, config=ServerFlags(tls_cert=str(cert), tls_key=str(key))) as server:
+        port = server.port
+        poll_until(served, timeout=None, what="a TLS request answered")
+        yield port, ctx
 
 
 def test_https_get_returns_200(tls_server):
@@ -145,8 +135,9 @@ def test_missing_cert_file_raises(tmp_path):
     """Non-existent cert path should raise a clear ValueError."""
     app = Mipyre()
     with pytest.raises((ValueError, OSError)):
-        app.run(
-            host="127.0.0.1", port=0,
+        app.run(ServerFlags(
+            host="127.0.0.1",
+            port=0,
             tls_cert=str(tmp_path / "missing.pem"),
             tls_key=str(tmp_path / "missing.pem"),
-        )
+        ))

@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 #[cfg(feature = "leak_detect")]
 #[pyo3::pyfunction]
 fn leak_detect_dump() {
-    crate::telemetry::dump_to_stderr();
+    mipyre_runtime::leak_detect::dump_to_stderr();
 }
 
 /// Panic with `message`, so the chaos tests can drive a real Rust panic through the dispatch
@@ -26,7 +26,7 @@ fn _fault_panic(message: String) {
 
 #[pyo3::pyfunction]
 fn workrequest_counts() -> Option<(u64, u64)> {
-    crate::runtime::PoolJob::counts()
+    mipyre_runtime::PoolJob::counts()
 }
 
 /// Return the parameter names of the route path `path` in order (`{*rest}` gives `rest`).
@@ -49,15 +49,12 @@ fn _in_worker(py: Python<'_>) -> bool {
     !mipyre_subinterp::attach::on_main(py)
 }
 
-/// Return how many threads that own a sub-interpreter run Python, which the process must not
-/// finalize under; when none does, wait without a deadline until every one has ended its
-/// interpreter (0) or one enters Python.
+/// End the process with status 1 and no finalization, after the log lines so far, `error`'s
+/// whole chain when there is one, and `why`.
 #[pyo3::pyfunction]
-fn _interpreters_running_python_at_exit(py: Python<'_>) -> usize {
-    match py.detach(mipyre_subinterp::decide_exit) {
-        mipyre_subinterp::ExitDecision::Finalize => 0,
-        mipyre_subinterp::ExitDecision::ExitWithoutFinalizing { running_python } => running_python.get(),
-    }
+#[pyo3(signature = (why, error))]
+fn _exit_without_finalization(py: Python<'_>, why: &str, error: Option<Bound<'_, pyo3::exceptions::PyBaseException>>) {
+    crate::boot::exit_without_finalizing(py, why, error.map(|e| PyErr::from_value(e.into_any())))
 }
 
 /// Return the physical cores as the server counts them, which is the default number of
@@ -88,45 +85,53 @@ fn _is_async_handler(handler: &Bound<'_, PyAny>) -> PyResult<bool> {
 /// `sys.get_int_max_str_digits()` allows.
 #[pyo3::pyfunction]
 fn encode_json<'py>(py: Python<'py>, value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    crate::exchange::json::encode(py, value)
+    mipyre_runtime::exchange::json::encode(py, value)
 }
 
 #[pymodule]
 fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Each interpreter's `mipyre.engine` holds its own (PEP 489 module state, b/335 D13).
-    m.set_state(crate::runtime::EngineModule::default())?;
+    // Each interpreter's `mipyre.engine` holds its own (PEP 489 module state).
+    m.set_state(mipyre_runtime::EngineModule::default())?;
     m.add_function(wrap_pyfunction!(crate::pyapi::alloc::_mimalloc_purge_delay, m)?)?;
     m.add_class::<crate::pyapi::App>()?;
     m.add_class::<crate::pyapi::PyRuntimeChoice>()?;
     m.add_class::<crate::pyapi::Server>()?;
-    m.add_class::<crate::runtime::process::LaneSet>()?;
-    m.add_class::<crate::runtime::CommandLine>()?;
-    m.add_class::<crate::runtime::process::StartStrategy>()?;
-    m.add_class::<crate::runtime::process::FailurePolicy>()?;
+    m.add_class::<crate::pyapi::lane_set::PyLaneSet>()?;
+    m.add_function(pyo3::wrap_pyfunction!(crate::pyapi::process::_create_lanes, m)?)?;
+    m.add_class::<mipyre_runtime::CommandLine>()?;
+    m.add_class::<crate::pyapi::process::PyStartStrategy>()?;
+    m.add_class::<crate::pyapi::process::PyFailurePolicy>()?;
     m.add("BUILD_ID", env!("MIPYRE_BUILD_ID"))?;
-    m.add_function(pyo3::wrap_pyfunction!(crate::runtime::process::_driver_name, m)?)?;
+    m.add(
+        "VALIDATION_DETAIL_LIMIT",
+        mipyre_runtime::exchange::VALIDATION_DETAIL_LIMIT,
+    )?;
+    m.add_function(pyo3::wrap_pyfunction!(crate::pyapi::process_driver::_driver_name, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
-        crate::runtime::process::_driver_start_template,
+        crate::pyapi::process_driver::_driver_start_template,
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
-        crate::runtime::process::_driver_spawn_template,
+        crate::pyapi::process_driver::_driver_spawn_template,
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
-        crate::runtime::process::_driver_start_import_worker,
+        crate::pyapi::process_driver::_driver_start_import_worker,
         m
     )?)?;
-    m.add_function(pyo3::wrap_pyfunction!(crate::runtime::process::_driver_fork_worker, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(crate::runtime::_routers_to_load, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(crate::runtime::_set_routers_to_load, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        crate::pyapi::process_driver::_driver_fork_worker,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(mipyre_runtime::_routers_to_load, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(mipyre_runtime::_set_routers_to_load, m)?)?;
     m.add(
         "DeclarationError",
-        m.py().get_type::<crate::runtime::DeclarationError>(),
+        m.py().get_type::<mipyre_runtime::DeclarationError>(),
     )?;
     m.add(
         "MissingAppFileError",
-        m.py().get_type::<crate::runtime::MissingAppFileError>(),
+        m.py().get_type::<mipyre_runtime::MissingAppFileError>(),
     )?;
     m.add(
         "LateRegistrationError",
@@ -134,26 +139,32 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add_class::<crate::pyapi::config::PyLogLevel>()?;
     m.add_class::<crate::pyapi::config::Compression>()?;
-    m.add_class::<crate::exchange::Request>()?;
-    m.add_class::<crate::exchange::Response>()?;
-    m.add_class::<crate::exchange::Cookie>()?;
-    m.add_class::<crate::exchange::SameSite>()?;
-    m.add_class::<crate::exchange::RequestHeaders>()?;
-    m.add_class::<crate::exchange::WebSocket>()?;
+    m.add_class::<mipyre_runtime::exchange::Request>()?;
+    m.add_class::<mipyre_runtime::exchange::Response>()?;
+    m.add_class::<mipyre_runtime::exchange::Cookie>()?;
+    m.add_class::<mipyre_runtime::exchange::SameSite>()?;
+    m.add_class::<mipyre_runtime::exchange::RequestHeaders>()?;
+    m.add_class::<mipyre_runtime::exchange::WebSocket>()?;
+    m.add_class::<mipyre_runtime::exchange::LoopWaits>()?;
+    m.add_class::<mipyre_runtime::ConnectionInbox>()?;
+    m.add_class::<mipyre_runtime::WsJob>()?;
     m.add_class::<crate::pyapi::state::AppStateView>()?;
-    m.add_class::<crate::exchange::ResponseStream>()?;
-    m.add_class::<crate::exchange::BodyStream>()?;
-    m.add_class::<crate::runtime::AbandonedWorker>()?;
-    m.add("WorkerException", m.py().get_type::<crate::runtime::WorkerException>())?;
-    m.add("BodyReadError", m.py().get_type::<crate::exchange::PyBodyReadError>())?;
-    m.add_class::<crate::exchange::HttpException>()?;
+    m.add_class::<mipyre_runtime::exchange::ResponseStream>()?;
+    m.add_class::<mipyre_runtime::exchange::BodyStream>()?;
+    m.add_class::<mipyre_runtime::AbandonedWorker>()?;
+    m.add("WorkerException", m.py().get_type::<mipyre_runtime::WorkerException>())?;
+    m.add(
+        "BodyReadError",
+        m.py().get_type::<mipyre_runtime::exchange::PyBodyReadError>(),
+    )?;
+    m.add_class::<mipyre_runtime::exchange::HttpException>()?;
     crate::db::register(m)?;
     m.add_class::<crate::pyapi::config::Metrics>()?;
     m.add_class::<crate::pyapi::config::RunMetrics>()?;
     m.add_class::<crate::boot::Flag>()?;
     m.add_class::<crate::boot::Deployment>()?;
     m.add_class::<crate::boot::ServerFlags>()?;
-    m.add_class::<crate::runtime::process::LaneRecipe>()?;
+    m.add_class::<crate::pyapi::process::PyLaneRecipe>()?;
     m.add_class::<crate::boot::EntryPoint>()?;
     m.add("ConfigError", m.py().get_type::<crate::boot::ConfigErrorException>())?;
     m.add_function(pyo3::wrap_pyfunction!(crate::pyapi::config::_flags, m)?)?;
@@ -169,20 +180,18 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(crate::telemetry::_python_log_level, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(workrequest_counts, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_in_worker, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(_interpreters_running_python_at_exit, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(_exit_without_finalization, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_physical_cores, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_route_params, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(encode_json, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(_is_async_handler, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(crate::runtime::_worker_recv, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(crate::runtime::_worker_close, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(crate::runtime::_worker_send, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(crate::runtime::_worker_fail, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(crate::runtime::_worker_timed_out, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(crate::runtime::_worker_to_response, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(mipyre_runtime::_worker_take, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(mipyre_runtime::_worker_send, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(mipyre_runtime::_worker_fail, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(mipyre_runtime::_worker_to_response, m)?)?;
     #[cfg(feature = "leak_detect")]
     m.add_function(pyo3::wrap_pyfunction!(leak_detect_dump, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(crate::runtime::_note_isolated, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(mipyre_runtime::_note_isolated, m)?)?;
     #[cfg(feature = "fault_injection")]
     m.add_function(pyo3::wrap_pyfunction!(_fault_panic, m)?)?;
     Ok(())

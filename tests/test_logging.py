@@ -75,14 +75,14 @@ def run_server_and_check(script: str, label: str, expected_strings: list[str]):
 def test_gil_mode_logging():
     """Framework logging in GIL mode — the Rust access log (one line per request)."""
     script = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre()
 app.enable_access_log()
 
 @app.get("/", runtime="main")
 def index(req): return "ok"
 
-app.run(host="127.0.0.1", port=0)
+app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
     assert run_server_and_check(script, "gil_logging", [
         "mipyre::access",
@@ -96,14 +96,14 @@ app.run(host="127.0.0.1", port=0)
 def test_subinterp_rust_logging():
     """Rust-level request logging in sub-interpreter mode via tracing."""
     script = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre()
 app.enable_access_log()
 
 @app.get("/")
 def index(req): return "ok"
 
-app.run(host="127.0.0.1", port=0)
+app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
     assert run_server_and_check(script, "subinterp_logging", [
         "mipyre::access",
@@ -114,7 +114,7 @@ app.run(host="127.0.0.1", port=0)
 def test_user_print_in_subinterp():
     """User print() works in sub-interpreter handlers."""
     script = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre()
 
 @app.get("/")
@@ -122,7 +122,7 @@ def index(req):
     print("USER_PRINT_MARKER", flush=True)
     return "ok"
 
-app.run(host="127.0.0.1", port=0)
+app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
     assert run_server_and_check(script, "user_print", [
         "USER_PRINT_MARKER",
@@ -135,7 +135,7 @@ def test_user_logging_in_subinterp():
 import logging
 logger = logging.getLogger("test")
 
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(debug=True)
 
 @app.get("/")
@@ -143,7 +143,7 @@ def index(req):
     logger.info("LOGGER_MARKER_12345")
     return "ok"
 
-app.run(host="127.0.0.1", port=0)
+app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
     assert run_server_and_check(script, "user_logging", [
         "LOGGER_MARKER_12345",
@@ -153,13 +153,13 @@ app.run(host="127.0.0.1", port=0)
 def test_debug_mode_tracing():
     """debug=True enables tracing output with access log."""
     script = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(debug=True)
 
 @app.get("/")
 def index(req): return "ok"
 
-app.run(host="127.0.0.1", port=0)
+app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
     assert run_server_and_check(script, "debug_mode", [
         "mipyre::server",
@@ -171,13 +171,13 @@ app.run(host="127.0.0.1", port=0)
 def test_debug_mode_access_log():
     """debug=True produces access log with latency."""
     script = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(debug=True)
 
 @app.get("/")
 def index(req): return "ok"
 
-app.run(host="127.0.0.1", port=0)
+app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
     assert run_server_and_check(script, "debug_access_log", [
         "mipyre::access",
@@ -190,7 +190,7 @@ def test_python_logging_bridge_main():
     """Python logging in main interpreter routes through Rust tracing."""
     script = '''
 import logging
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 app = Mipyre(debug=True)
 logger = logging.getLogger("myapp")
@@ -200,7 +200,7 @@ def index(req):
     logger.info("BRIDGE_TEST_MARKER")
     return "ok"
 
-app.run(host="127.0.0.1", port=0)
+app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
     assert run_server_and_check(script, "python_bridge_main", [
         "BRIDGE_TEST_MARKER",
@@ -211,13 +211,13 @@ app.run(host="127.0.0.1", port=0)
 def test_json_format():
     """JSON format output when configured."""
     script = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(debug=True, log_config={"format": "json"})
 
 @app.get("/")
 def index(req): return "ok"
 
-app.run(host="127.0.0.1", port=0)
+app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
     assert run_server_and_check(script, "json_format", [
         '"target":"mipyre::server"',
@@ -226,7 +226,7 @@ app.run(host="127.0.0.1", port=0)
 
 
 def test_a_process_workers_logging_is_the_same_json_line_as_a_sub_interpreters(tmp_path):
-    """b/876: a `runtime="process"` worker's Python logging goes through the engine's log, so a
+    """A `runtime="process"` worker's Python logging goes through the engine's log, so a
     collector that parses JSON keeps its line: the same keys as a sub-interpreter worker's line,
     with the worker's `lane` where a sub-interpreter's has its `worker`."""
     (tmp_path / "process_log_app.py").write_text('''
@@ -234,7 +234,7 @@ import logging
 from mipyre import Mipyre
 
 app = Mipyre(log_config={"level": "WARN"})
-log = logging.getLogger("b876")
+log = logging.getLogger("process_app")
 
 @app.get("/sub")
 def sub(req):
@@ -272,11 +272,11 @@ def proc(req):
     assert sub["target"] == process["target"] == "mipyre::app"
     assert sub["level"] == process["level"] == "WARN"
     assert set(sub["fields"]) - {"worker"} == set(process["fields"]) - {"lane"}, (sub, process)
-    assert process["fields"]["logger"] == "b876" and isinstance(process["fields"]["lane"], int), process
+    assert process["fields"]["logger"] == "process_app" and isinstance(process["fields"]["lane"], int), process
 
 
 _TRACED_APP = """
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre()
 app.enable_access_log()
 app.enable_request_id_header("traceparent")
@@ -284,7 +284,7 @@ app.enable_request_id_header("traceparent")
 @app.get("/hello")
 def hello(req): return {"request_id": req.request_id}
 
-app.run(host="127.0.0.1", port=0)
+app.run(ServerFlags(host="127.0.0.1", port=0))
 """
 
 TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -293,7 +293,7 @@ TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 def test_the_access_line_carries_the_request_id_the_response_carries_and_the_client_address():
     """A handler's answer and the engine's own 404 each have one access line, named by the id
     their response carries (the client's trace id, or the one the server made) and the client's
-    address, so the line is found by the trace id and joins the handler's lines (b/882)."""
+    address, so the line is found by the trace id and joins the handler's lines."""
     workdir = tempfile.mkdtemp(prefix="mipyre_log_traced_")
     script_path = os.path.join(workdir, "app.py")
     with open(script_path, "w") as f:

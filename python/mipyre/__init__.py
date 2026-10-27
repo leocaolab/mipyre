@@ -3,7 +3,7 @@
 from collections.abc import Mapping as _Mapping
 
 from mipyre.engine import Request, Response, Headers, WebSocket, SharedState, Stream, BodyStream, Metrics, get_gil_metrics, reset_peaks, flush_logs, LogLevel, Compression, HTTPException
-from mipyre.engine import BodyReadError, DeclarationError, LateRegistrationError, MissingAppFileError
+from mipyre.engine import BodyReadError, DeclarationError, LateRegistrationError, MissingAppFileError, ServerFlags
 from mipyre.app import Mipyre
 from mipyre._routes import FastRoute, Route, Router, Runtime, RuntimeDeclarationError
 from mipyre._process_lane.settings import ProcessLanes
@@ -52,7 +52,7 @@ _Mapping.register(Headers)
 
 __all__ = [
     "Router", "Runtime", "ProcessLanes",
-    "Mipyre", "Route", "FastRoute", "Request", "Response", "Headers", "WebSocket", "SharedState", "Stream", "BodyStream",
+    "Mipyre", "ServerFlags", "Route", "FastRoute", "Request", "Response", "Headers", "WebSocket", "SharedState", "Stream", "BodyStream",
     "Metrics", "get_gil_metrics", "reset_peaks", "flush_logs",
     "LogLevel", "Compression",
     "redirect", "rpc", "RPCClient", "HealthProbes", "OpenApi",
@@ -62,13 +62,15 @@ __all__ = [
     "Cookie", "SameSite", "get_cookies", "get_cookie",
     "parse_multipart", "MultipartError", "Form", "FormPart",
     "cached_json",
+    "EventSourceResponse", "ServerSentEvent",
     "AbandonedWorkersError", "ThreadedTemplateError",
 ]
 
 
 #: What only some programs use, by the module it is imported from on first use: RPC, `@rpc(app)` and
 #: its client (with msgpack), the `query=` binder, `HealthProbes`, `OpenApi`, a server run's `AbandonedWorkersError`
-#: (only the main interpreter runs a server) and the threaded template's `ThreadedTemplateError`.
+#: (only the main interpreter runs a server), the threaded template's `ThreadedTemplateError` and server-sent
+#: events from a generator.
 _ON_FIRST_USE = {
     "rpc": "mipyre._rpc", "RPCClient": "mipyre._rpc", "RPCError": "mipyre._rpc", "RPCRequestError": "mipyre._rpc",
     "RPCServerError": "mipyre._rpc", "RPCReplyError": "mipyre._rpc",
@@ -77,6 +79,7 @@ _ON_FIRST_USE = {
     "OpenApi": "mipyre._openapi",
     "AbandonedWorkersError": "mipyre._server_run",
     "ThreadedTemplateError": "mipyre._process_lane.threads",
+    "EventSourceResponse": "mipyre._sse", "ServerSentEvent": "mipyre._sse",
 }
 
 

@@ -3,7 +3,7 @@
 Entry point for the ``mipyre`` console script. Three subcommands:
 
 - ``mipyre run <module:attr>``   production-ish launch (no reload)
-- ``mipyre dev <module:attr>``   hot-reload, access log on (logs at INFO)
+- ``mipyre dev <module:attr>``   hot-reload, access log on (logs text at INFO)
 - ``mipyre routes <module:attr>`` print the registered route table
 
 The target is a ``module:attr`` string identifying a Mipyre app, just like
@@ -32,7 +32,7 @@ import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from mipyre import _server_run, flags
+from mipyre import _server_run, _target, flags
 from mipyre._server_run import Launch
 from mipyre.engine import ConfigError, Deployment, EntryPoint, ServerFlags
 
@@ -47,31 +47,23 @@ def _importable_cwd() -> None:
         sys.path.insert(0, cwd)
 
 
-def _set_app_argv(target: str, app_args: list[str]) -> None:
+def _set_app_argv(target: _target.Target, app_args: list[str]) -> None:
     """``sys.argv`` becomes the app's command line before any of the app is imported, so an app
     that parses it as it is imported reads its own arguments; the workers copy main's. Finding
     the app's file imports the packages above a dotted module, so they see the app's arguments
     behind the target as given; then ``argv[0]`` becomes the file."""
-    from mipyre import _target
-
     _importable_cwd()
-    sys.argv = [target, *app_args]
+    sys.argv = [target.text, *app_args]
     try:
         sys.argv[0] = _target.target_file(target)
-    except (ValueError, _target.MissingTargetError) as e:
+    except _target.MissingTargetError as e:
         sys.exit(f"mipyre: {e}")
 
 
-def _load_app(target: str) -> "Mipyre":
+def _load_app(target: _target.Target) -> "Mipyre":
     """Resolve ``module[:attr]`` (or ``path/to/app.py[:attr]``) → Mipyre instance.
     Importing the module runs its top-level code, which registers routes on the app."""
-    from mipyre import _target
-
     _importable_cwd()
-    try:
-        module_name, attr = _target.split_target(target)
-    except ValueError as e:
-        sys.exit(f"mipyre: {e}")
     try:
         module, app = _target.import_target(target)
     except _target.MissingTargetError as e:
@@ -80,13 +72,13 @@ def _load_app(target: str) -> "Mipyre":
     from mipyre.app import Mipyre
     if not isinstance(app, Mipyre):
         sys.exit(
-            f"mipyre: {target} is a {type(app).__name__}, expected mipyre.Mipyre"
+            f"mipyre: {target.text} is a {type(app).__name__}, expected mipyre.Mipyre"
         )
     # Sub-interpreter workers execute the script that defines the app. Under the CLI,
     # `__main__` is this file, so point them at the app's module instead.
     module_file = getattr(module, "__file__", None)
     if module_file:
-        _server_run.set_app_file(app, os.path.abspath(module_file))
+        app._engine.set_script_path(module_file)
     return app
 
 
@@ -161,7 +153,7 @@ class _Options:
 def _add_flags(o: _Options, *, reload: bool) -> None:
     """mipyre's settings as options, from the engine's declaration table: each takes its value
     as typed (the engine reads it, with the environment and ``pyproject.toml``); a boolean
-    given bare is on, ``--allowed-host`` and ``--trusted-proxy`` are repeatable. ``mipyre dev``
+    given bare is on, ``--allowed-hosts`` and ``--trusted-proxies`` are repeatable. ``mipyre dev``
     is the reloader itself, so it has no ``--reload``."""
     from mipyre.engine import _flags
 
@@ -188,8 +180,8 @@ def _add_dev_flags(o: _Options) -> None:
 
 
 def _given_flags(args: argparse.Namespace) -> dict[str, str]:
-    """The settings given on the command line, by flag name, as typed (``--allowed-host``'s
-    and ``--trusted-proxy``'s repeats joined by commas)."""
+    """The settings given on the command line, by flag name, as typed (``--allowed-hosts``'s
+    and ``--trusted-proxies``'s repeats joined by commas)."""
     from mipyre.engine import _flags
 
     given: dict[str, str] = {}
@@ -242,7 +234,7 @@ def main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
     commands = {
         "run": (_subcommand(sub, "run", "start the server", _add_run_flags), _cmd_run),
-        "dev": (_subcommand(sub, "dev", "start with hot-reload and the access log on (logs at INFO)", _add_dev_flags),
+        "dev": (_subcommand(sub, "dev", "start with hot-reload and the access log on (logs text at INFO)", _add_dev_flags),
                 _cmd_dev),
         "routes": (_subcommand(sub, "routes", "print the route table", None), _cmd_routes),
     }
@@ -256,10 +248,14 @@ def main(argv: list[str] | None = None) -> None:
         own.parser.error("the following arguments are required: target")
 
     flags._begin(rest, own.parser.prog, own.sites)
-    _set_app_argv(args.target, app_args)
+    try:
+        target = _target.parse_target(args.target)
+    except ValueError as e:
+        sys.exit(f"mipyre: {e}")
+    _set_app_argv(target, app_args)
 
     def import_app() -> Mipyre:
-        app = _load_app(args.target)
+        app = _load_app(target)
         flags._seal(_full_parser(own.parser), tokens)
         return app
 

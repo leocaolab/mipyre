@@ -297,6 +297,11 @@ def return_complex(req):
     return {"v": 1 + 2j}
 
 
+@app.get("/returned/tuple")
+def return_body_and_status(req):
+    return "x", 201
+
+
 @app.get("/unsupported/custom_obj")
 def return_custom_obj(req):
     class Foo:
@@ -400,7 +405,7 @@ def _logged_error(capfd, rid: str) -> str:
     """The `error` field of the process-log line carrying `rid`. The server runs in this
     process and logs a failure before it answers; its log writer is a background thread, so
     `flush_logs()` is the fence: past it, every line logged before is on stderr, and stderr is
-    read once (b/497). Read while the writer writes, a line can be lost: `readouterr()` reads
+    read once. Read while the writer writes, a line can be lost: `readouterr()` reads
     the capture file and then truncates it, and a line written in between is gone."""
     flush_logs()
     err = capfd.readouterr().err
@@ -458,7 +463,7 @@ class TestPrimitives:
 
     @pytest.mark.parametrize("which", sorted(_WIDE_INTS))
     def test_int_wider_than_64_bits_answers_what_json_dumps_writes(self, client, which):
-        """b/760: isojson raised `Integer exceeds 64-bit range` and the client got a 500."""
+        """An int wider than 64 bits is written as json.dumps writes it, not refused with a 500."""
         r = client.get(f"/int/wide/{which}")
         assert r.status_code == 200
         assert r.body == json.dumps({"n": _WIDE_INTS[which]}, separators=(",", ":")).encode()
@@ -660,6 +665,14 @@ class TestUnsupportedTypes:
         rid = _assert_generic_500(client.get("/unsupported/complex"))
         error = _logged_error(capfd, rid)
         assert "complex" in error.lower() or "serialize" in error.lower(), error
+
+    def test_a_returned_tuple_is_a_500_logging_its_type_and_repr(self, client, capfd):
+        rid = _assert_generic_500(client.get("/returned/tuple"))
+
+        assert _logged_error(capfd, rid) == (
+            "the returned tuple is not a response: ('x', 201); return a dict, list, str, bytes, "
+            "bytearray, None, Response or Stream"
+        )
 
 
 class TestDepthLimiting:

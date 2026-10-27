@@ -5,7 +5,7 @@ NoEventLoopError); running a coroutine on a loop of the handler's own is. Run as
 
 import asyncio
 
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 app = Mipyre()
 
@@ -34,4 +34,4 @@ def new_event_loop(req):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, threads=1)
+    app.run(ServerFlags(host="127.0.0.1", port=0, threads=1))

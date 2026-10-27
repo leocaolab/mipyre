@@ -1,0 +1,470 @@
+"""The Python package: multipart, cookies, the reloader, the isolation clone dir, `body=` with
+path parameters, MCP error codes."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import stat
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from mipyre import Mipyre
+from mipyre.cookies import Cookie
+from mipyre.engine import Response
+from mipyre.mcp import MCPServer
+from mipyre.testing import TestClient
+from mipyre.uploads import parse_multipart
+from tests._helpers import isolation_adapter_ns
+
+
+# ---------------------------------------------------------------------------
+# Multipart parser
+# ---------------------------------------------------------------------------
+
+
+class _MultipartRequest:
+    def __init__(self, body: bytes, boundary: str = "XyZ"):
+        self.headers = {"content-type": f"multipart/form-data; boundary={boundary}"}
+        self.body = body
+
+
+def _multipart(*parts: tuple[str, bytes], nl: bytes = b"\r\n") -> bytes:
+    out = b""
+    for name, data in parts:
+        out += b"--XyZ" + nl
+        out += f'Content-Disposition: form-data; name="{name}"; filename="{name}.txt"'.encode() + nl
+        out += nl + data + nl
+    return out + b"--XyZ--" + nl
+
+
+@pytest.mark.parametrize("data", [b"line1\r\n", b"a\r\n\r\n", b"\r\n", b"ends-with-lf\n"])
+def test_multipart_keeps_trailing_newlines_of_file_data(data):
+    form = parse_multipart(_MultipartRequest(_multipart(("f", data), ("g", b"x"))))
+    assert form["f"].data == data
+    assert form["g"].data == b"x"
+
+
+def test_multipart_lf_framing_keeps_trailing_newline():
+    form = parse_multipart(_MultipartRequest(_multipart(("f", b"text\n"), nl=b"\n")))
+    assert form["f"].data == b"text\n"
+
+
+def test_multipart_without_delimiter_raises():
+    from mipyre.uploads import MultipartError
+
+    with pytest.raises(MultipartError, match="XyZ"):
+        parse_multipart(_MultipartRequest(b"no multipart framing here"))
+
+
+def test_multipart_truncated_body_raises():
+    from mipyre.uploads import MultipartError
+
+    body = b'--XyZ\r\nContent-Disposition: form-data; name="f"\r\n\r\npartial data'
+    with pytest.raises(MultipartError, match="closing"):
+        parse_multipart(_MultipartRequest(body))
+
+
+# ---------------------------------------------------------------------------
+# Cookies
+# ---------------------------------------------------------------------------
+
+
+def _set_cookie_line(**attributes) -> str:
+    line = Response(body="ok", headers={"set-cookie": Cookie("sid", "v", **attributes)}).headers["set-cookie"]
+    assert isinstance(line, str), line
+    return line
+
+
+def test_cookie_expires_takes_datetime_and_formats_http_date():
+    when = datetime(2026, 10, 21, 7, 28, 0, tzinfo=timezone.utc)
+    header = _set_cookie_line(expires=when)
+    assert "Expires=Wed, 21 Oct 2026 07:28:00 GMT" in header
+
+
+def test_cookie_expires_converts_to_gmt():
+    when = datetime(2026, 10, 21, 9, 28, 0, tzinfo=timezone(timedelta(hours=2)))
+    header = _set_cookie_line(expires=when)
+    assert "Expires=Wed, 21 Oct 2026 07:28:00 GMT" in header
+
+
+def test_cookie_expires_rejects_naive_datetime():
+    with pytest.raises(ValueError, match="timezone"):
+        Cookie("sid", "v", expires=datetime(2026, 10, 21))
+
+
+def test_cookie_samesite_is_an_enum():
+    from mipyre.cookies import SameSite
+
+    header = _set_cookie_line(samesite=SameSite.STRICT)
+    assert "SameSite=Strict" in header
+    with pytest.raises(ValueError, match="Sideways"):
+        Cookie("sid", "v", samesite="Sideways")
+
+
+# ---------------------------------------------------------------------------
+# Reloader
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc:
+    def __init__(self, returncode=None):
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+    def send_signal(self, signum):
+        # A server stops on a stop signal and exits 0.
+        if self.returncode is None:
+            self.returncode = 0
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _write_module(directory: Path, name: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{name}.py").write_text(
+        "from mipyre import Mipyre\napp = Mipyre()\n"
+        "@app.get('/')\ndef index(req):\n    return 'ok'\n"
+    )
+
+
+@pytest.fixture
+def _restore_modules():
+    path, mods = list(sys.path), set(sys.modules)
+    yield
+    sys.path[:] = path
+    for m in set(sys.modules) - mods:
+        del sys.modules[m]
+
+
+def test_dev_reloader_reexecs_the_real_command_and_watches_the_app_dir(
+    tmp_path, monkeypatch, _restore_modules
+):
+    import watchfiles
+    from mipyre.cli import main
+
+    app_dir = tmp_path / "proj"
+    _write_module(app_dir, "dev_app")
+    monkeypatch.syspath_prepend(str(app_dir))
+    command = [sys.executable, "/venv/bin/mipyre", "dev", "dev_app"]
+    monkeypatch.setattr(sys, "orig_argv", command)
+    monkeypatch.setattr(sys, "argv", command[1:])
+    monkeypatch.setenv("MIPYRE_LOG", "0")
+    monkeypatch.delenv("_MIPYRE_RELOAD_CHILD", raising=False)
+
+    spawned, watched = [], []
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kw: spawned.append(argv) or _FakeProc())
+
+    def _watch(path, **kw):
+        watched.append(path)
+        # Ctrl-C to the reloader: it ends the watch with no change.
+        os.kill(os.getpid(), signal.SIGINT)
+        return iter(())
+
+    monkeypatch.setattr(watchfiles, "watch", _watch)
+
+    main(["dev", "dev_app"])
+
+    assert spawned == [command]
+    assert [os.path.realpath(p) for p in watched] == [os.path.realpath(app_dir)]
+
+
+class _Restarted(Exception):
+    pass
+
+
+def test_polling_reloader_restarts_after_the_child_crashes(tmp_path, monkeypatch):
+    script = tmp_path / "server.py"
+    script.write_text("print('v1')\n")
+    monkeypatch.setitem(sys.modules, "watchfiles", None)  # force the polling reloader
+    monkeypatch.setattr(sys, "orig_argv", [sys.executable, str(script)])
+    monkeypatch.setattr(sys, "argv", [str(script)])
+    monkeypatch.setattr(sys.modules["__main__"], "__file__", str(script), raising=False)
+    monkeypatch.delenv("_MIPYRE_RELOAD_CHILD", raising=False)
+
+    spawned = []
+
+    def _popen(argv, **kw):
+        spawned.append(argv)
+        if len(spawned) == 1:
+            script.write_text("print('v2')\n")  # the fix the developer saves
+            return _FakeProc(returncode=1)  # the child crashed on start
+        raise _Restarted
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
+
+    with pytest.raises(_Restarted):
+        Mipyre().run(reload=True)
+    assert spawned[0] == [sys.executable, str(script)]
+
+
+def test_reload_under_python_c_names_what_main_is_instead_of_guessing(tmp_path):
+    # `python -c` leaves `__main__.__file__` unset, so the reloader has no directory to
+    # watch. The error is typed and says what `__main__` and `sys.argv[0]` are.
+    script = (
+        "from mipyre import Mipyre\n"
+        "from mipyre import DeclarationError, MissingAppFileError\n"
+        "try:\n"
+        "    Mipyre().run(reload=True)\n"
+        "except MissingAppFileError as err:\n"
+        "    print('RAISED', type(err).__name__, isinstance(err, DeclarationError))\n"
+        "    print(err)\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k not in ("_MIPYRE_RELOAD_CHILD", "MIPYRE_RELOAD")}
+    r = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, env=env,
+                       capture_output=True, text=True, timeout=120, check=False)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "RAISED MissingAppFileError True" in r.stdout, out
+    assert "reload watches the directory of the app's source file" in r.stdout, out
+    assert "__main__ is <module '__main__'" in r.stdout, out
+    assert "which has no __file__" in r.stdout, out
+    assert "sys.argv[0] is '-c'" in r.stdout, out
+    assert "mipyre dev module:app" in r.stdout, out
+    assert "interactive session?" not in out, out
+
+
+# ---------------------------------------------------------------------------
+# Isolation clone dir
+# ---------------------------------------------------------------------------
+
+def _bootstrap_ns(isolate_dir=None):
+    """The isolation adapter's namespace, as a worker's bootstrap holds it (`isolation_adapter_ns`), with
+    `isolate_dir` the server's (by default the engine's: `mipyre` in this user's cache dir)."""
+    if isolate_dir is None:
+        from mipyre.engine import _user_cache_dir
+
+        isolate_dir = os.path.join(_user_cache_dir(), "mipyre")
+    return isolation_adapter_ns(isolate_dir)
+
+
+_unix_only = pytest.mark.skipif(
+    sys.platform not in ("linux", "darwin") or os.getuid() == 0,
+    reason="cp -c / --reflink and permission checks (root bypasses them)",
+)
+
+
+@_unix_only
+def test_isolate_clone_failure_raises_with_cp_stderr(tmp_path):
+    src = tmp_path / "fakelib"
+    src.mkdir()
+    (src / "__init__.py").write_text("")
+    worker_dir = tmp_path / "w0"
+    worker_dir.mkdir()
+    worker_dir.chmod(0o500)  # cp cannot create the clone here
+    ns = _bootstrap_ns()
+    try:
+        with pytest.raises(Exception, match="Permission denied"):
+            ns["_iso_clone_lib"]("fakelib", str(src), str(worker_dir), {})
+    finally:
+        worker_dir.chmod(0o700)
+
+
+@_unix_only
+def test_isolate_default_root_is_private_to_this_user(tmp_path, monkeypatch):
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ns = _bootstrap_ns()
+
+    worker_dir = ns["_iso_worker_dir"]()
+
+    assert worker_dir.startswith(str(tmp_path) + os.sep)
+    root = Path(ns["_iso_root"]())
+    assert worker_dir.startswith(str(root) + os.sep)
+    st = root.stat()
+    assert st.st_uid == os.getuid()
+    assert stat.S_IMODE(st.st_mode) == 0o700
+
+
+@_unix_only
+def test_an_isolate_dir_others_can_write_names_the_override(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    ns = _bootstrap_ns(shared)
+
+    with pytest.raises(ns["_IsoError"], match="writable by other users.*set MIPYRE_ISOLATE_DIR to a directory you own") as raised:
+        ns["_iso_worker_dir"]()
+    assert isinstance(raised.value.__cause__, ns["PrivateCopyError"])
+
+
+@pytest.mark.parametrize(
+    ("xdg", "want_linux", "want_darwin"),
+    [
+        ("XDG", "XDG", "HOME/Library/Caches"),
+        (None, "HOME/.cache", "HOME/Library/Caches"),
+        ("relative/cache", "HOME/.cache", "HOME/Library/Caches"),
+    ],
+)
+def test_the_user_cache_dir_follows_the_os_convention(tmp_path, monkeypatch, xdg, want_linux, want_darwin):
+    # The default isolate dir is `mipyre` in this directory; the engine reads it, on the
+    # platform it was built for. Its rule on the other platform is unit-tested beside it
+    # (`boot::config::tests::the_cache_directory_follows_the_os_convention`), as is the flag
+    # overriding the default (`the_isolate_dir_is_the_flag_else_a_directory_in_the_cache_directory`).
+    from mipyre.engine import _user_cache_dir
+
+    monkeypatch.setenv("HOME", str(tmp_path / "HOME"))
+    if xdg is None:
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    elif xdg == "XDG":
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "XDG"))
+    else:
+        monkeypatch.setenv("XDG_CACHE_HOME", xdg)
+
+    want = want_darwin if sys.platform == "darwin" else want_linux
+    assert _user_cache_dir() == tmp_path / want
+
+
+@_unix_only
+def test_isolate_root_writable_by_others_is_refused(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    ns = _bootstrap_ns(shared)
+    with pytest.raises(Exception, match="writable"):
+        ns["_iso_worker_dir"]()
+
+
+# ---------------------------------------------------------------------------
+# body= composes with path-param injection
+# ---------------------------------------------------------------------------
+
+
+def test_model_route_also_injects_path_params():
+    # Its own module: a worker serves one app per module.
+    from tests.apps.model_route_path_params import app
+
+    with TestClient(app) as c:
+        r = c.put("/items/7", body={"name": "bolt"})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"id": "7", "name": "bolt", "path": "/items/7"}
+
+        r = c.post("/tags/red", body={"name": "nut"})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"tag": "red", "name": "nut"}
+
+        r = c.put("/items/7", body={"nom": "bolt"})
+        assert r.status_code == 422
+        assert r.json()["detail"][0]["loc"] == ["name"]
+
+
+def test_model_route_signature_checked_at_registration():
+    from pydantic import BaseModel
+
+    class Item(BaseModel):
+        name: str
+
+    app = Mipyre()
+
+    def bad(req, item, oops):
+        return oops
+
+    with pytest.raises(ValueError, match="oops"):
+        app.post("/items/{item_id}", bad, body=Item)
+
+
+def test_model_must_be_a_pydantic_model():
+    app = Mipyre()
+    with pytest.raises(TypeError, match="dict"):
+        app.post("/items", lambda req, body: body, body=dict)
+
+
+# ---------------------------------------------------------------------------
+# MCP JSON-RPC error codes
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mcp():
+    server = MCPServer(Mipyre())
+
+    @server.tool(description="Add two numbers")
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    @server.tool()
+    def explode() -> str:
+        raise RuntimeError("secret dsn postgres://u:p@db")
+
+    @server.prompt("greet")
+    def greet(name: str) -> str:
+        return f"hi {name}"
+
+    return server
+
+
+def _rpc(server, method, params):
+    body = json.dumps({"jsonrpc": "2.0", "id": 7, "method": method, "params": params})
+    return server.answer(json.loads(body))
+
+
+def test_mcp_invalid_params_is_32602_with_the_validation_message(mcp):
+    resp = _rpc(mcp, "tools/call", {"name": "add", "arguments": {"a": 1}})
+    assert resp["error"]["code"] == -32602
+    assert "arguments: missing required key(s) ['b']" in resp["error"]["message"]
+
+    resp = _rpc(mcp, "prompts/get", {"name": "greet", "arguments": []})
+    assert resp["error"]["code"] == -32602
+    assert "must be an object" in resp["error"]["message"]
+
+
+def test_mcp_unknown_tool_is_32602(mcp):
+    resp = _rpc(mcp, "tools/call", {"name": "nope"})
+    assert resp["error"] == {"code": -32602, "message": "Unknown tool: nope"}
+
+
+def test_mcp_unknown_resource_is_32002(mcp):
+    resp = _rpc(mcp, "resources/read", {"uri": "config://missing"})
+    assert resp["error"] == {"code": -32002, "message": "Resource not found: config://missing"}
+
+
+def test_mcp_unexpected_exception_is_32603_internal_error(mcp):
+    resp = _rpc(mcp, "tools/call", {"name": "explode", "arguments": {}})
+    assert resp["error"] == {"code": -32603, "message": "Internal error"}
+
+
+def test_mcp_undecodable_body_is_a_parse_error():
+    app = Mipyre(runtime="main")
+    MCPServer(app).tool(lambda: "pong", name="ping")
+    with TestClient(app) as c:
+        r = c.post("/mcp", body=b"\xff\xfe{", headers={"Content-Type": "application/json"})
+    assert r.json()["error"]["code"] == -32700
+
+
+# ---------------------------------------------------------------------------
+# Smaller items
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_schema_with_unresolvable_hint_fails_at_registration():
+    server = MCPServer(Mipyre())
+
+    def tool(x) -> str:
+        return x
+
+    # An unresolvable hint, as a name imported only under TYPE_CHECKING leaves one.
+    tool.__annotations__["x"] = "NoSuchType"
+
+    with pytest.raises(TypeError, match="NoSuchType"):
+        server.tool(tool)
+
+
+def test_rpc_and_mcp_routes_are_listed_in_app_routes():
+    # Its own module: a worker serves one app per module.
+    from tests.apps.rpc_and_mcp_routes import app
+
+    with TestClient(app):
+        paths = {(r.method, r.path) for r in app.routes}
+    assert ("POST", "/rpc/echo") in paths
+    assert ("POST", "/mcp") in paths

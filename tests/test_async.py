@@ -4,7 +4,7 @@ Run it with MIPYRE_TEST_MODE=main to serve every handler on the main interpreter
 mode); without it, it serves on sub-interpreters."""
 import os
 
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
@@ -29,4 +29,4 @@ async def async_json(req):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0)
+    app.run(ServerFlags(host="127.0.0.1", port=0))

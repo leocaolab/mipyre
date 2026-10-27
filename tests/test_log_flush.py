@@ -1,4 +1,4 @@
-"""`flush_logs()` (b/441 L6): every line logged before it is on stderr when it returns, and `Mipyre.run()` calls it
+"""`flush_logs()`: every line logged before it is on stderr when it returns, and `Mipyre.run()` calls it
 as it ends, so a server's exit is a fence for its log.
 
 The log is written by a background thread (`telemetry/log_writer.rs`) that the process exit does not wait
@@ -48,7 +48,7 @@ def test_flush_logs_without_a_logger_returns_at_once():
 
 SHUTDOWN_LOGS = f"""
 import logging
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(log_config={{"level": "INFO", "format": "text", "access_log": False}})
 
 @app.get("/")
@@ -61,7 +61,7 @@ def say_goodbye():
         logging.getLogger("bye").warning("bye-line %d", i)
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, threads=1)
+    app.run(ServerFlags(host="127.0.0.1", port=0, threads=1))
 """
 
 

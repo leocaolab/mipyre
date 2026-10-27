@@ -1,7 +1,6 @@
-"""Layer 2, M4 (issue #6): workers run the real `mipyre` package and engine.
+"""Workers run the real `mipyre` package and engine.
 
-End-to-end tests from docs/design/real-engine-in-workers.md §9 that are new at M4. Each
-starts a real server in a subprocess (a sub-interpreter permanently disables
+Each test starts a real server in a subprocess (a sub-interpreter permanently disables
 `PyGILState_Check` in its process), stops it with SIGINT, and scans its whole log for the
 PyO3 fork's panic texts.
 """
@@ -96,8 +95,9 @@ def _no_panics(server: Server) -> None:
 RUN = """
 if __name__ == "__main__":
     # The sub-interpreter count: one per TPC thread, or the pool's with MIPYRE_TPC=0.
+    from mipyre import ServerFlags
     size = "subinterpreters" if os.environ.get("MIPYRE_TPC") == "0" else "threads"
-    app.run(host="127.0.0.1", port=int(os.environ["L2_PORT"]), **{{size: {workers}}})
+    app.run(ServerFlags(host="127.0.0.1", port=int(os.environ["L2_PORT"]), **{{size: {workers}}}))
 """
 
 
@@ -109,7 +109,7 @@ def _app(body: str, workers: int = 2, header: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# E2E-3a: a route table that differs in a worker fails startup with both lists
+# a route table that differs in a worker fails startup with both lists
 # ---------------------------------------------------------------------------
 
 
@@ -137,7 +137,7 @@ def test_route_only_in_worker_fails_startup_with_both_lists(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E2E-1 (new cases): closure hooks now run in workers; CORS is not applied twice
+# Closure hooks run in workers; CORS is not applied twice
 # ---------------------------------------------------------------------------
 
 
@@ -167,7 +167,7 @@ def test_worker_cors_header_applied_once(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E2E-4: app.state and a bare SharedState() in workers are main's map (FR-5)
+# app.state and a bare SharedState() in workers are main's map
 # ---------------------------------------------------------------------------
 
 
@@ -211,7 +211,7 @@ def test_worker_shared_state_is_mains(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E2E-5 (fetch_iter from a worker) and E2E-6 (*_async refused in a worker)
+# fetch_iter from a worker, and *_async refused in a worker
 # ---------------------------------------------------------------------------
 
 
@@ -251,7 +251,7 @@ def test_worker_pgpool_fetch_iter_and_async_refused(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E2E-7 / E2E-7b: async pool path returns headers, runs hooks per request (FR-14)
+# async pool path returns headers, runs hooks per request
 # ---------------------------------------------------------------------------
 
 
@@ -303,8 +303,7 @@ def test_async_pool_request_ids_do_not_cross(tmp_path):
     """Request ids stay with their requests under the worst interleaving: all `_IN_FLIGHT`
     requests are in their await at once (each says so with a file, then waits for its own
     release file), and they are released in reverse order of sending, each one answered before
-    the next is let go. Until b/441 the handlers slept a random 0-20 ms, a different
-    interleaving each run."""
+    the next is let go."""
     rendezvous = tmp_path / "rendezvous"
     (rendezvous / "in").mkdir(parents=True)
     (rendezvous / "go").mkdir()
@@ -350,13 +349,13 @@ def test_async_pool_request_ids_do_not_cross(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E2E-10 surface parity, E2E-18 pyclass module, E2E-20 script as a real module
+# Surface parity, the pyclass module, the script as a real module
 # ---------------------------------------------------------------------------
 
 _ENGINE_NAMES = [
     "MipyreApp", "Request", "Response", "WebSocket", "SharedState", "Stream",
     "PgPool", "PgCursor", "get_gil_metrics", "init_logger", "emit_python_log", "_in_worker",
-    "_worker_recv", "_worker_send", "_worker_to_response",
+    "_worker_take", "_worker_send", "_worker_to_response",
 ]
 
 
@@ -408,16 +407,16 @@ def test_worker_surface_matches_main_and_script_is_a_module(tmp_path):
         main = httpx.get(s.base + "/main", timeout=10).json()
         boom = httpx.get(s.base + "/boom", timeout=10)
     finally:
-        # The stop is the log's fence: run() waits for every line logged before it (flush_logs, b/441 L5).
+        # The stop is the log's fence: run() waits for every line logged before it (flush_logs).
         rc = s.stop()
-    # E2E-10: the same public surface in a worker as on main (FR-12).
+    # the same public surface in a worker as on main.
     assert worker["in_worker"] is True and main["in_worker"] is False
     assert worker["surface"] == main["surface"]
     assert worker["surface"]["engine"] == _ENGINE_NAMES
-    # E2E-18: pyclasses are mipyre.engine's (FR-18).
+    # pyclasses are mipyre.engine's.
     assert worker["type"] == "<class 'mipyre.engine.Request'>"
-    # E2E-20: `from __future__ import annotations` works, get_type_hints resolves worker
-    # classes, and a handler's traceback names the script and line (FR-20).
+    # `from __future__ import annotations` works, get_type_hints resolves worker
+    # classes, and a handler's traceback names the script and line.
     assert worker["hints"] == ["x", "y"] and worker["module"] == "__mipyre_worker__"
     assert boom.status_code == 500
     log = s.log()
@@ -428,7 +427,7 @@ def test_worker_surface_matches_main_and_script_is_a_module(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E2E-11: worker log records carry their worker id; main's carry none (FR-8)
+# worker log records carry their worker id; main's carry none
 # ---------------------------------------------------------------------------
 
 
@@ -451,7 +450,7 @@ def test_worker_logs_carry_worker_id(tmp_path):
         s.wait_up()
         httpx.get(s.base + "/main_log", timeout=10)
     finally:
-        # The stop is the log's fence (flush_logs at the end of run(), b/441 L5).
+        # The stop is the log's fence (flush_logs at the end of run()).
         rc = s.stop()
     records = []
     for line in s.log().splitlines():
@@ -469,7 +468,7 @@ def test_worker_logs_carry_worker_id(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E2E-13 two apps, E2E-14b mipyre never re-executed
+# Two apps; mipyre never re-executed
 # ---------------------------------------------------------------------------
 
 
@@ -530,7 +529,7 @@ def test_isolation_never_reexecutes_mipyre(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E2E-15: pydantic only for body= apps, and body= validates in workers
+# pydantic only for body= apps, and body= validates in workers
 # ---------------------------------------------------------------------------
 
 
@@ -596,7 +595,7 @@ def test_model_validates_in_workers_through_isolation(tmp_path, tpc):
 
 
 # ---------------------------------------------------------------------------
-# E2E-16 Stream from a worker, E2E-17 main-only process-wide setters
+# Stream from a worker; main-only process-wide setters
 # ---------------------------------------------------------------------------
 
 
@@ -617,7 +616,7 @@ def test_stream_from_worker_is_a_loud_500(tmp_path):
         s.wait_up()
         r = httpx.get(s.base + "/stream", timeout=10)
     finally:
-        # The stop is the log's fence (flush_logs at the end of run(), b/441 L5).
+        # The stop is the log's fence (flush_logs at the end of run()).
         rc = s.stop()
     assert r.status_code == 500
     assert ("a Stream response is only served from the main interpreter, so register the "
@@ -655,7 +654,7 @@ def test_worker_max_body_size_is_mains(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E2E-19 teardown (FR-19): clean stop, failed start, abandoned worker
+# Teardown: clean stop, failed start, abandoned worker
 # ---------------------------------------------------------------------------
 
 
@@ -708,7 +707,7 @@ def test_failed_worker_start_exits_nonzero_without_abort(tmp_path, tpc):
 
 
 # ---------------------------------------------------------------------------
-# E2E-21 the CLI, E2E-22 raw-engine scripts
+# The CLI; raw-engine scripts
 # ---------------------------------------------------------------------------
 
 
@@ -739,7 +738,7 @@ def test_cli_run_serves_worker_routes(tmp_path):
 def test_raw_engine_script_serves_unchanged(tmp_path):
     s = Server(tmp_path, """
         import os
-        from mipyre.engine import MipyreApp, RuntimeChoice
+        from mipyre.engine import MipyreApp, RuntimeChoice, ServerFlags
 
         app = MipyreApp()
 
@@ -753,8 +752,7 @@ def test_raw_engine_script_serves_unchanged(tmp_path):
         app.route("GET", "/ping", ping, RuntimeChoice.Worker)
 
         if __name__ == "__main__":
-            app.run(host="127.0.0.1", port=int(os.environ["L2_PORT"]),
-                    threads=2)
+            app.run(ServerFlags(host="127.0.0.1", port=int(os.environ["L2_PORT"]), threads=2))
     """)
     try:
         s.wait_up()

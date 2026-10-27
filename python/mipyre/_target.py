@@ -7,16 +7,27 @@ import importlib
 import importlib.util
 import os
 import sys
+from dataclasses import dataclass
 
 
-def split_target(target: str) -> tuple[str, str]:
-    """``module[:attr]`` or ``path/to/file.py[:attr]`` → (module or path, attr)."""
-    if target.count(":") > 1:
-        raise ValueError(f"invalid target {target!r}: expected module:attr (exactly one ':')")
-    module, _, attr = target.partition(":")
+@dataclass(frozen=True)
+class Target:
+    """A target as given, and the module (or ``.py`` path) and attribute it names. Only
+    :func:`parse_target` makes one, so ``module`` is never empty."""
+
+    text: str
+    module: str
+    attr: str
+
+
+def parse_target(text: str) -> Target:
+    """Read ``module[:attr]`` or ``path/to/file.py[:attr]``; ``attr`` defaults to ``app``."""
+    if text.count(":") > 1:
+        raise ValueError(f"invalid target {text!r}: expected module:attr (exactly one ':')")
+    module, _, attr = text.partition(":")
     if not module:
-        raise ValueError(f"invalid target {target!r}: module name must not be empty")
-    return module, attr or "app"
+        raise ValueError(f"invalid target {text!r}: module name must not be empty")
+    return Target(text, module, attr or "app")
 
 
 class MissingTargetError(Exception):
@@ -45,41 +56,40 @@ def _target_path(module_name: str) -> str | None:
     return None
 
 
-def target_file(target: str) -> str:
+def target_file(target: Target) -> str:
     """The source file of the module ``target`` names, found without executing that module
     (the packages above a dotted module are imported, as importing it would): what
     ``sys.argv[0]`` is while the app imports. A module with no file of its own (a namespace
     package) is named by its module name. A module or file that does not exist is a
     :class:`MissingTargetError`."""
-    module_name, _attr = split_target(target)
-    path = _target_path(module_name)
+    path = _target_path(target.module)
     if path is not None:
         if not os.path.isfile(path):
-            raise MissingTargetError(target, path, None)
+            raise MissingTargetError(target.text, path, None)
         return path
     try:
-        spec = importlib.util.find_spec(module_name)
+        spec = importlib.util.find_spec(target.module)
     except ModuleNotFoundError as e:
-        if e.name is None or not names_target(module_name, e.name):
+        if e.name is None or not names_target(target.module, e.name):
             raise
-        raise MissingTargetError(target, e.name, None) from None
+        raise MissingTargetError(target.text, e.name, None) from None
     if spec is None:
-        raise MissingTargetError(target, module_name, None)
+        raise MissingTargetError(target.text, target.module, None)
     if spec.has_location and spec.origin is not None:
         return os.path.abspath(spec.origin)
-    return module_name
+    return target.module
 
 
-def import_target(target: str):
+def import_target(target: Target):
     """The module ``target`` names, imported (a ``.py`` path is loaded under its stem's
     name), and the object its attribute names. A module, file or attribute that does not
     exist is a :class:`MissingTargetError`; whatever else importing the module raises
     propagates as it is."""
-    module_name, attr = split_target(target)
+    module_name, attr = target.module, target.attr
     path = _target_path(module_name)
     if path is not None:
         if not os.path.isfile(path):
-            raise MissingTargetError(target, path, None)
+            raise MissingTargetError(target.text, path, None)
         name = os.path.splitext(os.path.basename(path))[0]
         spec = importlib.util.spec_from_file_location(name, path)
         if spec is None or spec.loader is None:
@@ -96,9 +106,9 @@ def import_target(target: str):
         except ModuleNotFoundError as e:
             if e.name is None or not names_target(module_name, e.name):
                 raise
-            raise MissingTargetError(target, e.name, None) from None
+            raise MissingTargetError(target.text, e.name, None) from None
     # Looked up in the module's namespace only: a module `__getattr__` is the module's code.
     namespace = vars(module)
     if attr not in namespace:
-        raise MissingTargetError(target, module_name, attr)
+        raise MissingTargetError(target.text, module_name, attr)
     return module, namespace[attr]

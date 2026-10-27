@@ -91,12 +91,12 @@ def test_upload_small_body(client):
 
 
 def test_upload_large_body_does_not_oom(client):
-    # 5 MB — well under default 10 MB cap. We're mainly checking the
+    # 2 MB — under the default 2.5 MiB cap. We're mainly checking the
     # iterator delivers chunks and the total matches.
-    payload = b"x" * (5 * 1024 * 1024)
+    payload = b"x" * (2 * 1024 * 1024)
     resp = client.post("/upload", body=payload)
     data = resp.json()
-    assert data["bytes"] == 5 * 1024 * 1024
+    assert data["bytes"] == 2 * 1024 * 1024
     assert data["chunks"] >= 1
 
 

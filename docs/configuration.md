@@ -4,13 +4,13 @@ Every setting mipyre reads, where it is set, and its default.
 
 ## Where settings come from
 
-- **Code**: `Mipyre(...)`, `app.run(...)`, `ProcessLanes(...)`, attributes and `enable_*` methods on the app. What belongs to the app wherever it runs: its routes and their runtimes, limits, logging, probes, metrics, compression.
+- **Code**: `Mipyre(...)`, `ServerFlags(...)` (passed to `app.run()`), `ProcessLanes(...)`, attributes and `enable_*` methods on the app. What belongs to the app wherever it runs: its routes and their runtimes, limits, logging, probes, metrics, compression.
 - **The deployment**: every server setting (address, sizes, TLS, the server model, process workers, tuning) is also a `mipyre run` / `mipyre dev` flag, a `MIPYRE_*` environment variable and a key in `[tool.mipyre]` of the `pyproject.toml` in the directory the server starts in. [Every server setting](#every-server-setting) lists the three names of each.
 
 A deployment value overrides the code's: the `mipyre run` flag first, then the environment, then `pyproject.toml`, then what the code gives, then the default. The start prints each code value it replaced:
 
 ```text
-  port=18125 (MIPYRE_PORT) overrides 18123 (run(port=))
+  port=18125 (MIPYRE_PORT) overrides 18123 (ServerFlags(port=))
 ```
 
 Every value is checked once, at startup, and every mistake stops the start, all of them at once, each naming where it came from: a value that doesn't parse, a `MIPYRE_*` variable or `[tool.mipyre]` key that is not a setting (a misspelling, or one mipyre no longer reads), and a value given to a server that doesn't use it. For example:
@@ -27,16 +27,16 @@ From `app.run()` or a test, the same reasons are one `mipyre.engine.ConfigError`
 
 | Setting | In code | Environment | `mipyre run` flag | Default |
 |---|---|---|---|---|
-| address | `run(host=)` | `MIPYRE_HOST` | `--host` | `127.0.0.1` |
-| port | `run(port=)` | `MIPYRE_PORT` | `--port` | `8000` |
-| server threads: thread-per-core threads (one sub-interpreter each), or with `MIPYRE_TPC=0` the I/O threads and accept loops | `run(threads=)` | `MIPYRE_THREADS` | `--threads` | thread-per-core: physical cores (performance cores on Apple silicon); `MIPYRE_TPC=0`: logical CPUs |
-| the sub-interpreter pool's size (`MIPYRE_TPC=0` only; thread-per-core runs one per thread) | `run(subinterpreters=)` | `MIPYRE_SUBINTERPRETERS` | `--subinterpreters` | logical CPUs |
+| address | `ServerFlags(host=)` | `MIPYRE_HOST` | `--host` | `127.0.0.1` |
+| port | `ServerFlags(port=)` | `MIPYRE_PORT` | `--port` | `8000` |
+| server threads: thread-per-core threads (one sub-interpreter each), or with `MIPYRE_TPC=0` the I/O threads and accept loops | `ServerFlags(threads=)` | `MIPYRE_THREADS` | `--threads` | thread-per-core: physical cores (performance cores on Apple silicon); `MIPYRE_TPC=0`: logical CPUs |
+| the sub-interpreter pool's size (`MIPYRE_TPC=0` only; thread-per-core runs one per thread) | `ServerFlags(subinterpreters=)` | `MIPYRE_SUBINTERPRETERS` | `--subinterpreters` | logical CPUs |
 | server model | | `MIPYRE_TPC` | `--tpc` | `1`: thread-per-core. `0` (or `false`, `no`, `off`): multi-thread server, I/O threads in front of a pool of sub-interpreters |
-| TLS certificate chain and key (PEM) | `run(tls_cert=, tls_key=)` | `MIPYRE_TLS_CERT`, `MIPYRE_TLS_KEY` | `--tls-cert`, `--tls-key` | unset: plain HTTP. Set both or neither |
-| more TLS ports; `port` then serves plain HTTP | `run(extra_tls_ports=[...])` | `MIPYRE_TLS_PORTS` (comma-separated) | `--extra-tls-ports` (comma-separated) | none |
-| more plain ports (HTTP/1.1 and HTTP/2 with prior knowledge) | `run(extra_plain_ports=[...])` | `MIPYRE_PLAIN_PORTS` (comma-separated) | `--extra-plain-ports` (comma-separated) | none |
-| names this server is reached by; a request whose `Host` is another name gets `421` (stops DNS rebinding). `localhost` and IP addresses are always served; `["*"]` serves any name, for a reverse proxy that checks it | `run(allowed_hosts=[...])` | `MIPYRE_ALLOWED_HOSTS` (comma-separated) | `--allowed-host` (repeatable) | none: `localhost` and IP addresses only |
-| reverse proxies whose `X-Forwarded-For` names the client (`req.client_ip`): IP addresses and CIDR blocks. A request from one of them takes its client from the header, read from the right past every listed proxy; anyone else's header is ignored. See [Behind nginx](integrations.md#behind-nginx) | `run(trusted_proxies=[...])` | `MIPYRE_TRUSTED_PROXIES` (comma-separated) | `--trusted-proxy` (repeatable) | none: the TCP peer is the client |
+| TLS certificate chain and key (PEM) | `ServerFlags(tls_cert=, tls_key=)` | `MIPYRE_TLS_CERT`, `MIPYRE_TLS_KEY` | `--tls-cert`, `--tls-key` | unset: plain HTTP. Set both or neither |
+| more TLS ports; `port` then serves plain HTTP | `ServerFlags(extra_tls_ports=[...])` | `MIPYRE_EXTRA_TLS_PORTS` (comma-separated) | `--extra-tls-ports` (comma-separated) | none |
+| more plain ports (HTTP/1.1 and HTTP/2 with prior knowledge) | `ServerFlags(extra_plain_ports=[...])` | `MIPYRE_EXTRA_PLAIN_PORTS` (comma-separated) | `--extra-plain-ports` (comma-separated) | none |
+| names this server is reached by; a request whose `Host` is another name gets `421` (stops DNS rebinding). `localhost` and IP addresses are always served; `["*"]` serves any name, for a reverse proxy that checks it | `ServerFlags(allowed_hosts=[...])` | `MIPYRE_ALLOWED_HOSTS` (comma-separated) | `--allowed-hosts` (repeatable) | none: `localhost` and IP addresses only |
+| reverse proxies whose `X-Forwarded-For` names the client (`req.client_ip`): IP addresses and CIDR blocks. A request from one of them takes its client from the header, read from the right past every listed proxy; anyone else's header is ignored. See [Behind nginx](integrations.md#behind-nginx) | `ServerFlags(trusted_proxies=[...])` | `MIPYRE_TRUSTED_PROXIES` (comma-separated) | `--trusted-proxies` (repeatable) | none: the TCP peer is the client |
 | hot reload | `run(reload=True)` | `MIPYRE_RELOAD=1` | `--reload`, or `mipyre dev` | off |
 
 The address must be an IP address (`127.0.0.1`, `0.0.0.0`, `::1`); host names such as `localhost` are not resolved and stop the start.
@@ -60,10 +60,10 @@ The worker processes `runtime="process"` routes run on. Each setting comes from 
 |---|---|---|---|---|---|
 | worker processes | `workers=` | `--process-workers` | `MIPYRE_PROCESS_WORKERS` | `workers` | one per physical core (performance core on Apple silicon) |
 | a handler's time limit, in seconds; past it the worker is killed and replaced, `504` | `timeout=` | `--process-timeout` | `MIPYRE_PROCESS_TIMEOUT` | `timeout` | `30` |
-| requests queued per worker before `503` | `queue_per_worker=` | `--process-queue` | `MIPYRE_PROCESS_QUEUE` | `queue_per_worker` | `128` |
+| requests queued per worker before `503` | `queue_per_worker=` | `--process-queue-per-worker` | `MIPYRE_PROCESS_QUEUE_PER_WORKER` | `queue_per_worker` | `128` |
 | largest request body, and largest response, in bytes | `slot_bytes=` | `--process-slot-bytes` | `MIPYRE_PROCESS_SLOT_BYTES` | `slot_bytes` | `262144` (256 KiB) |
 | how a worker gets the app: `"import"` or `"fork"` | `start=` | `--process-start` | `MIPYRE_PROCESS_START` | `start` | `"import"` |
-| what a failed worker host does: `"isolate"` takes it out of service and keeps serving with the rest; `"exit"` stops the server at the first failure | | `--process-host-failure` | `MIPYRE_LANE_HOST_FAILURE` | `host_failure` | `"isolate"` |
+| what a failed worker host does: `"isolate"` takes it out of service and keeps serving with the rest; `"exit"` stops the server at the first failure | | `--process-host-failure` | `MIPYRE_PROCESS_HOST_FAILURE` | `host_failure` | `"isolate"` |
 | microseconds a worker spins after an answer, waiting for the next request, before it sleeps | | `--process-spin-us` | `MIPYRE_PROCESS_SPIN_US` | `spin_us` | `50` |
 
 ```toml
@@ -80,14 +80,17 @@ Set on the app, in code. Each app keeps its own.
 
 | Attribute | Default | Past it |
 |---|---|---|
-| `max_body_size` | 10 MB (10,485,760 bytes) | `413` |
-| `request_timeout` | 30 s for the body to arrive, and again for the handler to answer | `408` for the body, `504` for the handler |
-| `body_min_rate` | 1024 bytes/s: a body earns one more second for every this many bytes it delivers, so a steady upload isn't cut off | `408` |
-| `body_time_limit` | 600 s, the most a body may take however fast it arrives | `408` |
+| `max_body_size` | 2.5 MiB (2,621,440 bytes, as Django's) | `413` |
+| `request_timeout` | 30 s for the handler to answer | `504` |
+| `body_grace` | 5 s for the body to arrive however slowly it comes | `408` |
+| `body_min_rate` | 1024 bytes/s: past `body_grace` a body goes on while its average rate stays at least this, so a steady upload isn't cut off and a trickle is | `408` |
+| `body_time_limit` | 30 s, the most a body may take however fast it arrives | `408` |
 | `interrupt_grace` | 2 s for a sync handler interrupted at `request_timeout` to end before its worker is replaced | |
 | `shutdown_timeout` | 5 s for each of the app's threads to finish at shutdown | the thread is abandoned and reported |
 | `max_websocket_message_size` | 1 MiB, either direction | a client message closes the connection with `1009`; a larger `ws.send` raises `ValueError` |
 | `max_websocket_connections` | 1024 | `503` for the upgrade |
+| `websocket_ping_interval` | 20 s a client may go unheard before it is pinged | |
+| `websocket_ping_timeout` | 20 s for a pinged client to send a frame | the connection is closed with `1011` and counted in `mipyre_websocket_keepalive_timeouts_total` |
 
 ```python
 app.max_body_size = 64 * 1024 * 1024
@@ -108,9 +111,9 @@ Fixed limits, not configurable:
 
 | Setting | In code | Environment | Default |
 |---|---|---|---|
-| level, format, access log | `Mipyre(log_config={"level": ..., "format": ..., "access_log": ...})` | | `ERROR`, `"json"`, no access log |
+| level, format, access log | `Mipyre(log_config={"level": ..., "format": ..., "access_log": ...})` | | `WARN`, `"json"`, no access log |
 | development defaults | `Mipyre(debug=True)` | | text at `DEBUG` with the access log on |
-| the access log on, and the level raised to `INFO` when it is `ERROR` or `OFF` | `app.enable_access_log(level=None, sample=1, always_log_status=None)` | `MIPYRE_LOG=1` (`--log`) | off |
+| the access log on, and the level raised to `INFO` when it is `WARN`, `ERROR` or `OFF` | `app.enable_access_log(level=None, sample=1, always_log_status=None)` | `MIPYRE_LOG=1` (`--log`) | off |
 
 `log_config` keys: `level` (`"OFF"`, `"ERROR"`, `"WARN"`, `"INFO"`, `"DEBUG"`, `"TRACE"`, or a `LogLevel`), `format` (`"json"` or `"text"`), `access_log` (`True` or `False`). An unknown level raises `ValueError` in `Mipyre()`.
 
@@ -314,13 +317,13 @@ Each is also a `mipyre run` flag and a `[tool.mipyre]` key ([Every server settin
 | `MIPYRE_GC_THRESHOLD` | requests between collections in `count` mode; `0` never collects | `100000` |
 | `MIPYRE_GC_IDLE_MS` | how often `idle` mode checks for a lull, in milliseconds | `100` |
 | `MIPYRE_GC_OOM_FAILSAFE` | requests after which `idle` mode collects even without a lull | `50000` |
-| `MIPYRE_GIL_BRIDGE_WORKERS` | threads that run the `def` handlers of `runtime="main"` routes on the thread-per-core server (`async def` ones wait on the main interpreter's event loop, holding none) | `4` |
-| `MIPYRE_GIL_BRIDGE_CAPACITY` | requests queued for those threads before `503` | 16 per bridge thread (`64`) |
+| `MIPYRE_BRIDGE_WORKERS` | the most threads that run the `def` handlers of `runtime="main"` routes, on every server (`async def` ones wait on the main interpreter's event loop, holding none). Four start with the server; past them a thread starts when a request finds none free, and retires after 10 s idle | `4` (thread-per-core), `512` (`MIPYRE_TPC=0`) |
+| `MIPYRE_BRIDGE_CAPACITY` | main-interpreter requests queued (`async def`: queued or running) before `503` | 16 per thread (`64` thread-per-core, `8192` with `MIPYRE_TPC=0`) |
 | `MIPYRE_ASYNC_QUEUE_CAPACITY` | requests queued for the sub-interpreters that run `async def` handlers before `503` | 128 per worker of the pool that runs them |
 | `MIPYRE_METRICS` | `1` turns on the engine's own counters and a memory (RSS) sampler | `0` |
-| `MIPYRE_TPC_DARWIN` | macOS only: how the thread-per-core server accepts connections. `listener`: a listening socket per thread. `fanout`: one acceptor that hands connections to the threads | `listener` |
+| `MIPYRE_TPC_ACCEPT` | macOS only: how the thread-per-core server accepts connections. `listener`: each thread runs its own accept loop on the port's one listening socket, so whichever thread is free takes the next connection (macOS's `SO_REUSEPORT` would hand every connection to one socket). `fanout`: one acceptor that hands connections to the threads | `listener` |
 
-`idle` GC mode needs the default thread-per-core server with a listener per thread; the multi-thread server (`MIPYRE_TPC=0`) and `MIPYRE_TPC_DARWIN=fanout` take `count` or `off`, and `idle` there stops the start.
+`idle` GC mode needs the default thread-per-core server with a listener per thread; the multi-thread server (`MIPYRE_TPC=0`) and `MIPYRE_TPC_ACCEPT=fanout` take `count` or `off`, and `idle` there stops the start.
 
 ## Every server setting
 
@@ -331,30 +334,30 @@ Each server setting, by its three names. A `[tool.mipyre]` key is written in `py
 | `threads` | `--threads` | `MIPYRE_THREADS` | `[tool.mipyre] threads` | one per physical core (thread-per-core); with tpc off, one per logical CPU | the server's threads: thread-per-core threads, or with tpc off the I/O threads |
 | `subinterpreters` | `--subinterpreters` | `MIPYRE_SUBINTERPRETERS` | `[tool.mipyre] subinterpreters` | one per logical CPU | the sub-interpreter pool's size, with tpc off; thread-per-core runs one per thread |
 | `tpc` | `--tpc` | `MIPYRE_TPC` | `[tool.mipyre] tpc` | on | thread-per-core; off runs the multi-thread server |
-| `tpc_accept` | `--tpc-accept` | `MIPYRE_TPC_DARWIN` | `[tool.mipyre] tpc_accept` | listener | how thread-per-core threads take connections on macOS: a listener each, or one fanout acceptor |
+| `tpc_accept` | `--tpc-accept` | `MIPYRE_TPC_ACCEPT` | `[tool.mipyre] tpc_accept` | listener | how thread-per-core threads take connections on macOS: an accept loop each on one shared socket, or one fanout acceptor |
 | `gc_mode` | `--gc-mode` | `MIPYRE_GC_MODE` | `[tool.mipyre] gc_mode` | count | when a sub-interpreter worker runs gc.collect() |
 | `gc_threshold` | `--gc-threshold` | `MIPYRE_GC_THRESHOLD` | `[tool.mipyre] gc_threshold` | 100000 | requests between collections in count mode; 0 never collects |
 | `gc_idle_ms` | `--gc-idle-ms` | `MIPYRE_GC_IDLE_MS` | `[tool.mipyre] gc_idle_ms` | 100 | the lull, in milliseconds, after which idle mode collects |
 | `gc_oom_failsafe` | `--gc-oom-failsafe` | `MIPYRE_GC_OOM_FAILSAFE` | `[tool.mipyre] gc_oom_failsafe` | 50000 | requests after which idle mode collects even without a lull; 0 collects only in lulls |
-| `bridge_workers` | `--bridge-workers` | `MIPYRE_GIL_BRIDGE_WORKERS` | `[tool.mipyre] bridge_workers` | 4 | threads that run main-interpreter routes for a thread-per-core server |
-| `bridge_capacity` | `--bridge-capacity` | `MIPYRE_GIL_BRIDGE_CAPACITY` | `[tool.mipyre] bridge_capacity` | 16 per bridge worker | main-interpreter requests queued before 503 |
+| `bridge_workers` | `--bridge-workers` | `MIPYRE_BRIDGE_WORKERS` | `[tool.mipyre] bridge_workers` | 4 (thread-per-core) / 512 (tpc off) | most threads that run main-interpreter def routes |
+| `bridge_capacity` | `--bridge-capacity` | `MIPYRE_BRIDGE_CAPACITY` | `[tool.mipyre] bridge_capacity` | 16 per main-interpreter thread | main-interpreter requests queued (async def: queued or running) before 503 |
 | `async_queue_capacity` | `--async-queue-capacity` | `MIPYRE_ASYNC_QUEUE_CAPACITY` | `[tool.mipyre] async_queue_capacity` | the async pool's own | async def requests queued before 503 |
 | `metrics` | `--metrics` | `MIPYRE_METRICS` | `[tool.mipyre] metrics` | off | count every answer and sample RSS |
 | `host` | `--host` | `MIPYRE_HOST` | `[tool.mipyre] host` | 127.0.0.1 | the address to bind |
 | `port` | `--port` | `MIPYRE_PORT` | `[tool.mipyre] port` | 8000 | the port to bind |
 | `tls_cert` | `--tls-cert` | `MIPYRE_TLS_CERT` | `[tool.mipyre] tls_cert` | none (plain HTTP) | the TLS certificate chain (PEM); given with tls_key |
 | `tls_key` | `--tls-key` | `MIPYRE_TLS_KEY` | `[tool.mipyre] tls_key` | none (plain HTTP) | the TLS private key (PEM); given with tls_cert |
-| `extra_tls_ports` | `--extra-tls-ports` | `MIPYRE_TLS_PORTS` | `[tool.mipyre] extra_tls_ports` | none | more ports served over TLS |
-| `extra_plain_ports` | `--extra-plain-ports` | `MIPYRE_PLAIN_PORTS` | `[tool.mipyre] extra_plain_ports` | none | more ports served over plain HTTP |
-| `allowed_hosts` | `--allowed-host` | `MIPYRE_ALLOWED_HOSTS` | `[tool.mipyre] allowed_hosts` | localhost and IP addresses | DNS names this server is reached by, besides localhost and IP addresses ('*' for any) |
-| `trusted_proxies` | `--trusted-proxy` | `MIPYRE_TRUSTED_PROXIES` | `[tool.mipyre] trusted_proxies` | none: the TCP peer is the client | reverse proxies (IP addresses and CIDR blocks) whose X-Forwarded-For names the client |
+| `extra_tls_ports` | `--extra-tls-ports` | `MIPYRE_EXTRA_TLS_PORTS` | `[tool.mipyre] extra_tls_ports` | none | more ports served over TLS |
+| `extra_plain_ports` | `--extra-plain-ports` | `MIPYRE_EXTRA_PLAIN_PORTS` | `[tool.mipyre] extra_plain_ports` | none | more ports served over plain HTTP |
+| `allowed_hosts` | `--allowed-hosts` | `MIPYRE_ALLOWED_HOSTS` | `[tool.mipyre] allowed_hosts` | localhost and IP addresses | DNS names this server is reached by, besides localhost and IP addresses ('*' for any) |
+| `trusted_proxies` | `--trusted-proxies` | `MIPYRE_TRUSTED_PROXIES` | `[tool.mipyre] trusted_proxies` | none: the TCP peer is the client | reverse proxies (IP addresses and CIDR blocks) whose X-Forwarded-For names the client |
 | `isolate_dir` | `--isolate-dir` | `MIPYRE_ISOLATE_DIR` | `[tool.mipyre] isolate_dir` | mipyre in the user's cache directory | where each sub-interpreter worker keeps its copy of an isolated extension |
 | `process.workers` | `--process-workers` | `MIPYRE_PROCESS_WORKERS` | `[tool.mipyre.process] workers` | one per physical core | worker processes for runtime="process" routes |
-| `process.queue_per_worker` | `--process-queue` | `MIPYRE_PROCESS_QUEUE` | `[tool.mipyre.process] queue_per_worker` | 128 | requests each process worker holds before 503 |
+| `process.queue_per_worker` | `--process-queue-per-worker` | `MIPYRE_PROCESS_QUEUE_PER_WORKER` | `[tool.mipyre.process] queue_per_worker` | 128 | requests each process worker holds before 503 |
 | `process.slot_bytes` | `--process-slot-bytes` | `MIPYRE_PROCESS_SLOT_BYTES` | `[tool.mipyre.process] slot_bytes` | 262144 | the largest request and answer a process worker takes, in bytes |
 | `process.start` | `--process-start` | `MIPYRE_PROCESS_START` | `[tool.mipyre.process] start` | import | how a process worker gets the app: import it, or fork from a template that did |
 | `process.timeout` | `--process-timeout` | `MIPYRE_PROCESS_TIMEOUT` | `[tool.mipyre.process] timeout` | 30 | a process handler's time, in seconds; past it the worker is killed and the request answered 504 |
 | `process.spin_us` | `--process-spin-us` | `MIPYRE_PROCESS_SPIN_US` | `[tool.mipyre.process] spin_us` | 50 | how long a process worker spins for the next request, in microseconds, before it sleeps |
-| `process.host_failure` | `--process-host-failure` | `MIPYRE_LANE_HOST_FAILURE` | `[tool.mipyre.process] host_failure` | isolate | what a failed process lane or host does: take it out of service, or end the server |
+| `process.host_failure` | `--process-host-failure` | `MIPYRE_PROCESS_HOST_FAILURE` | `[tool.mipyre.process] host_failure` | isolate | what a failed process lane or host does: take it out of service, or end the server |
 | `reload` | `--reload` | `MIPYRE_RELOAD` | `[tool.mipyre] reload` | off | restart the app when its files change |
 | `log` | `--log` | `MIPYRE_LOG` | `[tool.mipyre] log` | off; on under mipyre dev | turn Python logging on |

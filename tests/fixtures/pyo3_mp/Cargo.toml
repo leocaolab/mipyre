@@ -3,8 +3,7 @@
 #
 # The [patch.crates-io] below is a COPY of the root Cargo.toml's: a standalone crate cannot inherit the root's
 # patch. tests/test_isolate.py::test_fixture_pyo3_pins_match_root keeps it (and this crate's Cargo.lock pyo3 sources)
-# identical to the root; a mismatch fails that test. Remove the copy when the fixture moves into the workspace:
-# arc b/2622 (archcheck supports the 测试夹具包 category).
+# identical to the root; a mismatch fails that test.
 [workspace]
 
 [package]

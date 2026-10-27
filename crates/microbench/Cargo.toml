@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 # Only std, and only ever a dev-dependency: a bench's harness must not reach a process that links a
-# package (dev/archcheck.toml P2 gives every category one edge to it, and nothing else).
+# package.
 [dependencies]
 
 [lints]

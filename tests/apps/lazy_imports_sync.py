@@ -6,8 +6,9 @@ import sys
 from mipyre import Mipyre
 
 # What a worker used to import for everyone (a90a637a): importlib.metadata for `__version__` (~1.3 MiB),
-# email.utils for the cookie expires formatter (~0.4 MiB), ctypes in the bootstrap (~0.2 MiB).
-DEFERRED = ("importlib.metadata", "email.utils", "ctypes")
+# email.utils for the cookie expires formatter (~0.4 MiB), ctypes in the bootstrap (~0.2 MiB),
+# urllib.parse for multipart's filename* (with ipaddress, ~1 ms an interpreter).
+DEFERRED = ("importlib.metadata", "email.utils", "ctypes", "urllib.parse")
 
 app = Mipyre()
 

@@ -1,4 +1,4 @@
-"""b/845 E: how one server run ends — the outcome it raises (`run_outcome`), what `mipyre run`
+"""How one server run ends — the outcome it raises (`run_outcome`), what `mipyre run`
 does with it, and what a `TestClient` hands back."""
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import textwrap
 import pytest
 
 from mipyre import AbandonedWorkersError, Mipyre
-from mipyre._server_run import run_outcome, runs_of
+from mipyre._server_run import run_outcome
 from mipyre.testing import TestClient
 
 
@@ -95,7 +95,7 @@ def test_a_request_after_the_server_died_names_why_it_died():
         raise RuntimeError("pool closed")
 
     client = TestClient(app)
-    runs_of(app).stop()
+    app.stop()
     client.server._thread.join(20)
     with pytest.raises(RuntimeError, match="request failed") as raised:
         client.get("/")
@@ -179,7 +179,7 @@ def test_mipyre_run_with_abandoned_workers_prints_the_whole_chain_and_exits_1(tm
 
 def test_a_flag_the_server_does_not_use_stops_the_start_naming_the_flag_given(tmp_path):
     # The thread-per-core server (the default) has no sub-interpreter pool to size: a size given
-    # for it is an error (b/335 D19), named as the flag it was given as.
+    # for it is an error, named as the flag it was given as.
     (tmp_path / "server_run_app.py").write_text(textwrap.dedent(APP.format(grace="")))
     env = {k: v for k, v in os.environ.items() if not k.startswith("MIPYRE_")}
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(tmp_path), os.environ.get("PYTHONPATH")]))
@@ -190,4 +190,27 @@ def test_a_flag_the_server_does_not_use_stops_the_start_naming_the_flag_given(tm
     assert done.returncode != 0, done.stdout[-3000:]
     assert "subinterpreters is given (mipyre run --subinterpreters" in done.stderr, done.stderr[-3000:]
     assert "does not use it" in done.stderr, done.stderr[-3000:]
-    assert "run(subinterpreters=)" not in done.stderr, done.stderr[-3000:]
+    assert "ServerFlags(subinterpreters=)" not in done.stderr, done.stderr[-3000:]
+
+
+# ---------------------------------------------------------------------------
+# app_file: the app's source file, as the engine resolves it
+# ---------------------------------------------------------------------------
+
+
+def test_a_named_app_file_wins_over_main_s_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules["__main__"], "__file__", str(tmp_path / "main.py"), raising=False)
+    app = Mipyre()
+    app._engine.set_script_path(str(tmp_path / "named.py"))
+    assert app._engine.app_file() == str(tmp_path / "named.py")
+
+
+def test_with_nothing_named_the_app_file_is_main_s_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules["__main__"], "__file__", str(tmp_path / "main.py"), raising=False)
+    assert Mipyre()._engine.app_file() == str(tmp_path / "main.py")
+
+
+def test_a_relative_app_file_is_taken_from_the_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys.modules["__main__"], "__file__", "./src/../app.py", raising=False)
+    assert Mipyre()._engine.app_file() == os.path.abspath("./src/../app.py")

@@ -72,7 +72,7 @@ fn wire_error(e: impl std::fmt::Display) -> PyErr {
 
 /// Decodes `json`/`jsonb` with the codec `req.json()` uses, so a wide integer stays exact.
 fn json<'py>(py: Python<'py>, text: &[u8]) -> PyResult<Bound<'py, PyAny>> {
-    crate::exchange::loads(py, text).map_err(wire_error)
+    mipyre_runtime::exchange::loads(py, text).map_err(wire_error)
 }
 
 fn date(py: Python<'_>, days: i32) -> PyResult<Bound<'_, PyAny>> {

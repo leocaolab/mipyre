@@ -1,6 +1,7 @@
 """Measure mipyre in each runtime mode with wrk on Linux, or print the table of a results file.
 
     python benchmarks/public/run.py measure --out results.jsonl [--reps 3] [--server-cpus 0-3,8-11] [--client-cpus 4-7,12-15]
+        [--cell subinterp-tpc/plaintext ...]
     python benchmarks/public/run.py table results.jsonl
 """
 
@@ -197,6 +198,8 @@ def measure(args: argparse.Namespace) -> None:
         for rep in range(1, args.reps + 1):
             for mode, scenarios in modes.CELLS:
                 for scenario in scenarios:
+                    if args.cell and modes.cell_name(mode, scenario) not in args.cell:
+                        continue
                     for attempt in range(1, MAX_ATTEMPTS + 1):
                         record = run_cell(mode, scenarios, scenario, rep, params, args, logs)
                         out.write(json.dumps({**context, **record, "attempt": attempt}) + "\n")
@@ -252,8 +255,10 @@ def main() -> None:
     m.add_argument("--server-cpus", default="0-3,8-11")
     m.add_argument("--client-cpus", default="4-7,12-15")
     m.add_argument("--wrk-threads", type=int, default=8)
-    m.add_argument("--connections", type=int, default=128)
+    m.add_argument("--connections", type=int, default=64)
     m.add_argument("--duration", type=int, default=10)
+    m.add_argument("--cell", action="append", choices=sorted(modes.CELL_NAMES),
+                   help="measure only this cell; repeat for several (default: every cell)")
     m.set_defaults(run=measure)
     t = sub.add_parser("table")
     t.add_argument("results")

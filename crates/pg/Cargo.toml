@@ -1,0 +1,21 @@
+[package]
+name = "mipyre_pg"
+description = "A server run's Postgres pools, one per DSN, on a mipyre-db tokio runtime of their own, and the handles code holds to them; no Python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No pyo3: the Python face of a pool (`PgPool`) and reading which module made
+# a handle are the engine's `db/`.
+[dependencies]
+# `panic_message`, the workspace's one reading of a panic payload (tests/test_request_path.py).
+mipyre_util = { path = "../util" }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+parking_lot = "0.12"
+thiserror = "2"
+tracing = "0.1"
+
+[lints]
+workspace = true

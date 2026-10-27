@@ -16,14 +16,18 @@ use tokio_util::sync::CancellationToken;
 
 use super::client::{client_failures, drive_client, run_loopback_clients, ClientError, LOOPBACK_CLIENT};
 use super::measure::{measure, measure_profiled, Measurement, ProfileDepth, ProfileReport};
-use crate::runtime::{LiveWorkers, ServerRunStop, WorkerKind, WorkerRecipe};
-use crate::serve::{serve_on_workers, tpc_accept_loop_inline, ServeError, Site, TpcServer, TpcThread, TpcThreads};
+use crate::boot::worker_loss_listener;
 use crate::sync::{AtomicU64, Mutex};
-use crate::telemetry::RunCounters;
 use mipyre_cpu::CoreId;
-use mipyre_tpc::{panic_message, ShutdownDeadline};
+use mipyre_runtime::{LiveWorkers, WorkerCounters, WorkerKind, WorkerRecipe};
+use mipyre_server::ServerCounters;
+use mipyre_server::{
+    serve_on_workers, tpc_accept_loop_inline, ServeError, ServerRunStop, Site, TpcServer, TpcThread, TpcThreads,
+};
+use mipyre_tpc::ShutdownDeadline;
 use mipyre_transport::driver::TransportDriver;
 use mipyre_transport::endpoint::{Endpoints, ListenerSet, ListenerSpec};
+use mipyre_util::panic_message;
 
 /// Sizes the in-memory connection buffer in each direction.
 const DUPLEX_BUFFER_BYTES: usize = 64 * 1024;
@@ -81,11 +85,13 @@ fn join_failures(first: &BenchPartError, rest: &[BenchPartError]) -> String {
 }
 
 /// Holds what a bench's worker threads are made of. Each thread gets its own copy of the site so
-/// no two cores share a refcount cacheline; every copy counts in `counters`.
+/// no two cores share a refcount cacheline; every copy counts in `counters`, and the workers in
+/// `workers`.
 pub(crate) struct BenchWorkers {
     pub(crate) recipe: Arc<WorkerRecipe>,
     pub(crate) sites: Vec<Arc<Site>>,
-    pub(crate) counters: Arc<RunCounters>,
+    pub(crate) counters: Arc<ServerCounters>,
+    pub(crate) workers: Arc<WorkerCounters>,
 }
 
 impl BenchWorkers {
@@ -96,15 +102,21 @@ impl BenchWorkers {
             recipe,
             sites,
             counters,
+            workers,
         } = self;
-        let (_, lives) = LiveWorkers::new(WorkerKind::TpcThread, sites.len(), run.clone(), Arc::clone(&counters));
+        let (_, lives) = LiveWorkers::new(
+            WorkerKind::TpcThread,
+            sites.len(),
+            worker_loss_listener(run.clone()),
+            &workers,
+        );
         TpcServer {
             gc: recipe.spec().gc,
             threads: TpcThreads::WithWorkers {
                 threads: sites.into_iter().zip(lives).collect(),
                 recipe,
             },
-            main_bridge: None,
+            main: None,
             async_pool: None,
             cpus: cpus.to_vec(),
             counters,
@@ -117,20 +129,20 @@ impl BenchWorkers {
     }
 }
 
-/// Measures throughput with each worker serving `conns_per_worker` in-memory connections, each
+/// Measures throughput with each thread serving `conns_per_thread` in-memory connections, each
 /// driven by a client task on the same thread.
 ///
 /// # Errors
 ///
 /// Returns [`BenchError`] when a thread does not start or any part of the bench fails.
 pub(crate) fn run_inmem_bench(
-    conns_per_worker: usize,
+    conns_per_thread: usize,
     duration: Duration,
     workers: BenchWorkers,
     core_ids: &[CoreId],
     request: Arc<[u8]>,
 ) -> Result<Measurement, BenchError> {
-    serve_inmem_while(conns_per_worker, duration, workers, core_ids, request, |counter| {
+    serve_inmem_while(conns_per_thread, duration, workers, core_ids, request, |counter| {
         measure(counter, duration)
     })
 }
@@ -141,22 +153,22 @@ pub(crate) fn run_inmem_bench(
 ///
 /// Returns [`BenchError`] when a thread does not start or any part of the bench fails.
 pub(crate) fn run_inmem_profile(
-    conns_per_worker: usize,
+    conns_per_thread: usize,
     duration: Duration,
     workers: BenchWorkers,
     core_ids: &[CoreId],
     request: Arc<[u8]>,
     depth: ProfileDepth,
 ) -> Result<(Measurement, ProfileReport), BenchError> {
-    serve_inmem_while(conns_per_worker, duration, workers, core_ids, request, |counter| {
+    serve_inmem_while(conns_per_thread, duration, workers, core_ids, request, |counter| {
         measure_profiled(counter, duration, depth)
     })
 }
 
-/// Serves `conns_per_worker` in-memory connections on each worker thread while `measure` reads
+/// Serves `conns_per_thread` in-memory connections on each server thread while `measure` reads
 /// the request counter on this thread, then stops the server and joins its threads.
 fn serve_inmem_while<R>(
-    conns_per_worker: usize,
+    conns_per_thread: usize,
     duration: Duration,
     workers: BenchWorkers,
     core_ids: &[CoreId],
@@ -164,7 +176,7 @@ fn serve_inmem_while<R>(
     measure: impl FnOnce(&AtomicU64) -> R,
 ) -> Result<R, BenchError> {
     println!(
-        "\n  Mipyre v{} [in-memory bench] — {} workers × {conns_per_worker} virtual conns, {}s",
+        "\n  Mipyre v{} [in-memory bench] — {} threads × {conns_per_thread} virtual conns, {}s",
         env!("CARGO_PKG_VERSION"),
         workers.sites.len(),
         duration.as_secs()
@@ -176,7 +188,7 @@ fn serve_inmem_while<R>(
         move |tpc_thread: Rc<TpcThread>, (), stop: CancellationToken, _deadline| {
             let (counter, failed, request) = (Arc::clone(&counter), Arc::clone(&failed), Arc::clone(&request));
             async move {
-                let mut failures = serve_inmem(Rc::clone(&tpc_thread), conns_per_worker, counter, stop, request).await;
+                let mut failures = serve_inmem(Rc::clone(&tpc_thread), conns_per_thread, counter, stop, request).await;
                 failures.extend(retirement(&tpc_thread));
                 failed.lock().extend(failures);
                 Ok(())
@@ -222,11 +234,11 @@ pub(crate) fn run_loopback_bench(
         addr: (Ipv4Addr::LOCALHOST, 0).into(),
         tls: None,
     };
-    let listeners = Endpoints::bind(&ListenerSet::one(spec), copies, crate::serve::bind_options())
+    let listeners = Endpoints::bind(&ListenerSet::one(spec), copies, mipyre_server::bind_options())
         .map_err(BenchError::BindFailed)?;
     let addr = listeners.bound()[0].addr;
     println!(
-        "\n  Mipyre v{} [loopback bench] — {} workers, {client_conns} client conns, port {}, {}s",
+        "\n  Mipyre v{} [loopback bench] — {} threads, {client_conns} client conns, port {}, {}s",
         env!("CARGO_PKG_VERSION"),
         workers.sites.len(),
         addr.port(),
@@ -331,9 +343,7 @@ fn fail_on(failures: Vec<BenchPartError>) -> Result<(), BenchError> {
 
 /// Returns why `tpc_thread`'s worker retired, if it did, as a failure of the bench.
 fn retirement(tpc_thread: &TpcThread) -> Option<BenchPartError> {
-    let Err(why) = tpc_thread.worker.as_ref()?.serving() else {
-        return None;
-    };
+    let why = tpc_thread.worker.as_ref()?.retirement_cause()?;
     Some(BenchPartError::WorkerRetired {
         worker: tpc_thread.index.get(),
         why,
@@ -354,13 +364,13 @@ async fn serve_inmem(
     let clients = (0..conns)
         .map(|_| {
             let (server_io, client_io) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
-            tokio::task::spawn_local(crate::serve::drive_conn(
+            tokio::task::spawn_local(mipyre_server::drive_conn(
                 server_io,
                 mipyre_transport::driver::Peer::InMemory,
                 None,
                 {
                     let tpc_thread = Rc::clone(&tpc_thread);
-                    move |req, peer| crate::serve::handle_request_tpc_inline(req, Rc::clone(&tpc_thread), peer)
+                    move |req, peer| mipyre_server::handle_request(req, Rc::clone(&tpc_thread), peer)
                 },
                 server_stop.stopped(),
             ));

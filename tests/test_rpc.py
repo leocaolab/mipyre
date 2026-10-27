@@ -65,7 +65,7 @@ def test_rpc_two_arg_handler(client):
 
 def test_rpc_error_envelope(client):
     """Handler that raises → the engine's generic 500 with the request id; the
-    exception text goes to the log, not to the client (D4)."""
+    exception text goes to the log, not to the client."""
     resp = client.post(
         "/rpc/error",
         body=b"{}",
@@ -239,7 +239,7 @@ def test_rpc_refuses_a_name_the_client_cannot_call(name):
         rpc(app, name)
 
 
-# --- FastAPI's shapes: the result is the body, a failure its status and detail (b/845) ---
+# --- FastAPI's shapes: the result is the body, a failure its status and detail ---
 
 
 def test_a_str_result_is_a_json_string_not_text():

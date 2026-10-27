@@ -1,15 +1,9 @@
-"""No hard-coded log target in the shared crates (b/262 (5), infra_tpc review #5, infra_http review #17).
+"""No hard-coded log target in the shared crates.
 
-A shared crate (`crates/*` other than the extension module) is linked by more than one product.
-A `target: "<product>::server"` written into one sends that
-crate's lines to whichever product's logger the string names, whoever links it. Their lines
-keep the default target, the module path (`mipyre_tpc::threads`, ...), and the product decides
-where those go.
-
-The rule names no product: a literal `target:` in a shared crate's `src/` is a breach unless it
-is that crate's own name (`"mipyre_subinterp"` in `mipyre_subinterp`, read from its Cargo.toml), so
-it holds across a rename, and a crate renamed without its literal goes red. The shared crates are found by what they are (every workspace package
-that does not build a cdylib), not by a list of names, so a crate added later is covered.
+A shared crate is a workspace package that builds no cdylib and is not one of the server's parts
+(`SERVER_PARTS`). A literal `target:` in its `src/` is refused unless it is the crate's own library
+name or a path under it, read from its Cargo.toml; its other lines keep the default target, the
+module path. The server's parts keep mipyre's documented targets (`mipyre::server`, `mipyre::handler`).
 """
 from __future__ import annotations
 
@@ -24,10 +18,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # possibly spread over several lines.
 LITERAL_TARGET = re.compile(r"\btarget\s*:\s*\"([^\"]*)\"")
 
+SERVER_PARTS = {"mipyre_process", "mipyre_runtime", "mipyre_server"}
+
 
 def shared_crates(root: str) -> dict[str, str]:
-    """Each workspace member whose package builds no cdylib: its directory (relative to `root`)
-    -> its library name."""
+    """Each workspace member whose package builds no cdylib and is not one of the server's parts:
+    its directory (relative to `root`) -> its library name."""
     with open(os.path.join(root, "Cargo.toml"), "rb") as f:
         members = tomllib.load(f)["workspace"]["members"]
     shared = {}
@@ -36,8 +32,8 @@ def shared_crates(root: str) -> dict[str, str]:
             with open(manifest_path, "rb") as f:
                 manifest = tomllib.load(f)
             lib = manifest.get("lib", {})
-            if "cdylib" not in lib.get("crate-type", []):
-                name = lib.get("name", manifest["package"]["name"].replace("-", "_"))
+            name = lib.get("name", manifest["package"]["name"].replace("-", "_"))
+            if "cdylib" not in lib.get("crate-type", []) and name not in SERVER_PARTS:
                 shared[os.path.relpath(os.path.dirname(manifest_path), root)] = name
     return shared
 
@@ -60,10 +56,11 @@ def literal_targets(root: str) -> dict[str, int]:
     return found
 
 
-def test_the_shared_crates_are_found_and_the_extension_module_is_not_one():
+def test_the_shared_crates_are_found_and_the_engine_and_its_parts_are_not():
     shared = shared_crates(ROOT)
     assert "crates/tpc" in shared and "crates/subinterp" in shared, shared
     assert "crates/pyext" not in shared, shared
+    assert "crates/runtime" not in shared and "crates/process" not in shared, shared
 
 
 def test_no_shared_crate_hard_codes_a_log_target():

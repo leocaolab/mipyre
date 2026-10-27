@@ -22,7 +22,7 @@ impl AsRef<StaticMountRule> for Mount {
     }
 }
 
-/// Builds the table `benchmarks/paths/app.py` serves for `BENCH_KIND=http`.
+/// Builds a table with a fast response, two worker routes and a static mount.
 fn bench_routes() -> RouteTable<u32, Mount> {
     let mut t = RouteTable::new();
     let fast = FastResponse::parse(Bytes::from_static(b"ok"), "text/plain", 200, &Default::default())
@@ -38,9 +38,27 @@ fn bench_routes() -> RouteTable<u32, Mount> {
     t
 }
 
+/// Builds a table with one param route, apart from [`bench_routes`] so the other cases' tables
+/// stay as they were.
+fn param_routes() -> RouteTable<u32, Mount> {
+    let mut t = RouteTable::new();
+    t.insert(
+        "GET",
+        "/json/{count}",
+        1,
+        "h".into(),
+        HandlerPlace::Worker(HandlerKind::Sync),
+    )
+    .must("register a param route");
+    t
+}
+
 /// Decides `method path` and follows the decision as far as the engine goes without IO.
 fn route_decide(name: &str, method: Method, path: &'static str, n: u64) {
-    let routes = bench_routes();
+    route_decide_in(bench_routes(), name, method, path, n);
+}
+
+fn route_decide_in(routes: RouteTable<u32, Mount>, name: &str, method: Method, path: &'static str, n: u64) {
     let headers = HeaderMap::new();
     measure(name, n, |_| {
         match decide(
@@ -78,6 +96,11 @@ fn route_hit(n: u64) {
     route_decide("route_hit", Method::GET, "/json", n);
 }
 
+/// Decides a route with a path param, which the handler reads or not.
+fn route_param(n: u64) {
+    route_decide_in(param_routes(), "route_param", Method::GET, "/json/7", n);
+}
+
 /// Finds no `HEAD` route and falls back to the `GET` one.
 fn route_head(n: u64) {
     route_decide("route_head", Method::HEAD, "/json", n);
@@ -94,8 +117,9 @@ fn route_static(n: u64) {
 }
 
 fn main() {
-    let cases: [Case; 4] = [
+    let cases: [Case; 5] = [
         ("route_hit", route_hit),
+        ("route_param", route_param),
         ("route_head", route_head),
         ("route_notfound", route_notfound),
         ("route_static", route_static),

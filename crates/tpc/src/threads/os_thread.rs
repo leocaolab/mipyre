@@ -4,6 +4,8 @@ use std::convert::Infallible;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use mipyre_util::panic_message;
+
 /// How long a [`crate::StopWatcher`] dropped without `finish` waits for its thread.
 pub(crate) const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -101,20 +103,6 @@ fn thread_name(thread: &std::thread::Thread) -> String {
         .map_or_else(|| format!("{:?}", thread.id()), str::to_string)
 }
 
-/// Returns a panic payload's text; a payload that is neither `&str` nor `String` becomes a fixed
-/// sentence. A `&Box<dyn Any + Send>` passed in place of the payload it holds is itself an `Any`,
-/// so the box is looked into rather than called a payload of neither kind.
-pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(inner) = payload.downcast_ref::<Box<dyn std::any::Any + Send>>() {
-        return panic_message(inner.as_ref());
-    }
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "<panic payload is neither &str nor String>".to_string())
-}
-
 /// Returns [`panic_message`] of `payload` and drops it, catching a panic the drop raises, which
 /// would otherwise escape the code that caught the first. The second panic's payload is leaked,
 /// not dropped, so its drop cannot panic either.
@@ -186,14 +174,5 @@ mod tests {
     fn a_thread_that_ends_is_joined_with_its_result() {
         let thread = spawn(std::thread::Builder::new(), || 7).unwrap();
         assert_eq!(thread.join_by(Instant::now() + Duration::from_secs(10)), Ok(7));
-    }
-
-    #[test]
-    fn a_payload_passed_as_its_box_is_read_through_it() {
-        let payload = std::panic::catch_unwind(|| panic!("real message")).unwrap_err();
-        assert_eq!(panic_message(&payload), "real message");
-        assert_eq!(panic_message(&*payload), "real message");
-        let neither: Box<dyn std::any::Any + Send> = Box::new(7_u8);
-        assert_eq!(panic_message(&*neither), "<panic payload is neither &str nor String>");
     }
 }

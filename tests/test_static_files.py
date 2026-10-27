@@ -100,7 +100,7 @@ def test_post_static_file_rejected(client):
 
 
 # -----------------------------------------------------------------------------
-# TOCTOU regression (advisor audit #14)
+# TOCTOU: a symlink swapped in after the containment check
 # -----------------------------------------------------------------------------
 #
 # Background: static file serving canonicalizes the candidate path, verifies
@@ -115,8 +115,7 @@ def test_post_static_file_rejected(client):
 # are rejected.
 #
 # This test simulates the post-check swap: we replace one of the static
-# files with a symlink to /etc/passwd, then request it. Before the fix the
-# server would happily read /etc/passwd. After the fix it refuses (500 or
+# files with a symlink to /etc/passwd, then request it. The server refuses (500 or
 # 404 or 403 — any non-200 with no /etc/passwd content is acceptable).
 
 def test_static_symlink_out_of_root_refused(static_dir):
@@ -152,7 +151,7 @@ def test_static_symlink_out_of_root_refused(static_dir):
 
 def test_a_large_file_is_served_whole_with_its_length_on_get_and_head(client):
     """A file of many chunks is the whole file on GET, and HEAD says its length with no body,
-    whether the cache keeps it or it is sent from disk a chunk at a time (b/619)."""
+    whether the cache keeps it or it is sent from disk a chunk at a time."""
     got = client.get("/static/big.bin")
     assert got.status_code == 200
     assert got.body == BIG

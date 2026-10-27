@@ -1,0 +1,74 @@
+[package]
+name = "mipyre_runtime"
+description = "Runs Python handlers: sub-interpreter workers and their pool, the main interpreter's threads, a process lane's worker, the hook chain around each call, and the exchange between Python objects and HTTP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# A sub-interpreter worker samples the reference count of each request's `Request` as it lets go of it
+# into a `metrics` counter; the engine's `leak_detect` turns it on (crates/pyext/Cargo.toml says how to build it).
+leak_detect = ["dep:metrics", "dep:metrics-util"]
+
+# Start-phase timestamps to stderr; the engine's `startup_trace` turns it on.
+startup_trace = ["mipyre_subinterp/startup_trace"]
+
+# The test helpers the engine's tests share with this package's (`src/testkit.rs`): a log capture that
+# installs the binary's one global subscriber, and the thread stack readings. Only the engine's
+# dev-dependency turns it on.
+testkit = ["dep:tracing-subscriber", "dep:libc"]
+
+# No hyper connection driver and no mipyre_server: what serves connections hands requests to this package.
+[dependencies]
+mipyre_tpc = { path = "../tpc" }
+mipyre_subinterp = { path = "../subinterp" }
+# The shared-memory channel a process-lane worker serves on (`src/lane_worker.rs`).
+mipyre_shm = { path = "../shm" }
+mipyre_http = { path = "../http" }
+mipyre_transport = { path = "../transport" }
+mipyre_util = { path = "../util" }
+mipyre_core = { path = "../core" }
+# The lane worker's side of the wire, and the lane failures a request can end in (`UnansweredError::Lane`).
+mipyre_process = { path = "../process" }
+# The handles an interpreter's `EngineModule` keeps to a run's pools.
+mipyre_pg = { path = "../pg" }
+pyo3 = "0.29"
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+hyper = { version = "1.11", features = ["server", "http1", "http2"] }
+bytes = "1"
+serde_json = "1"
+# A cookie's `Expires` as an HTTP-date (exchange/cookie.rs).
+httpdate = "1"
+itoa = "1"
+parking_lot = "0.12"
+form_urlencoded = "1"
+crossbeam-channel = "0.5"
+dashmap = "6"
+tracing = "0.1"
+# The system calls it has safe calls for (a lane worker's parent, the asyncio doorbell).
+rustix = { version = "1.1.5", default-features = false, features = ["std", "event", "fs", "pipe", "process", "time"] }
+thiserror = "2"
+
+metrics = { version = "0.24", optional = true }
+metrics-util = { version = "0.19", features = ["debugging"], optional = true }
+
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+libc = "0.2"
+
+# The Loom models (`src/live_workers/loom_model.rs`, `src/job_queue/loom_model.rs`), built only under
+# `--cfg sync_model`, which swaps `src/sync.rs`'s names for Loom's in this crate and in every package built with it:
+# `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_runtime --lib --profile model --target-dir target/loom loom`.
+[target.'cfg(all(sync_model, not(sync_shuttle)))'.dependencies]
+loom = "0.7"
+
+# The Shuttle models (`src/job_queue/shuttle_model.rs`), built only under `--cfg sync_model --cfg
+# sync_shuttle`, which swaps `src/sync.rs`'s names for Shuttle's instead.
+[target.'cfg(all(sync_model, sync_shuttle))'.dependencies]
+shuttle = "0.9.8"
+
+[lints]
+workspace = true

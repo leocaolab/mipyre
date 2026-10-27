@@ -1,6 +1,6 @@
-# pyre is a workspace and nothing else (b/51 E0b): one package per domain in `crates/<domain>`
-# (`crates/README.md`); the engine is `mipyre_pyext` in `crates/pyext` (maturin finds it through pyproject.toml's
-# `manifest-path`). A root that is a package is a layout arc archcheck cannot judge (arc b/2596).
+# pyre is a workspace and nothing else: one package per domain in `crates/<domain>`;
+# the engine is `mipyre_pyext` in `crates/pyext` (maturin finds it through pyproject.toml's
+# `manifest-path`).
 #
 # Every directory under `crates/` is a package, so one glob names them all. `[profile]` and the `[patch]` at
 # the bottom must stay in this file: cargo reads both only from the workspace root and ignores them in a
@@ -11,9 +11,9 @@ members = ["crates/*"]
 exclude = ["third_party/kqueue"]
 resolver = "2"
 
-# Suppressions are written down (b/53 E1-2, design §5.1): a lint is silenced only by
+# Suppressions are written down: a lint is silenced only by
 # `#[expect(lint, reason = "...")]` — which turns red once the lint stops firing, so a stale one cannot stay —
-# and a test is ignored only with a reason. The merge gate's clippy step (-D warnings) is what enforces these.
+# and a test is ignored only with a reason. Clippy with -D warnings enforces these.
 # The verification builds name their cfg: `sync_model` (the Loom models: each package's sync primitives are
 # swapped for Loom's model of them, `RUSTFLAGS="--cfg sync_model"`; with `--cfg sync_shuttle` as well, a package that
 # has Shuttle models takes Shuttle's names instead, and `sync_shuttle_random` adds their nightly random schedules),
@@ -35,12 +35,12 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [workspace.package]
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
 license = "Apache-2.0"
 
 # Test, clippy and fuzz builds (`test` and `fuzz` inherit it): line tables only, so a panic's backtrace still names
-# file and line; the variable and type info nothing here reads is not generated (b/958).
+# file and line; the variable and type info nothing here reads is not generated.
 [profile.dev]
 debug = "line-tables-only"
 
@@ -50,24 +50,23 @@ codegen-units = 1      # Single codegen unit: max optimization at cost of compil
 opt-level = 3          # Aggressive optimization
 strip = true           # Strip symbols: smaller binary, better icache
 
-# The engine the merge gate tests (stubtest and the default pytest run, b/973): release's code without the link-time
-# work. The gate judges what the engine does, not how fast it does it; speed is the wheel's, and the wheel and the
-# counts keep `release` with fat LTO. Fat LTO with one codegen unit cost the gate ~75-97 s each round it rebuilt.
-# Its own target dir (target/gate), apart from target/release where the microbench counts build.
+# The engine the tests run against (stubtest and the default pytest run): release's code without the link-time
+# work, which took ~75-97 s each rebuild. Tests judge what the engine does, not how fast it does it; the wheel and the
+# instruction counts keep `release` with fat LTO. Its own target dir (target/gate), apart from target/release.
 [profile.gate]
 inherits = "release"
 lto = "off"
 codegen-units = 16
 
-# The gate's fault-injection build (`--features fault_injection`, b/959): the gate's engine with the test-only
+# The fault-injection build (`--features fault_injection`): the test engine with the test-only
 # feature, in its own target dir (target/fault-injection) so the two builds do not rebuild each other.
 [profile.fault-injection]
 inherits = "gate"
 
-# What the Loom and Shuttle models in dev/proofs.toml build with: the gate's build (release's optimization, which the
+# What the Loom and Shuttle models build with: the test build (release's optimization, which the
 # model checkers need to get through their schedules in time, without fat LTO and one codegen unit), kept incremental
 # since each model target dir rebuilds only the crates a change touched. With release, every change to the engine
-# crate was a three-minute rebuild in each model target dir; the models run as fast either way (b/960).
+# crate was a three-minute rebuild in each model target dir; the models run as fast either way.
 [profile.model]
 inherits = "gate"
 incremental = true
@@ -88,6 +87,5 @@ pyo3-macros = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026
 pyo3-macros-backend = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-22.1" }
 pyo3-build-config = { git = "https://github.com/leocaolab/pyo3", tag = "subinterp-2026-10-22.1" }
 # kqueue 1.2.1 (notify's macOS backend) with one change, an O_NONBLOCK open in
-# Watcher::add_filename so a FIFO in a watched tree does not hang the watcher (b/951);
-# third_party/README.md says what was taken and what was changed.
+# Watcher::add_filename so a FIFO in a watched tree does not hang the watcher.
 kqueue = { path = "third_party/kqueue" }

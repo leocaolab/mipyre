@@ -457,11 +457,14 @@ class _Registry:
                 return CommandLine(list(sys.argv), self._flag_table(values), True)
             case _Unparsed():
                 return CommandLine(list(sys.argv), self._flag_table(layered), False)
-            case _Parsing() | _Installed():
+            case _Parsing(prog=prog):
+                raise FlagError(_served_at_import(f"{prog} imported the app's module, and it serves the app itself"))
+            case _Installed():
                 raise FlagError(
-                    f"a server started while the command line is {state}: only main serves, and only after "
-                    "it parsed the command line (under `mipyre run`, a server started as the app is "
-                    "imported is one an `if __name__ == '__main__':` guard is missing from)"
+                    _served_at_import(
+                        'a runtime="process" worker imported the app\'s module to serve its routes, and only '
+                        "the main process serves"
+                    )
                 )
 
     def _flag_table(self, values: Mapping[str, object]) -> dict[str, tuple[str, list[str] | None, object, object]]:
@@ -512,6 +515,13 @@ class _Registry:
                 f"{declaration.site}) holds"
             )
         return _stored(declaration.kind, value)
+
+
+def _served_at_import(importer: str) -> str:
+    return (
+        f"app.run() was called while {importer}: put app.run() under "
+        '`if __name__ == "__main__":` so it runs only when the file is run as a script'
+    )
 
 
 def _check_reserved(declaration: _Declaration, reserved: Mapping[str, _Site]) -> None:

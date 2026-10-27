@@ -2,6 +2,83 @@
 
 All notable changes to mipyre are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/): within 1.x, the public API does not break.
 
+## [3.0.0] — unreleased
+
+WebSocket handlers are `async def` and run on the sub-interpreters by default, the server is given its settings as one `ServerFlags`, every setting has one spelling, and the request-body defaults are tighter. It breaks the 2.0 API in the places listed under Breaking; an old spelling fails where it is written, never silently.
+
+### Breaking
+
+WebSocket:
+
+- A WebSocket handler is an `async def`: `recv()`, `recv_bytes()`, `recv_message()`, `send()` and `send_bytes()` return awaitables, and `async for msg in ws` yields each message until the connection ends. A `def` handler raises `TypeError` when the route is declared. A send that finds the buffer full waits for room instead of raising `BlockingIOError`; a receive while another task awaits one raises `RuntimeError`.
+- `app.websocket(path, handler=None, *, runtime=None)` runs the handler on the route's runtime, the app's unless given, like an HTTP route: by default each connection is a task on a sub-interpreter worker's event loop, so handlers on different workers run in parallel and module globals are per worker (share through `app.state`). `runtime="main"` runs them on the main interpreter's event loop; `runtime="process"` raises `ValueError`. A connection waiting for a message holds no thread. The `before_request` hooks of a WebSocket route run on its event loop: write them as `async def`, since a blocking `def` hook stalls every connection there.
+
+Settings and running:
+
+- `app.run(config=None, *, reload=False)` takes the server's settings as one `ServerFlags` (`from mipyre import ServerFlags`), the value `TestClient(config=)` and `TestServer(config=)` take: `app.run(port=8001)` is `app.run(ServerFlags(port=8001))`. The start's summary and errors name a code value as `ServerFlags(port=)`.
+- `Mipyre(routers=[...])` is gone: write `app.include_router("svc.admin:router")`, one line per router, with `prefix="/admin"` to put its paths under `/admin` (it starts with `/` and does not end with one, else `ValueError`). A router is still named by its import string, so each runtime imports only the routers it serves; a `Router` object raises `TypeError` saying how to name it. A target that names no module or attribute raises the error the app's own target does, which `mipyre run` prints as one line.
+- One spelling per setting: its variable is `MIPYRE_` and its name in capitals, its option `--` and its name with dashes. Renamed: `MIPYRE_TPC_DARWIN` → `MIPYRE_TPC_ACCEPT`, `MIPYRE_GIL_BRIDGE_WORKERS` / `MIPYRE_GIL_BRIDGE_CAPACITY` → `MIPYRE_BRIDGE_WORKERS` / `MIPYRE_BRIDGE_CAPACITY`, `MIPYRE_TLS_PORTS` / `MIPYRE_PLAIN_PORTS` → `MIPYRE_EXTRA_TLS_PORTS` / `MIPYRE_EXTRA_PLAIN_PORTS`, `MIPYRE_PROCESS_QUEUE` → `MIPYRE_PROCESS_QUEUE_PER_WORKER`, `MIPYRE_LANE_HOST_FAILURE` → `MIPYRE_PROCESS_HOST_FAILURE`, `--allowed-host` → `--allowed-hosts`, `--trusted-proxy` → `--trusted-proxies`, `--process-queue` → `--process-queue-per-worker`, `MIPYRE_WORKERS` → `MIPYRE_THREADS`. An old name is not read: a variable stops the start with a `ConfigError` as an unknown variable, an option as an unrecognized argument; the new name is the one in this list.
+- `app.process_lanes` is gone: `app.lane_stats()` returns the counters it was read for (worker pids, deaths, respawns, ...), a new snapshot per call, or `None` before a server prepared the app or without process routes. `mipyre.engine.LaneSet` is private.
+- A 2.x keyword on a route, `app.run()` or `TestClient` (`gil=`, `model=`, `stream=`, `host=`, ...) is Python's own `TypeError` for an unexpected keyword, no longer a message naming the new spelling.
+- `get_gil_metrics().static_bytes_in_flight` is gone: each server counts its own static answers, as `static_bytes_in_flight` in its `RunMetrics` (`TestServer.metrics()`) and `mipyre_static_bytes_in_flight` on its `/metrics`.
+
+Request bodies:
+
+- `max_body_size` defaults to 2.5 MiB (2,621,440 bytes, as Django's), was 10 MiB; `body_time_limit` defaults to 30 s, was 600 s.
+- A body has `app.body_grace` (default 5 s) to arrive however slowly it comes, no longer `request_timeout`; past it, it goes on only while its average rate since it started is at least `body_min_rate`, and gets `408` as soon as it falls below. A body sent far slower than `body_min_rate` used to earn a second for every `body_min_rate` bytes and hold its connection up to `body_time_limit`. `request_timeout` is now the handler's time only (`504`), and for `body=BodyStream` how long the handler may leave a chunk untaken.
+
+Handlers and routes:
+
+- A handler that returns something that is not a response (a tuple, a set, an int, another object), from the handler, an `after_request` hook or as a `Response`'s body, answers the generic `500` and logs the type and its `repr`, e.g. `the returned tuple is not a response: ('x', 201)`. It used to go out as `200 text/plain` with its `str()`. A response is a `dict`, `list`, `str`, `bytes`, `bytearray`, `None`, `Response` or `Stream`.
+- A route path that does not start with `/` raises `ValueError` where it is declared, on the app and on a `Router`: `GET 'nopath': a route path starts with "/"`.
+- A path param annotated as anything but `str` raises `TypeError` at registration, naming the handler, the parameter and the annotation; a path param is always the `str` the URL holds.
+- A handler whose first parameter is named after a path param raises `TypeError` at registration with the signature to write: `def hello(name)` on `/hello/{name}` used to get the request in `name`; write `def hello(req, name)`.
+- `MCPServer`: a tool whose `input_schema` does not list as required an argument its handler requires raises `ValueError` when it is registered. A call is checked against the whole input schema once, so `"additionalProperties": false` is enforced, and the messages name the path: `invalid params: arguments.expression: expected string, got integer`, `invalid params: arguments: missing required key(s) ['b']`.
+
+Logs:
+
+- The production log level is `WARN` (was `ERROR`), so a handler's `logger.warning(...)` is logged. Turning the access log on (`enable_access_log()`, `MIPYRE_LOG=1`, `mipyre dev`) raises it to `INFO`, as it raised `ERROR`.
+
+### Added
+
+- `EventSourceResponse(source)` and `ServerSentEvent(data=None, event=None, id=None, retry=None)`: a handler on `runtime="main"` returns a generator or async generator of events, and mipyre writes them as `text/event-stream` with `Cache-Control: no-cache`, waits out a slow client, and closes the generator when the client leaves. At most 256 sync generators are read at once; one more is answered `503`.
+- `Stream.wait_writable()` (blocks with the GIL released) and `await Stream.wait_writable_async()` wait for room after a `send` raised `BlockingIOError`, and raise `ConnectionError` once the client is gone or the stream closed, `close()` from another thread included. `Stream.send_event` takes `retry=` (milliseconds), and its `data` is optional.
+- `app.stop()` stops the app's running servers from any thread, as `SIGTERM` does: each run drains, runs its shutdown hooks and returns from `app.run()`. It does not wait; with no run of the app running it does nothing.
+- WebSocket keepalive: a client unheard for `app.websocket_ping_interval` (default 20 s) is pinged, and one that sends no frame within `app.websocket_ping_timeout` (default 20 s) after that is closed with `1011`, counted in `mipyre_websocket_keepalive_timeouts_total` and `RunMetrics.ws_keepalive_timeouts`.
+- The log counts the lines it drops: `get_gil_metrics().log_lines_dropped` (and `log_lines_write_failed`, the ones stderr refused) and `mipyre_log_lines_dropped_total{reason="queue_full"|"write_failed"}`, with a warning at most once a minute.
+- `get_gil_metrics().workers_abandoned` and `pools_at_abandon_limit`, also `mipyre_workers_abandoned` and `mipyre_pools_at_abandon_limit` on `/metrics`, and an `abandoned_workers` check in every `/readyz` of `HealthProbes` on `runtime="main"` (the default), which fails while a pool is at its limit (see Changed).
+- `app.lane_stats()` counts `unawaited_skips`, the queued process-route requests skipped because their client had gone.
+
+### Changed
+
+- WebSocket connections no longer hold an OS thread each: in 2.0, 2,048 connections were 2,048 threads on one GIL. On one Mac, an echo server on the sub-interpreters answered about 58,000–64,000 echoes/s from 512 to 4,096 connections, where 2.0 answered 42,000 at 512 and 1,600 at 2,048.
+- A WebSocket client that stops reading is cut off after 10 s without progress and warned of, as an HTTP client is, and a handler waiting for room wakes at once.
+- One way to run `runtime="main"` handlers on every server: with `MIPYRE_TPC=0` they no longer go to tokio's blocking pool. A `def` handler runs on up to `bridge_workers` threads (default 4 thread-per-core, 512 with `MIPYRE_TPC=0`; more start as needed and retire after 10 s idle), with `bridge_capacity` requests waiting (16 per thread) and the next one answered `503`. `bridge_workers` and `bridge_capacity` now apply to every server with main-interpreter routes. The access log's `source` is `main` on every server, and the threads are named `mipyre-main-def-N`.
+- `async def` handlers run on one stock asyncio event loop per interpreter. At `request_timeout` the client gets `504` and the handler's task is not cancelled: it runs to its end and its late answer is dropped; stopping the server cancels it.
+- A request whose client left before its handler started is not run, on `runtime="main"` and on process routes.
+- A request handed to another thread's process lanes waits in a queue of fixed size (the lanes' `queue_per_worker` each); past it the request is answered `503`, where it used to wait without limit.
+- A sub-interpreter pool abandons a sync worker that an interruption did not end, and starts a replacement, only while it has abandoned fewer still-running workers than it has sync workers; at that limit the stuck worker keeps its place until its request ends, so a handler that never returns can no longer grow the process's threads without bound. Reaching the limit logs one `ERROR` and leaving it one `INFO`, and `/readyz` answers `503` so the orchestrator restarts the process. The interruption warning is held to one a minute.
+- macOS: the thread-per-core server's threads accept from one shared socket (Darwin's `SO_REUSEPORT` handed every connection to one of them), and the multi-thread server runs an accept loop per I/O thread instead of one.
+- The request-head read timeout and a new connection's deadline are kept by one clock thread, `mipyre-clock`, ticking every 100 ms, instead of a timer per request: they fire up to 100 ms late.
+- The log writer writes the lines waiting in its queue in one write, up to 64 KiB, instead of one write per line.
+- What a newcomer's mistakes print: `app.run()` reached while the app's module is imported (no `if __name__ == "__main__":` guard, under `mipyre run` or in a process worker) raises `FlagError` saying to add the guard, and a process worker whose app fails to import no longer prints its own traceback. A failed start is raised once, without a second JSON `ERROR` line, and a port in use adds the ways to give another. A TLS file that cannot be used is a `ConfigError` naming the setting and where it was given, and a key that is not the certificate's says so with both file names.
+- The start banner reads `Mipyre v3.0.0` and counts `N sub-interp + N main + N process + N async` (was `+ N GIL +`); the start log's `topology` says `sub-interp` / `pool` (was `hybrid-inline` / `hybrid`). `mipyre dev` logs text unless `log_config` gives a format.
+- A sub-interpreter `def` handler that imports an extension which can't load in a sub-interpreter logs its `500` with the advice the worker's start gives (`runtime="process"`, `"main"` or `"isolated"`).
+- An unknown `MIPYRE_*` variable's error names it without its value, which may be a secret.
+- A buffered request body that arrives in several frames is copied once, and `req.params` is decoded once per request; each access returns a new `dict`.
+- Building from source uses the Rust toolchain pinned in `rust-toolchain.toml` (1.97.1).
+
+### Fixed
+
+- Request smuggling: a request with both `Content-Length` and `Transfer-Encoding: chunked`, in either order, is read by the chunks alone, its `Content-Length` is dropped before the handler or a process worker sees it, and the connection closes after the answer (RFC 9112, section 6.3). With the `Content-Length` first, the handler used to see a length that disagreed with its body and bytes after the body were read as the next request. hyper 1.11.1.
+- A WebSocket client that sent nothing after the upgrade, lost its network without a FIN, or trickled a frame byte by byte held its connection forever; it is now closed by the keepalive (see Added).
+- A `SIGINT` or `SIGTERM` received between two runs in one process no longer stops the next run as it starts. After a run, `SIGTERM` ends the process again instead of being caught and dropped, and a run takes the stop signals back from a handler installed with `signal.signal` between runs, giving them back when it ends.
+- `Accept-Encoding` weights outside 0–1, and `NaN`, disable that coding (RFC 9110): `br;q=-1, *` no longer picks brotli.
+- `runtime="isolated"`: copying a package while another process writes its bytecode no longer fails the worker's start.
+- A process worker whose fork answer came after its deadline no longer sits idle until something else reads the template's socket.
+- A `sys.path` too long for the process lanes' setup frame raises `ValueError` when the lanes start, instead of the template closing the link without a reason.
+- tokio 1.53.3 (RUSTSEC-2026-0386) and ctutils 0.4.4 (RUSTSEC-2026-0385).
+
 ## [2.0.0] — 2026-10-22
 
 A large rework: settings are declared once and checked at startup, the features an app turns on are objects of their own, the engine answers more by itself, and `runtime="process"` routes run on a shared-memory channel of their own (the `mipyre_shm` crate). It breaks the 1.0 API in the places listed under Breaking. An old spelling fails where it is written, not silently; most of the errors name the new spelling.

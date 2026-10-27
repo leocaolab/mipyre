@@ -1,9 +1,9 @@
-"""A process-lane worker's start (design §11.4): the import worker gets the app itself;
+"""A process-lane worker's start: the import worker gets the app itself;
 the fork worker inherits it from the template. Either way it ends in the engine's loop
 (`MipyreApp._serve_lane_worker`) and never comes back.
 
 `python -m mipyre._process_lane.worker` is the entry of a worker the SpawnDriver
-started (macOS while b/32 lasts); the ForkDriver's workers come in through `run` in the
+started (macOS); the ForkDriver's workers come in through `run` in the
 forked template.
 """
 
@@ -16,7 +16,7 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
-from mipyre.engine import CommandLine, LaneSet, _set_routers_to_load
+from mipyre.engine import CommandLine, _LaneSet, _set_routers_to_load
 
 from mipyre._process_lane.server import START_REFUSED, LaneSetup, LaneWorker, refuse_unpinned_start, unpin_env
 
@@ -55,22 +55,27 @@ def load_app(setup: LaneSetup):
     _set_routers_to_load(list(setup.routers))
     from mipyre import _target
 
-    _module, app = _target.import_target(setup.target)
+    _module, app = _target.import_target(_target.parse_target(setup.target))
     return app
 
 
-def import_app(lanes: LaneSet, worker: LaneWorker):
+class _ReportedImportFailure(Exception):
+    """The app's import failed in this worker and the failure went to the server, which prints it."""
+
+
+def import_app(lanes: _LaneSet, worker: LaneWorker):
     """`start="import"`: the app, imported here with the run's command line; a failed import is
-    reported to the server."""
+    reported to the server, which says it once for every worker, and the worker ends without
+    printing it."""
     try:
         install_command_line(worker.command_line)
         return load_app(worker.setup)
-    except BaseException:
+    except BaseException as failure:
         lanes._report_start_failure(traceback.format_exc())
-        raise
+        raise _ReportedImportFailure from failure
 
 
-def attach(worker: LaneWorker) -> LaneSet:
+def attach(worker: LaneWorker) -> _LaneSet:
     """Map `worker`'s lane from the fds the template handed it. A worker that cannot map its lane
     cannot report into it either: it refuses its start (START_REFUSED), which the server takes as
     final for the lane."""
@@ -80,14 +85,14 @@ def attach(worker: LaneWorker) -> LaneSet:
         # A spawned worker got its pair inheritable; the bell stays open for the worker's life,
         # and a program the app runs must not get it.
         os.set_inheritable(bell, False)
-        return LaneSet._attach(worker.lane, worker.attempt, setup.depth, setup.slot_bytes, setup.worker_spin_us, shm, bell)
+        return _LaneSet._attach(worker.lane, worker.attempt, setup.depth, setup.slot_bytes, setup.worker_spin_us, shm, bell)
     except BaseException:  # noqa: BLE001 — printed; the process exits START_REFUSED
         traceback.print_exc()
         sys.stderr.flush()
         os._exit(START_REFUSED)
 
 
-def run(worker: LaneWorker, sock, template_fds: tuple[int, ...], app_of: Callable[[LaneSet], Any]) -> None:
+def run(worker: LaneWorker, sock, template_fds: tuple[int, ...], app_of: Callable[[_LaneSet], Any]) -> None:
     """Leave the template, map the lane, then serve the app `app_of` returns until the process ends.
 
     Each worker reseeds before the app is had: a forked worker drops the random state it copied
@@ -100,6 +105,8 @@ def run(worker: LaneWorker, sock, template_fds: tuple[int, ...], app_of: Callabl
         _reseed()
         app_of(lanes)._engine._serve_lane_worker(lanes, worker.template_pid)
         print(f"mipyre: process-lane worker {worker.lane} left its loop", file=sys.stderr, flush=True)
+    except _ReportedImportFailure:
+        pass
     except BaseException:  # noqa: BLE001 — a worker never returns into the template
         traceback.print_exc()
         sys.stderr.flush()

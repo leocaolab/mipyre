@@ -1,10 +1,10 @@
-"""TPC teardown, end to end (b/175).
+"""TPC teardown, end to end.
 
 A TPC thread that a stop leaves running past the join deadline is kept with the app's abandoned
 workers and named, and the process exits without finalizing. That exit (``os._exit``, no
 ``Py_Finalize``) is the process's own, so only a real process can show it; the join deadline is
 the app's ``shutdown_timeout``, set short here. The drain's timeout and its counters are Rust
-tests (``mipyre_tpc::threads`` and ``serve::tpc``), b/301.
+tests (``mipyre_tpc::threads`` and ``serve::tpc``).
 """
 
 from __future__ import annotations
@@ -20,13 +20,7 @@ import threading
 
 import httpx
 
-from tests._helpers import read_file, settle
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from tests._helpers import free_port_below_ephemeral, read_file, settle
 
 
 def _wait_listening(port: int, timeout: float = 90) -> None:
@@ -70,15 +64,27 @@ def _wait_exit(proc: subprocess.Popen, timeout: float = 90) -> int:
         raise AssertionError("the server did not exit")
 
 
+# The stuck handler holds the thread that would answer, so the process's exit closes the
+# connection without a response.
+CONNECTION_CLOSED = (httpx.RemoteProtocolError, httpx.ReadError)
+
+
+def _get_stuck(port: int, outcome: dict) -> None:
+    try:
+        outcome["response"] = httpx.get(f"http://127.0.0.1:{port}/stuck", timeout=120)
+    except httpx.HTTPError as e:
+        outcome["error"] = e
+
+
 def test_a_tpc_thread_abandoned_past_the_join_deadline_exits_without_finalizing(tmp_path):
     """The exit without `Py_Finalize` (`os._exit` with a live sub-interpreter) is the process's own end,
     so only a real process run to its exit code shows it."""
-    port = _free_port()
+    port = free_port_below_ephemeral()
     proc, log_path = _spawn(
         tmp_path,
         f"""
         import threading
-        from mipyre import Mipyre
+        from mipyre import Mipyre, ServerFlags
 
         app = Mipyre()
         # The join deadline after the stop: the stuck thread is given up on this soon.
@@ -95,7 +101,7 @@ def test_a_tpc_thread_abandoned_past_the_join_deadline_exits_without_finalizing(
             threading.Event().wait()
 
         if __name__ == "__main__":
-            app.run(host="127.0.0.1", port={port})
+            app.run(ServerFlags(host="127.0.0.1", port={port}))
             print("RETURNED", flush=True)
         """,
         {},
@@ -103,17 +109,20 @@ def test_a_tpc_thread_abandoned_past_the_join_deadline_exits_without_finalizing(
     read = read_file(log_path)
     try:
         _wait_listening(port)
-        threading.Thread(
-            target=lambda: httpx.get(f"http://127.0.0.1:{port}/stuck", timeout=120),
-            daemon=True,
-        ).start()
+        stuck_outcome: dict = {}
+        client = threading.Thread(target=_get_stuck, args=(port, stuck_outcome), daemon=True)
+        client.start()
         settle(read, lambda text: "HANDLER-STUCK" in text, timeout=60)
         os.killpg(os.getpgid(proc.pid), signal.SIGINT)
         rc = _wait_exit(proc)
+        # Joined here, the client's failure is this test's, not an unhandled thread exception in
+        # whichever test runs next.
+        client.join()
     finally:
         if proc.poll() is None:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     log = read()
+    assert isinstance(stuck_outcome.get("error"), CONNECTION_CLOSED), (stuck_outcome, log[-3000:])
     # The stop went down the abandoned path: the run raised AbandonedWorkersError, naming the TPC
     # thread, and `run()` exited through `os._exit` (no finalization, no abort).
     assert rc == 1, log[-3000:]

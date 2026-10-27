@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import TYPE_CHECKING, Callable
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any, Callable
 
-from mipyre.engine import Compression, LogLevel, MipyreApp as _MipyreApp, SharedState, _route_params
+from mipyre.engine import Compression, Deployment, EntryPoint, LogLevel, MipyreApp as _MipyreApp, ServerFlags, SharedState, _route_params
 from mipyre.engine import _routers_to_load as _engine_routers_to_load, _in_worker
 from mipyre.engine import BodyStream
-from mipyre._log.settings import LogConfig, LogLevelName, _AccessLog, _LogSettings, _parse_level
+from mipyre._log.settings import LogConfig, LogLevelName, _AccessLog, _parse_level, _parsed_level
 from mipyre._bind import bind_handler
 from mipyre._routes import (
     _ENGINE_RUNTIME,
@@ -18,13 +19,13 @@ from mipyre._routes import (
     RouteDeclaration,
     Runtime,
     _body_model,
+    _is_prefix,
     _pydantic_core_facts,
     _pydantic_refusal,
     _RouteVerbs,
     _validates,
     app_runtime,
     import_router,
-    reject_removed_serve_args,
 )
 from mipyre._process_lane.settings import ProcessLanes
 
@@ -32,7 +33,6 @@ if TYPE_CHECKING:
     from types import FrameType
 
     from mipyre._server_run import AppRuns
-    from mipyre.engine import LaneSet
 
 
 def _decorator_or_call(register: Callable[[Callable], object], handler: Callable | None) -> Callable:
@@ -43,19 +43,6 @@ def _decorator_or_call(register: Callable[[Callable], object], handler: Callable
         return fn
 
     return decorator(handler) if handler is not None else decorator
-
-
-def _require_int(name: str, value: object) -> None:
-    """``bool`` is an ``int`` subclass; a limit set to ``True`` is a bug, not 1."""
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise TypeError(f"{name} must be int, got {type(value).__name__}")
-
-
-def _require_seconds(name: str, value: object) -> None:
-    """Reject anything but ``int`` or ``float`` seconds; a ``bool`` is an ``int``, but a
-    timeout set to ``True`` is a bug, not 1 s."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{name} must be int or float seconds, got {type(value).__name__}")
 
 
 class Mipyre(_RouteVerbs):
@@ -98,120 +85,142 @@ class Mipyre(_RouteVerbs):
         log_config: LogConfig | None = None,
         *,
         runtime: Runtime | str | None = None,
-        routers: list[str] | tuple[str, ...] = (),
         process: ProcessLanes | None = None,
     ) -> None:
         """``runtime``: where this app's routes run unless a route or its router says
-        otherwise — ``"subinterp"`` (default), ``"isolated"``, ``"process"`` or ``"main"``. ``routers``:
-        ``Router``s by import string (``"myapp.analytics:router"``); each runtime imports
-        only the routers that have routes it serves. ``process``: process-lane settings."""
+        otherwise — ``"subinterp"`` (default), ``"isolated"``, ``"process"`` or ``"main"``.
+        ``process``: process-lane settings. Routers are added with :meth:`include_router`."""
         self._engine = _MipyreApp()
         self.runtime = app_runtime(runtime, "Mipyre(...)")
         if process is not None and not isinstance(process, ProcessLanes):
             raise TypeError(f"process= takes a mipyre.ProcessLanes, got {type(process).__name__}")
         self._process_declared = process
-        self._router_targets = tuple(routers)
-        # Routers by runtime they have routes in (filled by _load_routers, main only).
         self._routers_by_runtime: dict[Runtime, list[str]] = {r: [] for r in Runtime}
         self.debug = debug
         self._startup_hooks: list[Callable] = []
         self._shutdown_hooks: list[Callable] = []
         self._routes: list[Route] = []
         self._fast_routes: list[FastRoute] = []
-        self._app_file_path: str | None = None
-        # Parsed here, so a bad level fails at construction; applied by the first server.
-        self._configured_log = _LogSettings.resolve(debug, log_config or {})
+        # Its level is parsed here, so a bad one fails at construction; the first server
+        # resolves and applies it.
+        self._log_config = _parsed_level(log_config or {})
         self._access_log: _AccessLog | None = None
         # Made by the app's first run (`_server_run.runs_of`), on main only; a worker never serves.
         self._runs: AppRuns | None = None
-        self._defined_in = _defining_module_file(self)
+        creator = _creating_frame(self)
+        self._defined_in = _module_file(creator)
         # The modules whose code makes this app's PgPool handles: a server run of it takes those
-        # and no other app's (b/335 D17).
-        self._engine._add_home_module(_creating_globals(self))
-        # Guards the enable_* helpers' check-then-set: two threads must not both pass
-        # "already enabled?" and register the routes/hooks twice.
-        self._has_isolated_routes = False
-        self._load_routers()
+        # and no other app's.
+        self._engine._add_home_module({} if creator is None else creator.f_globals)
 
-    def _load_routers(self) -> None:
-        """Imports this app's routers and registers their routes: all of them on the main
-        interpreter; in a worker, only the ones its runtime serves (the engine says which:
-        a router with process routes may import what a sub-interpreter can't load)."""
+    def include_router(self, target: str, *, prefix: str = "") -> None:
+        """Serve the routes of the :class:`~mipyre.Router` that ``target`` names
+        (``"myapp.admin:router"``), each at ``prefix`` followed by its own path.
+
+        The router is named by import string, not passed as an object, so that each runtime
+        imports it only if it serves one of its routes: the server imports every router, a
+        sub-interpreter only those with sub-interpreter routes, a process worker only those
+        with process routes. A library a process router imports never loads in a
+        sub-interpreter.
+
+        :raises TypeError: ``target`` is not a ``str``, or names something that is not a Router.
+        :raises ValueError: ``prefix`` is neither empty nor starts with ``/`` without ending with one.
+        :raises MissingTargetError: the module or its attribute does not exist.
+        """
+        if not isinstance(target, str):
+            raise TypeError(
+                "include_router takes a router's import string, as in "
+                f'app.include_router("myapp.admin:router"), not a {type(target).__name__}: each '
+                "runtime imports only the routers that have routes it serves, so a library a "
+                "router imports (numpy, say) never loads in a sub-interpreter. An object passed "
+                "here was imported by the app's module, which every runtime imports."
+            )
+        if not _is_prefix(prefix):
+            raise ValueError(
+                f'include_router({target!r}, prefix={prefix!r}): a prefix starts with "/" and does '
+                'not end with "/"'
+            )
         only = _engine_routers_to_load()
-        for target in self._router_targets:
-            if only is not None and target not in only:
-                continue
-            router = import_router(target)
-            self._engine._add_home_module(vars(sys.modules[target.partition(":")[0]]))
-            for declaration in router._routes:
-                self._add(declaration)
-            for runtime in {self._runtime_of(declaration) for declaration in router._routes}:
-                self._routers_by_runtime[runtime].append(target)
+        if only is not None and target not in only:
+            return
+        module, router = import_router(target)
+        self._engine._add_home_module(vars(module))
+        for declaration in router._routes:
+            self._add(replace(declaration, path=prefix + declaration.path))
+        for runtime in {self._runtime_of(declaration) for declaration in router._routes}:
+            self._routers_by_runtime[runtime].append(target)
         self._engine._set_subinterp_routers(
             list(dict.fromkeys(t for r in Runtime if r.on_subinterpreters for t in self._routers_by_runtime[r]))
         )
 
     @property
     def max_body_size(self) -> int:
-        """Max request body size in bytes; a larger body is answered 413. Default: 10 MB.
+        """Max request body size in bytes; a larger body is answered 413. Default: 2.5 MiB
+        (2621440, as Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE``).
         Per app: another app in the same process keeps its own."""
         return self._engine.max_body_size()
 
     @max_body_size.setter
     def max_body_size(self, size: int) -> None:
         """Set max request body size. Example: ``app.max_body_size = 50 * 1024 * 1024``"""
-        _require_int("max_body_size", size)
-        if size < 0:
-            raise ValueError(f"max_body_size must be non-negative, got {size}")
         self._engine.set_max_body_size(size)
 
     @property
     def request_timeout(self) -> float:
-        """Seconds each step of a request may take before the server gives up on it: its
-        whole body arriving (past it: ``408 Request Timeout``), then its handler answering
-        (past it: ``504 Gateway Timeout``). Default: 30. Per app: another app in the same
-        process keeps its own.
+        """Seconds a request's handler may take to answer before the server gives up on it
+        (past it: ``504 Gateway Timeout``); for a streamed body (``body=BodyStream``), also how
+        long the handler may leave each chunk untaken. The body's own time is ``body_grace``.
+        Default: 30. Per app: another app in the same process keeps its own.
 
-        A sync handler in a sub-interpreter worker still running then is interrupted; an
-        ``async def`` handler's task is cancelled a little before it (2 s, or half the
-        timeout when that is less), so it is answered 504 rather than left computing a
-        result nobody takes. Example: ``app.request_timeout = 60``.
+        A sync handler in a sub-interpreter worker still running then is interrupted. An
+        ``async def`` handler's task is not cancelled: it runs to its end and its late answer
+        is dropped; only stopping the server cancels it. Example: ``app.request_timeout = 60``.
         """
         return self._engine.request_timeout()
 
     @request_timeout.setter
     def request_timeout(self, seconds: float) -> None:
-        _require_seconds("request_timeout", seconds)
-        self._engine.set_request_timeout(float(seconds))
+        self._engine.set_request_timeout(seconds)
+
+    @property
+    def body_grace(self) -> float:
+        """Seconds a request body may take to arrive however slowly it comes; past it the body
+        goes on only while it averages at least ``body_min_rate``, else ``408 Request Timeout``.
+        Default: 5. Per app. Example: ``app.body_grace = 15``.
+        """
+        return self._engine.body_grace()
+
+    @body_grace.setter
+    def body_grace(self, seconds: float) -> None:
+        self._engine.set_body_grace(seconds)
 
     @property
     def body_min_rate(self) -> int:
-        """Bytes per second at which a request body earns time past ``request_timeout``: a
-        body gets one more second for every ``body_min_rate`` bytes it delivers, so an upload
-        that keeps arriving at least this fast is never cut off as too slow (up to
-        ``body_time_limit``), and one that trickles slower gets ``408`` when the time it earned
-        runs out. For a streamed body (``body=BodyStream``), the time it waits for the handler to
-        read is not counted. Default: 1024. Per app. Example: ``app.body_min_rate = 64 * 1024``.
+        """The average bytes per second a request body must keep up to go on past
+        ``body_grace``: its bytes pay for one second each ``body_min_rate`` of them, so an
+        upload averaging at least this fast is never cut off as too slow (up to
+        ``body_time_limit``), and one averaging slower gets ``408`` at ``body_grace``, or as
+        soon as its bytes stop paying for the time it has taken. For a streamed body
+        (``body=BodyStream``), the time it waits for the handler to read is not counted.
+        Default: 1024. Per app. Example: ``app.body_min_rate = 64 * 1024``.
         """
         return self._engine.body_min_rate()
 
     @body_min_rate.setter
     def body_min_rate(self, bytes_per_second: int) -> None:
-        _require_int("body_min_rate", bytes_per_second)
         self._engine.set_body_min_rate(bytes_per_second)
 
     @property
     def body_time_limit(self) -> float:
         """The most seconds a request body may take, however fast it keeps arriving (see
         ``body_min_rate``); past it: ``408``. It bounds how long one client can hold a
-        connection with an upload. Default: 600. Per app. Example: ``app.body_time_limit = 3600``.
+        connection with an upload. Default: 30. Per app. Example: ``app.body_time_limit = 3600``.
         """
         return self._engine.body_time_limit()
 
     @body_time_limit.setter
     def body_time_limit(self, seconds: float) -> None:
-        _require_seconds("body_time_limit", seconds)
-        self._engine.set_body_time_limit(float(seconds))
+        self._engine.set_body_time_limit(seconds)
 
     @property
     def interrupt_grace(self) -> float:
@@ -223,8 +232,7 @@ class Mipyre(_RouteVerbs):
 
     @interrupt_grace.setter
     def interrupt_grace(self, seconds: float) -> None:
-        _require_seconds("interrupt_grace", seconds)
-        self._engine.set_interrupt_grace(float(seconds))
+        self._engine.set_interrupt_grace(seconds)
 
     @property
     def shutdown_timeout(self) -> float:
@@ -238,8 +246,7 @@ class Mipyre(_RouteVerbs):
 
     @shutdown_timeout.setter
     def shutdown_timeout(self, seconds: float) -> None:
-        _require_seconds("shutdown_timeout", seconds)
-        self._engine.set_shutdown_timeout(float(seconds))
+        self._engine.set_shutdown_timeout(seconds)
 
     @property
     def max_websocket_message_size(self) -> int:
@@ -253,12 +260,11 @@ class Mipyre(_RouteVerbs):
 
     @max_websocket_message_size.setter
     def max_websocket_message_size(self, size: int) -> None:
-        _require_int("max_websocket_message_size", size)
         self._engine.set_max_websocket_message_size(size)
 
     @property
     def max_websocket_connections(self) -> int:
-        """Concurrent WebSocket connections (one handler thread each). Default: 1024.
+        """Concurrent WebSocket connections. Default: 1024.
 
         An upgrade beyond the cap is answered ``503 Service Unavailable``.
         """
@@ -266,8 +272,31 @@ class Mipyre(_RouteVerbs):
 
     @max_websocket_connections.setter
     def max_websocket_connections(self, count: int) -> None:
-        _require_int("max_websocket_connections", count)
         self._engine.set_max_websocket_connections(count)
+
+    @property
+    def websocket_ping_interval(self) -> float:
+        """Seconds a WebSocket client may go unheard before the server pings it. Default: 20.
+
+        A client that sends no frame within ``websocket_ping_timeout`` of the ping is closed
+        with ``1011`` and counted in ``mipyre_websocket_keepalive_timeouts_total``.
+        """
+        return self._engine.websocket_ping_interval()
+
+    @websocket_ping_interval.setter
+    def websocket_ping_interval(self, seconds: float) -> None:
+        self._engine.set_websocket_ping_interval(seconds)
+
+    @property
+    def websocket_ping_timeout(self) -> float:
+        """Seconds a pinged WebSocket client has to send a frame before it is closed with
+        ``1011``. Default: 20.
+        """
+        return self._engine.websocket_ping_timeout()
+
+    @websocket_ping_timeout.setter
+    def websocket_ping_timeout(self, seconds: float) -> None:
+        self._engine.set_websocket_ping_timeout(seconds)
 
     def enable_compression(
         self,
@@ -400,9 +429,8 @@ class Mipyre(_RouteVerbs):
             if refusal is not None:
                 raise refusal
         if runtime is Runtime.ISOLATED:
-            # Every sub-interpreter of this app loads the isolation adapter (design §14.3).
+            # Every sub-interpreter of this app loads the isolation adapter.
             self._engine._use_isolation()
-            self._has_isolated_routes = True
 
         is_async = self._engine.route(method, path, bound, _ENGINE_RUNTIME[runtime], declaration.body is BodyStream)
         self._routes.append(Route(
@@ -460,45 +488,11 @@ class Mipyre(_RouteVerbs):
                 allow_credentials=True,
             )
         """
-        def _normalize_cors_value(name: str, value: object) -> str:
-            # Contract is `str | list[str]`, but accept any non-str
-            # sequence (e.g. tuple) too. Reject everything else loudly
-            # here, naming the setting, rather than as the engine's
-            # opaque argument TypeError.
-            if isinstance(value, str):
-                return value
-            if isinstance(value, (list, tuple)):
-                # str(o) would silently coerce ints/None/objects into
-                # syntactically-valid-but-wrong header tokens (e.g.
-                # [None, 8080] -> "None, 8080"). Reject mixed types loudly
-                # so a typo fails at config time, not as a broken header.
-                if not all(isinstance(o, str) for o in value):
-                    bad = next(o for o in value if not isinstance(o, str))
-                    raise TypeError(
-                        f"CORS: {name} list/tuple must contain only str, "
-                        f"got {type(bad).__name__}"
-                    )
-                return ", ".join(value)
-            raise TypeError(
-                f"CORS: {name} must be a str or list/tuple of str, "
-                f"got {type(value).__name__}"
-            )
-
-        # The engine owns the rule: it parses each origin, refuses `*` with credentials, puts the
-        # headers on every response and answers preflights.
-        if isinstance(allow_origins, str):
-            origins = [allow_origins]
-        elif isinstance(allow_origins, (list, tuple)) and all(isinstance(o, str) for o in allow_origins):
-            origins = list(allow_origins)
-        else:
-            raise TypeError(
-                f"CORS: allow_origins must be a str or a list/tuple of str, got {allow_origins!r}"
-            )
         self._engine.set_cors_config(
-            origins,
-            _normalize_cors_value("allow_methods", allow_methods),
-            _normalize_cors_value("allow_headers", allow_headers),
-            _normalize_cors_value("expose_headers", expose_headers) or None,
+            _cors_values("allow_origins", allow_origins),
+            ", ".join(_cors_values("allow_methods", allow_methods)),
+            ", ".join(_cors_values("allow_headers", allow_headers)),
+            ", ".join(_cors_values("expose_headers", expose_headers)) or None,
             allow_credentials,
             max_age,
         )
@@ -596,34 +590,41 @@ class Mipyre(_RouteVerbs):
     # WebSocket
     # ------------------------------------------------------------------
 
-    def websocket(self, path: str, handler: Callable | None = None) -> Callable:
-        """Register a WebSocket handler. Use as decorator or direct call.
+    def websocket(
+        self, path: str, handler: Callable | None = None, *, runtime: Runtime | str | None = None
+    ) -> Callable:
+        """Register an ``async def`` WebSocket handler. Use as decorator or direct call.
 
-        The handler receives a ``WebSocket`` object with ``recv()``,
-        ``send(msg)``, and ``close()`` methods::
+        The handler receives a ``WebSocket`` whose receives and sends are awaited::
 
             @app.websocket("/ws")
-            def ws_handler(ws):
-                while True:
-                    msg = ws.recv()
-                    if msg is None:
-                        break
-                    ws.send(f"echo: {msg}")
+            async def ws_handler(ws):
+                async for msg in ws:
+                    await ws.send(f"echo: {msg}")
 
         ``path`` is a route path like any other: ``{name}`` parameters land in
-        ``ws.request.params``.
+        ``ws.request.params``. A ``def`` handler raises ``TypeError``.
 
-        Concurrency: each open connection holds one OS thread for its handler,
-        attached to the main interpreter, because ``recv()`` blocks until a
-        message comes. All connections share the main interpreter's GIL, so
-        handlers run one at a time between their waits; the number of open
-        connections (and threads) is capped by ``max_websocket_connections``
-        (default 1024; past it an upgrade is answered 503). An ``async def``
-        handler is run with ``asyncio.run`` on its connection's thread: it is
-        a thread per connection too, and the ``WebSocket`` methods block that
-        thread's event loop while they wait.
+        ``runtime``: where the handler runs, the app's runtime unless given. By default each
+        connection is a task on one of the async sub-interpreter workers' engines, which share
+        no GIL; module state is per worker, so connections on different workers do not see
+        each other's globals (use ``app.state`` to share). ``runtime="main"`` runs every
+        connection on the main interpreter's async engine instead, where they share the main
+        interpreter's globals and its GIL. ``runtime="process"`` raises ``ValueError``.
+
+        The ``before_request`` hooks run on the engine's loop before the 101: write the hooks
+        an app with WebSocket routes has as ``async def``, since a ``def`` hook that blocks
+        stalls every connection on that engine while it runs.
+
+        A connection waiting for a message holds no thread. The number of open connections is
+        capped by ``max_websocket_connections`` (default 1024; past it an upgrade is answered
+        503).
         """
-        return _decorator_or_call(lambda fn: self._engine.websocket(path, fn), handler)
+        place = self.runtime if runtime is None else Runtime.parse(runtime, f"websocket {path}")
+        if place is Runtime.ISOLATED:
+            self._engine._use_isolation()
+        engine_runtime = _ENGINE_RUNTIME[place]
+        return _decorator_or_call(lambda fn: self._engine.websocket(path, fn, engine_runtime), handler)
 
     # ------------------------------------------------------------------
     # Static files
@@ -713,106 +714,62 @@ class Mipyre(_RouteVerbs):
     # Run
     # ------------------------------------------------------------------
 
-    def run(
-        self,
-        *,
-        host: str | None = None,
-        port: int | None = None,
-        threads: int | None = None,
-        subinterpreters: int | None = None,
-        reload: bool = False,
-        tls_cert: str | None = None,
-        tls_key: str | None = None,
-        extra_tls_ports: list[int] | None = None,
-        extra_plain_ports: list[int] | None = None,
-        allowed_hosts: list[str] | None = None,
-        trusted_proxies: list[str] | None = None,
-        **removed: object,
-    ) -> None:
-        """Start the Mipyre server.
-
-        Args:
-            threads: The server's threads: the thread-per-core threads (default:
-                        physical cores), or with ``MIPYRE_TPC=0`` the Tokio I/O threads
-                        and accept loops (default: logical CPUs). Default:
-                        ``MIPYRE_THREADS``.
-            subinterpreters: With ``MIPYRE_TPC=0`` only, the sub-interpreter pool's size
-                        (default: logical CPUs); the thread-per-core server runs one
-                        sub-interpreter per thread. Default: ``MIPYRE_SUBINTERPRETERS``.
-
-            A size the selected server does not use is ignored, not an error: one script
-            can run under several ``MIPYRE_TPC`` settings. The
-            server prints a ``Note:`` line saying which size, where it was given, and why
-            it is not used: ``subinterpreters`` on the thread-per-core server (one per
-            thread) and when no handler runs on a sub-interpreter (``runtime="main"``
-            app, or ``MIPYRE_TPC=0`` with no route on one).
-            tls_cert: Path to PEM certificate chain (enables HTTPS).
-                      Required together with ``tls_key``. Default None → plain HTTP.
-            tls_key:  Path to PEM private key. Required together with ``tls_cert``.
-            extra_tls_ports: More ports serving TLS (``MIPYRE_TLS_PORTS``); ``port``
-                        then serves plain HTTP.
-            extra_plain_ports: More ports serving plain HTTP/1.1 and h2c (HTTP/2 with
-                        prior knowledge) (``MIPYRE_PLAIN_PORTS``).
-            allowed_hosts: The DNS names this server is reached by
-                        (``MIPYRE_ALLOWED_HOSTS``, comma-separated). ``localhost`` and IP
-                        addresses are always served; a request to any other name gets
-                        421, which stops DNS rebinding. ``["*"]`` serves any name, for a
-                        reverse proxy that checks it.
-            trusted_proxies: The addresses and CIDR blocks of the reverse proxies in front
-                        of this server (``MIPYRE_TRUSTED_PROXIES``, comma-separated). A
-                        request from one of them gets its ``req.client_ip`` from
-                        ``X-Forwarded-For``, read from the right past every trusted proxy;
-                        from anyone else the header is ignored. None by default: the TCP
-                        peer is the client.
-        """
-        reject_removed_serve_args("app.run()", removed)
-        from mipyre.engine import Deployment, EntryPoint, ServerFlags, _in_worker
-
-        # In a worker the script only registers routes; the server runs on main, which reads
-        # the deployment once.
+    def run(self, config: ServerFlags | None = None, *, reload: bool = False) -> None:
+        """Serve the app until SIGINT: this process's deployment (environment,
+        ``pyproject.toml``) laid over ``config``, the flags the code gives
+        (``ServerFlags(port=8000, threads=4)``); a deployment value wins. In a sub-interpreter
+        worker, which executes the script to register its routes, it returns at once."""
         if _in_worker():
             return
         # Imported here: only the main interpreter serves, and a worker never loads it.
         from mipyre import _server_run
 
         deployment = Deployment.from_process({}, EntryPoint.Script)
-        config = ServerFlags._from_run(
-            host=host,
-            port=port,
-            threads=threads,
-            subinterpreters=subinterpreters,
-            tls_cert=tls_cert,
-            tls_key=tls_key,
-            extra_tls_ports=extra_tls_ports,
-            extra_plain_ports=extra_plain_ports,
-            allowed_hosts=allowed_hosts,
-            trusted_proxies=trusted_proxies,
-        )
-        _server_run.run(self, deployment, config, _server_run.Launch(), reload=deployment.reload(reload))
+        flags = ServerFlags() if config is None else config
+        _server_run.run(self, deployment, flags, _server_run.Launch(), reload=deployment.reload(reload))
 
-    @property
-    def process_lanes(self) -> LaneSet | None:
-        """The engine's lanes of this app once a server prepared it (``None`` before, or
-        without process routes): worker pids and respawn counters (``stats()``)."""
-        return None if self._runs is None else self._runs.process_lanes
+    def stop(self) -> None:
+        """Stop this app's servers in this process the way SIGTERM does, from any thread.
+
+        Each running ``run()`` (and ``TestClient`` server) of the app drains its connections,
+        runs the shutdown hooks and returns; this call does not wait for that. A run whose
+        startup hooks are still running stops as soon as its server starts. With none running
+        it does nothing, and a run started afterwards serves."""
+        if self._runs is not None:
+            self._runs.stop()
+
+    def lane_stats(self) -> dict[str, Any] | None:
+        """Return a snapshot of the process lanes' counters and worker pids (``respawn_us`` in
+        microseconds), or ``None`` before a server prepared the app or when it has no process
+        routes."""
+        lanes = None if self._runs is None else self._runs.process_lanes
+        return None if lanes is None else lanes.stats()
 
 
-def _creating_globals(app: object) -> dict:
-    """The globals of the code that created ``app``: the module of the function or module-level
-    code that called ``Mipyre(...)``."""
+def _cors_values(name: str, value: object) -> list[str]:
+    """Return a CORS setting given as one ``str`` or a list or tuple of them as a list.
+
+    Raises ``TypeError`` naming the setting for anything else, so a typo fails here rather
+    than as the engine's argument error or as a header such as ``None, 8080``."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
+        return list(value)
+    raise TypeError(f"CORS: {name} must be a str or a list/tuple of str, got {value!r}")
+
+
+def _creating_frame(app: object) -> FrameType | None:
+    """Return the frame of the code that called ``Mipyre(...)`` for ``app``, stepping out of
+    ``Mipyre.__init__`` and any subclass ``__init__`` that called it; None when none is left."""
     frame: FrameType | None = sys._getframe(1)
     while frame is not None and frame.f_locals.get("self") is app:
         frame = frame.f_back
-    return frame.f_globals if frame is not None else {}
+    return frame
 
 
-def _defining_module_file(app: object) -> str | None:
-    """The file whose module-level code created ``app`` — the script sub-interpreter
-    workers can execute to rebuild it — or None when a function created it."""
-    frame: FrameType | None = sys._getframe(1)
-    # Step out of Mipyre.__init__ and any subclass __init__ that called it.
-    while frame is not None and frame.f_locals.get("self") is app:
-        frame = frame.f_back
+def _module_file(frame: FrameType | None) -> str | None:
+    """Return the file whose module-level code ``frame`` runs — the script sub-interpreter
+    workers can execute to rebuild the app — or None when it is a function's frame."""
     if frame is None or frame.f_code.co_name != "<module>":
         return None
     file = frame.f_globals.get("__file__")

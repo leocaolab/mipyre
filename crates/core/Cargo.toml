@@ -1,0 +1,29 @@
+[package]
+name = "mipyre_core"
+description = "The request's way through a Python backend, whichever it is: time a call on this thread and judge the budget once it returns, or hand the ask over, wait for the reply within the budget, and drop the run when the budget is spent or the caller leaves"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No pyo3: the backends that run Python elsewhere
+# implement `HandoffBackend` in the engine, and the TPC thread's inline call is timed with `InlineTimer` there.
+[dependencies]
+# `RequestBudget`, the app's limit on waiting for a handler.
+mipyre_http = { path = "../http" }
+# `time` for the deadline, `rt` for the task's coop budget the deadline is polled past.
+tokio = { version = "1", features = ["time", "rt"] }
+# Pins the backend's run and the deadline in place inside `ReplyWait`; already under tokio.
+pin-project-lite = "0.2"
+
+[dev-dependencies]
+# The microbenches' harness and counting allocator.
+mipyre_microbench = { path = "../microbench" }
+# The paused clock (`test-util`) the budget tests run on.
+tokio = { version = "1", features = ["time", "rt", "macros", "test-util"] }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "reply_wait"
+harness = false

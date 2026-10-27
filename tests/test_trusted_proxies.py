@@ -1,4 +1,4 @@
-"""``trusted_proxies`` (docs/design/forwarded-client.md): only a peer the deployment lists as a
+"""``trusted_proxies``: only a peer the deployment lists as a
 reverse proxy may name the client in ``X-Forwarded-For``. Each test serves the app on a real
 socket, from 127.0.0.1, and sends the header a proxy, or a client forging one, would."""
 

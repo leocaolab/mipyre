@@ -19,7 +19,7 @@ class _MarkerRaises:
 
     @property
     def _asyncio_future_blocking(self):
-        raise ValueError("marker lookup broke: b383")
+        raise ValueError("marker lookup broke")
 
 
 class _NoMarker:
@@ -54,7 +54,7 @@ def client():
 def _logged_error(capfd, rid: str) -> str:
     """The `error` field of the log line carrying `rid`. The server runs in this process and logs
     the failure before it answers; its log writer is a background thread, so `flush_logs()` is
-    the fence: every line logged before it is on stderr when it returns (b/441)."""
+    the fence: every line logged before it is on stderr when it returns."""
     flush_logs()
     seen = capfd.readouterr().err
     for line in seen.splitlines():
@@ -71,7 +71,7 @@ def test_a_future_marker_lookup_that_raises_fails_the_request_with_that_error(cl
     resp = client.get("/marker-raises")
     assert resp.status_code == 500, (resp.status_code, resp.text)
     error = _logged_error(capfd, resp.json()["request_id"])
-    assert "ValueError" in error and "marker lookup broke: b383" in error, error
+    assert "ValueError" in error and "marker lookup broke" in error, error
 
 
 def test_an_awaitable_without_the_marker_is_run(client):

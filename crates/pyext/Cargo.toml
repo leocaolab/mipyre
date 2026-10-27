@@ -1,5 +1,4 @@
-# pyre's engine as a Python extension (b/51 E0b: moved here from the repository root, which is now a
-# workspace only — see the root Cargo.toml).
+# pyre's engine as a Python extension; the repository root is a workspace only (see the root Cargo.toml).
 [package]
 name = "mipyre_pyext"
 description = "The Python extension module `mipyre.engine` (maturin builds it; pyproject.toml names this manifest)"
@@ -8,8 +7,7 @@ edition.workspace = true
 license.workspace = true
 
 # maturin takes the module name from pyproject.toml's `module-name` and `#[pymodule] fn engine`,
-# not from this; tests/test_final_w2.py's layering rule and benchmarks/bench_profile.py look for
-# `mipyre_engine` (in source and in perf frames).
+# not from this; tests/test_request_path.py's layering rule and perf frames look for `mipyre_engine`.
 [lib]
 name = "mipyre_engine"
 crate-type = ["cdylib"]
@@ -23,9 +21,7 @@ crate-type = ["cdylib"]
 #   maturin develop --release --features leak_detect
 # Snapshot the histogram from Python (handler or shutdown) via
 #   mipyre.engine.leak_detect_dump()
-# See docs/memory-leak-investigation-2026-04-19.md for how it pinned down the
-# sub-interpreter finalizer bug.
-leak_detect = ["dep:metrics", "dep:metrics-util"]
+leak_detect = ["mipyre_runtime/leak_detect"]
 
 # In-process throughput harnesses: `MipyreApp.bench_inmem` (virtual
 # connections, no TCP) and `MipyreApp.bench_loopback` (real TCP, client in
@@ -33,8 +29,8 @@ leak_detect = ["dep:metrics", "dep:metrics-util"]
 #
 # Build with:
 #   maturin develop --release --features bench
-# then run the scripts in benchmarks/ (bench_inmem*.py, bench_loopback*.py).
-bench = ["dep:httparse", "dep:backtrace"]
+# then call either harness from Python.
+bench = ["mipyre_server/bench", "dep:httparse", "dep:backtrace"]
 
 # Start-phase timestamps: where a server's startup spends its time (the sub-interpreters'
 # creation, their setup, the start gate). Each stamp goes to stderr in a build with this
@@ -42,8 +38,8 @@ bench = ["dep:httparse", "dep:backtrace"]
 #
 # Build with:
 #   maturin develop --release --features startup_trace
-# and run a server; `benchmarks/bench_startup.py` measures the total.
-startup_trace = ["mipyre_subinterp/startup_trace"]
+# and run a server.
+startup_trace = ["mipyre_runtime/startup_trace"]
 
 # Test-only fault injection: `mipyre.engine._fault_panic(message)` panics in Rust, so a
 # handler that calls it drives a real panic through the dispatch path that runs it (bridge,
@@ -52,15 +48,15 @@ startup_trace = ["mipyre_subinterp/startup_trace"]
 #
 # Build with:
 #   maturin develop --release --features fault_injection
-# then run `pytest tests/test_review_ra.py -k panic`.
+# then run `pytest tests/test_dispatch_paths.py -k panic`.
 fault_injection = []
 
 [dependencies]
-# The domain packages (crates/README.md).
+# The domain packages.
 mipyre_cpu = { path = "../cpu" }
 mipyre_tpc = { path = "../tpc" }
 mipyre_subinterp = { path = "../subinterp" }
-# The process lanes' shared-memory channel: the ring's counter checks, the slot header, the spin window.
+# The errors of the shared-memory channel the server answers for.
 mipyre_shm = { path = "../shm" }
 # HTTP: the route table this engine instantiates with its Python handlers (`plan`), and the
 # body, write coalescing and static files it serves through (`io`).
@@ -69,6 +65,18 @@ mipyre_http = { path = "../http" }
 mipyre_transport = { path = "../transport" }
 # The log throttles and the clock they run on.
 mipyre_util = { path = "../util" }
+# How a request handed to a Python backend gets its reply within the budget (`dispatch`, and the port the
+# backends implement), and the timer that judges the budget of a call on this thread (`InlineTimer`).
+mipyre_core = { path = "../core" }
+# The process lanes' host side (`runtime="process"`); the worker's serve loop is mipyre_runtime's.
+mipyre_process = { path = "../process" }
+# What runs Python handlers, and the exchange between Python objects and HTTP; `pyapi/module.rs` registers its
+# classes and functions and sets its per-interpreter state.
+mipyre_runtime = { path = "../runtime" }
+# The HTTP server the engine assembles and runs.
+mipyre_server = { path = "../server" }
+# A server run's Postgres pools and the handles to them; their Python face (`PgPool`) is `src/db/`.
+mipyre_pg = { path = "../pg" }
 # No `extension-module` feature (deprecated in PyO3 0.26+): maturin (>= 1.9.4, pinned in
 # pyproject.toml) sets PYO3_BUILD_EXTENSION_MODULE when it builds the wheel, which leaves
 # libpython unlinked there; a plain `cargo test` links libpython, so the unit-test binary
@@ -79,30 +87,16 @@ pyo3 = "0.29"
 # process-wide mutexes — every TPC thread, every time it waits for IO (seen as the
 # top user-space HITM line in `perf c2c`). Nothing here spawns child processes
 # through tokio.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util", "io-std", "fs", "signal", "parking_lot"] }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
-http-body-util = "0.1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util", "io-std", "fs", "parking_lot"] }
+hyper = { version = "1.11", features = ["server", "http1", "http2"] }
 bytes = "1"
 matchit = "0.8"
 serde_json = "1"
-# pyproject.toml's [tool.mipyre] tables, with the line of every key for the errors (b/335 D11); parsing only.
+# pyproject.toml's [tool.mipyre] tables, with the line of every key for the errors; parsing only.
 toml = { version = "0.9", default-features = false, features = ["std", "parse"] }
-# A cookie's `Expires` as an HTTP-date (exchange/cookie.rs).
-httpdate = "1"
-# The access log's numbers, as serde_json writes them (telemetry/access_line.rs).
-itoa = "1"
 parking_lot = "0.12"
-form_urlencoded = "1"
-percent-encoding = "2"
 crossbeam-channel = "0.5"
-crossbeam-utils = "0.8"
-tokio-tungstenite = "0.26"
-tungstenite = "0.26"
-# base64 and sha1 provided transitively by tungstenite
 futures-util = "0.3"
-dashmap = "6"
-tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 mimalloc = { version = "0.1", default-features = false }
 # Its options (`mi_option_set`), for `src/alloc.rs`; the same crate `mimalloc` links.
@@ -111,17 +105,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
-# Times answers by the CPU's counter (`serve/site.rs`).
+# The clock a site times answers by (mipyre_server's `Site`).
 quanta = { version = "0.12", default-features = false }
-# The system calls it has safe calls for (process lanes, telemetry); libc keeps the rest, in
-# `lane/os.rs` and `telemetry/monitor.rs`.
+# The system calls it has safe calls for (a lane worker's parent, telemetry, the asyncio doorbell); libc keeps the
+# rest.
 rustix = { version = "1.1.5", default-features = false, features = ["std", "event", "fs", "net", "param", "pipe", "process", "shm", "thread", "time"] }
 thiserror = "2"
-core_affinity = "0.8"
 pythonize = "0.29"
-tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging", "tls12"] }
-pin-project-lite = "0.2"
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring-webpki",
@@ -130,34 +121,20 @@ sqlx = { version = "0.9", default-features = false, features = [
     "macros",
 ] }
 
-# Optional — pulled in only by the `leak_detect` feature.
-metrics = { version = "0.24", optional = true }
-metrics-util = { version = "0.19", features = ["debugging"], optional = true }
-
 # Optional — pulled in only by the `bench` feature (the bench client parses response heads).
 httparse = { version = "1", optional = true }
 # The bench's allocation profile records allocating call stacks.
 backtrace = { version = "0.3", optional = true }
 
 [dev-dependencies]
+mipyre_runtime = { path = "../runtime", features = ["testkit"] }
 proptest = "1"
-# The fuzz target of the lane's answer decoder (src/lane/wire_fuzz.rs): `cargo test` replays its committed corpus,
+# The fuzz target of the NUMERIC decoder (src/db/numeric/fuzz.rs): `cargo test` replays its committed corpus,
 # `cargo bolero test` mutates it under libFuzzer.
 # Exactly 0.13.4: from 0.13.5 on its derive crate pins indexmap to =2.11.2, which would move the workspace's
 # shipping indexmap (h2, sqlx) back from 2.14.
 bolero = "=0.13.4"
 tokio = { version = "1", features = ["test-util"] }
-
-# The Loom models (`src/runtime/live_workers/loom_model.rs`), built only under `--cfg sync_model`, which swaps `src/sync.rs`'s names
-# for Loom's in this crate and in every package built with it, so Loom is a dependency under that cfg only:
-# `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_pyext --lib --profile model --target-dir target/loom loom`.
-[target.'cfg(all(sync_model, not(sync_shuttle)))'.dependencies]
-loom = "0.7"
-
-# The Shuttle models (`src/runtime/job_queue/shuttle_model.rs`, b/744), built only under `--cfg sync_model --cfg
-# sync_shuttle`, which swaps `src/sync.rs`'s names for Shuttle's instead.
-[target.'cfg(all(sync_model, sync_shuttle))'.dependencies]
-shuttle = "0.9.8"
 
 [lints]
 workspace = true

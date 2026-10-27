@@ -1,6 +1,6 @@
 """Mipyre example — decorator syntax, an after_request hook, custom responses, a custom 404."""
 
-from mipyre import Mipyre, Response
+from mipyre import Mipyre, Response, ServerFlags
 
 app = Mipyre()
 
@@ -74,4 +74,4 @@ def not_found(req):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8000)
+    app.run(ServerFlags(host="127.0.0.1", port=8000))

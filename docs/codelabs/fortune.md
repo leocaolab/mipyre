@@ -1,6 +1,6 @@
 # Build a fortune app with mipyre
 
-A step-by-step guide to mipyre 2.0.0: where your code runs, how to configure the server, and how to test and deploy an app.
+A step-by-step guide to mipyre 3.0.0: where your code runs, how to configure the server, and how to test and deploy an app.
 
 ## Before you begin
 
@@ -48,7 +48,7 @@ mipyre --version
 **Checkpoint:**
 
 ```text
-mipyre 2.0.0
+mipyre 3.0.0
 ```
 
 `pydantic`, `numpy` and `pytest` are only needed for the steps that use them. `watchfiles` lets `mipyre dev` watch files efficiently; without it, the reloader polls.
@@ -85,10 +85,10 @@ python app.py
 **Checkpoint:** the server prints its address and how it serves. The thread and CPU counts depend on your machine; the `not pinned` note appears on macOS, which has no CPU pinning:
 
 ```text
-  Mipyre v2.0.0 [TPC mode, hybrid-inline]
+  Mipyre v3.0.0
   Listening on http://127.0.0.1:8000
   TPC threads: 6 (CPUs: 18, not pinned: this platform has no CPU pinning)
-  Routes: 1 sub-interp + 0 GIL + 0 process + 0 async
+  Routes: 1 sub-interp + 0 main + 0 process + 0 async
 ```
 
 In a second terminal:
@@ -250,7 +250,8 @@ Replace `app.py` with an app that lists the router:
 ```python
 from mipyre import Mipyre
 
-app = Mipyre(routers=["pages:router"])
+app = Mipyre()
+app.include_router("pages:router")
 
 if __name__ == "__main__":
     app.run()
@@ -315,7 +316,7 @@ curl -s -i localhost:8000/fortunes
 ```text
 HTTP/1.1 200 OK
 content-type: text/html; charset=utf-8
-server: Mipyre/2.0.0
+server: Mipyre/3.0.0
 content-length: 704
 date: ...
 
@@ -365,7 +366,7 @@ What mipyre enforces, so you find out at startup or on the first request, not in
 - **The `*_async` `PgPool` methods** raise `NotImplementedError` outside the main interpreter: `fetch_all_async is not available in sub-interpreter workers; use fetch_all (sync) or route with runtime='main'`.
 - **A `process` route** can't use `PgPool` or `app.state`: both raise `RuntimeError`, because a worker process has its own copy of the server's state. It gets the request and returns a response.
 
-Other things that always run on the main interpreter: WebSocket handlers (one thread per connection), the health probes (unless you pass `runtime=`), the MCP endpoint and the OpenAPI document.
+Other things that always run on the main interpreter: the health probes (unless you pass `runtime=`), the MCP endpoint and the OpenAPI document. WebSocket routes run on the app's runtime, like any other route.
 
 ## 7. Add a validated write on `main`
 
@@ -409,7 +410,9 @@ List the router in `app.py`:
 ```python
 from mipyre import Mipyre
 
-app = Mipyre(routers=["pages:router", "submit:router"])
+app = Mipyre()
+app.include_router("pages:router")
+app.include_router("submit:router")
 
 if __name__ == "__main__":
     app.run()
@@ -429,7 +432,7 @@ curl -s localhost:8000/fortunes/latest
 ```text
 HTTP/1.1 201 Created
 content-type: application/json
-server: Mipyre/2.0.0
+server: Mipyre/3.0.0
 content-length: 37
 date: ...
 
@@ -437,10 +440,10 @@ date: ...
 [{"id":7,"message":"Mipyre was here."},{"id":6,"message":"フレームワークのベンチマーク"},{"id":5,"message":"Any program that runs right is obsolete."}]
 ```
 
-The banner now counts the routes on the main interpreter as `GIL`:
+The banner now counts the routes on the main interpreter as `main`:
 
 ```text
-  Routes: 2 sub-interp + 2 GIL + 0 process + 0 async
+  Routes: 2 sub-interp + 2 main + 0 process + 0 async
 ```
 
 The sub-interpreters import `pages.py` only; `submit.py`, and pydantic with it, is imported by the main interpreter alone. Stop the server.
@@ -475,7 +478,10 @@ List it in `app.py`:
 ```python
 from mipyre import Mipyre
 
-app = Mipyre(routers=["pages:router", "submit:router", "lucky:router"])
+app = Mipyre()
+app.include_router("pages:router")
+app.include_router("submit:router")
+app.include_router("lucky:router")
 
 if __name__ == "__main__":
     app.run()
@@ -490,10 +496,10 @@ python app.py
 ```text
   Process lanes: 6 workers (template pid 54106, timeout 30000 ms, queue 128/worker; BLAS (numpy, scipy): 1 thread per worker; polars: 1 thread per worker)
 
-  Mipyre v2.0.0 [TPC mode, hybrid-inline]
+  Mipyre v3.0.0
   Listening on http://127.0.0.1:8000
   TPC threads: 6 (CPUs: 18, not pinned: this platform has no CPU pinning)
-  Routes: 2 sub-interp + 2 GIL + 1 process + 0 async
+  Routes: 2 sub-interp + 2 main + 1 process + 0 async
 ```
 
 In the second terminal:
@@ -547,17 +553,17 @@ GET     /lucky/{name}     lucky          runtime=process
 5 route(s)
 ```
 
-`pages.py` names no runtime, so its routes take the app's. An app that a deployment should be able to move reads a setting of its own and passes it in. In `app.py`, change the `Mipyre(...)` line to:
+`pages.py` names no runtime, so its routes take the app's. An app that a deployment should be able to move reads a setting of its own and passes it in. In `app.py`, change the lines that make the app to:
 
 ```python
 import os
 
 from mipyre import Mipyre
 
-app = Mipyre(
-    runtime=os.environ.get("FORTUNE_RUNTIME", "subinterp"),
-    routers=["pages:router", "submit:router", "lucky:router"],
-)
+app = Mipyre(runtime=os.environ.get("FORTUNE_RUNTIME", "subinterp"))
+app.include_router("pages:router")
+app.include_router("submit:router")
+app.include_router("lucky:router")
 ```
 
 and compare:
@@ -583,7 +589,10 @@ GET     /lucky/{name}     lucky          runtime=process
 This guide keeps its routes where step 6 put them, so pin the app's runtime in code:
 
 ```python
-app = Mipyre(runtime="subinterp", routers=["pages:router", "submit:router", "lucky:router"])
+app = Mipyre(runtime="subinterp")
+app.include_router("pages:router")
+app.include_router("submit:router")
+app.include_router("lucky:router")
 ```
 
 `MIPYRE_RUNTIME` is not one of mipyre's settings, and a deployment that sets it doesn't start:
@@ -607,7 +616,7 @@ An unknown runtime name anywhere is an error too.
 Settings live in two places:
 
 - **Code** (`app.py`): what belongs to the app wherever it runs: runtimes, limits, logging format, probes, metrics.
-- **The deployment**: the server's settings (address, port, sizes, TLS, process workers). Each one is a `mipyre run` flag, a `MIPYRE_*` environment variable and a key in `[tool.mipyre]` of the `pyproject.toml` in the directory you start the server in. They can be given in code too (`app.run(port=...)`, `ProcessLanes(...)`); a deployment value overrides the code's, the flag first, then the environment, then `pyproject.toml`, and the start prints each value the deployment gave.
+- **The deployment**: the server's settings (address, port, sizes, TLS, process workers). Each one is a `mipyre run` flag, a `MIPYRE_*` environment variable and a key in `[tool.mipyre]` of the `pyproject.toml` in the directory you start the server in. They can be given in code too (`app.run(ServerFlags(port=...))`, `ProcessLanes(...)`); a deployment value overrides the code's, the flag first, then the environment, then `pyproject.toml`, and the start prints each value the deployment gave.
 
 Every mistake stops the server at startup, all at once, each naming where it came from: a value that doesn't parse, a `MIPYRE_*` variable or `[tool.mipyre]` key that is no setting, and a value the server doesn't use.
 
@@ -628,7 +637,7 @@ MIPYRE_TPC=0 mipyre run app:app --subinterpreters 4
 ```
 
 ```text
-  Mipyre v2.0.0 [hybrid mode]
+  Mipyre v3.0.0
   Listening on http://127.0.0.1:8000
   Sub-interpreters: 4 | IO threads: 18 (CPUs: 18)
 ```
@@ -663,10 +672,10 @@ Each setting comes from the first place that sets it: a `mipyre run` flag, the e
 |---|---|---|---|---|
 | worker processes | `--process-workers` | `MIPYRE_PROCESS_WORKERS` | `workers` | one per physical core |
 | handler timeout | `--process-timeout` (seconds) | `MIPYRE_PROCESS_TIMEOUT` (seconds) | `timeout` (seconds) | 30 s |
-| queue per worker before `503` | `--process-queue` | `MIPYRE_PROCESS_QUEUE` | `queue_per_worker` | 128 |
+| queue per worker before `503` | `--process-queue-per-worker` | `MIPYRE_PROCESS_QUEUE_PER_WORKER` | `queue_per_worker` | 128 |
 | largest request or response | `--process-slot-bytes` | `MIPYRE_PROCESS_SLOT_BYTES` | `slot_bytes` | 262144 (256 KiB) |
 | how a worker gets the app | `--process-start` | `MIPYRE_PROCESS_START` | `start` | `import` |
-| what a failed worker host does | `--process-host-failure` | `MIPYRE_LANE_HOST_FAILURE` | `host_failure` | `isolate` |
+| what a failed worker host does | `--process-host-failure` | `MIPYRE_PROCESS_HOST_FAILURE` | `host_failure` | `isolate` |
 
 `start = "import"` starts each worker without the app and lets it import the app itself, which is safe whatever the app does at import. `"fork"` imports the app once in a template and forks the workers from it: faster to replace and less memory, for apps whose workers are replaced often; the template must be single-threaded when it forks, or the start fails naming the threads. `host_failure = "isolate"` takes a failed part out of service and keeps serving with the rest; `"exit"` stops the server at the first failure. Either way the process exits non-zero when it ends because of one, so a supervisor restarts it.
 
@@ -681,20 +690,23 @@ app.request_timeout = 10
 
 | Attribute | Default | Past it |
 |---|---|---|
-| `max_body_size` | 10 MB | `413` |
-| `request_timeout` | 30 s, for the body to arrive and again for the handler to answer | `408` for the body, `504` for the handler |
-| `body_min_rate` | 1024 bytes/s: an upload earns one more second per this many bytes, so a steady upload isn't cut off | `408` |
-| `body_time_limit` | 600 s, the most an upload may take | `408` |
+| `max_body_size` | 2.5 MiB | `413` |
+| `request_timeout` | 30 s for the handler to answer | `504` |
+| `body_grace` | 5 s for an upload to arrive however slowly it comes | `408` |
+| `body_min_rate` | 1024 bytes/s: past `body_grace` an upload goes on while its average rate stays at least this, so a steady upload isn't cut off and a trickle is | `408` |
+| `body_time_limit` | 30 s, the most an upload may take | `408` |
 | `interrupt_grace` | 2 s for a sync handler interrupted at `request_timeout` to end before its worker is replaced | |
 | `shutdown_timeout` | 5 s for each thread to finish at shutdown | |
 | `max_websocket_message_size` | 1 MiB | the connection is closed with `1009` |
 | `max_websocket_connections` | 1024 | `503` |
+| `websocket_ping_interval` | 20 s a WebSocket client may go unheard before it is pinged | |
+| `websocket_ping_timeout` | 20 s for a pinged client to send a frame | the connection is closed with `1011` |
 
 The server also closes a connection that sends no request head within 10 s, and one that stops reading a response for 10 s. These two are fixed.
 
 ### Logging and the access log
 
-By default the server logs errors only, as JSON lines, without an access log. Change that in code with `Mipyre(log_config={...})`, for example `log_config={"level": "INFO", "format": "text"}` for colored text lines in a terminal. `log_config` takes `level` (`"OFF"`, `"ERROR"`, `"WARN"`, `"INFO"`, `"DEBUG"`, `"TRACE"`), `format` (`"json"` or `"text"`) and `access_log` (`True` or `False`). `Mipyre(debug=True)` switches the defaults to text at DEBUG with the access log on. `MIPYRE_LOG=1` in the environment, and `mipyre dev`, turn the access log on and raise the level to INFO.
+By default the server logs warnings and errors, as JSON lines, without an access log. Change that in code with `Mipyre(log_config={...})`, for example `log_config={"level": "INFO", "format": "text"}` for colored text lines in a terminal. `log_config` takes `level` (`"OFF"`, `"ERROR"`, `"WARN"`, `"INFO"`, `"DEBUG"`, `"TRACE"`), `format` (`"json"` or `"text"`) and `access_log` (`True` or `False`). `Mipyre(debug=True)` switches the defaults to text at DEBUG with the access log on. `MIPYRE_LOG=1` in the environment, and `mipyre dev`, turn the access log on and raise the level to INFO.
 
 The access log writes one line per response, including `404`s and responses that never reach Python. At high traffic, sample it, and keep every error. Add to `app.py`:
 
@@ -702,7 +714,7 @@ The access log writes one line per response, including `404`s and responses that
 app.enable_access_log(sample=100, always_log_status=400)
 ```
 
-This logs about 1 in 100 responses, plus every response with status 400 or higher. Turning the access log on also raises the log level to INFO if it was ERROR or OFF, so the server's own INFO lines (startup, shutdown) appear too.
+This logs about 1 in 100 responses, plus every response with status 400 or higher. Turning the access log on also raises the log level to INFO if it was WARN, ERROR or OFF, so the server's own INFO lines (startup, shutdown) appear too.
 
 ### Metrics and health probes
 
@@ -735,7 +747,10 @@ from mipyre import HealthProbes, Mipyre
 
 from db import pool
 
-app = Mipyre(runtime="subinterp", routers=["pages:router", "submit:router", "lucky:router"])
+app = Mipyre(runtime="subinterp")
+app.include_router("pages:router")
+app.include_router("submit:router")
+app.include_router("lucky:router")
 
 app.max_body_size = 64 * 1024
 app.request_timeout = 10
@@ -766,7 +781,7 @@ python -c 'print("x" * 70000)' | curl -s -i -X POST localhost:8000/fortunes -H '
 
 ```text
 {"status": "alive"}
-{"status": "ready", "checks": {"db": {"ok": true}}}
+{"status": "ready", "checks": {"abandoned_workers": {"ok": true}, "db": {"ok": true}}}
 mipyre_http_requests_total{method="GET",status_class="2xx"} 2
 HTTP/1.1 413 Payload Too Large
 ```
@@ -840,7 +855,7 @@ def test_lucky_numbers_are_the_same_for_a_name(client):
 
 
 def test_ready(client):
-    assert client.get("/readyz").json() == {"status": "ready", "checks": {"db": {"ok": True}}}
+    assert client.get("/readyz").json() == {"status": "ready", "checks": {"abandoned_workers": {"ok": True}, "db": {"ok": True}}}
 ```
 
 The tests import the app from `app.py`, defined at module level as the sub-interpreters and the worker processes need, and reach the database through `DATABASE_URL` from step 3. `client.post(body=dict)` sends JSON; `params=` adds a query string; responses have `status_code`, `headers`, `body`, `text`, `json()`.

@@ -7,7 +7,7 @@
 use std::alloc::System;
 use std::hint::black_box;
 
-use mipyre_http::io::request_id::RequestId;
+use mipyre_http::plan::request_id::RequestId;
 use mipyre_http::plan::response;
 use mipyre_microbench::{measure, run, AllocationCounter, Case};
 

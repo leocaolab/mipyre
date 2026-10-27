@@ -9,7 +9,8 @@ from mipyre.uploads import parse_multipart
 
 from fullstack.auth import require_auth
 
-app = Mipyre(routers=["fullstack.validated:router"])
+app = Mipyre()
+app.include_router("fullstack.validated:router")
 app.enable_cors(allow_origins="*")
 app.enable_access_log()
 

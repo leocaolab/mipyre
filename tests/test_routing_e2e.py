@@ -11,7 +11,7 @@ from tests.conftest import feature_server_factory
 
 SERVER = '''
 import os
-from mipyre import Mipyre, Response, redirect
+from mipyre import Mipyre, Response, redirect, ServerFlags
 
 app = Mipyre(runtime=os.environ["MIPYRE_TEST_MODE"])
 
@@ -44,10 +44,7 @@ def rd(req):
     return redirect("/")
 
 if __name__ == "__main__":
-    app.run(
-        host="127.0.0.1",
-        port=int(os.environ["MIPYRE_PORT"]),
-    )
+    app.run(ServerFlags(host="127.0.0.1", port=int(os.environ["MIPYRE_PORT"])))
 '''
 
 feature_server = feature_server_factory(SERVER)

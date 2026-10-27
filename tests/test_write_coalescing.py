@@ -1,4 +1,4 @@
-"""Write coalescing (docs/write-coalescing.md) on the production serving path, over raw
+"""Write coalescing on the production serving path, over raw
 sockets: a response is never held for the client's next request, pipelined responses come
 back whole and in order, and nothing kept is lost when the connection closes. Plain TCP
 on the sub-interpreter TPC path, and TLS on the TPC main-interpreter path.
@@ -16,7 +16,7 @@ import threading
 import pytest
 
 from mipyre import Mipyre, Response, Stream
-from mipyre._server_run import runs_of
+from mipyre.engine import ServerFlags
 from mipyre.testing import TestClient, TestServer
 from tests._helpers import poll_until
 
@@ -67,8 +67,8 @@ class _Reader:
     """Parses HTTP/1.1 responses off a socket (Content-Length or chunked bodies).
 
     Reads block until the bytes arrive or the server closes the connection (EOFError): what
-    the tests check is which bytes arrive and in what order, never how fast (b/325). How
-    soon a response is written is the Rust tests' (`crates/pyext/src/serve/coalesce_tests.rs`,
+    the tests check is which bytes arrive and in what order, never how fast. How
+    soon a response is written is the Rust tests' (`crates/server/src/coalesce_tests.rs`,
     on a paused clock)."""
 
     def __init__(self, sock):
@@ -145,7 +145,7 @@ def test_a_response_followed_by_half_a_request_arrives_at_once(client):
 def test_headers_sent_a_few_bytes_at_a_time_complete(client):
     # A smoke test over a real socket. Every cut point and pause is covered in Rust, on an
     # in-memory pipe and a paused clock (`requests_cut_anywhere_are_answered_as_if_sent_whole`
-    # in crates/pyext/src/serve/coalesce_tests.rs); here the kernel may join the pieces.
+    # in crates/server/src/coalesce_tests.rs); here the kernel may join the pieces.
     request = _get("/echo/slow")
     with _connect(client.port) as sock:
         for i in range(0, len(request), 2):
@@ -215,20 +215,9 @@ def tls_port(tmp_path_factory):
     def tls_echo(req):
         return Response(req.params["name"], content_type="text/plain")
 
-    t = threading.Thread(
-        target=lambda: tls_app.run(
-            host="127.0.0.1", port=0, tls_cert=str(cert), tls_key=str(key)
-        ),
-        daemon=True,
-    )
-    t.start()
-    runs = poll_until(lambda: runs_of(tls_app).serving(), timeout=None, what="TLS bind")
-    port = runs[0].port
-    poll_until(lambda: _tls_answers(port), timeout=None, what="TLS serving")
-    yield port
-    for run in runs:
-        run.stop()
-    t.join(10)
+    with TestServer(tls_app, config=ServerFlags(tls_cert=str(cert), tls_key=str(key))) as server:
+        poll_until(lambda: _tls_answers(server.port), timeout=None, what="TLS serving")
+        yield server.port
 
 
 def _tls_context():

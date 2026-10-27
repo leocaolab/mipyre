@@ -1,6 +1,6 @@
 """Test: Hybrid mode — fast routes on sub-interp, numpy routes on GIL."""
 
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 app = Mipyre()
 
@@ -39,4 +39,4 @@ def orjson_route(req):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0)
+    app.run(ServerFlags(host="127.0.0.1", port=0))

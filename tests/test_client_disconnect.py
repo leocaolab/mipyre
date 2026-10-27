@@ -1,4 +1,4 @@
-"""A client that hangs up while its request is being answered (b/357, b/358).
+"""A client that hangs up while its request is being answered.
 
 Whatever a client does with its connection, it cannot keep the server's work for it alive or
 make the server log for it: a streamed response's producer is told the client is gone
@@ -52,8 +52,7 @@ def test_a_streamed_response_whose_client_hangs_up_tells_its_producer_and_stops(
                         stream.send(f"chunk {sent}\n")
                         sent += 1
                     except BlockingIOError:
-                        # The buffer is full until the server writes (or finds the client gone).
-                        threading.Event().wait(0.001)
+                        stream.wait_writable()
             except ConnectionError as e:
                 outcome.put((type(e), str(e), sent))
 
@@ -77,7 +76,7 @@ def test_a_streamed_response_whose_client_hangs_up_tells_its_producer_and_stops(
 
 IN_FLIGHT_SCRIPT = r'''
 import asyncio, os
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 GATE = int(os.environ["MIPYRE_TEST_GATE_PORT"])
 app = Mipyre()
@@ -96,7 +95,7 @@ async def held(req):
     return {"answered": "after the client left"}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, subinterpreters=1)
+    app.run(ServerFlags(host="127.0.0.1", port=0, subinterpreters=1))
 '''
 
 

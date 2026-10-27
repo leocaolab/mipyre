@@ -1,9 +1,9 @@
-"""With metrics on, the request counter counts every request exactly once (b/51 E6, design §4.5).
+"""With metrics on, the request counter counts every request exactly once.
 
 The count is taken where every answer goes out (`serve::pipeline::finish`), whatever answers it:
 a route on a sub-interpreter worker, a route on the main interpreter, a pre-built response, a 405,
 a 404, and a WebSocket upgrade. What an answer counts as is unit-tested beside the counters
-(`telemetry::run_counters`, `serve::error_response::answer_of`); this is the one wiring test that
+(`serve::counters`, `serve::error_response::answer_of`); this is the one wiring test that
 a real server's paths reach that point once each. Each path is counted on its own, so one path
 that misses a count and another that counts twice cannot cancel out.
 """
@@ -38,12 +38,12 @@ app.add_fast_response("GET", "/fast", b"fast")
 
 
 @app.websocket("/ws")
-def ws_echo(ws):
+async def ws_echo(ws):
     while True:
-        msg = ws.recv()
+        msg = await ws.recv()
         if msg is None:
             break
-        ws.send(msg)
+        await ws.send(msg)
 
 
 @pytest.fixture(scope="module")

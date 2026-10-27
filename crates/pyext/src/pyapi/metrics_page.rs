@@ -8,26 +8,37 @@ use hyper::StatusCode;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use crate::exchange::Response;
-use crate::telemetry::{exposition, read_counters, RunCounters};
+use crate::telemetry::{exposition, read_counters};
+use mipyre_http::io::static_files::StaticMount;
+use mipyre_runtime::exchange::Response;
+use mipyre_runtime::WorkerCounters;
+use mipyre_server::ServerCounters;
 
 /// The handler of the run's metrics route; each run binds its own, so a page shows only the run
 /// that serves it.
 #[pyclass(frozen, module = "mipyre.engine")]
 pub(crate) struct MetricsPage {
-    run: Arc<RunCounters>,
+    run: Arc<ServerCounters>,
+    workers: Arc<WorkerCounters>,
+    mounts: Vec<StaticMount>,
 }
 
 impl MetricsPage {
-    pub(crate) fn new(run: Arc<RunCounters>) -> Self {
-        MetricsPage { run }
+    pub(crate) fn new(run: Arc<ServerCounters>, workers: Arc<WorkerCounters>, mounts: Vec<StaticMount>) -> Self {
+        MetricsPage { run, workers, mounts }
     }
 }
 
 #[pymethods]
 impl MetricsPage {
     fn __call__(&self, py: Python<'_>, _req: &Bound<'_, PyAny>) -> Response {
-        let page = exposition::render(&self.run.read(), &read_counters());
+        let static_bytes_in_flight = self.mounts.iter().map(StaticMount::bytes_in_flight).sum();
+        let page = exposition::render(
+            &self.run.read(),
+            &self.workers.read(),
+            static_bytes_in_flight,
+            &read_counters(),
+        );
         Response {
             body: PyBytes::new(py, page.as_bytes()).into_any().unbind(),
             status: StatusCode::OK,

@@ -1,0 +1,49 @@
+[package]
+name = "mipyre_process"
+description = "The process lanes' host side: starting the template and its workers, watching them die, backing off, and carrying HTTP requests and answers to them in frames over shared memory; no Python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No pyo3 and no hyper: what runs Python in a worker process
+# (`runtime/lane_worker.rs`) and the fork's Python half (`pyapi/process_driver.rs`) are the engine's.
+[dependencies]
+mipyre_shm = { path = "../shm" }
+mipyre_cpu = { path = "../cpu" }
+mipyre_tpc = { path = "../tpc" }
+mipyre_http = { path = "../http" }
+# `Peer`, the client address a request frame carries.
+mipyre_transport = { path = "../transport" }
+mipyre_core = { path = "../core" }
+# `panic_message`, the workspace's one reading of a panic payload.
+mipyre_util = { path = "../util" }
+http = "1"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
+tokio-util = "0.7"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+crossbeam-queue = "0.3"
+parking_lot = "0.12"
+rustix = { version = "1.1.5", default-features = false, features = ["std", "event", "fs", "net", "pipe", "process", "shm", "thread", "time"] }
+libc = "0.2"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"
+# The fuzz target of the answer decoder (src/wire_fuzz.rs): `cargo test` replays its committed corpus,
+# `cargo bolero test` mutates it under libFuzzer.
+# Exactly 0.13.4: from 0.13.5 on its derive crate pins indexmap to =2.11.2, which would move the workspace's
+# shipping indexmap (h2, sqlx) back from 2.14.
+bolero = "=0.13.4"
+tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(all(sync_model, not(sync_shuttle)))'.dependencies]
+loom = "0.7"
+
+[target.'cfg(all(sync_model, sync_shuttle))'.dependencies]
+shuttle = "0.9.8"
+
+[lints]
+workspace = true

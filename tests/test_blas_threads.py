@@ -1,6 +1,6 @@
 """BLAS (and polars) thread pools are limited in process-lane worker processes only, before
-the app is imported there; the server process is left alone (design §5). A pool the user
-sized through any one of its variables is left whole, as the user set it."""
+the app is imported there; the server process is left alone. A pool already sized through any
+one of its variables is left whole, as it was set."""
 
 import json
 import os

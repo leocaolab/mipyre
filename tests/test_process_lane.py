@@ -8,6 +8,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -75,11 +76,11 @@ def server(tmp_path):
     s.stop()
 
 
-def worker_pids(s: Server, n=8) -> set[int]:
-    """The workers that answer n overlapping requests: lanes fill lowest first, so only
-    requests that overlap reach every worker."""
-    with concurrent.futures.ThreadPoolExecutor(n) as ex:
-        return set(ex.map(lambda _: s.json("/sleep?s=0.15")["pid"], range(n)))
+def worker_pids(s: Server) -> set[int]:
+    """The lanes' worker processes, as the host records them; a lane between workers has none.
+    Asked of the host, not of which workers some requests reached: overlapping requests reach
+    every lane only if they overlap, which a loaded machine does not promise."""
+    return {pid for pid in s.json("/lanes")["worker_pids"] if pid is not None}
 
 
 def test_the_ring_depth_is_the_largest_power_of_two_up_to_8_the_queue_holds():
@@ -104,12 +105,10 @@ def test_a_thread_is_exiting_by_its_kernel_flag(stat, exiting):
 
 
 def test_a_fork_is_refused_naming_every_other_thread():
-    from mipyre._process_lane.threads import ThreadedTemplateError, refusal
+    from mipyre._process_lane.threads import refusal
 
     assert refusal([], "the template", "fix it") is None
-    error = refusal(["polars-ooc-clea", ""], "the template", "Use import.")
-    assert isinstance(error, ThreadedTemplateError)
-    assert str(error) == (
+    assert refusal(["polars-ooc-clea", ""], "the template", "Use import.") == (
         "the template must be single-threaded when it forks (a fork copies only the calling thread, so a "
         "pool these threads belong to would be missing in every worker), but it runs 2 other thread(s): "
         "polars-ooc-clea, <unnamed>. Use import."
@@ -124,6 +123,7 @@ def test_hello_answers_from_a_worker_process(server):
     pids = worker_pids(server)
     assert server_pid not in pids
     assert len(pids) == 2
+    assert server.json("/pid")["pid"] in pids
 
 
 def test_a_worker_gets_its_setup_from_the_template_not_from_the_environment(server):
@@ -157,7 +157,7 @@ def test_a_raising_handler_is_500_and_its_worker_lives(server):
 
 
 def test_too_many_response_headers_are_500_and_the_worker_lives(server):
-    """b/927: past the lines a header map takes room for is the handler's ValueError, not a panic."""
+    """Past the lines a header map takes room for is the handler's ValueError, not a panic."""
     before = worker_pids(server)
     status, _, body = server.get("/too-many-headers")
     assert status == 500, body
@@ -191,8 +191,29 @@ def block_path(mark) -> str:
 
 def blocked_worker(mark) -> int:
     """The pid of the worker a /block request is in, once the handler has written it: waited
-    for by the file, for no length of time (b/325)."""
+    for by the file, for no length of time."""
     return int(poll_until(lambda: mark.exists() and mark.read_text(), timeout=None, what=f"{mark}"))
+
+
+def wait_for_exit(pid: int) -> None:
+    """Return once process `pid` has exited: waited for by the kernel's exit event, for no
+    length of time. A pid already gone raises nothing: its exit has happened."""
+    try:
+        if sys.platform == "linux":
+            fd = os.pidfd_open(pid)
+            try:
+                select.select([fd], [], [])
+            finally:
+                os.close(fd)
+        else:
+            kq = select.kqueue()
+            try:
+                exit_event = select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)
+                kq.control([exit_event], 1, None)
+            finally:
+                kq.close()
+    except ProcessLookupError:
+        return
 
 
 def test_sigkill_of_a_busy_worker_is_502_and_it_is_replaced(tmp_path):
@@ -204,7 +225,48 @@ def test_sigkill_of_a_busy_worker_is_502_and_it_is_replaced(tmp_path):
             os.kill(blocked_worker(mark), signal.SIGKILL)
             status, _, body = fut.result()
         assert status == 502, body
-        poll_until(lambda: len(worker_pids(s, 20)) == 2, timeout=None, what="two workers again")
+        poll_until(lambda: len(worker_pids(s)) == 2, timeout=None, what="two workers again")
+    finally:
+        s.stop()
+
+
+def zombie_children(parent: int) -> list[str]:
+    """Return the `ps` lines of `parent`'s children that exited and were never reaped."""
+    table = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,stat="], capture_output=True, text=True, check=True).stdout
+    return [ln for ln in table.splitlines() if (f := ln.split())[1] == str(parent) and f[2].startswith("Z")]
+
+
+def test_the_zombie_check_sees_a_child_exited_and_not_reaped_and_not_once_reaped():
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    wait_for_exit(child.pid)
+    assert [ln.split()[0] for ln in zombie_children(os.getpid())].count(str(child.pid)) == 1
+    child.wait()
+    assert str(child.pid) not in [ln.split()[0] for ln in zombie_children(os.getpid())]
+
+
+def test_workers_killed_together_are_all_reaped_and_replaced(tmp_path):
+    """Three idle workers SIGKILLed at once: each death is counted, each is reaped by the template
+    (the host logs its signal, which only the template's wait status gives), each lane gets a
+    replacement, and neither the server nor the template is left with a zombie child."""
+    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=3, MIPYRE_PROCESS_TIMEOUT=PATIENT_S)
+    try:
+        before = poll_until(lambda: p if len(p := worker_pids(s)) == 3 else None, timeout=None, what="three workers")
+        for pid in before:
+            os.kill(pid, signal.SIGKILL)
+        stats = poll_until(
+            lambda: (st := s.json("/lanes"))["respawns"] == 3 and len(set(st["worker_pids"]) - {None}) == 3 and st,
+            timeout=None,
+            what="three replacements",
+        )
+        assert (stats["deaths"], stats["respawn_failures"]) == (3, 0), stats
+        assert not set(stats["worker_pids"]) & before, (stats, before)
+        log = s.read().splitlines()
+        for pid in before:
+            [death] = [ln for ln in log if f"worker {pid} died" in ln]
+            assert "killed by signal 9" in death, death
+        templates = [int(p) for p in subprocess.run(["pgrep", "-P", str(s.proc.pid)], capture_output=True, text=True).stdout.split()]
+        assert len(templates) == 1, templates
+        assert zombie_children(s.proc.pid) + zombie_children(templates[0]) == []
     finally:
         s.stop()
 
@@ -221,21 +283,26 @@ def test_a_stream_from_a_process_route_is_500_naming_the_fix_and_its_worker_live
     assert worker_pids(server) == before
 
 
-def test_a_handler_past_its_memory_limit_fails_alone_and_the_lanes_keep_serving(server):
+def test_a_handler_past_its_memory_limit_fails_alone_and_the_lanes_keep_serving(tmp_path):
     """A handler that grows until its worker's address-space limit refuses it: the request is a
-    500 (MemoryError) or a 502 (the worker died of it), the other worker is untouched, and the
-    next requests are answered by both lanes."""
-    before = worker_pids(server)
-    status, _, body = server.get("/hog", timeout=None)
-    assert status in (500, 502), (status, body)
-    assert server.get("/hello")[0] == 200
+    500 (MemoryError) or a 502 (the worker died of it), the other worker is untouched, the next
+    request is answered and both lanes have a worker again. The lane timeout is one no request reaches, so the
+    request ends by the refusal however long the growing takes."""
+    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=2, MIPYRE_PROCESS_TIMEOUT=PATIENT_S)
+    try:
+        before = worker_pids(s)
+        status, _, body = s.get("/hog", timeout=None)
+        assert status in (500, 502), (status, body)
+        assert s.get("/hello")[0] == 200
 
-    def both_serving():
-        pids = worker_pids(server)
-        return pids if len(pids) == 2 else None
+        def both_serving():
+            pids = worker_pids(s)
+            return pids if len(pids) == 2 else None
 
-    after = poll_until(both_serving, timeout=None, what="two workers serving")
-    assert len(after & before) >= 1  # the worker that did not hog is the one it was
+        after = poll_until(both_serving, timeout=None, what="two workers serving")
+        assert len(after & before) >= 1  # the worker that did not hog is the one it was
+    finally:
+        s.stop()
 
 
 def test_a_request_queued_behind_a_dying_worker_is_502_and_the_replacement_serves_only_later_ones(tmp_path):
@@ -256,7 +323,7 @@ def test_a_request_queued_behind_a_dying_worker_is_502_and_the_replacement_serve
             assert s.json("/server_pid")["pid"] != dying
             # The kill waits until the host holds both requests, the blocked one and the one queued
             # behind it: a submit returns before its request reaches the server, so a round trip
-            # sent after it does not prove it arrived (b/971).
+            # sent after it does not prove it arrived.
             poll_until(lambda: s.json("/lanes")["requests_in_lanes"] == 2, timeout=None, what="/pid queued behind /block")
             os.kill(dying, signal.SIGKILL)
             status, _, body = running.result()
@@ -298,7 +365,7 @@ def test_a_handler_past_the_timeout_is_504_and_its_worker_is_replaced(server, tm
 
 
 def test_a_full_queue_is_503_never_a_wait(tmp_path):
-    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=1, MIPYRE_PROCESS_QUEUE=8, MIPYRE_PROCESS_TIMEOUT=30)
+    s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=1, MIPYRE_PROCESS_QUEUE_PER_WORKER=8, MIPYRE_PROCESS_TIMEOUT=30)
     try:
         with concurrent.futures.ThreadPoolExecutor(40) as ex:
             results = list(ex.map(lambda _: s.get("/sleep?s=0.3", timeout=30)[0], range(40)))
@@ -418,7 +485,7 @@ def test_unservable_process_routes_are_registration_errors(kwargs, fn_src, needl
 def test_python_app_py_serves_process_routes_after_its_import_started_threads(tmp_path):
     """Under `python app.py` the app's first run starts the template, after the app was
     imported. This app's import ran a polars query, which started polars' threads: the
-    template is a new interpreter on every platform (b/909), which the threads do not reach,
+    template is a new interpreter on every platform, which the threads do not reach,
     so the route serves."""
     app = os.path.join(os.path.dirname(__file__), "apps", "process_lane_threaded_app.py")
     log_path = str(tmp_path / "server.log")
@@ -476,9 +543,10 @@ def test_a_polars_app_runs_on_process_lanes(tmp_path):
 
 
 def test_a_worker_stuck_in_a_handler_dies_with_its_template(tmp_path):
-    """SIGKILL the template while its worker is in a handler: the worker is gone within 1 s
-    (macOS: a kqueue EVFILT_PROC watch thread; Linux: PR_SET_PDEATHSIG). The worker is in its
-    handler once the handler has written its pid (b/494: until then a 0.5 s sleep guessed it)."""
+    """SIGKILL the template while its worker is in a handler: the worker exits with it (macOS:
+    a kqueue EVFILT_PROC watch thread; Linux: PR_SET_PDEATHSIG) and its request is 502. The
+    handler never returns and the server's timeout is PATIENT_S, so only the template's death
+    can end the worker. The worker is in its handler once the handler has written its pid."""
     s = Server(tmp_path, MIPYRE_PROCESS_WORKERS=1, MIPYRE_PROCESS_TIMEOUT=PATIENT_S)
     try:
         mark = tmp_path / "stuck.pid"
@@ -490,20 +558,9 @@ def test_a_worker_stuck_in_a_handler_dies_with_its_template(tmp_path):
             workers = [int(p) for p in subprocess.run(["pgrep", "-P", str(templates[0])], capture_output=True, text=True).stdout.split()]
             assert workers == [blocked], workers
             os.kill(templates[0], signal.SIGKILL)
-            t0 = time.monotonic()
-
-            def gone():
-                try:
-                    os.kill(workers[0], 0)
-                    return False
-                except ProcessLookupError:
-                    return True
-
-            poll_until(gone, timeout=1.0, interval=0.01, what="the worker exiting with its template")
-            took = time.monotonic() - t0
+            wait_for_exit(workers[0])
             status, _, body = fut.result()
         assert status == 502, body  # its request: the worker died running it
-        assert took < 1.0
     finally:
         s.stop()
 

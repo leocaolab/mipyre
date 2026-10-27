@@ -1,10 +1,10 @@
 """A Python call that blocks does not take the server's IO with it.
 
-- 64b0c9ef / 03c61193 (#3): a blocking main-interpreter handler (and a WebSocket handler's
-  join) ran on a Tokio IO thread; with as many blocked as there are IO threads, every other
-  route starved. Now handlers run on the blocking pool.
-- 03c61193 (#4): a WebSocket handler's `recv()` held the GIL while it waited for the client,
-  freezing every other Python thread (C5.1). Now it waits detached.
+- A blocking main-interpreter handler (and a WebSocket handler's join) runs on the blocking
+  pool, not a Tokio IO thread: with as many blocked as there are IO threads, every other route
+  would starve.
+- A WebSocket handler's `recv()` waits for the client detached from the GIL, not freezing every
+  other Python thread.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def test_blocked_main_handlers_past_the_io_thread_count_leave_a_fast_route_answe
     from tests.apps.blocking_main_handlers import app, entered, release
 
     blocked = IO_THREADS + 2
-    # A test server reads no environment (b/335 M5.6): the multi-thread server and its threads are its config.
+    # A test server reads no environment: the multi-thread server and its threads are its config.
     with TestServer(app, config=ServerFlags(tpc=False, threads=IO_THREADS)) as server, TestClient(server) as c:
         statuses: list[int] = []
 
@@ -54,22 +54,22 @@ def test_blocked_main_handlers_past_the_io_thread_count_leave_a_fast_route_answe
 
 
 WS_SCRIPT = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 app = Mipyre(runtime="main")
 
 @app.websocket("/wait")
-def wait(ws):
-    ws.send("ready")
-    msg = ws.recv()
-    ws.send(f"got {msg}")
+async def wait(ws):
+    await ws.send("ready")
+    msg = await ws.recv()
+    await ws.send(f"got {msg}")
 
 @app.get("/python")
 def python(req):
     return "ran"
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0)
+    app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
 
 

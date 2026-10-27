@@ -5,11 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# No hyper, no HTTP and no pyo3: a connection is bytes, and what is spoken over it is the layer above's
-# (`deny.toml` bans pyo3 under every package it does not list). Inside, tcp/ uses no tls/ (dev/archcheck.toml
-# E-P12), so the TCP half can be handed out alone.
+# No hyper, no HTTP and no pyo3: a connection is bytes, and what is spoken over it is the layer above's.
+# Inside, tcp/ uses no tls/, so the TCP half can be handed out alone.
 #
-# tokio's features are this crate's own: `cargo check -p mipyre_transport` in the merge gate builds it alone.
+# tokio's features are this crate's own: `cargo check -p mipyre_transport` builds it alone.
 [dependencies]
 mipyre_util = { path = "../util" }
 tokio = { version = "1", features = ["net", "time", "sync", "rt", "io-util"] }

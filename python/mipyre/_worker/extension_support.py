@@ -1,5 +1,5 @@
 """Whether an extension file can load shared in an own-GIL sub-interpreter: CPython's own
-multi-interpreter check, worked out before the load (design `docs/design/isolation-finder.md` §3.6).
+multi-interpreter check, worked out before the load.
 
 CPython lets an extension load in a sub-interpreter with its own GIL only if it is multi-phase and its
 `PyModuleDef` declares `Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`. A
@@ -37,6 +37,9 @@ if TYPE_CHECKING:
     from typing import BinaryIO
 
 _PY_MOD_MULTIPLE_INTERPRETERS = 3  # the slot id, CPython's moduleobject.h
+
+# The words of the ImportError CPython's check raises when it refuses a file (import.c).
+CPYTHON_REFUSAL = "does not support loading in subinterpreters"
 
 
 class MultipleInterpreters(enum.Enum):

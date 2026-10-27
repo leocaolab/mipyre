@@ -1,4 +1,4 @@
-"""One file, routes on two runtimes (design §3.4): the top imports nothing a
+"""One file, routes on two runtimes: the top imports nothing a
 sub-interpreter can't load; the process route imports one inside its function."""
 
 import os

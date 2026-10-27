@@ -2,7 +2,7 @@
 
 It must read it from the launcher's copy, not the install. A forked worker (Linux) runs the
 launcher's engine (.so, in memory since the fork), so after an in-place change to the install the
-new Python file would meet it (q/72 B says two versions never meet). A spawned worker (macOS)
+new Python file would meet it, and two versions must never meet. A spawned worker (macOS)
 imports everything from the copy, and the test holds for it as well.
 """
 

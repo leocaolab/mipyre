@@ -7,7 +7,7 @@ Runnable apps, from a one-file hello world to APIs that run numpy, pandas and py
 | [`hello.py`](hello.py) | routes, path and query parameters, an `after_request` hook, a custom 404 | `subinterp` | |
 | [`hello_subinterp.py`](hello_subinterp.py) | the default runtime, named explicitly | `subinterp` | |
 | [`sse_demo.py`](sse_demo.py) | Server-Sent Events with `Stream`, stopping when the client leaves | `subinterp`, `main` | [realtime](../docs/codelabs/realtime.md) |
-| [`websocket_demo.py`](websocket_demo.py) | a WebSocket echo for text and binary messages, refusing other sites | `subinterp`, main interpreter | [realtime](../docs/codelabs/realtime.md) |
+| [`websocket_demo.py`](websocket_demo.py) | a WebSocket echo for text and binary messages, refusing other sites | `subinterp` | [realtime](../docs/codelabs/realtime.md) |
 | [`ai_agent_server.py`](ai_agent_server.py) | MCP tools and a resource, a pydantic chat route, an SSE answer stream, session memory in `app.state` | `subinterp`, `main` | [AI agent](../docs/codelabs/ai-agent.md) |
 | [`trading_api.py`](trading_api.py) | numpy and pandas in worker processes, a pydantic order route, MsgPack RPC, a WebSocket price feed | `subinterp`, `main`, `process` | [trading](../docs/codelabs/trading.md) |
 | [`fullstack_api.py`](fullstack_api.py) | CRUD, pydantic validation, cookie sessions, scrypt password hashes, file upload | `subinterp`, `main` | |
@@ -33,10 +33,10 @@ Each example below lists what it needs, if you'd rather install less: `hello.py`
 Each route runs in one of mipyre's runtimes, and every example puts each route on the one it needs:
 
 - **`subinterp`** (the default): the sub-interpreter of the server thread that took the request, one GIL per thread, in parallel on every core. For pure Python, the standard library and `app.state`.
-- **`main`**: the server's main interpreter, one GIL for every `main` route. For pydantic (which can't load in a sub-interpreter) on routes that also use `app.state`, for `Stream` responses, and for anything that must exist once. WebSocket handlers, `/mcp` and `@rpc(app)` methods always run here.
+- **`main`**: the server's main interpreter, one GIL for every `main` route. For pydantic (which can't load in a sub-interpreter) on routes that also use `app.state`, for `Stream` responses, and for anything that must exist once. `/mcp` and `@rpc(app)` methods always run here; WebSocket routes run on the runtime they are given, like any route.
 - **`process`**: worker processes beside the server. For numpy, pandas and other extensions that can't load in a sub-interpreter, on routes that need only the request: no `app.state`, no database pool. An app with process routes starts with `python app.py` or `mipyre run`; `mipyre run` takes the `--process-*` flags.
 
-A module that the sub-interpreters import must not import a library they can't load, so the examples put such routes in a `Router` module of their own and list it in `Mipyre(routers=[...])`.
+A module that the sub-interpreters import must not import a library they can't load, so the examples put such routes in a `Router` module of their own and include it with `app.include_router("module:router")`.
 
 ## hello.py
 

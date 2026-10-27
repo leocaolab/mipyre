@@ -1,4 +1,4 @@
-"""Starting and stopping a server over and over in one process frees every worker's app (b/31).
+"""Starting and stopping a server over and over in one process frees every worker's app.
 
 Each start builds the workers' sub-interpreters, each runs the app script; each stop
 ends them. A handler's globals hold the app, so app -> handler -> globals -> app is a
@@ -8,11 +8,9 @@ arena of an interpreter that still has a live block. Every cycle then leaked eac
 worker's whole interpreter: ~8,000 blocks and ~11 MiB per worker.
 
 What is counted: each worker's app writes a file when it is freed (`tests/apps/restart_const.py`),
-so after every stop the files number exactly `WORKERS` times the stops so far. Until b/441 this
-was the process's allocated blocks and anonymous memory against thresholds (2,000 blocks, 8 MiB
-over four cycles), which let a worker keep its app now and then inside the noise; the anonymous
-memory given back to the OS, the allocator's part, is measured before a release
-(`benchmarks/soak_restart_memory.py`, `dev/release_soak.sh`).
+so after every stop the files number exactly `WORKERS` times the stops so far. Thresholds on allocated
+blocks or anonymous memory would let a worker keep its app now and then inside the noise; the
+anonymous memory given back to the OS, the allocator's part, is measured by a longer soak.
 
 The driver runs in a subprocess so the test process's own servers don't count. It reloads the
 app module (a fresh app, as a test suite reloading an app does), serves it with `WORKERS`

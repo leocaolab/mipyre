@@ -3,11 +3,12 @@ caller got its 504 while it waited is not run, and a worker that cannot be inter
 (`time.sleep`) is abandoned and replaced, so the next request is served.
 
 When each step happens is the pool's (`runtime/pool/`: `next_step`, `settle_interrupted`,
-unit-tested there); 504 on every serving path is test_review_m2's. This file keeps the one
+unit-tested there); 504 on every serving path is test_request_pipeline's. This file keeps the one
 run of the whole sequence on the pool, with a short budget (`app.request_timeout`) and grace
 (`app.interrupt_grace`).
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -41,8 +42,9 @@ def stop_server(proc, port):
 
 
 SINGLE_WORKER_SCRIPT = r'''
+import json
 import os
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 MARK = os.environ["MIPYRE_TEST_MARK"]
 SLOW_STARTED = os.environ["MIPYRE_TEST_SLOW_STARTED"]
@@ -72,7 +74,7 @@ def mark(req):
     return {"ran": True}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, subinterpreters=1)
+    app.run(ServerFlags(host="127.0.0.1", port=0, subinterpreters=1))
 '''
 
 
@@ -117,8 +119,8 @@ def test_request_whose_caller_gave_up_is_not_run(single_worker):
 
     slow = threading.Thread(target=call, args=("slow", "/slow", 40))
     slow.start()
-    # /slow is in the worker before /mark queues behind it (until b/441: a 0.5 s sleep, after
-    # which a loaded machine could still have /mark reach the worker first).
+    # /slow is in the worker before /mark queues behind it: on a loaded machine a fixed sleep
+    # could still let /mark reach the worker first.
     poll_until(slow_started.exists, timeout=None)
     queued = threading.Thread(target=call, args=("queued", "/mark", 40))
     queued.start()
@@ -138,3 +140,83 @@ def test_request_whose_caller_gave_up_is_not_run(single_worker):
     # Control: a live request runs the handler.
     assert get_status(port, "/mark", timeout=10) == 200
     assert mark.exists()
+
+
+STUCK_SCRIPT = r'''
+import json
+import os
+from mipyre import HealthProbes, Mipyre, ServerFlags
+
+FIFO = os.environ["MIPYRE_TEST_FIFO"]
+app = Mipyre()
+app.request_timeout = 1
+app.interrupt_grace = 0.5
+HealthProbes(app)
+
+@app.get("/")
+def index(req):
+    return {"ok": True}
+
+@app.get("/stuck")
+def stuck(req):
+    # An open blocked in C runs no bytecode, so the interruption cannot land until the test
+    # opens the FIFO's other end.
+    with open(FIFO) as f:
+        f.read()
+    return {"should": "never reach"}
+
+if __name__ == "__main__":
+    app.run(ServerFlags(host="127.0.0.1", port=0, subinterpreters=1))
+'''
+
+
+def get_json(port, path):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        with e:
+            return e.code, json.loads(e.read())
+
+
+def test_a_pool_at_its_abandon_limit_is_not_ready_until_its_stuck_worker_ends(tmp_path):
+    """One sync worker, so the first abandoned worker puts the pool at its limit: /readyz says
+    not ready, with its own check failing, and the log says so once. Once the stuck thread ends,
+    the pool is below its limit again, the log says that, and /readyz is ready again."""
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    script = tmp_path / "stuck_app.py"
+    script.write_text(STUCK_SCRIPT)
+    env = dict(os.environ, MIPYRE_TPC="0", MIPYRE_LOG="1", MIPYRE_TEST_FIFO=str(fifo))
+    log_path = str(script) + ".log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, str(script)], stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env
+        )
+    port = bound_port(read_file(log_path), proc)
+    try:
+        answers(f"http://127.0.0.1:{port}/", proc, read_file(log_path))
+        assert get_json(port, "/readyz") == (200, {"status": "ready", "checks": {"abandoned_workers": {"ok": True}}})
+
+        assert get_status(port, "/stuck", timeout=10) == 504
+        status, body = poll_until(
+            lambda: (lambda r: r if r[0] == 503 else None)(get_json(port, "/readyz")),
+            timeout=30,
+            what="/readyz not ready once the stuck worker is abandoned",
+        )
+        assert body["checks"] == {"abandoned_workers": {"ok": False}}, body
+        log = settle(read_file(log_path), lambda text: "the pool's limit of 1" in text)
+        assert log.count("abandoned sync workers still run, the pool's limit of 1") == 1, log
+
+        # Opening the write end is the release; nothing is written, because the handler may
+        # take its pending interruption and close its end before a write would land (EPIPE).
+        open(fifo, "w").close()
+        poll_until(
+            lambda: get_json(port, "/readyz")[0] == 200,
+            timeout=30,
+            what="/readyz ready once the abandoned thread ended",
+        )
+        log = settle(read_file(log_path), lambda text: "below the pool's limit of 1" in text)
+        assert "below the pool's limit of 1" in log, log
+    finally:
+        stop_server(proc, port)

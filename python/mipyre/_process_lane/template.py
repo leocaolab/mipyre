@@ -1,10 +1,10 @@
-"""The process-lane template (design §4.1, §11.4): started by the launcher before the app
+"""The process-lane template: started by the launcher before the app
 is imported; on the server's request it starts one worker per lane, and reaps them.
 
 The launcher below is the one place that matches on `StartStrategy`:
 
 - Import: the template holds no app code; each worker imports the app itself
-  (driver: a fork of this bare template, or a new process on macOS while b/32 lasts);
+  (driver: a fork of this bare template, or a new process on macOS);
 - Fork: the template imports the app (with the first run's command line), checks it is still
   single-threaded, then forks each worker.
 
@@ -51,7 +51,7 @@ class CommandFrameError(RuntimeError):
     """The server sent bytes that are no command frame the template takes: the template ends."""
 
 
-# The template socket's frames (crates/pyext/src/runtime/process/template.rs is the server's side): a 4-byte
+# The template socket's frames (crates/process/src/template.rs is the server's side): a 4-byte
 # little-endian length, then that many bytes, the first of which is the tag. Both directions
 # number their tags in one space.
 FRAME_HEADER_BYTES = 4
@@ -63,7 +63,7 @@ LANE_FDS = 2
 
 def frame(tag: int, body: bytes) -> bytes:
     """The frame of `tag` with `body`."""
-    return (1 + len(body)).to_bytes(4, "little") + bytes([tag]) + body
+    return (1 + len(body)).to_bytes(FRAME_HEADER_BYTES, "little") + bytes([tag]) + body
 
 
 def _words(*values: int, signed: tuple[bool, ...]) -> bytes:
@@ -110,25 +110,23 @@ def lane_fds_missing_frame(lane: int, got: int) -> bytes:
     return frame(LANE_FDS_MISSING, _words(lane, got, signed=(False, False)))
 
 
-def split_frame(buf: bytes | bytearray) -> tuple[int, bytes, int] | None:
-    """The first frame in `buf` as (tag, body, bytes it takes), or None while it is not whole.
-    A length past MAX_FRAME_BYTES, or one with no tag, is refused from the header alone."""
-    if len(buf) < FRAME_HEADER_BYTES:
-        return None
-    n = int.from_bytes(buf[:FRAME_HEADER_BYTES], "little")
+def frame_length(head: bytes | bytearray) -> int:
+    """The length a frame's header gives, refused past MAX_FRAME_BYTES or with no room for a tag
+    before anything is read for it."""
+    n = int.from_bytes(head[:FRAME_HEADER_BYTES], "little")
     if not 1 <= n <= MAX_FRAME_BYTES:
         raise CommandFrameError(f"a frame of {n} bytes from the server: frames are 1 to {MAX_FRAME_BYTES}")
+    return n
+
+
+def split_frame(buf: bytes | bytearray) -> tuple[int, bytes, int] | None:
+    """The first frame in `buf` as (tag, body, bytes it takes), or None while it is not whole."""
+    if len(buf) < FRAME_HEADER_BYTES:
+        return None
+    n = frame_length(buf)
     if len(buf) < FRAME_HEADER_BYTES + n:
         return None
     return buf[FRAME_HEADER_BYTES], bytes(buf[FRAME_HEADER_BYTES + 1 : FRAME_HEADER_BYTES + n]), FRAME_HEADER_BYTES + n
-
-
-def whole_frame(buf: bytes) -> tuple[int, bytes]:
-    """The tag and the body of `buf`, which is one whole frame."""
-    whole = split_frame(buf)
-    if whole is None or whole[2] != len(buf):
-        raise CommandFrameError(f"{len(buf)} bytes from the server that are not one frame: {buf[:64].hex()}")
-    return whole[0], whole[1]
 
 
 def parse_words(tag: int, body: bytes, count: int) -> list[int]:
@@ -192,15 +190,12 @@ def _read_exact(sock: socket.socket, n: int) -> bytes | None:
 
 
 def _recv_setup(sock: socket.socket) -> LaneSetup | None:
-    """The server's setup frame, or None when the server closed the socket first. Read to the
-    byte: each lane's frame follows with its fds, which a read past the setup would drop."""
-    head = _read_exact(sock, FRAME_HEADER_BYTES)
-    if head is None:
+    """The server's setup frame, or None when the server closed the socket first."""
+    command = _recv_command(sock)
+    if command is None:
         return None
-    rest = _read_exact(sock, int.from_bytes(head, "little"))
-    if rest is None:
-        return None
-    tag, body = whole_frame(head + rest)
+    tag, body, fds, _cut = command
+    _refuse_fds(tag, fds)
     if tag != SETUP:
         raise CommandFrameError(f"a frame with tag {tag} where the setup (tag {SETUP}) comes")
     return LaneSetup.decode(body)
@@ -227,16 +222,23 @@ def _recv_command(sock: socket.socket) -> tuple[int, bytes, list[int], bool] | N
     if len(head) < FRAME_HEADER_BYTES:
         _close(fds)
         return None
-    n = int.from_bytes(head, "little")
-    if not 1 <= n <= MAX_FRAME_BYTES:
+    try:
+        n = frame_length(head)
+    except CommandFrameError:
         _close(fds)
-        raise CommandFrameError(f"a frame of {n} bytes from the server: frames are 1 to {MAX_FRAME_BYTES}")
+        raise
     rest = _read_exact(sock, n)
     if rest is None:
         _close(fds)
         return None
-    tag, body = whole_frame(head + rest)
-    return tag, body, fds, bool(flags & socket.MSG_CTRUNC)
+    return rest[0], rest[1:], fds, bool(flags & socket.MSG_CTRUNC)
+
+
+def _refuse_fds(tag: int, fds: list[int]) -> None:
+    """Close `fds`, which came on a frame with `tag`, and refuse them: only a lane's frame carries fds."""
+    _close(fds)
+    if fds:
+        raise CommandFrameError(f"{len(fds)} fds on a frame with tag {tag}: only a lane's frame carries fds")
 
 
 def _close(fds) -> None:
@@ -412,9 +414,7 @@ def main(sock: socket.socket, launcher_build: str | None) -> None:
                 if tag == LANE:
                     take_lane(parse_words(tag, body, 1)[0], fds, cut)
                     continue
-                _close(fds)
-                if fds:
-                    raise CommandFrameError(f"{len(fds)} fds on a frame with tag {tag}: only a lane's frame carries fds")
+                _refuse_fds(tag, fds)
                 if tag == RUN:
                     take_run(parse_run(body))
                 else:

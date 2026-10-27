@@ -1,4 +1,4 @@
-"""An `async def` hook on a sync path, then a `def` handler that runs a loop of its own (b/550).
+"""An `async def` hook on a sync path, then a `def` handler that runs a loop of its own.
 
 The hook's coroutine runs on the thread's event loop, marked running only for that run
 (`mipyre._worker.awaitable.run`): the handler after it, in the same request and on the same thread,
@@ -16,7 +16,7 @@ import pytest
 from mipyre import Mipyre
 from mipyre.testing import TestClient, TestServer
 
-SEEN = contextvars.ContextVar("b550_seen", default="unset")
+SEEN = contextvars.ContextVar("hook_seen", default="unset")
 
 app = Mipyre()
 

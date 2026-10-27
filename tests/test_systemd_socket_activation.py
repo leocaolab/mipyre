@@ -27,7 +27,7 @@ from tests._helpers import bound_port, kill_session, read_file
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="socket activation is Unix only")
 
 APP = """
-    from mipyre import Mipyre
+    from mipyre import Mipyre, ServerFlags
 
     app = Mipyre()
 
@@ -35,9 +35,9 @@ APP = """
     def root(req):
         return "handed"
 
-    # No host or port: a server serving handed sockets does not use them (b/335 D19); one that
+    # No host or port: a server serving handed sockets does not use them; one that
     # binds its own gets them from the deployment (MIPYRE_HOST / MIPYRE_PORT).
-    app.run(threads=2)
+    app.run(ServerFlags(threads=2))
 """
 
 
@@ -120,7 +120,7 @@ def test_a_malformed_listen_fds_stops_the_start_naming_it(tmp_path):
 
 def test_extra_ports_beside_handed_sockets_stop_the_start(tmp_path):
     handed = _handed_socket()
-    proc, output = _start(tmp_path, handed, env={"MIPYRE_PLAIN_PORTS": str(_free_port())})
+    proc, output = _start(tmp_path, handed, env={"MIPYRE_EXTRA_PLAIN_PORTS": str(_free_port())})
     try:
         assert proc.wait(timeout=30) != 0, output()
         assert "LISTEN_FDS" in output() and ".socket unit" in output(), output()
@@ -130,7 +130,7 @@ def test_extra_ports_beside_handed_sockets_stop_the_start(tmp_path):
 
 
 def test_a_port_given_beside_handed_sockets_stops_the_start_naming_it(tmp_path):
-    # E2E-8(7): the .socket unit names the addresses, so a port given too is unused (D19).
+    # The .socket unit names the addresses, so a port given too is unused.
     handed = _handed_socket()
     proc, output = _start(tmp_path, handed, env={"MIPYRE_PORT": str(_free_port())})
     try:

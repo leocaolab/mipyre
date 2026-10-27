@@ -41,7 +41,7 @@ class ReloadTarget:
         directory the app's source lives in."""
         return cls(
             argv=(sys.executable, *sys.orig_argv[1:]),
-            watch_dir=os.path.dirname(os.path.abspath(app_file)),
+            watch_dir=os.path.dirname(app_file),
         )
 
 

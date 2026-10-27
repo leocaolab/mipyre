@@ -11,7 +11,7 @@ use mipyre_http::plan::compression::{
     BrotliQuality, CompressionSettings, CompressionSettingsError, EnabledCodecs, GzipLevel,
 };
 
-use crate::boot::{CodeCall, Deployment, EntryPoint, Flag, FlagScope, ServerFlags, FLAGS};
+use crate::boot::{cli_option, env_variable, CodeCall, Deployment, EntryPoint, Flag, FlagScope, ServerFlags, FLAGS};
 use crate::telemetry;
 
 /// Returns the name of `arg`'s type for a `TypeError`, or what reading it raised.
@@ -354,17 +354,25 @@ impl Metrics {
         self.0.static_answers_cut
     }
 
-    /// Return how many bytes static answers sent from disk hold now, read and not yet written out.
-    #[getter]
-    fn static_bytes_in_flight(&self) -> u64 {
-        self.0.static_bytes_in_flight
-    }
-
     /// Return how many async database results were dropped because their asyncio loop had
     /// closed.
     #[getter]
     fn db_results_undeliverable(&self) -> u64 {
         self.0.db_results_undeliverable
+    }
+
+    /// Return how many log lines were dropped, because the log's writer could not keep up or
+    /// because stderr refused them.
+    #[getter]
+    fn log_lines_dropped(&self) -> u64 {
+        let dropped = self.0.log_lines_dropped;
+        dropped.queue_full + dropped.write_failed
+    }
+
+    /// Return how many of the dropped log lines stderr refused (EPIPE, a closed or full disk).
+    #[getter]
+    fn log_lines_write_failed(&self) -> u64 {
+        self.0.log_lines_dropped.write_failed
     }
 
     /// Return how many GIL acquisition waits exceeded 50 ms.
@@ -453,6 +461,19 @@ impl Metrics {
         self.0.nodelay_failures
     }
 
+    /// Return how many sync workers the pools abandoned are still running their requests.
+    #[getter]
+    fn workers_abandoned(&self) -> u64 {
+        self.0.workers_abandoned
+    }
+
+    /// Return how many pools are at their limit of abandoned workers; `/readyz` is not ready
+    /// while one is.
+    #[getter]
+    fn pools_at_abandon_limit(&self) -> u64 {
+        self.0.pools_at_abandon_limit
+    }
+
     fn __repr__(&self) -> String {
         format!("{:?}", self.0).replacen("Counters", "Metrics", 1)
     }
@@ -463,7 +484,9 @@ impl Metrics {
 #[pyclass(frozen, name = "RunMetrics", module = "mipyre.engine")]
 #[derive(Debug, Clone)]
 pub(crate) struct RunMetrics {
-    pub(crate) counts: telemetry::RunCounts,
+    pub(crate) counts: mipyre_server::ServerCounts,
+    pub(crate) workers: mipyre_runtime::WorkerTally,
+    pub(crate) static_bytes_in_flight: u64,
     /// What the run runs without, as `component: reason`, from each part that holds it.
     pub(crate) degraded: Vec<String>,
 }
@@ -488,44 +511,51 @@ impl RunMetrics {
     /// Return how many requests were served, or `None` while the run does not count its answers (its `metrics` flag is off).
     #[getter]
     fn total_requests(&self) -> Option<u64> {
-        self.counts.answers.as_ref().map(telemetry::AnswerCounts::total)
+        self.counts.answers.as_ref().map(mipyre_server::AnswerCounts::total)
     }
 
     /// Return how many workers are serving now.
     #[getter]
-    fn workers_serving(&self) -> i64 {
-        self.counts.workers_serving
+    fn workers_serving(&self) -> usize {
+        self.workers.workers_serving
     }
 
     /// Return how many workers stopped serving on their own while the server ran.
     #[getter]
-    fn workers_died(&self) -> u64 {
-        self.counts.workers_died
+    fn workers_died(&self) -> usize {
+        self.workers.workers_died
     }
 
     /// Return how many `runtime="process"` worker processes died (crashed, were killed, timed
     /// out) and were replaced while the server ran.
     #[getter]
-    fn process_workers_died(&self) -> u64 {
-        self.counts.process_workers_died
+    fn process_workers_died(&self) -> usize {
+        self.workers.process_workers_died
     }
 
     /// Return how many `gc.collect()` calls raised or panicked; each retired its worker.
     #[getter]
-    fn gc_failures(&self) -> u64 {
-        self.counts.gc_failures
+    fn gc_failures(&self) -> usize {
+        self.workers.gc_failures()
     }
 
     /// Return how many workers were retired because their `gc.collect()` failed.
     #[getter]
-    fn workers_retired(&self) -> u64 {
-        self.counts.workers_retired
+    fn workers_retired(&self) -> usize {
+        self.workers.workers_retired
     }
 
     /// Return why the last worker retired, in its own words, or `None` while none has.
     #[getter]
     fn last_worker_retirement(&self) -> Option<String> {
-        self.counts.last_worker_retirement.clone()
+        self.workers.last_worker_retirement.clone()
+    }
+
+    /// Return how many bytes the server's static answers sent from disk hold now, read and not
+    /// yet written out.
+    #[getter]
+    fn static_bytes_in_flight(&self) -> u64 {
+        self.static_bytes_in_flight
     }
 
     /// Return how many requests were answered 422 because their `body=` model or `query=`
@@ -533,6 +563,13 @@ impl RunMetrics {
     #[getter]
     fn validation_failures(&self) -> u64 {
         self.counts.validation_failures
+    }
+
+    /// Return how many WebSocket clients were pinged and closed with 1011 because no frame came
+    /// in time.
+    #[getter]
+    fn ws_keepalive_timeouts(&self) -> u64 {
+        self.counts.ws_keepalive_timeouts
     }
 
     /// Return how many threads could not be pinned to their core and run unpinned.
@@ -625,14 +662,14 @@ impl Flag {
 
     /// The `mipyre run` option, `--threads`.
     #[getter]
-    fn cli(&self) -> &'static str {
-        self.cli
+    fn cli(&self) -> String {
+        cli_option(self.name)
     }
 
     /// The environment variable, `MIPYRE_THREADS`.
     #[getter]
-    fn env(&self) -> &'static str {
-        self.env
+    fn env(&self) -> String {
+        env_variable(self.name)
     }
 
     /// The `pyproject.toml` key in its table, `[tool.mipyre] threads`.
@@ -641,7 +678,7 @@ impl Flag {
         self.file.to_string()
     }
 
-    /// Every place app code gives it, `run(threads=)`.
+    /// Every place app code gives it, `ServerFlags(threads=)`.
     #[getter]
     fn code(&self) -> Vec<String> {
         self.code.iter().map(ToString::to_string).collect()
@@ -677,7 +714,12 @@ impl Flag {
     }
 
     fn __repr__(&self) -> String {
-        format!("Flag({:?}, {}, {})", self.name, self.cli, self.env)
+        format!(
+            "Flag({:?}, {}, {})",
+            self.name,
+            cli_option(self.name),
+            env_variable(self.name)
+        )
     }
 }
 
@@ -698,7 +740,7 @@ impl Deployment {
     }
 
     /// Reads this process's environment and the `pyproject.toml` in its working directory, once,
-    /// with `flags`: the command line's values by flag name, as typed.
+    /// with `flags`, the command line's values by flag name as typed.
     ///
     /// # Errors
     ///
@@ -744,10 +786,10 @@ impl Deployment {
         &self,
         config: PyRef<'_, ServerFlags>,
         physical_cores: usize,
-    ) -> PyResult<crate::runtime::process::LaneRecipe> {
+    ) -> PyResult<super::process::PyLaneRecipe> {
         let cores = std::num::NonZeroUsize::new(physical_cores)
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("physical_cores must be at least 1"))?;
-        Ok(Deployment::lanes(self, &config, cores))
+        Ok(Deployment::lanes(self, &config, cores).into())
     }
 
     /// Whether to reload on file changes: the deployment's `reload`, else `run(reload=)`.
@@ -776,14 +818,8 @@ fn flag_text(value: &Bound<'_, PyAny>) -> PyResult<String> {
     value.str()?.extract()
 }
 
-/// Reads the keywords Python code passed `call` into its flags; a keyword given `None` is a
+/// Reads the keywords Python code passed `call` into `flags`; a keyword given `None` is a
 /// keyword not given.
-fn flags_of(call: CodeCall, given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<ServerFlags> {
-    let mut flags = ServerFlags::default();
-    give_all(&mut flags, call, given)?;
-    Ok(flags)
-}
-
 fn give_all(flags: &mut ServerFlags, call: CodeCall, given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<()> {
     for (keyword, value) in given.into_iter().flatten() {
         if value.is_none() {
@@ -795,13 +831,8 @@ fn give_all(flags: &mut ServerFlags, call: CodeCall, given: Option<&Bound<'_, py
     Ok(())
 }
 
-/// The flags `run()`'s keywords give, each named as `run(name=)`.
-pub(crate) fn run_flags(given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<ServerFlags> {
-    flags_of(CodeCall::Run, given)
-}
-
-/// The flag values app code gives one server: `ServerFlags(threads=2)` is the programmatic
-/// way (`TestClient(config=)`, `start(config=)`); `run()`'s keywords come in as `_from_run`.
+/// The flag values app code gives one server: `ServerFlags(threads=2)`, passed to `run()`,
+/// `start(config=)` or `TestClient(config=)`.
 #[pymethods]
 impl ServerFlags {
     /// # Errors
@@ -811,7 +842,9 @@ impl ServerFlags {
     #[new]
     #[pyo3(signature = (**given))]
     fn new(given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<Self> {
-        flags_of(CodeCall::ServerFlags, given)
+        let mut flags = ServerFlags::default();
+        give_all(&mut flags, CodeCall::ServerFlags, given)?;
+        Ok(flags)
     }
 
     /// These flags with `given` set as well, each named as `ServerFlags(name=)`: what a
@@ -830,12 +863,5 @@ impl ServerFlags {
         let mut flags = self.clone();
         give_all(&mut flags, CodeCall::ProcessLanes, given)?;
         Ok(flags)
-    }
-
-    /// The values `run()` was given, each named as `run(name=)` in summaries and errors.
-    #[staticmethod]
-    #[pyo3(signature = (**given))]
-    fn _from_run(given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<Self> {
-        flags_of(CodeCall::Run, given)
     }
 }

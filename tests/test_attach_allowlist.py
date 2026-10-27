@@ -13,12 +13,10 @@ caller that a thread state is current, so it is never right where `attach` would
 site of either kind is counted in its own list, and moving a site from one to the other
 shows up in both.
 
-Scanned: the engine's `src/` (`crates/pyext/src/` since b/51 E0b) AND every shared crate's
-`crates/*/src/` (b/47 q/5 a). The
-rule is about code that enters Python from a Rust thread, and that code is moving into
-`crates/subinterp` — a rule that only read `src/` would go green the moment a
-guarded site left it, which is how a guard quietly stops guarding. The counts stay exact;
-an allowlist entry follows its file to the new path.
+Scanned: every workspace package's `crates/*/src/`, the engine's `crates/pyext/src/` among them.
+Code that enters Python from a Rust thread moves between crates; a rule that read only one crate
+would go green the moment a guarded site left it. The counts stay exact; an allowlist entry
+follows its file to the new path.
 """
 from __future__ import annotations
 
@@ -34,31 +32,27 @@ ATTACH_CURRENT = re.compile(r"Python::attach_current\s*\(")
 
 # path (relative to the repo root) -> (exact count, why it is safe)
 ALLOWLIST = {
-    # Moved with the file (b/228: which interpreter a Rust thread enters is the sub-interpreter
-    # floor's, `crates/subinterp`).
+    # Which interpreter a Rust thread enters is decided in `crates/subinterp`.
     "crates/subinterp/src/attach.rs": (
         1,
         "with_interpreter itself: runs only when the thread is already bound to the target "
         "interpreter, so it re-attaches that thread state",
     ),
-    # mipyre_subinterp's unit tests (`#[cfg(test)] mod tests`, b/178 review): attaches on the
-    # test's own thread to the main interpreter (`Python::initialize` first). No engine code runs
-    # in it, and no thread is bound to a worker when it attaches. Reviewed when registered.
-    # b/411: 2 -> 1, the take-back test begins its unit with `SubInterpreter::with_unit` on a
-    # real sub-interpreter now, not by attaching to main.
+    # mipyre_subinterp's unit tests (`#[cfg(test)] mod tests`): attaches on the test's own thread
+    # to the main interpreter (`Python::initialize` first). No engine code runs in it, and no
+    # thread is bound to a worker when it attaches.
     "crates/subinterp/src/interp.rs": (
         1,
         "unit tests only (`mod tests`): after a sub-interpreter's prepare panicked, main still "
         "runs Python; the interruption/end protocol's other tests run on a recording host "
-        "since b/303 and attach nothing",
+        "and attach nothing",
     ),
 }
 
 # The same, for `Python::attach_current`.
 ALLOWLIST_CURRENT = {
-    # Moved with the file: the worker lifecycle is `crates/subinterp` since b/47 S2a-5
-    # (q/5 a). Same site, same count — and this is the one place in the whole workspace that
-    # needs an API only the PyO3 fork has, so the fork tag and this entry are one fact.
+    # The one place in the whole workspace that needs an API only the PyO3 fork has, so the
+    # fork tag and this entry are one fact.
     "crates/subinterp/src/interp.rs": (
         1,
         "enter (SubInterpreter::with_gil / with_unit): on the thread the worker is bound to, "
@@ -80,7 +74,7 @@ def _walk_all(root: str):
 
 def scan_roots(root: str) -> list[str]:
     """Every Rust tree the rule covers: each workspace package's `src/` — the engine's
-    (`crates/pyext/src`, b/51 E0b) and every shared crate's."""
+    (`crates/pyext/src`) and every shared crate's."""
     roots = sorted(glob.glob(os.path.join(root, "crates", "*", "src")))
     return [p for p in roots if os.path.isdir(p)]
 
@@ -133,18 +127,18 @@ def test_no_bare_attach_outside_allowlist():
 def test_gate_catches_a_seeded_bare_attach(tmp_path):
     """The gate fails on a new bare attach, not just passes on today's tree."""
     shutil.copytree(os.path.join(ROOT, "crates"), tmp_path / "crates")
-    target = tmp_path / "crates" / "pyext" / "src" / "serve" / "respond.rs"
+    target = tmp_path / "crates" / "server" / "src" / "respond.rs"
     with open(target, "a", encoding="utf-8") as f:
         f.write("\n#[allow(dead_code)]\nfn seeded() {\n    pyo3::Python::attach(|_py| ());\n}\n")
     found = violations(str(tmp_path))
     assert len(found) == 1, found
-    assert found[0].startswith("crates/pyext/src/serve/respond.rs: 1 bare attach site(s)"), found
+    assert found[0].startswith("crates/server/src/respond.rs: 1 bare attach site(s)"), found
 
 
 def test_gate_catches_a_seeded_attach_current(tmp_path):
     """The `attach_current` list is a gate too: a new site fails it."""
     shutil.copytree(os.path.join(ROOT, "crates"), tmp_path / "crates")
-    target = tmp_path / "crates" / "pyext" / "src" / "serve" / "respond.rs"
+    target = tmp_path / "crates" / "server" / "src" / "respond.rs"
     with open(target, "a", encoding="utf-8") as f:
         f.write(
             "\n#[allow(dead_code)]\nfn seeded() {\n"
@@ -152,7 +146,7 @@ def test_gate_catches_a_seeded_attach_current(tmp_path):
         )
     found = violations(str(tmp_path))
     assert len(found) == 1, found
-    assert found[0].startswith("crates/pyext/src/serve/respond.rs: 1 attach_current site(s)"), found
+    assert found[0].startswith("crates/server/src/respond.rs: 1 attach_current site(s)"), found
 
 
 def test_gate_catches_a_seeded_bare_attach_in_a_shared_crate(tmp_path):

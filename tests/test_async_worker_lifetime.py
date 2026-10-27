@@ -25,7 +25,7 @@ from tests._helpers import answers, bound_port, read_file
 BUDGET_S = 1.0
 
 SCRIPT = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre()
 app.request_timeout = BUDGET
 
@@ -44,7 +44,7 @@ async def slow(req):
     return {"slow": True}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, subinterpreters=2)
+    app.run(ServerFlags(host="127.0.0.1", port=0, subinterpreters=2))
 '''.replace("BUDGET", str(BUDGET_S)).replace("SLOW_FOR", str(BUDGET_S / 5))
 
 

@@ -1,4 +1,4 @@
-"""The route vocabulary (docs/design/route-vocabulary.md): the runtime names, and one declaration
+"""The route vocabulary: the runtime names, and one declaration
 surface that a Router and the app share."""
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ import pydantic
 import pytest
 
 from mipyre import BodyStream, Mipyre, OpenApi, Route, Router, Runtime, RuntimeDeclarationError
+from mipyre._routes import _is_prefix, _is_route_path
 
 VERBS = ("get", "post", "put", "delete", "patch", "options", "head", "route")
 EVERY_RUNTIME = "'subinterp', 'isolated', 'process', 'main'"
@@ -51,17 +52,26 @@ def _error_of(declare) -> tuple[type, str]:
     "declare",
     [
         lambda owner: owner.get("/x", lambda req: 1, body=BodyStream),
-        lambda owner: owner.post("/x", lambda req, p: 1, model=Point),
-        lambda owner: owner.post("/x", lambda req: 1, stream=True),
-        lambda owner: owner.get("/x", lambda req: 1, gil=True),
-        lambda owner: owner.get("/x", lambda req: 1, process=False),
         lambda owner: owner.get("/x", lambda req: 1, typo=1),
         lambda owner: owner.get("/x", lambda req: 1, runtime="proces"),
     ],
-    ids=["stream-on-get", "model", "stream", "gil", "process", "unknown-keyword", "unknown-runtime"],
+    ids=["stream-on-get", "unknown-keyword", "unknown-runtime"],
 )
 def test_a_router_refuses_a_declaration_as_the_app_does(declare):
     assert _error_of(lambda: declare(Router())) == _error_of(lambda: declare(Mipyre()))
+
+
+@pytest.mark.parametrize(("path", "taken"), [("/", True), ("/x", True), ("", False), ("x/", False), ("nopath", False)])
+def test_a_route_path_is_one_that_starts_with_a_slash(path, taken):
+    assert _is_route_path(path) is taken
+
+
+@pytest.mark.parametrize("owner", [Mipyre, Router], ids=["app", "router"])
+def test_a_route_path_without_a_leading_slash_is_refused_at_declaration_quoting_it(owner):
+    with pytest.raises(ValueError) as err:
+        owner().get("nopath", lambda req: 1)
+
+    assert str(err.value) == """GET 'nopath': a route path starts with "/\""""
 
 
 def test_a_route_lists_the_function_it_was_declared_with_and_its_classes():
@@ -89,7 +99,9 @@ def test_a_route_neither_it_nor_its_router_places_runs_on_the_apps_runtime(tmp_p
     )
     monkeypatch.syspath_prepend(str(tmp_path))
 
-    app = Mipyre(runtime="main", routers=["routes_mod:router", "routes_mod:placed"])
+    app = Mipyre(runtime="main")
+    app.include_router("routes_mod:router")
+    app.include_router("routes_mod:placed")
     docs = OpenApi(app, title="T", version="1")
 
     assert [(r.path, r.runtime) for r in app.routes] == [
@@ -98,6 +110,96 @@ def test_a_route_neither_it_nor_its_router_places_runs_on_the_apps_runtime(tmp_p
     ]
     assert "/hidden" not in docs.document()["paths"]
     assert "/plain" in docs.document()["paths"]
+
+
+def _router_module(tmp_path, monkeypatch) -> None:
+    (tmp_path / "router_targets.py").write_text("from mipyre import Router\nrouter = Router()\nnot_a_router = 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+
+def test_a_router_target_imports_the_module_and_the_router_it_names(tmp_path, monkeypatch):
+    from mipyre._routes import import_router
+
+    _router_module(tmp_path, monkeypatch)
+    module, router = import_router("router_targets:router")
+
+    assert module.__name__ == "router_targets"
+    assert router is module.router
+
+
+def test_a_router_target_naming_no_attribute_is_a_missing_target_quoting_it(tmp_path, monkeypatch):
+    from mipyre._routes import import_router
+    from mipyre._target import MissingTargetError
+
+    _router_module(tmp_path, monkeypatch)
+    with pytest.raises(MissingTargetError) as err:
+        import_router("router_targets:absent")
+
+    assert str(err.value) == "cannot import 'router_targets:absent': module 'router_targets' has no attribute 'absent'"
+
+
+def test_a_router_target_naming_something_else_is_refused_naming_its_type(tmp_path, monkeypatch):
+    from mipyre._routes import import_router
+
+    _router_module(tmp_path, monkeypatch)
+    with pytest.raises(TypeError) as err:
+        import_router("router_targets:not_a_router")
+
+    assert str(err.value) == "router 'router_targets:not_a_router' is a int, expected mipyre.Router"
+
+
+@pytest.mark.parametrize(
+    ("prefix", "taken"),
+    [("", True), ("/a", True), ("/a/b", True), ("/", False), ("/a/", False), ("a", False), ("a/", False)],
+)
+def test_a_prefix_is_none_or_starts_with_a_slash_and_does_not_end_with_one(prefix, taken):
+    assert _is_prefix(prefix) is taken
+
+
+@pytest.mark.parametrize("prefix", ["", "/a", "/a/b"])
+@pytest.mark.parametrize("path", ["/", "/x", "/x/"])
+def test_a_prefix_joined_to_a_route_path_is_a_route_path_with_no_empty_segment(prefix, path):
+    joined = prefix + path
+
+    assert _is_route_path(joined)
+    assert "//" not in joined
+
+
+def test_an_included_router_serves_each_route_under_the_prefix(tmp_path, monkeypatch):
+    (tmp_path / "admin_mod.py").write_text(
+        "from mipyre import Router\n"
+        "router = Router()\n"
+        "router.get('/', lambda req: 1)\n"
+        "router.get('/users/{id}', lambda req, id: id)\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    app = Mipyre(runtime="main")
+
+    app.include_router("admin_mod:router", prefix="/admin")
+
+    assert [r.path for r in app.routes] == ["/admin/", "/admin/users/{id}"]
+
+
+@pytest.mark.parametrize("prefix", ["/", "/admin/", "admin"])
+def test_an_include_with_a_prefix_of_another_shape_is_refused_quoting_it(prefix):
+    with pytest.raises(ValueError) as err:
+        Mipyre().include_router("admin_mod:router", prefix=prefix)
+
+    assert str(err.value) == (
+        f"include_router('admin_mod:router', prefix={prefix!r}): a prefix starts with \"/\" and does not end with \"/\""
+    )
+
+
+def test_a_router_passed_as_an_object_is_refused_saying_why_and_how_to_name_it():
+    with pytest.raises(TypeError) as err:
+        Mipyre().include_router(Router())
+
+    assert str(err.value) == (
+        'include_router takes a router\'s import string, as in app.include_router("myapp.admin:router"), '
+        "not a Router: each runtime imports only the routers that have routes it serves, so a library a "
+        "router imports (numpy, say) never loads in a sub-interpreter. An object passed here was imported "
+        "by the app's module, which every runtime imports."
+    )
 
 
 def test_every_runtime_has_an_engine_executor():

@@ -112,7 +112,7 @@ def test_get_event_loop_after_a_late_asyncio_import_is_mipyres_error():
 
 
 def test_a_def_handler_runs_a_coroutine_on_a_loop_of_its_own():
-    # What the error tells the user to do instead works in a def handler.
+    # What the error says to do instead works in a def handler.
     with _served("lazy_asyncio_imported.py") as (port, _read_log):
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
         assert _get(conn, "/asyncio-run") == (200, "ran")

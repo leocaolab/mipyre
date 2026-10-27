@@ -3,13 +3,13 @@ lanes it gets. The template's own code is `template.py`, the workers' `worker.py
 processes start on this machine the engine's `ProcessDriver` (src/process_lane/driver.rs),
 the thread pools each worker limits before import `mipyre._thread_pools`.
 
-Start order (docs/process-lanes-declared-design.md §4.1): ``mipyre run module:app``
+Start order: ``mipyre run module:app``
 starts the template with the platform's driver (a fork on Linux) before any app code is
 imported, while mipyre owns a process that runs no other thread, and hands it to the
 server's run. Any other way in (``app.run()``, ``mipyre dev``, a test server) has imported
 the app first, and the app's imports may have started threads (numpy's BLAS pool, a database
 pool) that a fork would leave behind: its first server starts the template as a new
-interpreter, on every platform, whatever threads the process runs (b/909). When the app has
+interpreter, on every platform, whatever threads the process runs. When the app has
 process routes the server sends the template what a worker must import, and each run sends it
 every lane's channel (its shared memory and its host's wake pipe, as fds), which the template
 hands to the workers it starts for that lane without mapping it.
@@ -19,9 +19,9 @@ launcher and a forked template or worker through the packages' `__path__`, a spa
 from scratch. So that they all run the launcher's build even when the install changes under a
 running server, the launcher clones the `mipyre` it loaded into a run directory as it hands the
 template its lanes, and it and the template point their packages there; the workers import from
-there too (docs/design/shm-channel.md §2.2). Only an app with process routes gets one: the run
+there too. Only an app with process routes gets one: the run
 directory lives in the user's cache directory, which a server without process routes never
-writes to (b/877).
+writes to.
 """
 
 from __future__ import annotations
@@ -43,8 +43,9 @@ from types import ModuleType
 from mipyre._clone import PrivateCopyError, claim_name, clone_tree, ensure_private_dir
 from mipyre.engine import (
     BUILD_ID,
-    LaneSet,
+    _LaneSet,
     StartStrategy,
+    _create_lanes,
     _driver_name,
     _driver_spawn_template,
     _driver_start_template,
@@ -58,7 +59,7 @@ from mipyre._process_lane.threads import ThreadedTemplateError, require_single_t
 _PACKAGE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "__init__.py")
 
 __all__ = [
-    "LaneSet", "LaneSetup", "LaneWorker", "SpentTemplate", "Template", "ThreadedTemplateError", "pin_to_run_dir",
+    "LaneSetup", "LaneWorker", "SpentTemplate", "Template", "ThreadedTemplateError", "pin_to_run_dir",
     "start", "start_template_as_new_interpreter", "start_template_with_driver",
 ]
 
@@ -366,12 +367,12 @@ def start(
     *,
     log_level: str,
     log_format: str,
-) -> LaneSet:
+) -> _LaneSet:
     """Makes the server's lanes and hands `template` its setup: each worker sets
     `thread_limits` in its environment, logs as the server does (`log_level`, a `LogLevel`
     name, and `log_format`), then imports the app as `target` (`module:attr`)."""
     depth = ring_depth(settings.queue_per_worker)
-    lanes = LaneSet(
+    lanes = _create_lanes(
         settings.workers,
         slot_bytes=settings.slot_bytes,
         depth=depth,

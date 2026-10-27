@@ -3,22 +3,24 @@
 
 use std::sync::Arc;
 
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
+use pyo3::types::{PyBool, PyFloat, PyInt};
 use tokio_util::sync::CancellationToken;
 
 use crate::boot::{AppSource, Deployment, EntryPoint, ServerFlags, ServerRecipe};
 use crate::pyapi::state::AppStateView;
-use crate::runtime::AbandonedWorker;
-use crate::serve::Routes;
 use mipyre_http::plan::cors::Cors;
 use mipyre_http::plan::cross_origin::HostNames;
 use mipyre_http::plan::forwarded::Proxies;
 use mipyre_http::plan::limits::{
-    connection_limit, BodyMinRate, BodyTimeLimit, ByteLimit, InterruptGrace, MessageByteLimit, RequestBudget,
-    ShutdownTimeout, WsLimitError,
+    connection_limit, BodyGrace, BodyMinRate, BodyTimeLimit, ByteLimit, InterruptGrace, MessageByteLimit, PingAfter,
+    PongWithin, RequestBudget, ShutdownTimeout,
 };
-use mipyre_http::plan::route::RuntimeChoice;
+use mipyre_http::plan::route::{RuntimeChoice, WsPlace};
 use mipyre_http::plan::site::{AccessLog, ServeSettings};
+use mipyre_runtime::AbandonedWorker;
+use mipyre_runtime::Routes;
 
 #[cfg(feature = "bench")]
 mod bench;
@@ -35,7 +37,7 @@ struct RunSettings {
     recipe: ServerRecipe,
     names: HostNames,
     proxies: Proxies,
-    command_line: crate::runtime::CommandLine,
+    command_line: mipyre_runtime::CommandLine,
     /// The server takes TCP connections, not only in-memory ones.
     tcp: bool,
 }
@@ -53,25 +55,25 @@ pub(crate) struct App {
     routes: Arc<crate::sync::RwLock<Routes>>,
     /// The server's workers rebuild the app from this.
     source: AppSource,
-    store: crate::runtime::AppStore,
+    store: mipyre_runtime::AppStore,
     settings: ServeSettings,
     access_log: AccessLogSetting,
     /// Each server's run adds the worker threads it abandoned at shutdown to this.
     abandoned: crate::boot::AbandonedWorkers,
-    process_lanes: Option<Arc<crate::runtime::process::ServerLanes>>,
+    process_lanes: Option<Arc<mipyre_process::ServerLanes>>,
     /// Each run serves its metrics page at this path, through the app's hooks, when it is set.
     metrics_path: Option<String>,
     /// Counts this app's server runs, to name each in an error.
     runs: crate::sync::AtomicU64,
     /// The modules whose code makes this app's `PgPool` handles (where it was created, its
-    /// routers'), besides its script: a run takes only theirs (b/335 D17, q/157 C).
-    home_modules: Vec<crate::runtime::ModuleKey>,
+    /// routers'), besides its script: a run takes only theirs.
+    home_modules: Vec<mipyre_pg::ModuleKey>,
 }
 
 pyo3::create_exception!(
     mipyre.engine,
     LateRegistrationError,
-    crate::runtime::DeclarationError,
+    mipyre_runtime::DeclarationError,
     "A route or hook registered after the app's registrations were sealed (the first \
      server's start). Workers rebuild the app by running its script, so they only have \
      what the script registered: a late hook would silently skip every worker route. A \
@@ -119,7 +121,7 @@ impl App {
                 routers: Vec::new(),
                 isolation: false,
             },
-            store: crate::runtime::map_for_new(py)?,
+            store: mipyre_runtime::map_for_new(py)?,
             settings: ServeSettings::defaults(),
             access_log: AccessLogSetting {
                 on: false,
@@ -147,7 +149,7 @@ impl App {
 
     /// Set the process lanes this app's `runtime="process"` routes run on; they must be set
     /// before the first server starts.
-    fn _set_process_lanes(&mut self, lanes: &crate::runtime::process::LaneSet) -> PyResult<()> {
+    fn _set_process_lanes(&mut self, lanes: &crate::pyapi::lane_set::PyLaneSet) -> PyResult<()> {
         self.process_lanes = Some(Arc::clone(lanes.server("_set_process_lanes")?));
         Ok(())
     }
@@ -161,11 +163,12 @@ impl App {
     fn _serve_lane_worker(
         &self,
         py: Python<'_>,
-        lanes: &crate::runtime::process::LaneSet,
+        lanes: &crate::pyapi::lane_set::PyLaneSet,
         template_pid: i32,
     ) -> PyResult<()> {
-        let template_pid = crate::runtime::process::pid_from_python(template_pid)?;
-        lanes.serve_worker(py, self.rules(py), template_pid)
+        let template_pid = crate::pyapi::lane_set::pid_from_python(template_pid)?;
+        let (peer, bell) = lanes.peer("serving a lane")?;
+        mipyre_runtime::serve_lane_worker(py, peer, bell, self.rules(py), template_pid)
     }
 
     /// Take the worker threads this app's servers abandoned at shutdown; a second call
@@ -289,20 +292,22 @@ impl App {
     }
 
     /// Set this app's largest request body in bytes; a larger body is answered 413. The
-    /// default is 10 MiB.
-    fn set_max_body_size(&mut self, size: usize) {
-        self.settings.limits.max_body = ByteLimit(size as u64);
+    /// default is 2.5 MiB.
+    fn set_max_body_size(&mut self, size: &Bound<'_, PyAny>) -> PyResult<()> {
+        const SETTING: &str = "max_body_size";
+        self.settings.limits.max_body = ByteLimit::new(SETTING, int_setting(SETTING, size)?).map_err(refused)?;
+        Ok(())
     }
 
-    fn max_body_size(&self) -> usize {
-        self.settings.limits.max_body.as_usize()
+    fn max_body_size(&self) -> u64 {
+        self.settings.limits.max_body.0
     }
 
-    /// Set the seconds each step of a request may take: its whole body arriving (408 past
-    /// it), then its handler answering (504 past it). The default is 30.
-    fn set_request_timeout(&mut self, seconds: f64) -> PyResult<()> {
+    /// Set the seconds a request's handler may take to answer (504 past it), and a streamed
+    /// body's handler to take each chunk. The default is 30.
+    fn set_request_timeout(&mut self, seconds: &Bound<'_, PyAny>) -> PyResult<()> {
         self.settings.limits.request_budget =
-            RequestBudget::from_secs(seconds).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            RequestBudget::from_secs(seconds_setting("request_timeout", seconds)?).map_err(refused)?;
         Ok(())
     }
 
@@ -310,11 +315,23 @@ impl App {
         self.settings.limits.request_budget.get().as_secs_f64()
     }
 
-    /// Set how many bytes of request body earn one more second past the request timeout. The
-    /// default is 1024.
-    fn set_body_min_rate(&mut self, bytes_per_second: i64) -> PyResult<()> {
+    /// Set the seconds a request body may take to arrive however slowly it comes (408 past it,
+    /// unless it keeps up the minimum rate). The default is 5.
+    fn set_body_grace(&mut self, seconds: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.settings.limits.body_grace =
+            BodyGrace::from_secs(seconds_setting("body_grace", seconds)?).map_err(refused)?;
+        Ok(())
+    }
+
+    fn body_grace(&self) -> f64 {
+        self.settings.limits.body_grace.get().as_secs_f64()
+    }
+
+    /// Set the average rate, in bytes per second, below which a request body is refused once its
+    /// grace has passed. The default is 1024.
+    fn set_body_min_rate(&mut self, bytes_per_second: &Bound<'_, PyAny>) -> PyResult<()> {
         self.settings.limits.body_min_rate =
-            BodyMinRate::new(bytes_per_second).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            BodyMinRate::new(int_setting("body_min_rate", bytes_per_second)?).map_err(refused)?;
         Ok(())
     }
 
@@ -322,11 +339,11 @@ impl App {
         self.settings.limits.body_min_rate.get().get()
     }
 
-    /// Set the seconds a request body may take at most, whatever it earns by arriving. The
-    /// default is 600.
-    fn set_body_time_limit(&mut self, seconds: f64) -> PyResult<()> {
+    /// Set the seconds a request body may take at most, however fast it arrives. The
+    /// default is 30.
+    fn set_body_time_limit(&mut self, seconds: &Bound<'_, PyAny>) -> PyResult<()> {
         self.settings.limits.body_time_limit =
-            BodyTimeLimit::from_secs(seconds).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            BodyTimeLimit::from_secs(seconds_setting("body_time_limit", seconds)?).map_err(refused)?;
         Ok(())
     }
 
@@ -336,9 +353,9 @@ impl App {
 
     /// Set the seconds an interrupted sync request's worker gets to end it before it is
     /// abandoned. The default is 2.
-    fn set_interrupt_grace(&mut self, seconds: f64) -> PyResult<()> {
+    fn set_interrupt_grace(&mut self, seconds: &Bound<'_, PyAny>) -> PyResult<()> {
         self.settings.limits.interrupt_grace =
-            InterruptGrace::from_secs(seconds).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            InterruptGrace::from_secs(seconds_setting("interrupt_grace", seconds)?).map_err(refused)?;
         Ok(())
     }
 
@@ -348,9 +365,9 @@ impl App {
 
     /// Set the seconds a shutdown waits for each of the app's threads to finish its requests
     /// and end its interpreter. The default is 5.
-    fn set_shutdown_timeout(&mut self, seconds: f64) -> PyResult<()> {
+    fn set_shutdown_timeout(&mut self, seconds: &Bound<'_, PyAny>) -> PyResult<()> {
         self.settings.limits.shutdown_timeout =
-            ShutdownTimeout::from_secs(seconds).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            ShutdownTimeout::from_secs(seconds_setting("shutdown_timeout", seconds)?).map_err(refused)?;
         Ok(())
     }
 
@@ -360,8 +377,9 @@ impl App {
 
     /// Set the largest WebSocket message and frame in bytes, in either direction. The default
     /// is 1 MiB.
-    fn set_max_websocket_message_size(&mut self, size: i64) -> PyResult<()> {
-        self.settings.limits.ws.max_message_bytes = MessageByteLimit::new(size).map_err(ws_limit_error)?;
+    fn set_max_websocket_message_size(&mut self, size: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.settings.limits.ws.max_message_bytes =
+            MessageByteLimit::new(int_setting("max_websocket_message_size", size)?).map_err(refused)?;
         Ok(())
     }
 
@@ -371,13 +389,38 @@ impl App {
 
     /// Set how many WebSocket connections may be open at once; an upgrade beyond it is
     /// answered 503. The default is 1024.
-    fn set_max_websocket_connections(&mut self, count: i64) -> PyResult<()> {
-        self.settings.limits.ws.max_connections = connection_limit(count).map_err(ws_limit_error)?;
+    fn set_max_websocket_connections(&mut self, count: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.settings.limits.ws.max_connections =
+            connection_limit(int_setting("max_websocket_connections", count)?).map_err(refused)?;
         Ok(())
     }
 
     fn max_websocket_connections(&self) -> usize {
         self.settings.limits.ws.max_connections.get()
+    }
+
+    /// Set the seconds a WebSocket client may go unheard before the server pings it. The
+    /// default is 20.
+    fn set_websocket_ping_interval(&mut self, seconds: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.settings.limits.ws.keepalive.ping_after =
+            PingAfter::from_secs(seconds_setting("websocket_ping_interval", seconds)?).map_err(refused)?;
+        Ok(())
+    }
+
+    fn websocket_ping_interval(&self) -> f64 {
+        self.settings.limits.ws.keepalive.ping_after.get().as_secs_f64()
+    }
+
+    /// Set the seconds a pinged WebSocket client has to send a frame before the server closes
+    /// it with 1011. The default is 20.
+    fn set_websocket_ping_timeout(&mut self, seconds: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.settings.limits.ws.keepalive.pong_within =
+            PongWithin::from_secs(seconds_setting("websocket_ping_timeout", seconds)?).map_err(refused)?;
+        Ok(())
+    }
+
+    fn websocket_ping_timeout(&self) -> f64 {
+        self.settings.limits.ws.keepalive.pong_within.get().as_secs_f64()
     }
 
     /// Register a constant response for an exact method and path, served without entering
@@ -437,9 +480,16 @@ impl App {
         self.source.script_path = Some(path);
     }
 
+    /// Returns the app's source file, absolute: the one set by `set_script_path`, else
+    /// `__main__.__file__`. Sub-interpreter workers execute it and the reloader watches its
+    /// directory.
+    fn app_file(&self, py: Python<'_>) -> PyResult<std::ffi::OsString> {
+        Ok(mipyre_runtime::app_file(py, self.source.script_path.as_deref())?.into_os_string())
+    }
+
     /// Records a module whose code makes this app's `PgPool` handles, by its globals.
     fn _add_home_module(&mut self, globals: &Bound<'_, pyo3::types::PyDict>) -> PyResult<()> {
-        let key = crate::runtime::ModuleKey::of_globals(globals)?;
+        let key = crate::db::module_key_of_globals(globals)?;
         if !self.home_modules.contains(&key) {
             self.home_modules.push(key);
         }
@@ -499,12 +549,45 @@ impl App {
         Ok(())
     }
 
-    /// Register the WebSocket handler for `path`, whose `{name}` parameters land in
-    /// `ws.request.params`. A second handler for the same path raises `ValueError`.
-    fn websocket(&mut self, path: &str, handler: Py<PyAny>) -> PyResult<()> {
-        self.routes
-            .write()
-            .add_websocket(path, handler)
+    /// Register the `async def` WebSocket handler for `path`, whose `{name}` parameters land in
+    /// `ws.request.params`, to run on a sub-interpreter worker or, with `runtime=Main`, on the
+    /// main interpreter. A `def` handler raises `TypeError`; `runtime=Lane`, or a second handler
+    /// for the same path, `ValueError`; and a worker route registered once the app is sealed
+    /// `LateRegistrationError`.
+    #[pyo3(signature = (path, handler, runtime=PyRuntimeChoice::Worker))]
+    fn websocket(
+        slf: &Bound<'_, Self>,
+        path: &str,
+        handler: Bound<'_, PyAny>,
+        runtime: PyRuntimeChoice,
+    ) -> PyResult<()> {
+        Self::serve_in_worker(slf)?;
+        if !crate::pyapi::is_async_handler(&handler)? {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "websocket {path}: the handler must be an `async def`: it awaits ws.recv() and ws.send() on an \
+                 async engine, where a blocking wait would stall every other connection"
+            )));
+        }
+        let place = match runtime {
+            PyRuntimeChoice::Worker => WsPlace::Worker,
+            PyRuntimeChoice::Main => WsPlace::Main,
+            PyRuntimeChoice::Lane => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "websocket {path}: runtime='process' does not serve WebSocket connections; use \
+                     the default (a sub-interpreter) or runtime='main'"
+                )))
+            }
+        };
+        let app = slf.borrow();
+        let mut routes = app.routes.write();
+        if routes.is_sealed() && place == WsPlace::Worker {
+            return Err(LateRegistrationError::new_err(format!(
+                "websocket {path} is registered after app.run() started (for example from an on_startup \
+                 hook). Such a route exists only in the main interpreter, so it needs runtime='main'."
+            )));
+        }
+        routes
+            .add_websocket(path, handler.unbind(), place)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
@@ -525,7 +608,7 @@ impl App {
     /// `OSError(EADDRINUSE)` here.
     ///
     /// Its flags are `deployment` (what the entry point read; none by default) laid over
-    /// `config` (what the code gives; nothing by default): a deployment value wins (b/335 D7).
+    /// `config` (what the code gives; nothing by default): a deployment value wins.
     /// Nothing serves until the returned `Server`'s `serve()`, and its `shutdown()` stops only
     /// that server. `allowed_hosts` are the DNS names a request's host may be besides
     /// `localhost` and IP addresses (`["*"]`: any); any other host is answered 421.
@@ -542,7 +625,7 @@ impl App {
         deployment: Option<PyRef<'_, Deployment>>,
         config: Option<PyRef<'_, ServerFlags>>,
         transport: Option<&str>,
-        command_line: Option<crate::runtime::CommandLine>,
+        command_line: Option<mipyre_runtime::CommandLine>,
     ) -> PyResult<Server> {
         // A worker executes the whole script, so an unguarded `app.run()` in a raw-engine
         // script reaches here during the worker's init, which must not start a server.
@@ -554,7 +637,7 @@ impl App {
                  `if not mipyre.engine._in_worker():`",
             ));
         }
-        crate::exchange::require_json(py)?;
+        mipyre_runtime::exchange::require_json(py)?;
         let none = Deployment::default();
         let deployment = deployment.as_deref().unwrap_or(&none);
         let nothing = ServerFlags::default();
@@ -571,7 +654,7 @@ impl App {
         }
         let command_line = match command_line {
             Some(line) => line,
-            None => crate::runtime::CommandLine::of_main(py)?,
+            None => mipyre_runtime::CommandLine::of_main(py)?,
         };
         let stop = CancellationToken::new();
         let (parts, bound) = match transport {
@@ -595,7 +678,10 @@ impl App {
                 let (run, ()) = self.server_run(py, settings, &stop, |loops| {
                     Ok((server::bind(&specs, loops, &addresses)?, ()))
                 })?;
-                (server::RunSources::of(&run.site), server::BoundServer::tcp(run))
+                (
+                    server::RunSources::of(&run.site, &run.workers),
+                    server::BoundServer::tcp(run),
+                )
             }
             Transport::Memory => {
                 // No browser reaches a server without a socket, so no host is checked.
@@ -610,7 +696,7 @@ impl App {
                     Ok(mipyre_transport::memory::memory_listeners(loops))
                 })?;
                 (
-                    server::RunSources::of(&run.site),
+                    server::RunSources::of(&run.site, &run.workers),
                     server::BoundServer::memory(run, connector),
                 )
             }
@@ -619,12 +705,11 @@ impl App {
     }
 
     /// Bind with `start()`, then serve until SIGINT: a script's entry point, so its flags are
-    /// this process's deployment laid over `run()`'s keywords.
-    #[pyo3(signature = (**given))]
-    fn run(&self, py: Python<'_>, given: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<()> {
-        let config = Py::new(py, crate::pyapi::config::run_flags(given)?)?;
+    /// this process's deployment laid over `config`.
+    #[pyo3(signature = (config=None))]
+    fn run(&self, py: Python<'_>, config: Option<PyRef<'_, ServerFlags>>) -> PyResult<()> {
         let deployment = Py::new(py, Deployment::from_process(&[], EntryPoint::Script)?)?;
-        self.start(py, Some(deployment.borrow(py)), Some(config.borrow(py)), None, None)?
+        self.start(py, Some(deployment.borrow(py)), config, None, None)?
             .serve(py, None)
     }
 
@@ -634,15 +719,15 @@ impl App {
     /// Every route must be sync, off the GIL and not streaming; a failed worker or client
     /// raises.
     #[cfg(feature = "bench")]
-    #[pyo3(signature = (duration_s=10, workers=None, conns_per_worker=8))]
+    #[pyo3(signature = (duration_s=10, threads=None, conns_per_thread=8))]
     fn bench_inmem(
         &self,
         py: Python<'_>,
         duration_s: u64,
-        workers: Option<usize>,
-        conns_per_worker: usize,
+        threads: Option<usize>,
+        conns_per_thread: usize,
     ) -> PyResult<(u64, f64)> {
-        self.run_bench_inmem(py, duration_s, workers, conns_per_worker)
+        self.run_bench_inmem(py, duration_s, threads, conns_per_thread)
     }
 
     /// Measure the per-request cost of `request` on one TPC worker over `conns` in-memory
@@ -671,15 +756,15 @@ impl App {
     /// Every route must be sync, off the GIL and not streaming; a failed worker or client
     /// raises.
     #[cfg(feature = "bench")]
-    #[pyo3(signature = (duration_s=10, workers=None, client_conns=32))]
+    #[pyo3(signature = (duration_s=10, threads=None, client_conns=32))]
     fn bench_loopback(
         &self,
         py: Python<'_>,
         duration_s: u64,
-        workers: Option<usize>,
+        threads: Option<usize>,
         client_conns: usize,
     ) -> PyResult<(u64, f64, u16)> {
-        self.run_bench_loopback(py, duration_s, workers, client_conns)
+        self.run_bench_loopback(py, duration_s, threads, client_conns)
     }
 }
 
@@ -724,6 +809,30 @@ fn refuse_sealed_hook(routes: &Routes, what: &str) -> PyResult<()> {
     }
 }
 
-fn ws_limit_error(e: WsLimitError) -> PyErr {
+/// Raises a limit's refusal of a value as `ValueError`; the refusal names the setting and the value.
+fn refused(e: impl std::error::Error) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
+
+/// Reads a limit set in whole units from Python. A `bool` is an `int` subclass, but a limit set
+/// to `True` is a bug, not 1.
+fn int_setting(setting: &str, value: &Bound<'_, PyAny>) -> PyResult<i64> {
+    if value.is_instance_of::<PyBool>() || !value.is_instance_of::<PyInt>() {
+        return Err(PyTypeError::new_err(format!(
+            "{setting} must be int, got {}",
+            value.get_type().name()?
+        )));
+    }
+    value.extract()
+}
+
+/// Reads a limit set in seconds from Python: an `int` or a `float`, never a `bool`.
+fn seconds_setting(setting: &str, value: &Bound<'_, PyAny>) -> PyResult<f64> {
+    if value.is_instance_of::<PyBool>() || !(value.is_instance_of::<PyInt>() || value.is_instance_of::<PyFloat>()) {
+        return Err(PyTypeError::new_err(format!(
+            "{setting} must be int or float seconds, got {}",
+            value.get_type().name()?
+        )));
+    }
+    value.extract()
 }

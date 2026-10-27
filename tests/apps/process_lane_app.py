@@ -7,7 +7,7 @@ import os
 import threading
 import time
 
-from mipyre import Mipyre, Response, Stream
+from mipyre import Mipyre, Response, Stream, ServerFlags
 
 app = Mipyre()
 app.enable_access_log()
@@ -123,7 +123,7 @@ def hog(req):
 
 @app.get("/lanes", runtime="main")
 def lanes(req):
-    return dict(app.process_lanes.stats())
+    return app.lane_stats()
 
 
 @app.get("/server_pid", runtime="main")
@@ -133,9 +133,9 @@ def server_pid(req):
 
 @app.get("/lane_stats", runtime="main")
 def lane_stats(req):
-    stats = app.process_lanes.stats()
+    stats = app.lane_stats()
     return {"deaths": stats["deaths"], "respawns": stats["respawns"]}
 
 
 if __name__ == "__main__":
-    app.run(port=0)
+    app.run(ServerFlags(port=0))

@@ -9,7 +9,7 @@ the calling thread waits with its GIL released, so other workers make progress. 
 variants run on the main interpreter (`runtime="main"` routes); in a worker they raise
 `NotImplementedError`.
 
-The pools belong to the server run (b/335 D17). `PgPool.connect()` connects nothing: it
+The pools belong to the server run. `PgPool.connect()` connects nothing: it
 returns a handle and records what it asked for and which module asked. When a server starts it
 opens one pool per DSN from every handle the main interpreter still holds that its own app's
 modules made (the module that created the app, its script, its routers), and binds them to it;
@@ -103,15 +103,13 @@ keys its subclass ``UniqueViolation`` (SQLSTATE 23505).
 
 For large result sets, use `pool.fetch_iter(sql, ...)` to get a
 streaming cursor — O(1) memory, rows yielded one at a time; it works in any
-interpreter. Returning a streaming *response* (`Stream`) needs `runtime="main"`,
-so an export-style handler looks like this:
+interpreter. Returning a streaming *response* (`EventSourceResponse`, a `Stream`) needs
+`runtime="main"`, so an export-style handler looks like this:
 
     @app.get("/export", runtime="main")
     def export(req):
-        def stream():
-            for row in pool.fetch_iter("SELECT * FROM transactions"):
-                yield json.dumps(row) + "\\n"
-        return Stream(stream())
+        rows = pool.fetch_iter("SELECT * FROM transactions")
+        return EventSourceResponse(ServerSentEvent(json.dumps(row)) for row in rows)
 
 Not supported: transactions; mapping rows to Pydantic models.
 """

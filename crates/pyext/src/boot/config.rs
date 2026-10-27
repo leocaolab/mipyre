@@ -3,7 +3,7 @@
 //!
 //! Nothing deeper in the run path reads the environment. A value that cannot be used is a
 //! startup error naming its source and the text as written, never a silent default; every such
-//! error is found before any is reported (b/335 D19).
+//! error is found before any is reported.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -12,14 +12,14 @@ use std::path::{Path, PathBuf};
 
 use pyo3::prelude::*;
 
-use crate::runtime::process::{FailurePolicy, LaneRecipe, StartStrategy};
-use crate::runtime::BridgeConfig;
-use crate::serve::AcceptMode;
+use mipyre_process::{FailurePolicy, LaneRecipe, StartStrategy};
+use mipyre_runtime::MainSizes;
+use mipyre_server::AcceptMode;
 use mipyre_subinterp::gc::{GcMode, GcPolicy};
 
 use super::settings::{
-    CodeCall, CodeKey, Deployment, EntryPoint, Flag, FlagType, PyprojectKey, ServerFlagValues, ServerFlags, FLAGS,
-    RESERVED_PREFIXES,
+    cli_option, env_variable, CodeCall, CodeKey, Deployment, EntryPoint, Flag, FlagType, PyprojectKey,
+    ServerFlagValues, ServerFlags, FLAGS, RESERVED_PREFIXES,
 };
 
 /// Counts the requests a worker serves between `gc.collect()`s in count mode; on the baseline
@@ -28,11 +28,14 @@ const DEFAULT_GC_THRESHOLD: u64 = 100_000;
 /// Counts the requests after which idle mode collects even without a lull.
 const DEFAULT_GC_OOM_FAILSAFE: u64 = 50_000;
 const DEFAULT_GC_IDLE: std::time::Duration = std::time::Duration::from_millis(100);
-/// Runs four main-interpreter bridge threads because handlers mix CPU and I/O, and an
-/// I/O-bound handler releases the GIL for its peers.
-const DEFAULT_BRIDGE_WORKERS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
-/// Gives each bridge thread this many queue slots when the capacity is not set.
-const BRIDGE_QUEUE_PER_WORKER: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+/// Allows the thread-per-core server four main-interpreter `def` threads, all started with it,
+/// because handlers mix CPU and I/O and an I/O-bound handler releases the GIL for its peers.
+const DEFAULT_TPC_MAIN_THREADS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Allows the multi-thread server as many main-interpreter `def` threads as tokio's blocking pool,
+/// which ran them before, so as many handlers can wait on I/O at once.
+const DEFAULT_MULTI_THREAD_MAIN_THREADS: NonZeroUsize = NonZeroUsize::new(512).unwrap();
+/// Gives each main-interpreter `def` thread this many queue slots when the queue is not sized.
+const MAIN_QUEUE_PER_THREAD: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
 /// Holds the sizes given to a server, each with where it was given; `None` takes the topology's
 /// default.
@@ -57,11 +60,21 @@ pub(crate) enum ServerKind {
     MultiThread,
 }
 
+/// Returns the most main-interpreter `def` threads a server allows when the flag does not say.
+/// The thread-per-core server starts all four and never grows; the multi-thread one, the pool's
+/// and the GIL-mode server's alike, grows to as many as tokio's blocking pool did.
+fn default_main_threads(server: ServerKind) -> NonZeroUsize {
+    match server {
+        ServerKind::Tpc(_) => DEFAULT_TPC_MAIN_THREADS,
+        ServerKind::MultiThread => DEFAULT_MULTI_THREAD_MAIN_THREADS,
+    }
+}
+
 /// Holds the engine's own settings a server runs with (from its flags).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EngineSettings {
     pub(crate) gc: GcPolicy,
-    pub(crate) bridge: BridgeConfig,
+    pub(crate) main: MainSizes,
     /// Counts the requests the async worker pool queues before it answers 503; `None` keeps the
     /// pool's default.
     pub(crate) async_queue_capacity: Option<NonZeroUsize>,
@@ -69,18 +82,15 @@ pub(crate) struct EngineSettings {
     pub(crate) metrics: bool,
 }
 
-// ---- The deployment: what the command line, the environment and pyproject.toml give (b/335 C3). ----
+// ---- The deployment: what the command line, the environment and pyproject.toml give. ----
 
 /// Where a deployment value came from, as the user wrote that place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DeploymentPlace {
     /// An option of mipyre's command line: `command` is `mipyre run` or `mipyre dev`.
-    Cli {
-        command: &'static str,
-        option: &'static str,
-    },
+    Cli { command: &'static str, option: String },
     /// An environment variable.
-    Env(&'static str),
+    Env(String),
     /// A key of `pyproject.toml`, on `line` (from 1).
     File {
         path: PathBuf,
@@ -251,7 +261,7 @@ pub(crate) enum FlagError {
     #[error("{env}={lossy:?} is invalid for {flag}: it is not UTF-8")]
     NotUnicode {
         flag: &'static str,
-        env: &'static str,
+        env: String,
         lossy: String,
     },
     #[error("{}:{line}:{column}: pyproject.toml is not valid TOML: {message}", .path.display())]
@@ -269,7 +279,8 @@ pub(crate) enum FlagError {
     },
     #[error("{}: cannot be read: {error}", .path.display())]
     UnreadablePyproject { path: PathBuf, error: std::io::ErrorKind },
-    /// A `MIPYRE_` variable no flag reads (D19): a misspelled flag or a removed one.
+    /// A `MIPYRE_` variable no flag reads (D19): a misspelled flag or a removed
+    /// one. Its value is left out, since a variable nobody reads may hold a secret.
     #[error(
         "{name} is set, but it is not one of mipyre's settings (`mipyre run --help` lists them); \
          unset it, or rename it if it is your own ({reserved} are left to test and benchmark \
@@ -297,6 +308,14 @@ pub(crate) enum FlagError {
     TlsCertWithoutKey { cert: FlagSource },
     #[error("tls_key ({key}) is given without tls_cert: give both, or neither")]
     TlsKeyWithoutCert { key: FlagSource },
+    /// A TLS file a flag names cannot be used; `reason` says what reading it found, naming the
+    /// file.
+    #[error("{flag} ({from}): {reason}")]
+    TlsFileUnusable {
+        flag: &'static str,
+        from: FlagSource,
+        reason: String,
+    },
     #[error("port {port} is given twice: as {first} and as {second}")]
     DuplicatePort {
         port: u16,
@@ -325,6 +344,15 @@ impl ConfigError {
 
     pub(crate) fn errors(&self) -> impl Iterator<Item = &FlagError> {
         std::iter::once(&*self.first).chain(&self.rest)
+    }
+}
+
+impl From<FlagError> for ConfigError {
+    fn from(error: FlagError) -> Self {
+        ConfigError {
+            first: Box::new(error),
+            rest: Vec::new(),
+        }
     }
 }
 
@@ -438,22 +466,22 @@ pub(crate) fn read_flag<T: FlagType>(
         "{}: flags! gave it a shape its type is not written in",
         flag.name
     );
+    let env = env_variable(flag.name);
     let (raw, from) = if let Some((_, raw)) = sources.flags.iter().find(|(name, _)| *name == flag.name) {
-        let command = sources.entry.command().unwrap_or("mipyre run");
         (
             raw.clone(),
             DeploymentPlace::Cli {
-                command,
-                option: flag.cli,
+                command: cli_command(sources.entry),
+                option: cli_option(flag.name),
             },
         )
-    } else if let Some((_, raw)) = sources.env.iter().find(|(name, _)| name == flag.env) {
+    } else if let Some((_, raw)) = sources.env.iter().find(|(name, _)| *name == *env) {
         let raw = raw.clone().into_string().map_err(|raw| FlagError::NotUnicode {
             flag: flag.name,
-            env: flag.env,
+            env: env.clone(),
             lossy: raw.to_string_lossy().into_owned(),
         })?;
-        (raw, DeploymentPlace::Env(flag.env))
+        (raw, DeploymentPlace::Env(env))
     } else if let Some((path, entry)) = sources.file.as_ref().and_then(|file| {
         let (table, key) = Table::of(flag.file);
         file.entries
@@ -559,18 +587,47 @@ fn file_entry(text: &str, value: &toml::Spanned<toml::de::DeValue<'_>>) -> FileE
     }
 }
 
-/// Every `MIPYRE_` variable of `env` no flag reads, outside the reserved prefixes; a variable
-/// whose name is not UTF-8 is named with its invalid sequences replaced.
+/// What a variable's name is to mipyre.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VariableRole {
+    Current,
+    Reserved,
+    Unknown,
+}
+
+/// Returns what `name` is to mipyre, or `None` outside its prefix.
+fn variable_role(name: &str) -> Option<VariableRole> {
+    if !name.starts_with("MIPYRE_") {
+        return None;
+    }
+    Some(if FLAGS.iter().any(|flag| env_variable(flag.name) == name) {
+        VariableRole::Current
+    } else if RESERVED_PREFIXES.iter().any(|prefix| name.starts_with(prefix)) {
+        VariableRole::Reserved
+    } else {
+        VariableRole::Unknown
+    })
+}
+
+/// Every variable of `env` in mipyre's prefix that no flag reads.
 fn unknown_variables(env: &[(OsString, OsString)]) -> Vec<FlagError> {
     env.iter()
-        .map(|(name, _)| name.to_string_lossy())
-        .filter(|name| name.starts_with("MIPYRE_"))
-        .filter(|name| !RESERVED_PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
-        .filter(|name| !FLAGS.iter().any(|flag| flag.env == name.as_ref()))
-        .map(|name| FlagError::UnknownVariable {
-            name: name.into_owned(),
+        .filter_map(|(name, _)| {
+            let name = name.to_string_lossy();
+            match variable_role(&name)? {
+                VariableRole::Current | VariableRole::Reserved => None,
+                VariableRole::Unknown => Some(FlagError::UnknownVariable {
+                    name: name.into_owned(),
+                }),
+            }
         })
         .collect()
+}
+
+/// Returns the command whose options gave a value; only `mipyre run` and `mipyre dev` have
+/// options, so an entry point without a command line is named as `mipyre run`.
+fn cli_command(entry: EntryPoint) -> &'static str {
+    entry.command().unwrap_or("mipyre run")
 }
 
 /// Every key of the file's two tables no flag reads.
@@ -601,7 +658,7 @@ impl Deployment {
         file: Option<(&Path, &str)>,
         entry: EntryPoint,
     ) -> Result<Self, ConfigError> {
-        let mut errors = Vec::new();
+        let mut errors: Vec<FlagError> = Vec::new();
         let file = file.and_then(|(path, text)| match pyproject_tables(path, text) {
             Ok(entries) => Some(PyprojectTables { path, entries }),
             Err(error) => {
@@ -663,7 +720,7 @@ impl Deployment {
 }
 
 /// One server's flags laid over its code and checked together: everything its run is built from
-/// that a flag decides (b/335 C4).
+/// that a flag decides.
 #[derive(Debug, Clone)]
 pub(crate) struct ServerRecipe {
     pub(crate) values: ServerFlagValues,
@@ -813,11 +870,14 @@ impl ServerRecipe {
             },
             GcMode::Off => GcPolicy::Off,
         };
-        let workers = or_default(&values.bridge_workers, DEFAULT_BRIDGE_WORKERS);
-        let capacity = or_default(&values.bridge_capacity, workers.saturating_mul(BRIDGE_QUEUE_PER_WORKER));
+        let max_threads = or_default(&values.bridge_workers, default_main_threads(server));
+        let queue = or_default(
+            &values.bridge_capacity,
+            max_threads.saturating_mul(MAIN_QUEUE_PER_THREAD),
+        );
         let tuning = EngineSettings {
             gc,
-            bridge: BridgeConfig { workers, capacity },
+            main: MainSizes { max_threads, queue },
             async_queue_capacity: values.async_queue_capacity.as_ref().map(|value| *value.value()),
             metrics: or_default(&values.metrics, false),
         };
@@ -876,6 +936,51 @@ pub(super) mod tests {
                 .contains("MIPYRE_RUNTIME is set, but it is not one of mipyre's settings"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn a_former_variable_is_unknown_and_the_current_one_is_read() {
+        let e = Deployment::resolve(&variables(&["MIPYRE_TPC_DARWIN"]), &[], None, EntryPoint::Script).unwrap_err();
+        let unknown: Vec<_> = e.errors().cloned().collect();
+        assert_eq!(
+            unknown,
+            [FlagError::UnknownVariable {
+                name: "MIPYRE_TPC_DARWIN".to_string(),
+            }]
+        );
+        let current = [(OsString::from("MIPYRE_PROCESS_QUEUE_PER_WORKER"), OsString::from("8"))];
+        let d = Deployment::resolve(&current, &[], None, EntryPoint::Script).unwrap();
+        assert_eq!(d.process_queue.unwrap().value.get(), 8);
+    }
+
+    #[test]
+    fn only_a_name_under_the_mipyre_prefix_is_mipyres() {
+        assert_eq!(variable_role("MIPYRE_"), Some(VariableRole::Unknown));
+        assert_eq!(variable_role("MIPYRE"), None);
+        assert_eq!(variable_role("mipyre_host"), None);
+        assert_eq!(variable_role("_MIPYRE_HOST"), None);
+    }
+
+    #[test]
+    fn workers_is_unknown_and_threads_is_current() {
+        assert_eq!(variable_role("MIPYRE_WORKERS"), Some(VariableRole::Unknown));
+        assert_eq!(variable_role("MIPYRE_THREADS"), Some(VariableRole::Current));
+        assert_eq!(variable_role("MIPYRE_WORKER"), Some(VariableRole::Unknown));
+    }
+
+    #[test]
+    fn an_unknown_variable_is_refused_by_its_name_without_its_value() {
+        let secret = "postgres://app:hunter2@db/prod";
+        let env = [(OsString::from("MIPYRE_IO_WORKERS"), OsString::from(secret))];
+        let e = Deployment::resolve(&env, &[], None, EntryPoint::Script).unwrap_err();
+        let unknown: Vec<_> = e.errors().cloned().collect();
+        assert_eq!(
+            unknown,
+            [FlagError::UnknownVariable {
+                name: "MIPYRE_IO_WORKERS".to_string(),
+            }]
+        );
+        assert!(!e.to_string().contains("hunter2"), "{e}");
     }
 
     #[test]
@@ -990,9 +1095,17 @@ pub(super) mod tests {
                 tick: std::time::Duration::from_millis(100)
             }
         );
-        assert_eq!(config.tuning.bridge.workers.get(), 4);
-        assert_eq!(config.tuning.bridge.capacity.get(), 64);
+        assert_eq!(config.tuning.main.max_threads.get(), 4);
+        assert_eq!(config.tuning.main.queue.get(), 64);
         assert!(!config.tuning.metrics);
+    }
+
+    #[test]
+    fn the_main_threads_default_to_four_with_tpc_and_to_tokios_blocking_pool_without() {
+        let tpc = recipe(&[]).unwrap().tuning.main;
+        assert_eq!((tpc.max_threads.get(), tpc.queue.get()), (4, 64));
+        let multi_thread = recipe(&[("MIPYRE_TPC", "0")]).unwrap().tuning.main;
+        assert_eq!((multi_thread.max_threads.get(), multi_thread.queue.get()), (512, 8192));
     }
 
     #[test]
@@ -1067,30 +1180,30 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn bridge_sizes_are_positive() {
+    fn main_sizes_are_positive() {
         assert_eq!(
-            recipe(&[("MIPYRE_GIL_BRIDGE_WORKERS", "2")])
+            recipe(&[("MIPYRE_BRIDGE_WORKERS", "2")])
                 .unwrap()
                 .tuning
-                .bridge
-                .capacity
+                .main
+                .queue
                 .get(),
             32
         );
         assert_eq!(
-            recipe(&[("MIPYRE_GIL_BRIDGE_CAPACITY", "5")])
+            recipe(&[("MIPYRE_BRIDGE_CAPACITY", "5")])
                 .unwrap()
                 .tuning
-                .bridge
-                .capacity
+                .main
+                .queue
                 .get(),
             5
         );
         for (var, raw) in [
-            ("MIPYRE_GIL_BRIDGE_CAPACITY", "0"),
-            ("MIPYRE_GIL_BRIDGE_CAPACITY", "big"),
-            ("MIPYRE_GIL_BRIDGE_WORKERS", "0"),
-            ("MIPYRE_GIL_BRIDGE_WORKERS", "four"),
+            ("MIPYRE_BRIDGE_CAPACITY", "0"),
+            ("MIPYRE_BRIDGE_CAPACITY", "big"),
+            ("MIPYRE_BRIDGE_WORKERS", "0"),
+            ("MIPYRE_BRIDGE_WORKERS", "four"),
         ] {
             assert_eq!(invalid(&[(var, raw)]), (var.into(), raw.into()));
         }
@@ -1113,8 +1226,8 @@ pub(super) mod tests {
     fn metrics_and_topology_take_their_values_only() {
         assert!(recipe(&[("MIPYRE_METRICS", "1")]).unwrap().tuning.metrics);
         assert_eq!(invalid(&[("MIPYRE_METRICS", "most")]).0, "MIPYRE_METRICS");
-        assert_eq!(invalid(&[("MIPYRE_TPC_DARWIN", "fan-out")]).0, "MIPYRE_TPC_DARWIN");
-        let fanout = recipe(&[("MIPYRE_TPC_DARWIN", "fanout")]);
+        assert_eq!(invalid(&[("MIPYRE_TPC_ACCEPT", "fan-out")]).0, "MIPYRE_TPC_ACCEPT");
+        let fanout = recipe(&[("MIPYRE_TPC_ACCEPT", "fanout")]);
         #[cfg(target_os = "macos")]
         assert_eq!(fanout.unwrap().server, ServerKind::Tpc(AcceptMode::Fanout));
         #[cfg(not(target_os = "macos"))]
@@ -1141,7 +1254,7 @@ pub(super) mod tests {
         fn code(pairs: &[(&str, &str)]) -> ServerFlags {
             let mut code = ServerFlags::default();
             for (keyword, raw) in pairs {
-                code.give(CodeCall::Run, keyword, raw).unwrap();
+                code.give(CodeCall::ServerFlags, keyword, raw).unwrap();
             }
             code
         }
@@ -1166,7 +1279,7 @@ pub(super) mod tests {
             .unwrap();
             let summary = r.values.summary();
             assert!(
-                summary.contains(&"port=8001 (MIPYRE_PORT) overrides 9000 (run(port=))".to_string()),
+                summary.contains(&"port=8001 (MIPYRE_PORT) overrides 9000 (ServerFlags(port=))".to_string()),
                 "{summary:?}"
             );
             assert!(
@@ -1193,7 +1306,7 @@ pub(super) mod tests {
             let threads = r.sizes.threads.unwrap();
             assert_eq!(
                 (threads.value().get(), threads.source().to_string()),
-                (2, "run(threads=)".to_string())
+                (2, "ServerFlags(threads=)".to_string())
             );
         }
 
@@ -1203,7 +1316,7 @@ pub(super) mod tests {
                 .unwrap_err();
             assert_eq!(
                 errors(half),
-                ["tls_cert (run(tls_cert=)) is given without tls_key: give both, or neither"]
+                ["tls_cert (ServerFlags(tls_cert=)) is given without tls_key: give both, or neither"]
             );
             let other = crate::boot::ServerRecipe::of(
                 deployment(&[("MIPYRE_TLS_KEY", "/k.pem")]).over(&ServerFlags::default()),
@@ -1222,23 +1335,23 @@ pub(super) mod tests {
         #[test]
         fn a_port_given_twice_names_both_places() {
             let e = crate::boot::ServerRecipe::of(
-                deployment(&[("MIPYRE_TLS_PORTS", "8443,9000")]).over(&code(&[("port", "9000")])),
+                deployment(&[("MIPYRE_EXTRA_TLS_PORTS", "8443,9000")]).over(&code(&[("port", "9000")])),
             )
             .unwrap_err();
             assert_eq!(
                 errors(e),
-                ["port 9000 is given twice: as run(port=) and as MIPYRE_TLS_PORTS"]
+                ["port 9000 is given twice: as ServerFlags(port=) and as MIPYRE_EXTRA_TLS_PORTS"]
             );
             let e = crate::boot::ServerRecipe::of(
-                deployment(&[("MIPYRE_PLAIN_PORTS", "8000")]).over(&ServerFlags::default()),
+                deployment(&[("MIPYRE_EXTRA_PLAIN_PORTS", "8000")]).over(&ServerFlags::default()),
             )
             .unwrap_err();
             assert_eq!(
                 errors(e),
-                ["port 8000 is given twice: as the default and as MIPYRE_PLAIN_PORTS"]
+                ["port 8000 is given twice: as the default and as MIPYRE_EXTRA_PLAIN_PORTS"]
             );
             assert!(crate::boot::ServerRecipe::of(
-                deployment(&[("MIPYRE_PORT", "0"), ("MIPYRE_PLAIN_PORTS", "8000")]).over(&ServerFlags::default())
+                deployment(&[("MIPYRE_PORT", "0"), ("MIPYRE_EXTRA_PLAIN_PORTS", "8000")]).over(&ServerFlags::default())
             )
             .is_ok());
         }
@@ -1246,11 +1359,13 @@ pub(super) mod tests {
         #[test]
         fn a_keyword_that_is_no_flag_of_its_call_is_refused() {
             let mut code = ServerFlags::default();
-            assert!(code.give(CodeCall::Run, "gc_mode", "idle").is_err());
-            assert!(code.give(CodeCall::ServerFlags, "gc_mode", "idle").is_ok());
+            assert!(code.give(CodeCall::Run, "threads", "2").is_err());
+            assert!(code.give(CodeCall::ServerFlags, "threads", "2").is_ok());
             assert_eq!(
-                code.give(CodeCall::Run, "threads", "0").unwrap_err().to_string(),
-                "run(threads=): \"0\" is invalid: expected a positive whole number"
+                code.give(CodeCall::ServerFlags, "threads", "0")
+                    .unwrap_err()
+                    .to_string(),
+                "ServerFlags(threads=): \"0\" is invalid: expected a positive whole number"
             );
         }
     }
@@ -1301,7 +1416,10 @@ pub(super) mod tests {
             assert_eq!(threads.value, NonZeroUsize::new(8).unwrap());
             assert_eq!(threads.from.to_string(), "mipyre run --threads");
             let port = d.port.unwrap();
-            assert_eq!((port.value, port.from), (9100, DeploymentPlace::Env("MIPYRE_PORT")));
+            assert_eq!(
+                (port.value, port.from),
+                (9100, DeploymentPlace::Env("MIPYRE_PORT".into()))
+            );
             assert_eq!(
                 d.host.unwrap().from.to_string(),
                 "/srv/app/pyproject.toml:4: [tool.mipyre] host"
@@ -1423,7 +1541,7 @@ pub(super) mod tests {
 
         #[test]
         fn a_bad_port_list_names_the_variable_and_the_value() {
-            for var in ["MIPYRE_TLS_PORTS", "MIPYRE_PLAIN_PORTS"] {
+            for var in ["MIPYRE_EXTRA_TLS_PORTS", "MIPYRE_EXTRA_PLAIN_PORTS"] {
                 for raw in ["443x", "70000", "0"] {
                     let all = errors(resolve(&[(var, raw)], &[], None).unwrap_err());
                     assert!(
@@ -1437,7 +1555,10 @@ pub(super) mod tests {
         #[test]
         fn port_lists_parse_and_a_trailing_comma_is_nothing() {
             let d = resolve(
-                &[("MIPYRE_TLS_PORTS", "8443, 9443,"), ("MIPYRE_PLAIN_PORTS", "8082")],
+                &[
+                    ("MIPYRE_EXTRA_TLS_PORTS", "8443, 9443,"),
+                    ("MIPYRE_EXTRA_PLAIN_PORTS", "8082"),
+                ],
                 &[],
                 None,
             )
@@ -1463,7 +1584,7 @@ pub(super) mod tests {
         #[cfg(not(target_os = "macos"))]
         #[test]
         fn fanout_off_macos_says_so() {
-            let e = resolve(&[("MIPYRE_TPC_DARWIN", "fanout")], &[], None).unwrap_err();
+            let e = resolve(&[("MIPYRE_TPC_ACCEPT", "fanout")], &[], None).unwrap_err();
             assert!(errors(e)[0].ends_with("(fanout exists on macOS only)"));
         }
     }

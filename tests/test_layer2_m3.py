@@ -1,10 +1,6 @@
-"""Layer 2, M3 (issue #5): registration seal, worker-app registry and inert prerequisites.
+"""Registration seal, worker-app registry and inert prerequisites, on the main interpreter.
 
-These tests cover the main-interpreter behaviour. The worker side of M3 (FR-4, FR-5,
-FR-15, FR-17, FR-18) was tested through a probe app that loaded the real engine next to
-the mock; since M4 workers run the real package, so that coverage is in
-`test_layer2_m4.py` (probe app and test removed at M4, approved by the user on
-2026-09-23).
+The worker side is in `test_layer2_m4.py`.
 """
 from __future__ import annotations
 
@@ -74,7 +70,7 @@ def _write(tmp_path, name: str, source: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# main interpreter: seal (FR-2, N12), _in_worker (FR-15), module= (FR-18)
+# main interpreter: seal, _in_worker, module=
 # ---------------------------------------------------------------------------
 
 
@@ -124,7 +120,7 @@ def test_seal_is_idempotent():
 
 def test_on_startup_non_gil_route_fails_startup(tmp_path):
     script = _write(tmp_path, "startup_route.py", """
-        from mipyre import Mipyre
+        from mipyre import Mipyre, ServerFlags
         app = Mipyre(runtime="main")
 
         @app.get("/")
@@ -137,7 +133,7 @@ def test_on_startup_non_gil_route_fails_startup(tmp_path):
             def late(req):
                 return "no"
 
-        app.run(host="127.0.0.1", port=0)
+        app.run(ServerFlags(host="127.0.0.1", port=0))
     """)
     out = subprocess.run([sys.executable, script], capture_output=True, text=True, timeout=60)
     assert out.returncode != 0, out.stdout + out.stderr
@@ -145,7 +141,7 @@ def test_on_startup_non_gil_route_fails_startup(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# FR-13: pydantic only for routes with body=
+# pydantic only for routes with body=
 # ---------------------------------------------------------------------------
 
 
@@ -176,7 +172,7 @@ def test_model_route_still_validates():
 
 
 # ---------------------------------------------------------------------------
-# FR-14 / E2E-7b (GIL mode half): request ids never cross between concurrent requests
+# GIL mode: request ids never cross between concurrent requests
 # ---------------------------------------------------------------------------
 
 
@@ -188,15 +184,14 @@ def test_request_id_is_per_request_under_concurrency(tmp_path):
     """Request ids stay with their requests under the worst interleaving: all `_IN_FLIGHT`
     requests are in their await at once (each says so with a file, then waits for its own
     release file), and they are released in reverse order of sending, each one answered before
-    the next is let go (as test_layer2_m4's pool half, C5). Until b/494 the handlers slept a
-    random 0-20 ms, a different interleaving each run."""
+    the next is let go (as test_layer2_m4's pool half)."""
     log_path = str(tmp_path / "server.log")
     rendezvous = tmp_path / "rendezvous"
     (rendezvous / "in").mkdir(parents=True)
     (rendezvous / "go").mkdir()
     script = _write(tmp_path, "request_id.py", """
         import asyncio, os
-        from mipyre import Mipyre
+        from mipyre import Mipyre, ServerFlags
         app = Mipyre(runtime="main")
         app.enable_request_id_header()
         RENDEZVOUS = os.environ["RID_RENDEZVOUS"]
@@ -213,7 +208,7 @@ def test_request_id_is_per_request_under_concurrency(tmp_path):
                 await asyncio.sleep(0.005)
             return "ok"
 
-        app.run(host="127.0.0.1", port=0)
+        app.run(ServerFlags(host="127.0.0.1", port=0))
     """)
     proc = _start(script, log_path, {"RID_RENDEZVOUS": str(rendezvous)})
     try:
@@ -240,7 +235,7 @@ def test_request_id_is_per_request_under_concurrency(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# E2E-3b + E2E-1 subset: app.run() only under a __main__ guard, MIPYRE_LOG=1, /mcp
+# app.run() only under a __main__ guard, MIPYRE_LOG=1, /mcp
 # ---------------------------------------------------------------------------
 
 
@@ -248,7 +243,7 @@ def test_request_id_is_per_request_under_concurrency(tmp_path):
 def test_main_guard_logging_and_mcp_in_subinterp_mode(tmp_path):
     log_path = str(tmp_path / "server.log")
     script = _write(tmp_path, "guarded.py", """
-        from mipyre import Mipyre
+        from mipyre import Mipyre, ServerFlags
         app = Mipyre()
 
         @app.get("/w")
@@ -263,7 +258,7 @@ def test_main_guard_logging_and_mcp_in_subinterp_mode(tmp_path):
             return a + b
 
         if __name__ == "__main__":
-            app.run(host="127.0.0.1", port=0, threads=2)
+            app.run(ServerFlags(host="127.0.0.1", port=0, threads=2))
     """)
     proc = _start(script, log_path, {"MIPYRE_LOG": "1"})
     try:

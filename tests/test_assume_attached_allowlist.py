@@ -8,11 +8,10 @@ init on the main OS thread, whose gilstate thread state is main's). Each allowli
 states why; the counts are exact, so a new site fails and a removed one must come off.
 Companion to `test_attach_allowlist.py`.
 
-Scanned: the engine's `src/` (`crates/pyext/src/` since b/51 E0b) AND every shared crate's
-`crates/*/src/` (b/47 q/5 a) — the
-worker code this rule is about is moving into `crates/subinterp`, and a rule that
-only read `src/` would go green the moment a guarded site left it. The counts stay exact;
-an allowlist entry follows its file to the new path.
+Scanned: every workspace package's `crates/*/src/`, the engine's `crates/pyext/src/` among them.
+The worker code this rule is about moves between crates, and a rule that read only one crate would
+go green the moment a guarded site left it. The counts stay exact; an allowlist entry follows its
+file to the new path.
 """
 from __future__ import annotations
 
@@ -27,9 +26,8 @@ ASSUME = re.compile(r"assume_attached\s*\(")
 
 # path (relative to the repo root) -> (exact count, why it is safe)
 ALLOWLIST = {
-    # Moved with the file (b/47 S2a-5, q/5 a). b/411: 2 -> 1, `thread_is_in` is gone (a unit's
-    # drop runs in its own attach and uses the `py` it keeps, so it no longer asks where the
-    # thread is).
+    # A unit's drop runs in its own attach and uses the `py` it keeps, so it does not ask where
+    # the thread is.
     "crates/subinterp/src/interp.rs": (
         1,
         "with_assumed_attached: a worker's init, on the main OS thread with the new worker's "
@@ -50,7 +48,7 @@ def _walk_all(root: str):
 
 def scan_roots(root: str) -> list[str]:
     """Every Rust tree the rule covers: each workspace package's `src/` — the engine's
-    (`crates/pyext/src`, b/51 E0b) and every shared crate's."""
+    (`crates/pyext/src`) and every shared crate's."""
     roots = sorted(glob.glob(os.path.join(root, "crates", "*", "src")))
     return [p for p in roots if os.path.isdir(p)]
 
@@ -93,7 +91,7 @@ def test_no_assume_attached_outside_allowlist():
 
 def test_gate_catches_a_seeded_assume_attached(tmp_path):
     shutil.copytree(os.path.join(ROOT, "crates"), tmp_path / "crates")
-    target = tmp_path / "crates" / "pyext" / "src" / "serve" / "respond.rs"
+    target = tmp_path / "crates" / "server" / "src" / "respond.rs"
     with open(target, "a", encoding="utf-8") as f:
         f.write(
             "\n#[allow(dead_code)]\nfn seeded() {\n"
@@ -101,7 +99,7 @@ def test_gate_catches_a_seeded_assume_attached(tmp_path):
         )
     found = violations(str(tmp_path))
     assert len(found) == 1, found
-    assert found[0].startswith("crates/pyext/src/serve/respond.rs: 1 assume_attached site(s)"), found
+    assert found[0].startswith("crates/server/src/respond.rs: 1 assume_attached site(s)"), found
 
 
 def test_gate_catches_a_seeded_assume_attached_in_a_shared_crate(tmp_path):

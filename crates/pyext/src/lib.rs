@@ -1,4 +1,4 @@
-/// Miri runs no C, so under it the extension keeps Rust's own allocator (b/719).
+/// Miri runs no C, so under it the extension keeps Rust's own allocator.
 #[cfg(not(any(feature = "bench", miri)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -12,14 +12,9 @@ static GLOBAL: bench::AllocationCounter = bench::AllocationCounter;
 mod bench;
 mod boot;
 mod db;
-mod exchange;
 mod pyapi;
-mod runtime;
-mod serve;
 mod sync;
 mod telemetry;
-#[cfg(test)]
-mod thread_stack;
 
 /// Checks that the extension allocates through mimalloc in both builds; the bench counter passes
 /// every call on to mimalloc.

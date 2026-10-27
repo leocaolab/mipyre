@@ -1,6 +1,6 @@
 """Path-parameter injection: FastAPI-style ``def h(req, order_id)``.
 
-Mipyre registers the user's handler with the Rust engine after a Python-
+Mipyre registers the app's handler with the Rust engine after a Python-
 side decorator pass. Routes whose handler signature is exactly ``(req)``
 stay byte-identical to today — the decorator returns the original function
 and the hot path is not touched. Only routes that declare extra positional
@@ -131,7 +131,7 @@ def test_colon_path_template_is_a_registration_error():
     """Only `{name}` / `{*name}` are path parameters. matchit 0.8 reads `:name` as
     literal text, so `/items/:item_id` would register, never match `/items/42`, and
     injection would pass None; registration refuses it and names the `{item_id}` to
-    write instead (decision Q2)."""
+    write instead."""
     app = Mipyre()
 
     def h(req, item_id):

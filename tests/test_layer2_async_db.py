@@ -1,13 +1,12 @@
-"""E2E-8, async-DB part (Layer 2, M1): `PgPool.*_async` on main keeps working once workers
+"""`PgPool.*_async` on main keeps working once workers
 execute the engine.
 
 Runs `_l2_async_db_app.py`, drives an async `runtime="main"` DB route and worker routes
 concurrently while a main-interpreter thread awaits `fetch_all_async` on its own loop, stops
 the server with SIGINT, and scans the whole log for Rust panics and the PyO3 fork's refusals.
 
-Before M1 this failed: `pyo3-async-runtimes` resolved the futures with a bare
-`Python::attach` on its Tokio threads, which the fork refuses once several interpreters have
-executed the engine (spike R-3: the await never completed).
+Futures resolved with a bare `Python::attach` on Tokio threads would never complete: the fork
+refuses that attach once several interpreters have executed the engine.
 """
 from __future__ import annotations
 
@@ -33,7 +32,7 @@ pytestmark = [
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATHS = ("/adb", "/w")
-# The load, by count (b/441; until then 6 s of it, as many requests as the machine managed):
+# The load, by count, not by time:
 # each of `CLIENTS` threads sends every path `ROUNDS` times.
 CLIENTS = 12
 ROUNDS = 25

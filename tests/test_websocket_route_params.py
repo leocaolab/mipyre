@@ -1,4 +1,4 @@
-"""A WebSocket route is a route path like any other (b/51 E7): `{name}` parameters match and
+"""A WebSocket route is a route path like any other: `{name}` parameters match and
 reach the handler as `ws.request.params`; a path the router would read differently is refused
 at registration."""
 
@@ -14,21 +14,21 @@ import pytest
 from tests._helpers import answers, bound_port, read_file
 
 SERVER = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 app = Mipyre(runtime="main")
 
 @app.websocket("/room/{name}")
-def room(ws):
-    ws.send(ws.request.params["name"])
-    ws.recv()
+async def room(ws):
+    await ws.send(ws.request.params["name"])
+    await ws.recv()
 
 @app.get("/health")
 def health(req):
     return {"ok": True}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0)
+    app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
 
 
@@ -66,9 +66,13 @@ async def test_a_path_no_websocket_route_matches_is_not_upgraded(server):
             pass
 
 
+async def _handler(ws):
+    pass
+
+
 def test_a_colon_parameter_is_refused_naming_the_brace_form():
     from mipyre.engine import MipyreApp
 
     app = MipyreApp()
     with pytest.raises(ValueError, match=r"\{id\}"):
-        app.websocket("/ws/:id", lambda ws: None)
+        app.websocket("/ws/:id", _handler)

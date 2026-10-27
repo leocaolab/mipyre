@@ -126,7 +126,17 @@ fn polls(io: ScriptIo, step: Step, warmup: Step, n: u64) -> (f64, f64) {
     (ns, per)
 }
 
-fn write_some(io: &mut CoalescingIo<ScriptIo>, cx: &mut Context<'_>) {
+const PIPELINED: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+
+/// Reads a request and answers it while more may be unread, so the answer is kept to share a write.
+fn read_then_write(io: &mut CoalescingIo<ScriptIo>, cx: &mut Context<'_>) {
+    let mut space = [0u8; PIPELINED.len()];
+    let mut buf = ReadBuf::new(&mut space);
+    let read = Pin::new(&mut *io).poll_read(cx, &mut buf);
+    assert!(
+        matches!(read, Poll::Ready(Ok(()))) && !buf.filled().is_empty(),
+        "read: {read:?}"
+    );
     let kept = Pin::new(io).poll_write(cx, &[b'x'; 100]);
     assert!(matches!(kept, Poll::Ready(Ok(100))), "kept: {kept:?}");
 }
@@ -176,8 +186,8 @@ fn script(full: bool, script: &'static [u8], chunk: usize) -> (ScriptIo, Arc<Ato
 }
 
 fn blocked_poll(n: u64) {
-    let (io, writes) = script(true, b"", 0);
-    let (ns, _) = polls(io, flush, write_some, n);
+    let (io, writes) = script(true, PIPELINED, 0);
+    let (ns, _) = polls(io, flush, read_then_write, n);
     // The count includes the warm-up poll, which writes once too.
     let inner = writes.load(Ordering::Relaxed);
     println!(

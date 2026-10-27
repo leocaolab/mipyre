@@ -4,13 +4,12 @@ the session history in app.state, which a worker process can't reach. So they ru
 runtime="main", and only the main interpreter imports this module."""
 
 import json
-import threading
 import time
 from collections.abc import Iterator
 
 from pydantic import BaseModel
 
-from mipyre import Router, SharedState, Stream
+from mipyre import EventSourceResponse, Router, ServerSentEvent, SharedState, Stream
 
 from ai_agent.memory import remember
 
@@ -54,23 +53,20 @@ def chat(body: ChatRequest):
     return {"response": answer, "session_id": body.session_id, "tokens": len(tokens)}
 
 
-def send_answer(stream: Stream, state: SharedState, prompt: str, session_id: str) -> None:
+def answer_events(state: SharedState, prompt: str, session_id: str) -> Iterator[ServerSentEvent]:
+    """Yield the answer's tokens, then a ``done`` event, then remember the answer. A client
+    that leaves closes the generator at a ``yield``, so an answer it didn't read is not
+    remembered."""
     tokens = []
-    try:
-        for token in fake_llm_generate(prompt):
-            stream.send_event(token, event="token")
-            tokens.append(token)
-        stream.send_event(json.dumps({"done": True, "tokens": len(tokens)}), event="done")
-    except ConnectionError:
-        return  # the client went away; the answer it didn't read is not remembered
+    for token in fake_llm_generate(prompt):
+        yield ServerSentEvent(token, event="token")
+        tokens.append(token)
+    yield ServerSentEvent(json.dumps({"done": True, "tokens": len(tokens)}), event="done")
     remember(state, session_id, prompt, "".join(tokens))
-    stream.close()
 
 
 @router.get("/stream")
-def stream_chat(req):
+def stream_chat(req) -> Stream:
     prompt = req.query_params.get("prompt", "hello")
     session_id = req.query_params.get("session_id", "default")
-    stream = Stream()
-    threading.Thread(target=send_answer, args=(stream, _state(), prompt, session_id), daemon=True).start()
-    return stream
+    return EventSourceResponse(answer_events(_state(), prompt, session_id))

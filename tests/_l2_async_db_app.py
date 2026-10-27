@@ -1,10 +1,10 @@
-"""E2E-8, async-DB part (Layer 2, M1): `PgPool.*_async` on main while workers execute the
+"""`PgPool.*_async` on main while workers execute the
 real engine.
 
-Like `_l2_main_side_app.py`, every worker imports the real `mipyre.engine` (M4), so more
+Like `_l2_main_side_app.py`, every worker imports the real `mipyre.engine`, so more
 than one interpreter has executed it and the PyO3 fork refuses a bare foreign-thread attach.
-`pyo3-async-runtimes` resolved `*_async` futures with exactly such an attach on its own
-threads (spike R-3). Two callers are driven here:
+A `*_async` future resolved with such an attach on a Tokio thread would never complete. Two
+callers are driven here:
 
 - `/adb`: an async `runtime="main"` route awaiting `fetch_all_async`;
 - a thread on the main interpreter running its own asyncio loop that awaits
@@ -14,7 +14,7 @@ import os
 from typing import Any
 
 import mipyre.engine as _engine
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 IN_WORKER = _engine._in_worker()
 
@@ -50,7 +50,7 @@ if not IN_WORKER:
 @app.get("/w")
 def worker_route(req):
     # Served by a worker, which runs the real engine.
-    return {"real_engine": _engine._in_worker() and hasattr(_engine, "_worker_recv")}
+    return {"real_engine": _engine._in_worker() and hasattr(_engine, "_worker_take")}
 
 
 @app.get("/adb", runtime="main")
@@ -65,4 +65,4 @@ def background_state(req):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ["L2_PORT"]))
+    app.run(ServerFlags(host="127.0.0.1", port=int(os.environ["L2_PORT"])))

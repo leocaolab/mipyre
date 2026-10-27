@@ -24,7 +24,7 @@ from tests._helpers import answers, bound_port, kill_session, read_file, text_ap
 
 LOOP_SCRIPT = r'''
 import logging, os
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 app = Mipyre()
 app.request_timeout = 2
@@ -45,7 +45,7 @@ def say(req):
     return "said"
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, subinterpreters=1)
+    app.run(ServerFlags(host="127.0.0.1", port=0, subinterpreters=1))
 '''
 
 def start_server(tmp_path, source):
@@ -79,7 +79,7 @@ def stop_server(proc, port):
 def log_at_exit(proc, log_path) -> str:
     """The server's whole log: it is stopped (SIGINT) first, and its exit is the log's fence
     (`run()` waits for every line logged before it, `flush_logs`). For a line that must not be
-    there: no wait for it can say it will not come (b/495)."""
+    there: no wait for it can say it will not come."""
     os.killpg(os.getpgid(proc.pid), signal.SIGINT)
     proc.wait(timeout=None)
     log = read_file(log_path)()
@@ -103,7 +103,7 @@ def loop_server(tmp_path):
 
 RAISE_SCRIPT = r'''
 import os
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 app = Mipyre()
 app.request_timeout = 4
@@ -117,7 +117,7 @@ def raises(req):
     raise KeyboardInterrupt("raised by the handler itself, not by the watchdog")
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, subinterpreters=1)
+    app.run(ServerFlags(host="127.0.0.1", port=0, subinterpreters=1))
 '''
 
 
@@ -128,7 +128,7 @@ def test_a_handler_raising_keyboard_interrupt_by_itself_is_500_not_504(tmp_path)
     try:
         assert get_status(port, "/raise", timeout=15) == 500
         assert get_status(port, "/", timeout=15) == 200
-        # The log writer is non-blocking: the line lands some time after the 500 (b/441 L7).
+        # The log writer is non-blocking: the line lands some time after the 500.
         text_appears(read_file(log_path), "the handler raised KeyboardInterrupt", proc)
     finally:
         stop_server(proc, port)
@@ -152,5 +152,5 @@ def test_the_log_at_exit_has_a_line_logged_just_before_the_stop(loop_server):
     """The fence of the test above: a line the worker logs just before the stop is in the log
     it reads, so an abandonment logged that late would be seen too."""
     proc, port, log_path = loop_server
-    assert get_status(port, "/say?text=abandon-probe-b495", timeout=15) == 200
-    assert "abandon-probe-b495" in log_at_exit(proc, log_path)
+    assert get_status(port, "/say?text=abandon-probe", timeout=15) == 200
+    assert "abandon-probe" in log_at_exit(proc, log_path)

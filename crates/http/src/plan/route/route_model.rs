@@ -1,4 +1,4 @@
-//! The route table against a reference model (b/739): one sequence of registrations and requests goes to a
+//! The route table against a reference model: one sequence of registrations and requests goes to a
 //! [`RouteTable`] and to a model a reader can check by eye, and every step's outcome must agree.
 //!
 //! The model keeps every registered route in a list. A request is matched by trying each route of its method in turn,
@@ -13,9 +13,17 @@ use percent_encoding::percent_decode_str;
 use proptest::prelude::*;
 
 use super::{
-    BodyMode, HandlerCall, HandlerKind, HandlerPlace, MainHandler, Params, RouteError, RouteTable, WsRouteError,
+    BodyMode, HandlerCall, HandlerKind, HandlerPlace, MainHandler, RouteError, RouteTable, WsPlace, WsRouteError,
     WsRouteId,
 };
+
+/// Returns `params` decoded against `path` as owned pairs, each value there.
+pub(super) fn decoded_pairs(params: &super::Params, path: &str) -> Vec<(String, String)> {
+    params
+        .decoded(path)
+        .map(|(name, value)| (name.to_string(), value.expect("the value is in the path").into_owned()))
+        .collect()
+}
 
 /// One segment of a registered route path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +126,9 @@ fn most_specific<'a>(templates: impl Iterator<Item = (usize, &'a Template)>, pat
         .min_by(|a, b| a.0.cmp(&b.0))
         .map(|(_, index, params)| (index, params))
 }
+
+/// The parameters a route binds, each value percent-decoded.
+type Params = Vec<(String, String)>;
 
 #[derive(Clone, Debug)]
 enum Op {
@@ -269,12 +280,18 @@ fn ask_table(table: &Table, method: &str, path: &str) -> Answer {
             HandlerCall::Main(target, handler) => (*table.handler(target), HandlerPlace::Main(handler)),
             HandlerCall::Lane(id) => (id.index(), HandlerPlace::Lane),
         };
-        Resolution { route, place, params }
+        Resolution {
+            route,
+            place,
+            params: decoded_pairs(&params, path),
+        }
     });
     let allow = table
         .allowed_methods(path)
         .map(|value| value.to_str().expect("method names are visible ASCII").to_string());
-    let websocket = table.websocket(path).map(|(WsRouteId(index), params)| (index, params));
+    let websocket = table
+        .websocket(path)
+        .map(|(WsRouteId(index), params)| (index, decoded_pairs(&params, path)));
     Answer {
         resolved,
         fast_response: table.fast_response(&method, path).is_some(),
@@ -315,7 +332,7 @@ fn run(ops: &[Op]) -> Result<(), TestCaseError> {
             Op::WebSocket(template) => {
                 let rendered = template.render();
                 let index = table.handlers().count();
-                let got = registration(table.add_websocket(&rendered, index), |e| {
+                let got = registration(table.add_websocket(&rendered, index, WsPlace::Main), |e| {
                     matches!(e, WsRouteError::MisreadPath { .. })
                 });
                 prop_assert_eq!(got, model.add_websocket(template), "websocket {}", rendered);

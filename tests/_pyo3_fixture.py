@@ -23,11 +23,11 @@ _VARIANTS = {"undeclared": [], "declared": ["--features", "declare_per_interpret
 
 def build(root_dir: Path) -> dict[str, Path]:
     """{variant: dir under `root_dir` holding the importable module}. Built with cargo (an up-to-date build costs
-    next to nothing). No cargo is a failure, never a skip: a skip is red at the gate."""
+    next to nothing). No cargo is a failure, never a skip."""
     cargo = shutil.which("cargo")
     if cargo is None:
         pytest.fail("cargo not found: the tests build their PyO3 fixture (tests/fixtures/pyo3_mp) with cargo; "
-                    "install a Rust toolchain (the merge gate has one)")
+                    "install a Rust toolchain")
     env = dict(os.environ, PYO3_PYTHON=sys.executable)
     target = Path(os.environ.get("CARGO_TARGET_DIR") or FIXTURE_DIR / "target") / "debug"
     lib_ext = ".dylib" if sys.platform == "darwin" else ".so"

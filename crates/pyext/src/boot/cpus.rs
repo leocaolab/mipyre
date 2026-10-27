@@ -94,6 +94,11 @@ fn sizing_cpus(
                 error_type = "CpuReadError::CoreCount",
                 "sizing the physical-core defaults from the logical CPU count");
         }
+        Some(e @ CpuReadError::CoresNotCountedHere { .. }) => {
+            tracing::info!(target: "mipyre::server", error = %e,
+                error_type = "CpuReadError::CoresNotCountedHere",
+                "sizing the physical-core defaults from the logical CPU count");
+        }
         Some(e @ CpuReadError::Logical(_)) => {
             tracing::warn!(target: "mipyre::server", error = %e,
                 error_type = "CpuReadError::Logical", "sizing for one CPU");
@@ -107,9 +112,11 @@ fn sizing_cpus(
 fn sizing(read: Result<Cpus, CpuReadError>) -> (Cpus, Option<CpuReadError>) {
     match read {
         Ok(cpus) => (cpus, None),
-        Err(e @ (CpuReadError::Cores { logical } | CpuReadError::CoreCount { logical, .. })) => {
-            (Cpus::new(logical, logical), Some(e))
-        }
+        Err(
+            e @ (CpuReadError::Cores { logical }
+            | CpuReadError::CoreCount { logical, .. }
+            | CpuReadError::CoresNotCountedHere { logical }),
+        ) => (Cpus::new(logical, logical), Some(e)),
         Err(e @ CpuReadError::Logical(_)) => (Cpus::new(NonZeroUsize::MIN, NonZeroUsize::MIN), Some(e)),
     }
 }
@@ -128,6 +135,14 @@ mod tests {
         let (cpus, fallback) = sizing(Ok(read));
         assert_eq!(cpus, read);
         assert!(fallback.is_none());
+    }
+
+    #[test]
+    fn cores_this_platform_does_not_count_size_from_the_logical_count_and_say_why() {
+        let (cpus, fallback) = sizing(Err(CpuReadError::CoresNotCountedHere { logical: n(8) }));
+        assert_eq!((cpus.logical(), cpus.physical()), (n(8), n(8)));
+        let reason = fallback.expect("a fallback says why").to_string();
+        assert!(reason.contains("does not count physical cores"), "{reason}");
     }
 
     #[test]
@@ -209,7 +224,7 @@ mod tests {
             },
         )));
         let mut sized = None;
-        let log = crate::exchange::captured_log(|| sized = Some(sizing_cpus(Err(cores), &unread).0));
+        let log = mipyre_runtime::testkit::captured_log(|| sized = Some(sizing_cpus(Err(cores), &unread).0));
         let line = log.lines().find(|l| l.contains("no siblings file")).expect(&log);
         assert!(line.contains("\"error_type\":\"CpuReadError::Cores\""), "{line}");
         let sized = sized.unwrap();
@@ -220,8 +235,9 @@ mod tests {
             source: std::io::Error::other("no sysctl answer"),
         };
         let mut sized = None;
-        let log =
-            crate::exchange::captured_log(|| sized = Some(sizing_cpus(Err(counted), &Ok(PinOrder::Unsupported)).0));
+        let log = mipyre_runtime::testkit::captured_log(|| {
+            sized = Some(sizing_cpus(Err(counted), &Ok(PinOrder::Unsupported)).0)
+        });
         let line = log.lines().find(|l| l.contains("no sysctl answer")).expect(&log);
         assert!(line.contains("\"error_type\":\"CpuReadError::CoreCount\""), "{line}");
         let sized = sized.unwrap();
@@ -229,8 +245,9 @@ mod tests {
 
         let unknown = CpuReadError::Logical(std::io::Error::other("no parallelism"));
         let mut sized = None;
-        let log =
-            crate::exchange::captured_log(|| sized = Some(sizing_cpus(Err(unknown), &Ok(PinOrder::Unsupported)).0));
+        let log = mipyre_runtime::testkit::captured_log(|| {
+            sized = Some(sizing_cpus(Err(unknown), &Ok(PinOrder::Unsupported)).0)
+        });
         let line = log.lines().find(|l| l.contains("no parallelism")).expect(&log);
         assert!(line.contains("\"error_type\":\"CpuReadError::Logical\""), "{line}");
         let sized = sized.unwrap();

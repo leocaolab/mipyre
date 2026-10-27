@@ -1,4 +1,4 @@
-"""The app's own command line (docs/design/flags.md §17, b/890): under `mipyre run`, what follows
+"""The app's own command line: under `mipyre run`, what follows
 `--` is the app's, and every interpreter that runs the app has the same `sys.argv`, so an app that
 parses its arguments with argparse as it is imported reads the same values on main, in each
 sub-interpreter and in each process worker."""

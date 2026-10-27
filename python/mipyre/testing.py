@@ -333,17 +333,7 @@ class TestClient:
         timeout: float = 10.0,
         follow_redirects: bool = True,
         config: ServerFlags | None = None,
-        **removed: object,
     ):
-        from mipyre import _routes
-
-        for name in ("host", "port", "transport"):
-            if name in removed:
-                raise TypeError(
-                    f"TestClient(...): {name}= was removed. A server on a real TCP port is "
-                    "TestServer(app, host=..., port=...); TestClient(server) is a client of it"
-                )
-        _routes.reject_removed_serve_args("TestClient(...)", removed)
         if isinstance(target, TestServer):
             if config is not None:
                 raise TypeError("TestClient(server, config=...): the server was configured when it was made")

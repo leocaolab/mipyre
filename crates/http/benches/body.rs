@@ -1,62 +1,67 @@
 //! Measures reading a request body, streamed frame by frame or already whole.
-// The package's clippy.toml is plan/'s list; a bench measures the world through io/.
-#![expect(
-    clippy::disallowed_methods,
-    clippy::disallowed_types,
-    clippy::disallowed_macros,
-    reason = "a bench reads clocks, opens sockets and prints"
-)]
 
 use std::alloc::System;
 use std::future::Future;
 use std::hint::black_box;
-use std::sync::atomic::Ordering;
+use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Instant;
 
 use bytes::Bytes;
-use mipyre_microbench::{measure, run, AllocationCounter, Case, Must, ALLOCATIONS};
+use mipyre_microbench::{measure, run, AllocationCounter, Case, Must};
 
 #[global_allocator]
 static GLOBAL: AllocationCounter<System> = AllocationCounter(System);
 
-/// Feeds a streamed body to a reader that keeps up; the cost per frame includes the feed's timer.
+/// Hands one frame per poll, then has none until polled again, as a socket read that drained the
+/// kernel's buffer.
+struct FramePerPoll {
+    ready: bool,
+}
+
+impl hyper::body::Body for FramePerPoll {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        self.ready = !self.ready;
+        if self.ready {
+            Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(b"x")))))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// Feeds a streamed body to a reader that takes each chunk before the next frame comes, so the
+/// feeder never waits for room: a frame costs its poll, the hand-off and the poll of the idle
+/// timer. The feeder is polled by hand, so the runtime's time driver never turns.
 fn stream_feed_per_frame(n: u64) {
     let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+        .enable_time()
         .build()
         .must("build the runtime");
-    let frames = (0..n).map(|_| Ok::<_, hyper::Error>(hyper::body::Frame::data(Bytes::from_static(b"x"))));
-    let body = http_body_util::StreamBody::new(tokio_stream::iter(frames));
-    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
-    let started = Instant::now();
-    let received = rt.block_on(async move {
-        let (tx, mut rx) = mipyre_http::io::body::body_channel();
-        let feeder = tokio::spawn(mipyre_http::io::body::stream_body_feeder(
-            body,
-            tx,
-            usize::MAX,
-            mipyre_http::plan::limits::BodyTimeAllowance::absolute(
-                mipyre_http::plan::limits::RequestBudget::from_secs(3600.0).must("an hour is a budget"),
-            ),
-        ));
-        let mut chunks: u64 = 0;
-        while let Some(message) = rx.recv().await {
-            if let mipyre_http::io::body::BodyMessage::Chunk(_) = message {
-                chunks += 1;
-            }
-        }
-        feeder.await.must("the feeder task");
-        chunks
+    let _entered = rt.enter();
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let (tx, mut rx) = mipyre_http::io::body::body_channel();
+    let mut feeder = std::pin::pin!(mipyre_http::io::body::stream_body_feeder(
+        FramePerPoll { ready: false },
+        tx,
+        usize::MAX,
+        mipyre_http::plan::limits::BodyTimeAllowance::absolute(
+            mipyre_http::plan::limits::BodyGrace::from_secs(3600.0).must("an hour is a grace"),
+        ),
+        mipyre_http::plan::limits::RequestBudget::from_secs(3600.0).must("an hour is a budget"),
+    ));
+    measure("stream_feed_per_frame", n, |_| {
+        assert!(feeder.as_mut().poll(&mut cx).is_pending(), "the body never ends");
+        assert!(
+            matches!(rx.try_recv(), Ok(mipyre_http::io::body::BodyMessage::Chunk(_))),
+            "every frame arrives"
+        );
     });
-    let elapsed = started.elapsed();
-    let allocated = ALLOCATIONS.load(Ordering::Relaxed) - allocations;
-    assert_eq!(received, n, "every frame arrives");
-    println!(
-        "stream_feed_per_frame: {:.2} ns/frame, ALLOCATIONS_PER_FRAME={:.3} ({n} frames)",
-        elapsed.as_nanos() as f64 / n.max(1) as f64,
-        allocated as f64 / n.max(1) as f64,
-    );
 }
 
 /// Reads a body that came in with the head as one frame, as hyper hands it over, under the app's

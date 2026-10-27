@@ -33,7 +33,7 @@ def start_server(script_path):
             start_new_session=True,
         )
     port = bound_port(read_file(log_path), proc)
-    # Until it answers, for no length of time: it used to give up after 5 s and return as if it had started (b/441 T2).
+    # Until it answers, for no length of time: a fixed limit would return as if it had started.
     answers(f"http://127.0.0.1:{port}/", proc, read_file(log_path))
     return proc, port
 
@@ -94,7 +94,7 @@ def check(name, condition):
 # ==========================================================================
 
 SUBINTERP_SERVER = '''
-from mipyre import Mipyre, Response
+from mipyre import Mipyre, Response, ServerFlags
 import json
 
 app = Mipyre()
@@ -164,7 +164,7 @@ def echo_body(req):
     return req.json()
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0)
+    app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
 
 

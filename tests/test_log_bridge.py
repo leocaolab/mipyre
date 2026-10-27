@@ -1,6 +1,6 @@
 """``mipyre._log.bridge``: a sink that fails is handed to ``logging``'s own ``handleError``,
-and the code that logged goes on (b/393; the bridge once swallowed it with ``except: pass``);
-the level gate is the handler's, and the user's root logger is only ever lowered."""
+and the code that logged goes on; the level gate is the handler's, and the app's root logger is only
+ever lowered."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def test_the_handler_takes_what_the_engine_logs_and_everything_before_it_has_a_l
 @pytest.mark.parametrize(
     "current,engine_level,expected",
     [
-        # The engine logs less than the user wants: the user's level stays.
+        # The engine logs less than the app wants: the app's level stays.
         (logging.INFO, logging.ERROR, logging.INFO),
         (logging.WARNING, logging.WARNING, logging.WARNING),
         # The engine logs more: lowered so its records reach the handler.
@@ -65,7 +65,7 @@ def test_the_root_level_is_lowered_never_raised(current, engine_level, expected)
 
 def test_serving_does_not_raise_the_users_root_logger_level(tmp_path):
     """The user's root logger is at INFO with their own handler (Sentry, a file): after the
-    server starts at the production level (ERROR), a warning from a handler still reaches it."""
+    server starts at the production level (WARN), a warning from a handler still reaches it."""
     script = tmp_path / "app_script.py"
     script.write_text(textwrap.dedent("""
         import logging

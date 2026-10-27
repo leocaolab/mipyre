@@ -198,8 +198,10 @@ impl<M: Memory, B: Doorbell> HostEnd<M, B> {
 
     /// Starts start attempt `attempt`, a number the host picked and never picked before for this channel: clears the
     /// last attempt's report and writes the number. The lane hands the number to the peer it starts next, once any
-    /// earlier attempt's peer has exited or never started.
+    /// earlier attempt's peer has exited or never started. The attempt's ready report rings the host once, so its
+    /// byte is room the peer has.
     pub fn begin_attempt(&mut self, attempt: Attempt) {
+        self.wake_room = self.wake_room.saturating_add(1);
         let area = &self.channel.memory.header().start;
         area.state.store(start::NOT_REPORTED, Relaxed);
         area.note_len.store(0, Relaxed);
@@ -444,12 +446,19 @@ impl<M: Memory, B: Doorbell, P: Parker> PeerEnd<M, B, P> {
         )))
     }
 
-    /// Reports that the peer of `attempt` started; a peer of another attempt writes nothing.
-    pub fn report_ready(&self, attempt: Attempt) {
+    /// Reports that the peer of `attempt` started, then rings the host, which waits for its workers on the bell; a
+    /// peer of another attempt writes and rings nothing, and gets `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// The doorbell's, when it could not ring.
+    pub fn report_ready(&self, attempt: Attempt) -> Result<Option<B::Outcome>, B::Error> {
         let area = &self.channel.memory.header().start;
-        if area.attempt.load(Acquire) == attempt.0 {
-            area.state.store(start::READY, Release);
+        if area.attempt.load(Acquire) != attempt.0 {
+            return Ok(None);
         }
+        area.state.store(start::READY, Release);
+        self.bell.ring(&area.state).map(Some)
     }
 
     /// Reports that the peer of `attempt` could not start, leaving `note` (cut to [`NOTE_BYTES`]) for the host; a peer
@@ -683,7 +692,7 @@ mod tests {
         ));
     }
 
-    /// The wait goes on after the refused sleep, so the call after it counts no second wait (b/946).
+    /// The wait goes on after the refused sleep, so the call after it counts no second wait.
     #[test]
     fn a_wait_counts_once_across_a_refused_sleep() {
         struct RefuseFirst(std::cell::Cell<bool>);
@@ -885,7 +894,7 @@ mod tests {
     }
 
     /// Between the host's read of `published` and of `taken` a live peer may answer and take more; that is no
-    /// fault (b/833). `taken` past `sent` is.
+    /// fault. `taken` past `sent` is.
     #[test]
     fn a_live_peer_ahead_of_what_the_host_saw_runs_and_one_past_what_was_sent_is_at_fault() {
         let (mut host, _peer) = ends(8);
@@ -1103,12 +1112,37 @@ mod tests {
         let attempt = Attempt::new(1);
         host.begin_attempt(attempt);
         assert_eq!(host.start_report(attempt), Ok(None));
-        peer.report_ready(attempt);
+        peer.report_ready(attempt).unwrap();
         assert_eq!(host.start_report(attempt), Ok(Some(StartOutcome::Ready)));
         assert_eq!(
             host.start_report(Attempt::new(attempt.get() + 1)),
             Ok(None),
             "another attempt's report"
+        );
+    }
+
+    #[test]
+    fn a_ready_report_rings_the_host_once_and_another_attempts_rings_nothing() {
+        let (mut host, peer) = ends(1);
+        let attempt = Attempt::new(1);
+        host.begin_attempt(attempt);
+        assert_eq!(peer.report_ready(Attempt::new(2)), Ok(None));
+        assert_eq!(peer.bell.rings(), 0);
+        assert_eq!(peer.report_ready(attempt), Ok(Some(())));
+        assert_eq!(peer.bell.rings(), 1);
+    }
+
+    /// Each start attempt gives its peer room for the byte its ready report rings, on top of a slot's.
+    #[test]
+    fn a_start_attempt_adds_one_wake_byte_of_room() {
+        let (mut host, _) = ends(4);
+        host.begin_attempt(Attempt::new(1));
+        assert_eq!(host.hear_wakes(5), Ok(()));
+        let (mut host, _) = ends(4);
+        host.begin_attempt(Attempt::new(1));
+        assert_eq!(
+            host.hear_wakes(6),
+            Err(PeerFault::Wakes(WakeFloodError { bytes: 6, room: 5 }))
         );
     }
 
@@ -1125,7 +1159,7 @@ mod tests {
         );
     }
 
-    /// A failure an earlier attempt left is not the next attempt's: a replacement that starts is ready (b/796).
+    /// A failure an earlier attempt left is not the next attempt's: a replacement that starts is ready.
     #[test]
     fn an_earlier_attempts_failure_is_not_the_next_attempts() {
         let (mut host, _) = ends(1);
@@ -1138,13 +1172,13 @@ mod tests {
         let peer = || PeerEnd::new(Arc::clone(&host.channel), Bell::default(), Sleep(Ok(())));
         peer().report_failed(first, b"late");
         let replacement = peer();
-        replacement.report_ready(first);
+        replacement.report_ready(first).unwrap();
         assert_eq!(
             host.start_report(second),
             Ok(None),
             "a peer of an earlier attempt writes nothing"
         );
-        replacement.report_ready(second);
+        replacement.report_ready(second).unwrap();
         assert_eq!(host.start_report(second), Ok(Some(StartOutcome::Ready)));
     }
 

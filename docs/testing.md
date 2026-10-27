@@ -20,7 +20,8 @@ An app with routes on three runtimes. `app.py`:
 from mipyre import Cookie, Mipyre, Response
 from mipyre.cookies import get_cookie
 
-app = Mipyre(routers=["reports:router"])
+app = Mipyre()
+app.include_router("reports:router")
 
 ORDERS = {"1": "filled", "2": "open"}
 
@@ -120,9 +121,9 @@ Each client has its own cookie jar: cookies the server sets are sent back on tha
 
 ```python
 @app.websocket("/ws")
-def echo(ws):
-    while (msg := ws.recv_message()) is not None:
-        ws.send(f"echo: {msg}")
+async def echo(ws):
+    async for msg in ws:
+        await ws.send(f"echo: {msg}")
 ```
 
 a test reads:
@@ -272,8 +273,8 @@ Use the session's server in every test of that run, or start a server per test a
 
 The test server runs every runtime, as production does:
 
-- `subinterp` and `isolated` routes run in the server's sub-interpreters, inside the test process.
-- `main` routes and WebSocket handlers run on the test process's main interpreter.
+- `subinterp` and `isolated` routes, WebSocket routes included, run in the server's sub-interpreters, inside the test process.
+- `main` routes run on the test process's main interpreter.
 - `process` routes run in worker processes, sized and configured from `[tool.mipyre.process]`, `MIPYRE_PROCESS_*` variables or `Mipyre(process=ProcessLanes(...))`, as in production. The worker processes start from a template that a test server always starts as a new interpreter, on every platform, so they don't depend on what else runs in the test process: pytest-xdist's and pytest-timeout's threads don't stop them from starting (see [`pytest -n`](#running-tests-in-parallel-pytest--n)).
 
 The limits of each runtime ([runtimes.md](runtimes.md)) hold in tests too: a `process` route that uses `app.state` gets a `500`, as it would in production.
@@ -299,16 +300,16 @@ client = <mipyre.testing.TestClient object at 0x106430830>
         r = client.get("/orders/3")
 >       assert r.status_code == 404
 E       assert 500 == 404
-E        +  where 500 = TestResponse(status_code=500, body=b'{"detail":"Internal Server Error","request_id":"538ef38e745e71680000000000000000"...n', 'server': 'Mipyre/2.0.0', 'connection': 'close', 'content-length': '82', 'date': 'Wed, 21 Oct 2026 20:08:26 GMT'}).status_code
+E        +  where 500 = TestResponse(status_code=500, body=b'{"detail":"Internal Server Error","request_id":"538ef38e745e71680000000000000000"...n', 'server': 'Mipyre/3.0.0', 'connection': 'close', 'content-length': '82', 'date': 'Wed, 21 Oct 2026 20:08:26 GMT'}).status_code
 
 tests/test_missing.py:3: AssertionError
 ---------------------------- Captured stdout setup -----------------------------
   Process lanes: 6 workers (template pid 55556, timeout 30000 ms, queue 128/worker; BLAS (numpy, scipy): 1 thread per worker; polars: 1 thread per worker)
 
-  Mipyre v2.0.0 [TPC mode, hybrid-inline]
+  Mipyre v3.0.0
   Listening on http://127.0.0.1:56059
   TPC threads: 6 (CPUs: 18, not pinned: this platform has no CPU pinning)
-  Routes: 1 sub-interp + 2 GIL + 1 process + 0 async
+  Routes: 1 sub-interp + 2 main + 1 process + 0 async
 
 ----------------------------- Captured stderr call -----------------------------
 {"timestamp":"2026-10-21T20:08:26.372415Z","level":"ERROR","fields":{"message":"request failed","request_id":"538ef38e745e71680000000000000000","method":"GET","path":"/orders/3","error":"the handler raised KeyError: '3'","traceback":"Traceback (most recent call last):\n  File \".../.venv/lib/python3.14/site-packages/mipyre/_bind.py\", line 46, in bound\n    return fn(req, **req.params)\n  File \".../v/app.py\", line 11, in order\n    return {\"id\": order_id, \"status\": ORDERS[order_id]}\n                                      ~~~~~~^^^^^^^^^^\nKeyError: '3'\n"},"target":"mipyre::handler"}

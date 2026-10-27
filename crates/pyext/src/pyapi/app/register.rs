@@ -7,10 +7,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::{App, LateRegistrationError, RunSettings};
 use crate::boot::{InterpreterMode, ServerRun, Topology};
-use crate::runtime::{record_worker_app, AppRoute, ScriptRegistrations};
-use crate::serve::Site;
 use mipyre_http::plan::route::{ExpectedRoute, HandlerKind, HandlerPlace, RouteRegistration, RuntimeChoice};
 use mipyre_http::plan::site::SiteRules;
+use mipyre_runtime::{record_worker_app, AppRoute, AppWebSocket, ScriptRegistrations};
+use mipyre_server::Site;
 use mipyre_transport::driver::TransportDriver;
 
 /// Returns whether calling `handler` gives an awaitable, which sends its route to the async
@@ -58,6 +58,15 @@ impl App {
                     handler: table.handler(r.handler).bind(py).clone(),
                 })
                 .collect(),
+            websockets: table
+                .ws_routes()
+                .iter()
+                .zip(table.ws_handlers())
+                .map(|(route, handler)| AppWebSocket {
+                    route: route.clone(),
+                    handler: handler.bind(py).clone(),
+                })
+                .collect(),
             before_hooks: bind(table.before_hooks()),
             after_hooks: bind(table.after_hooks()),
             limits: app.settings.limits,
@@ -101,15 +110,15 @@ impl App {
         // A raw-engine script never calls `_seal_registrations`, so the table is sealed here
         // for workers to compare against.
         self.seal_if_unsealed();
-        let mut site = self.snapshot(py, self.start_counters(recipe.tuning.metrics, &server_cpus))?;
+        let workers = Arc::new(mipyre_runtime::WorkerCounters::new());
+        let mut site = self.snapshot(
+            py,
+            self.start_counters(recipe.tuning.metrics, &server_cpus),
+            Arc::clone(&workers),
+        )?;
         let crate::boot::ServerCpus { cpus, pin_order, .. } = server_cpus;
         site.rules.settings.names = names;
         site.rules.settings.proxies = proxies;
-        // In the background, before the first request: a mount whose files cannot be watched says
-        // so now, and serves uncached as before (q/55 B').
-        for mount in site.rules.routes.static_mounts() {
-            mount.start_watching();
-        }
         site.pg = self.seal_pg(py)?;
         let site: Arc<Site> = Arc::new(site);
         let topology = Topology::resolve(InterpreterMode::of(&site.rules.routes), &recipe, cpus)?;
@@ -152,35 +161,36 @@ impl App {
             store: self.store.clone(),
             abandoned: self.abandoned.clone(),
             readiness: crate::boot::ReadinessCallback::default(),
+            workers,
         };
         Ok((run, opened))
     }
 
     /// Opens this run's Postgres pools from every `PgPool.connect()` the main interpreter made,
-    /// reporting every conflict at once, and binds those handles to them (b/335 D17).
-    fn seal_pg(&self, py: Python<'_>) -> PyResult<Option<Arc<crate::runtime::RunPools>>> {
+    /// reporting every conflict at once, and binds those handles to them.
+    fn seal_pg(&self, py: Python<'_>) -> PyResult<Option<Arc<mipyre_pg::RunPools>>> {
         let mut modules = self.home_modules.clone();
         // The script workers run: the one set for the app, else `__main__`'s.
         match &self.source.script_path {
-            Some(script) => modules.push(crate::runtime::ModuleKey::of_path(py, script)?),
-            None => modules.extend(crate::runtime::ModuleKey::of_module(py, "__main__")?),
+            Some(script) => modules.push(crate::db::module_key_of_path(py, script)?),
+            None => modules.extend(crate::db::module_key_of_module(py, "__main__")?),
         }
-        let handles: Vec<_> = crate::runtime::EngineModule::with(py, |module| module.pg_handles())?
+        let handles: Vec<_> = mipyre_runtime::EngineModule::with(py, |module| module.pg_handles())?
             .into_iter()
             .filter(|handle| handle.made_by(&modules))
             .collect();
         let n = self.runs.fetch_add(1, crate::sync::Ordering::Relaxed) + 1;
-        let label = crate::runtime::RunLabel(match &self.source.script_path {
+        let label = mipyre_pg::RunLabel(match &self.source.script_path {
             Some(script) => format!("server run {n} of {}", script.display()),
             None => format!("server run {n} of this app"),
         });
-        py.detach(|| crate::runtime::RunPools::seal(label, &handles))
+        py.detach(|| mipyre_pg::RunPools::seal(label, &handles, mipyre_subinterp::PYTHON_THREAD_STACK))
             .map_err(|e| match e {
-                crate::runtime::RunPoolsError::ConnectFailed { .. } => {
+                mipyre_pg::RunPoolsError::ConnectFailed { .. } => {
                     pyo3::exceptions::PyConnectionError::new_err(e.to_string())
                 }
-                crate::runtime::RunPoolsError::Runtime(_) => pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
-                crate::runtime::RunPoolsError::Conflicts(_) | crate::runtime::RunPoolsError::Shared(_) => {
+                mipyre_pg::RunPoolsError::Runtime(_) => pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
+                mipyre_pg::RunPoolsError::Conflicts(_) | mipyre_pg::RunPoolsError::Shared(_) => {
                     pyo3::exceptions::PyValueError::new_err(e.to_string())
                 }
             })
@@ -197,9 +207,9 @@ impl App {
         &self,
         metrics: bool,
         cpus: &crate::boot::ServerCpus,
-    ) -> Arc<crate::telemetry::RunCounters> {
+    ) -> Arc<mipyre_server::ServerCounters> {
         Arc::new(
-            crate::telemetry::RunCounters::new(metrics || self.metrics_path.is_some())
+            mipyre_server::ServerCounters::new(metrics || self.metrics_path.is_some())
                 .sized_from_fallback(cpus.fallback_reason()),
         )
     }
@@ -211,18 +221,32 @@ impl App {
     /// # Errors
     ///
     /// Returns `ValueError` when the app has its own `GET` route at the metrics path.
-    pub(super) fn snapshot(&self, py: Python<'_>, counters: Arc<crate::telemetry::RunCounters>) -> PyResult<Site> {
+    pub(super) fn snapshot(
+        &self,
+        py: Python<'_>,
+        counters: Arc<mipyre_server::ServerCounters>,
+        workers: Arc<mipyre_runtime::WorkerCounters>,
+    ) -> PyResult<Site> {
         let mut rules = self.rules(py);
         // One budget per server: its mounts' caches hold their bytes against it, apart from any
-        // other server's in the process.
+        // other server's in the process. Its copies of the mounts count what they send from disk
+        // apart from other servers' copies too.
         let budget = Arc::new(mipyre_http::io::static_files::CacheBudget::new(
             mipyre_http::io::static_files::DEFAULT_CACHE_BUDGET_BYTES,
         ));
-        for mount in rules.routes.static_mounts() {
+        for mount in rules.routes.static_mounts_mut() {
             mount.cache_within(&budget);
+            mount.count_own_sends();
         }
         if let Some(path) = &self.metrics_path {
-            let page = Py::new(py, crate::pyapi::metrics_page::MetricsPage::new(Arc::clone(&counters)))?;
+            let page = Py::new(
+                py,
+                crate::pyapi::metrics_page::MetricsPage::new(
+                    Arc::clone(&counters),
+                    workers,
+                    rules.routes.static_mounts().to_vec(),
+                ),
+            )?;
             rules
                 .routes
                 .insert(
@@ -242,9 +266,10 @@ impl App {
         }
         Ok(Site {
             rules,
-            ws_connections: crate::serve::OpenConnections::default(),
+            ws_connections: mipyre_server::OpenConnections::default(),
+            large_body_permits: mipyre_server::LargeBodyPermits::none(),
             process: self.process_lanes.clone(),
-            counters,
+            counters: Arc::new(mipyre_server::SiteCounters::new(counters)),
             pg: None,
             clock: quanta::Clock::new(),
         })
@@ -337,7 +362,7 @@ impl App {
 /// Readies a start whose workers load isolated extensions, before any of them starts: the
 /// directory their copies go in is checked once now (made private to this user if missing,
 /// refused if another user owns it or can write to it), so a bad one fails the start rather
-/// than every worker (FR-13); each worker's claim checks again. With more than one worker, the
+/// than every worker; each worker's claim checks again. With more than one worker, the
 /// BLAS thread pools are limited to one thread each and the start says so.
 fn isolated_start(
     py: Python<'_>,

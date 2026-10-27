@@ -77,6 +77,10 @@ pub enum CpuReadError {
         logical: NonZeroUsize,
         source: io::Error,
     },
+    /// The physical cores are not counted on this platform, so no read failed.
+    CoresNotCountedHere {
+        logical: NonZeroUsize,
+    },
 }
 
 impl fmt::Display for CpuReadError {
@@ -94,6 +98,10 @@ impl fmt::Display for CpuReadError {
                 f,
                 "could not read this process's physical cores ({logical} logical CPUs): {source}"
             ),
+            CpuReadError::CoresNotCountedHere { logical } => write!(
+                f,
+                "this platform does not count physical cores ({logical} logical CPUs)"
+            ),
         }
     }
 }
@@ -102,7 +110,7 @@ impl std::error::Error for CpuReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CpuReadError::Logical(e) | CpuReadError::CoreCount { source: e, .. } => Some(e),
-            CpuReadError::Cores { .. } => None,
+            CpuReadError::Cores { .. } | CpuReadError::CoresNotCountedHere { .. } => None,
         }
     }
 }
@@ -110,6 +118,8 @@ impl std::error::Error for CpuReadError {
 #[derive(Debug)]
 pub enum PinOrderError {
     Affinity(io::Error),
+    /// core_affinity listed no CPUs for this process and gives no reason.
+    AffinityNotListed,
     EmptyMask,
     /// A CPU's SMT siblings could not be read.
     Topology(CpuListFileError),
@@ -120,7 +130,7 @@ impl PinOrderError {
         match self {
             PinOrderError::Affinity(e) => Some(e),
             PinOrderError::Topology(e) => e.os_error(),
-            PinOrderError::EmptyMask => None,
+            PinOrderError::AffinityNotListed | PinOrderError::EmptyMask => None,
         }
     }
 }
@@ -130,6 +140,12 @@ impl fmt::Display for PinOrderError {
         match self {
             PinOrderError::Affinity(e) => {
                 write!(f, "could not read which CPUs this process may run on: {e}")
+            }
+            PinOrderError::AffinityNotListed => {
+                write!(
+                    f,
+                    "could not read which CPUs this process may run on; core_affinity gives no reason"
+                )
             }
             PinOrderError::EmptyMask => {
                 write!(f, "the CPU affinity mask of this process lists no CPU")
@@ -146,7 +162,7 @@ impl std::error::Error for PinOrderError {
         match self {
             PinOrderError::Affinity(e) => Some(e),
             PinOrderError::Topology(e) => Some(e),
-            PinOrderError::EmptyMask => None,
+            PinOrderError::AffinityNotListed | PinOrderError::EmptyMask => None,
         }
     }
 }
@@ -451,16 +467,22 @@ impl HostCpus {
     pub fn read(quota: Quota) -> Self {
         let cpus = std::thread::available_parallelism()
             .map_err(CpuReadError::Logical)
-            .and_then(|logical| {
-                physical_cores()
-                    .map(|cores| Cpus::new(logical, threads_for(cores, quota)))
-                    .map_err(|source| CpuReadError::CoreCount { logical, source })
-            });
+            .and_then(|logical| cores_counted(logical).map(|cores| Cpus::new(logical, threads_for(cores, quota))));
         HostCpus {
             cpus,
             pin_order: read_pinning(),
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn cores_counted(logical: NonZeroUsize) -> Result<NonZeroUsize, CpuReadError> {
+    physical_cores().map_err(|source| CpuReadError::CoreCount { logical, source })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn cores_counted(logical: NonZeroUsize) -> Result<NonZeroUsize, CpuReadError> {
+    Err(CpuReadError::CoresNotCountedHere { logical })
 }
 
 #[cfg(target_os = "macos")]
@@ -470,8 +492,7 @@ fn read_pinning() -> Result<PinOrder, PinOrderError> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_pinning() -> Result<PinOrder, PinOrderError> {
-    let ids = core_affinity::get_core_ids()
-        .ok_or_else(|| PinOrderError::Affinity(io::Error::other("core_affinity could not list this process's CPUs")))?;
+    let ids = core_affinity::get_core_ids().ok_or(PinOrderError::AffinityNotListed)?;
     let cpus = CpuOrder::new(ids).ok_or(PinOrderError::EmptyMask)?;
     Ok(PinOrder::Pinned {
         cpus,
@@ -735,14 +756,6 @@ fn sysctl_int(name: &std::ffi::CStr) -> io::Result<i32> {
         ));
     }
     Ok(value)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn physical_cores() -> io::Result<NonZeroUsize> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "counting physical cores is Linux and macOS only here",
-    ))
 }
 
 // `CpuMask`'s words are 64-bit and the kernel reads `unsigned long`s. The bits land in the same

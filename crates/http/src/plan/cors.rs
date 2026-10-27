@@ -257,6 +257,9 @@ fn browser_origin(entry: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

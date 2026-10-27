@@ -1,16 +1,13 @@
-"""Regression for the streaming-body OOM (benchmark-17 audit bug #1).
+"""A streamed request body is bounded by backpressure, not buffered without limit.
 
-Before the fix the feeder used `std::sync::mpsc` — unbounded. A fast
-client could dump 10 GB of upload body into the channel faster than a
-slow Python handler drained it, trashing RAM.
-
-Now the feeder uses `tokio::sync::mpsc::channel(CHANNEL_CAPACITY)` and
+An unbounded channel would let a fast client dump an upload body into memory faster than a
+slow Python handler drains it. The feeder uses `tokio::sync::mpsc::channel(CHANNEL_CAPACITY)` and
 `.send().await`, which propagates backpressure to `poll_frame` → TCP
 window → client.
 
 The full DoS test needs a multi-GB-per-second peer that's not easy to
 simulate in pytest; this checks functional correctness (the handler still
-receives every chunk). The streamed-body budget is covered by test_final_w2.
+receives every chunk). The streamed-body budget is covered by test_request_path.
 """
 
 from mipyre import BodyStream, Mipyre

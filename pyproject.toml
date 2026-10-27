@@ -25,10 +25,10 @@ dependencies = ["isojson>=0.3"]
 test = [
     "pytest>=8",
     "pytest-asyncio>=1",
-    # The gate runs the suite on several workers (`-n`, b/156); `--dist loadgroup` honours
+    # The gate runs the suite on several workers (`-n`); `--dist loadgroup` honours
     # `@pytest.mark.xdist_group`, which pins tests that must not run beside each other to one worker.
     "pytest-xdist>=3.6",
-    # The one wall clock a test is held to (b/441): `timeout` below, a hang guard, not a criterion. A wait for an
+    # The one wall clock a test is held to: `timeout` below, a hang guard, not a criterion. A wait for an
     # event waits for the event alone (`poll_until(..., timeout=None)`); this ends the test that never gets it.
     "pytest-timeout>=2.3",
     "httpx",
@@ -45,26 +45,25 @@ test = [
     "pydantic-settings>=2",
     "watchfiles",
     "hypothesis",
-    # The merge gate installs this extra (plus isojson), so these are the gate's test deps too,
-    # and a local venv has them as well (b/147).
+    # Every test run installs this extra (plus isojson).
     # tests/test_isolate_shared_ext.py and tests/test_blas_threads_isolated.py importorskip scipy and
-    # threadpoolctl: missing = skip, and the gate's skip check (dev/skip_gate.py) makes a skip red.
+    # threadpoolctl: without them those tests skip.
     "scipy",
     "threadpoolctl",
-    # tests/test_process_lane.py imports polars; tests/test_final_w2.py runs maturin next to the test python.
+    # tests/test_process_lane.py imports polars; tests/test_request_path.py runs maturin next to the test python.
     "polars",
     "maturin>=1.9.4,<2.0",
-    # tests/test_openapi.py (b/748): the generated document is checked against the official OpenAPI 3.1 schema,
+    # tests/test_openapi.py: the generated document is checked against the official OpenAPI 3.1 schema,
     # and Schemathesis sends the requests that document describes to a served app.
     "openapi-spec-validator>=0.7",
     "schemathesis>=4",
 ]
-# The merge gate's lint step installs this extra and runs `ruff check` and mypy (b/56). Pinned: a new release
+# The lint step installs this extra and runs `ruff check` and mypy. Pinned: a new release
 # that adds a check would turn main red with no change in the tree. Check only; the repo has no formatter.
 lint = [
     "ruff==0.17.1",
     "mypy==2.4.0",
-    # dev/gate_timing.py reads merge.yml with PyYAML; its stubs let mypy check that use.
+    # Stubs for PyYAML, which the repository's scripts import, so mypy checks that use.
     "types-PyYAML==6.0.12.20260906",
     # examples/trading/analytics.py imports pandas, which the lint venv does not install; its stubs let mypy check it.
     "pandas-stubs==3.0.5.260914",
@@ -72,7 +71,7 @@ lint = [
 
 # Not extras: a dependency group is not in the wheel's metadata.
 [dependency-groups]
-# The pandas tier of the process-lane chaos soak (benchmarks/process_lane_e2e/tiers.py); the rest of what it imports
+# The pandas tier of the process-lane chaos soak; the rest of what it imports
 # is in the `test` extra.
 process-lane-e2e = ["pandas"]
 
@@ -80,7 +79,7 @@ process-lane-e2e = ["pandas"]
 mipyre = "mipyre.cli:main"
 
 [tool.maturin]
-# The engine is a workspace member, not the root (b/51 E0b); the wheel and the module are unchanged.
+# The engine is a workspace member, not the root; the wheel and the module are unchanged.
 manifest-path = "crates/pyext/Cargo.toml"
 python-source = "python"
 module-name = "mipyre.engine"
@@ -92,18 +91,21 @@ module-name = "mipyre.engine"
 # `python -m` prepends cwd automatically; bare `pytest` does not, and
 # the test_*_e2e files depend on the tests package being importable.
 pythonpath = ["."]
-# An unknown marker is an error, not a silently ignored typo; an xfail that passes fails (b/53 E1-2, design §5.1).
+# An unknown marker is an error, not a silently ignored typo; an xfail that passes fails.
 addopts = "--strict-markers"
 xfail_strict = true
-# Hang guard (b/441): a test still running after this many seconds fails with every thread's stack. Wide on purpose:
-# no test is judged by its time; dev/test_time_gate.py judges what each test asked for (sleep seconds, work).
+# Hang guard: a test still running after this many seconds fails with every thread's stack. Wide on purpose:
+# no test is judged by its time, only by what it asked for (sleep seconds, work).
 timeout = 300
+# The thread method ends the stuck test's process, which xdist reports as that test's crash and replaces. The signal
+# method only raises in the main thread, and a test whose cleanup then joins a thread that never returns (a pool
+# thread in `poll_until(timeout=None)`) stays stuck, and with it the whole run.
+timeout_method = "thread"
 
-# A suppression is a decision, and each one says what it suppresses and why (b/56, b/51 event 339): a `# noqa`
+# A suppression is a decision, and each one says what it suppresses and why: a `# noqa`
 # names its code (PGH004) and is red once nothing is left to suppress (RUF100); a `# type: ignore` names its
 # error code (PGH003 here, `ignore-without-code` in mypy) and is red once unused (`warn_unused_ignores`). The
-# reason follows the code on the same line, and dev/suppressions.py counts every one of them per file
-# against dev/suppressions.txt.
+# reason follows the code on the same line.
 [tool.ruff]
 target-version = "py314"
 
@@ -115,11 +117,9 @@ select = ["E4", "E7", "E9", "F", "BLE001", "S102", "PGH003", "PGH004", "RUF100"]
 
 [tool.mypy]
 python_version = "3.14"
-# Of benchmarks/, only what the merge gate runs: merge.yml's microbench step (bench_micro_count.py) and the board it
-# imports. The other scripts there and arena_submission/ are run by hand and are not checked (b/773).
 files = ["python/mipyre", "tests", "examples"]
-# benchmarks/ and examples/ as well, where bench_micro_count.py finds `_board` and the examples their packages
-# (`fullstack.main`): a script run as `python <dir>/<script>.py` has its own directory on sys.path.
+# examples/ as well, where the examples find their packages (`fullstack.main`): a script run as
+# `python <dir>/<script>.py` has its own directory on sys.path.
 mypy_path = ["python", "examples"]
 explicit_package_bases = true
 warn_unused_ignores = true

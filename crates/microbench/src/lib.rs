@@ -5,10 +5,8 @@
 //!   BENCH_N=10000000 cargo bench -p mipyre_http --bench body -- read_body_ready
 //!
 //! `BENCH_N` is the number of calls, and naming no case runs them all. `--list` prints the case
-//! names one per line, which is how `benchmarks/bench_micro_count.py` and
-//! `dev/run_microbenches.sh` find them. Instructions per call come from `bench_micro_count.py` on
-//! Linux, which the merge gate runs against `benchmarks/micro-count-baseline.json`: it runs one
-//! case per process, so a name selects exactly one case, and a name that selects none is an error.
+//! names one per line, so a runner can find them and count one case per process; a name selects
+//! exactly one case, and a name that selects none is an error.
 //!
 //! The bench binary chooses its allocator, so it declares the counting one itself:
 //!

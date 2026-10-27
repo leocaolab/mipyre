@@ -56,19 +56,21 @@ impl Captured {
 /// Lowers the soft fd limit to a few above the lowest free number and takes every fd still free
 /// below it, returning them so that dropping them frees the descriptors.
 fn exhaust_fds(fd: &OwnedFd) -> Vec<OwnedFd> {
-    // SAFETY: These are plain syscalls on a valid fd and a valid out-struct.
-    unsafe {
-        let lowest_free = libc::dup(fd.as_raw_fd());
-        assert!(lowest_free >= 0, "dup failed before the limit was lowered");
-        libc::close(lowest_free);
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
-        limit.rlim_cur = (lowest_free as libc::rlim_t + 16).min(limit.rlim_max);
-        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
-    }
+    // SAFETY: `fd` is borrowed, so its descriptor stays open for the call.
+    let lowest_free = unsafe { libc::dup(fd.as_raw_fd()) };
+    assert!(lowest_free >= 0, "dup failed before the limit was lowered");
+    // SAFETY: `lowest_free` was just returned by `dup`, so this test is its only owner and nothing
+    // else closes or uses it.
+    unsafe { libc::close(lowest_free) };
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a live, writable `rlimit`, the struct `getrlimit` fills.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+    limit.rlim_cur = (lowest_free as libc::rlim_t + 16).min(limit.rlim_max);
+    // SAFETY: `limit` is a live, initialized `rlimit`, the struct `setrlimit` reads.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
     let mut hogs = Vec::new();
     loop {
         // SAFETY: `fd` is a valid descriptor to dup.

@@ -2,7 +2,9 @@
 //! deployment lists as a proxy may name the client, in `X-Forwarded-For`, and the header is read
 //! from the right, past every listed proxy, to the first address that is not one.
 //!
-//! The design and why `Forwarded` (RFC 7239) is not read: `docs/design/forwarded-client.md`.
+//! `Forwarded` (RFC 7239) is not read: a proxy maintains only the header it writes and passes
+//! the other through as the client sent it, so reading both would trust a forged value, and the
+//! common proxies write `X-Forwarded-For`.
 
 // `core::net`: the address is a value; `std::net` is the socket half the plan never names.
 use core::net::IpAddr;

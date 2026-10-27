@@ -2,7 +2,7 @@
 
 mod os;
 // The topology and cgroup decisions have one caller, the Linux read path in os.rs; they compile
-// everywhere so their tests run on every machine. Registered in dev/arch_waivers.txt (E-S3, P3).
+// everywhere so their tests run on every machine.
 #[cfg_attr(
     not(target_os = "linux"),
     expect(dead_code, reason = "their one caller reads Linux's sysfs and cgroups")

@@ -1,7 +1,7 @@
 //! Counts the async database results the process could not deliver.
 //!
 //! A component that cannot do its job degrades while the server keeps serving, and says why
-//! where it is held: a run's CPU pinning on its `RunCounters`, a process lane's crash loop on
+//! where it is held: a run's CPU pinning on its `ServerCounters`, a process lane's crash loop on
 //! its `ServerLanes`, a static mount's lost watch on the mount, RSS sampling on the sampler
 //! (`monitor`), leak detection on its recorder. A run's list is `Server.metrics().degraded`,
 //! the process's `get_gil_metrics().degraded`. The socket and static-file degradations are

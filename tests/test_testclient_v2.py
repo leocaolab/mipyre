@@ -6,6 +6,10 @@ rebuild it by executing this module."""
 
 from __future__ import annotations
 
+import signal
+import subprocess
+import sys
+
 import pytest
 
 from mipyre import Mipyre, Response
@@ -202,3 +206,122 @@ def test_request_method_accepts_arbitrary_verbs():
     with TestClient(app) as c:
         r = c.request("PATCH", "/thing")
         assert r.text == "patched"
+
+
+# ---------------------------------------------------------------------------
+# A stop signal that came between two servers
+# ---------------------------------------------------------------------------
+
+_BETWEEN_RUNS = """
+import os
+import signal
+from mipyre import Mipyre
+from mipyre.testing import TestClient
+
+# The process handles SIGTERM itself, as it handles SIGINT: with the default action the signal
+# between the servers would end it.
+signal.signal(signal.SIGTERM, lambda signum, frame: None)
+app = Mipyre(runtime="main")
+
+@app.get("/")
+def index(req):
+    return "ok"
+
+with TestClient(app) as c:
+    assert c.get("/").status_code == 200
+# No server runs now; the signals the first one's watcher registered still reach the process.
+for signum in (signal.SIGINT, signal.SIGTERM):
+    try:
+        os.kill(os.getpid(), signum)
+    except KeyboardInterrupt:
+        pass
+with TestClient(app) as c:
+    print(c.get("/").status_code)
+"""
+
+
+def test_a_stop_signal_that_came_before_a_server_started_does_not_stop_it(tmp_path):
+    # Its own process: a signal reaches every thread of the process it is sent to.
+    script = tmp_path / "between_runs.py"
+    script.write_text(_BETWEEN_RUNS)
+    done = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.splitlines()[-1] == "200", done.stdout + done.stderr
+
+
+_AFTER_A_RUN = """
+import os
+import signal
+import sys
+from mipyre import Mipyre
+from mipyre.testing import TestClient
+
+app = Mipyre(runtime="main")
+
+@app.get("/")
+def index(req):
+    return "ok"
+
+with TestClient(app) as c:
+    assert c.get("/").status_code == 200
+print("served", flush=True)
+try:
+    os.kill(os.getpid(), getattr(signal, sys.argv[1]))
+    signal.pause()
+    print("survived", flush=True)
+except KeyboardInterrupt:
+    print("KeyboardInterrupt", flush=True)
+"""
+
+
+@pytest.mark.parametrize(
+    ("signum", "returncode", "last_line"),
+    [(signal.SIGTERM, -signal.SIGTERM, "served"), (signal.SIGINT, 0, "KeyboardInterrupt")],
+    ids=["sigterm", "sigint"],
+)
+def test_a_stop_signal_after_a_server_ran_is_handled_as_before_it(tmp_path, signum, returncode, last_line):
+    # SIGTERM takes its default action and ends the process; SIGINT is Python's KeyboardInterrupt.
+    script = tmp_path / "after_a_run.py"
+    script.write_text(_AFTER_A_RUN)
+    done = subprocess.run([sys.executable, str(script), signum.name], capture_output=True, text=True, timeout=120)
+    assert done.returncode == returncode, done.stdout + done.stderr
+    assert done.stdout.splitlines()[-1] == last_line, done.stdout + done.stderr
+
+
+_HANDLER_SWAPPED_BETWEEN_RUNS = """
+import os
+import signal
+import threading
+from mipyre import Mipyre
+from mipyre._server_run import ServerRun, Transport
+from mipyre.engine import ServerFlags
+from mipyre.testing import TestClient
+
+app = Mipyre(runtime="main")
+
+@app.get("/")
+def index(req):
+    return "ok"
+
+with TestClient(app) as c:
+    assert c.get("/").status_code == 200
+
+handled = threading.Event()
+signal.signal(signal.SIGTERM, lambda signum, frame: handled.set())
+run = ServerRun.in_test_process(app, ServerFlags(), transport=Transport.MEMORY)
+run.serve(on_serving=lambda: os.kill(os.getpid(), signal.SIGTERM))
+print("stopped", handled.is_set(), flush=True)
+os.kill(os.getpid(), signal.SIGTERM)
+handled.wait()
+print("handled", flush=True)
+"""
+
+
+def test_a_run_after_the_sigterm_handler_was_replaced_still_stops_on_sigterm(tmp_path):
+    # The second run owns SIGTERM, so the handler installed before it is not called for the
+    # signal that stopped it, and handles SIGTERM again once the run has ended.
+    script = tmp_path / "handler_swapped.py"
+    script.write_text(_HANDLER_SWAPPED_BETWEEN_RUNS)
+    done = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.splitlines()[-2:] == ["stopped False", "handled"], done.stdout + done.stderr

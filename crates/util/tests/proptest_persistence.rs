@@ -1,4 +1,4 @@
-//! Holds the check that `.cargo/config.toml` reaches the test processes cargo starts in this tree (b/758): a failing
+//! Holds the check that `.cargo/config.toml` reaches the test processes cargo starts in this tree: a failing
 //! proptest writes no proptest-regressions/ file beside the source. One crate's test stands for every crate, since
 //! cargo hands the same `[env]` to each.
 

@@ -100,6 +100,9 @@ impl<H, D> NoRoute<'_, '_, H, D> {
 }
 
 #[cfg(test)]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::plan::route::{BodyMode, HandlerPlace, MainHandler};
@@ -227,7 +230,10 @@ mod tests {
                     call,
                     HandlerCall::Main(t.route(t.route_id(0)).handler, MainHandler::Sync(BodyMode::Buffered))
                 );
-                assert_eq!(params, vec![("id".to_string(), "7".to_string())]);
+                assert_eq!(
+                    params.decoded("/users/7").collect::<Vec<_>>(),
+                    vec![("id", Some("7".into()))]
+                );
             }
             _ => panic!("expected a route"),
         }

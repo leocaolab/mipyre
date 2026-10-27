@@ -4,9 +4,7 @@ A fast response's bytes belong to the app's route table and are freed with it: t
 counted exactly in Rust (`plan/route.rs`, `every_registered_body_is_freed_with_its_table`:
 each registered body's drop, == the number registered). Here, the Python side of the same
 registration: an app that registered one, once dropped, leaves no block of the object allocator
-(`sys.getallocatedblocks()`) behind. Until b/441 both were one RSS threshold (`2 * 8 MiB` over 7
-apps here, 32 MiB over 200 apps in test_fast_response.py), which a leak had to cross several
-registrations to trip.
+(`sys.getallocatedblocks()`) behind.
 
 Servers are not started: starting and stopping one is test_restart_memory's.
 

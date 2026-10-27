@@ -1,8 +1,8 @@
-"""b/845 E (PR 5): the process-lane template is started by the app's first run — from
+"""The process-lane template is started by the app's first run — from
 `app.run()`, `mipyre dev` or a `TestClient` as from `mipyre run`. `mipyre run` starts it with
 the platform's driver before it imports the app, forked from a process with no other thread
 (Linux), the log's own writer thread stopped for the fork and started again. Every other entry
-starts it as a new interpreter on every platform (b/899 q/120 B, b/909), so a test process
+starts it as a new interpreter on every platform, so a test process
 running the test runner's threads (pytest-xdist's, pytest-timeout's) serves process routes too.
 
 Each case runs in a process of its own: the logger and the threads are process-wide state."""
@@ -165,7 +165,7 @@ def test_the_driver_does_not_fork_a_template_from_a_process_running_another_thre
 
 
 def test_a_testclient_serves_a_process_route_while_the_process_runs_another_thread(tmp_path):
-    # A test server's template is a new interpreter on every platform (b/899 q/120 B): the
+    # A test server's template is a new interpreter on every platform: the
     # thread does not reach it, so nothing refuses it.
     done = _run(tmp_path, """
         import os, threading
@@ -191,12 +191,12 @@ def test_a_testclient_serves_a_process_route_while_the_process_runs_another_thre
 
 def test_app_run_serves_a_process_route_while_the_process_runs_another_thread(tmp_path):
     # `python app.py` imported the app first, and an app's imports may start threads (numpy's
-    # BLAS pool, a database pool): its template is a new interpreter on every platform (b/909).
+    # BLAS pool, a database pool): its template is a new interpreter on every platform.
     log_path = str(tmp_path / "server.log")
     (tmp_path / "threaded_app.py").write_text(textwrap.dedent("""
         import os, threading
 
-        from mipyre import Mipyre
+        from mipyre import Mipyre, ServerFlags
 
         threading.Thread(target=threading.Event().wait, name="held-by-test", daemon=True).start()
 
@@ -209,7 +209,7 @@ def test_app_run_serves_a_process_route_while_the_process_runs_another_thread(tm
 
 
         if __name__ == "__main__":
-            app.run(port=0)
+            app.run(ServerFlags(port=0))
     """))
     env = {k: v for k, v in os.environ.items() if not k.startswith("MIPYRE_")}
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(tmp_path), os.environ.get("PYTHONPATH")]))
@@ -299,14 +299,14 @@ def _pytest(tmp_path, *args: str) -> subprocess.CompletedProcess:
 
 
 def test_process_routes_are_tested_under_pytest_xdist(tmp_path):
-    # xdist's execnet runs a thread in each worker process (b/899 §1.1 item 4).
+    # xdist's execnet runs a thread in each worker process.
     done = _pytest(tmp_path, "-n", "2")
     assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-3000:]
     assert "2 passed" in done.stdout, done.stdout[-3000:]
 
 
 def test_process_routes_are_tested_under_pytest_timeouts_thread_method(tmp_path):
-    # The thread method runs a timer thread beside each test (b/899 §1.1 item 4).
+    # The thread method runs a timer thread beside each test.
     done = _pytest(tmp_path, "--timeout", "120", "-o", "timeout_method=thread")
     assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-3000:]
     assert "2 passed" in done.stdout, done.stdout[-3000:]

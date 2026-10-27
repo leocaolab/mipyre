@@ -68,7 +68,7 @@ def test_metrics_shape():
 
 
 def test_run_metrics_shape(client):
-    """A server's own counts (``Server.metrics()``, b/335 D15) are a RunMetrics snapshot."""
+    """A server's own counts (``Server.metrics()``) are a RunMetrics snapshot."""
     m = client.server.metrics()
     assert isinstance(m, RunMetrics)
     assert isinstance(m.dropped_requests, int)
@@ -76,7 +76,7 @@ def test_run_metrics_shape(client):
 
 
 def test_degradation_counters_are_exposed(client):
-    """The degradations the engine took are counted (b/132): the process's in its snapshot, a
+    """The degradations the engine took are counted: the process's in its snapshot, a
     server's in its own; the counters are integers, and the CPU sizing fallback is a reason or
     None."""
     m = get_gil_metrics()
@@ -84,8 +84,9 @@ def test_degradation_counters_are_exposed(client):
         "precompressed_fallbacks",
         "static_unwatched_mounts",
         "static_answers_cut",
-        "static_bytes_in_flight",
         "db_results_undeliverable",
+        "log_lines_dropped",
+        "log_lines_write_failed",
         "gil_congested_waits",
         "client_disconnects",
         "accept_failures",
@@ -111,6 +112,7 @@ def test_degradation_counters_are_exposed(client):
         "cpu_qos_failures",
         "cpu_affinity_unreadable",
         "cpu_topology_unreadable",
+        "static_bytes_in_flight",
     ):
         assert isinstance(getattr(run, name), int), name
     assert run.last_worker_retirement is None or isinstance(run.last_worker_retirement, str)

@@ -1,6 +1,6 @@
 //! Gives Python handlers Postgres pools backed by sqlx: a server run's, one per DSN, or a
-//! handle's own outside any run (b/335 D17; the pools and their binding are
-//! `runtime::pg`'s).
+//! handle's own outside any run (the pools and their binding are
+//! `mipyre_pg`'s).
 //!
 //! `PgPool.connect()` only records what it asked for. A run sealing on the main interpreter
 //! opens one pool per DSN from every such call, refusing at once every setting two calls name
@@ -20,6 +20,7 @@ mod cell;
 mod cursor;
 mod error;
 mod kind;
+mod module_key;
 mod numeric;
 mod param;
 mod py_types;
@@ -33,10 +34,15 @@ use pyo3::prelude::*;
 
 use std::sync::Arc;
 
-use crate::runtime::{Dsn, EngineModule, Expiry, ModuleKey, OpenPool, PgHandle, PoolRequest};
+use mipyre_pg::{Dsn, Expiry, OpenPool, PgHandle, PoolRequest};
+use mipyre_subinterp::PYTHON_THREAD_STACK;
+
 use cursor::PgCursor;
 use error::DbError;
+use mipyre_runtime::EngineModule;
 use query::{FetchMode, SqlQuery};
+
+pub(crate) use self::module_key::{module_key_of_globals, module_key_of_module, module_key_of_path};
 
 /// Adds the DB classes and exceptions to the engine module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -57,7 +63,7 @@ fn run_blocking(
     let stmt = SqlQuery::from_py(py, sql, &params)?;
     let outcome = py
         .detach(|| {
-            let open = handle.open().map_err(DbError::from)?;
+            let open = handle.open(PYTHON_THREAD_STACK).map_err(DbError::from)?;
             open.runtime
                 .run(query::run(open.pool, stmt, fetch))
                 .map_err(DbError::from)?
@@ -68,7 +74,8 @@ fn run_blocking(
 
 /// The pool a query of `handle` runs on now, opened if it is the handle's own and not yet open.
 fn open(py: Python<'_>, handle: &PgHandle) -> PyResult<OpenPool> {
-    py.detach(|| handle.open()).map_err(|e| DbError::from(e).into_pyerr(py))
+    py.detach(|| handle.open(PYTHON_THREAD_STACK))
+        .map_err(|e| DbError::from(e).into_pyerr(py))
 }
 
 /// Runs the statement on the DB runtime and returns an asyncio future for its result.
@@ -159,7 +166,7 @@ impl PgPool {
             .import("sys")?
             .call_method1("_getframe", (0,))?
             .getattr("f_globals")?;
-        let owner = ModuleKey::of_globals(caller.cast::<pyo3::types::PyDict>()?)?;
+        let owner = module_key_of_globals(caller.cast::<pyo3::types::PyDict>()?)?;
         let handle = PgHandle::new(request, owner);
         EngineModule::with(py, |module| match module.run_pools() {
             // A worker of a run that has pools binds to them now.
@@ -256,7 +263,7 @@ impl PgPool {
 
 /// Refuses `PgPool` in a process-lane worker, a process apart from the server's pool.
 fn refuse_in_lane_worker() -> PyResult<()> {
-    crate::runtime::process::refuse_in_lane_worker("PgPool")
+    mipyre_process::refuse_in_lane_worker("PgPool")
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
 

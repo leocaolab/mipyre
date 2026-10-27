@@ -1,5 +1,5 @@
 {
-  "_about": "The template socket's frames, as bytes: commands written by crates/pyext/src/runtime/process/template.rs (TemplateCommand::frame) and read by python/mipyre/_process_lane/template.py (split_frame, parse_start, ...); reports written by template.py (forked_frame, exited_frame, ...) and read by template.rs (decode_template_report). Checked on both sides: runtime/process/tests.rs and tests/test_process_lane_start_failures.py.",
+  "_about": "The template socket's frames, as bytes: commands written by crates/process/src/template.rs (TemplateCommand::frame) and read by python/mipyre/_process_lane/template.py (split_frame, parse_start, ...); reports written by template.py (forked_frame, exited_frame, ...) and read by template.rs (decode_template_report). Checked on both sides: crates/process/src/tests.rs and tests/test_process_lane_start_failures.py.",
   "max_frame_bytes": 65536,
   "commands": [
     {

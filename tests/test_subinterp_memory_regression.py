@@ -25,10 +25,9 @@ Why measured on a running server: the regressions are leaks — objects and bloc
 request in the worker's own interpreter, counted by that interpreter (`gc`, `sys.getallocatedblocks`).
 Whether a reference is released depends on CPython's runtime, not on a value a function returns.
 
-The thread state a cross-thread attach made and never freed (`replace_creator_tstate`, fc45a7f)
+The thread state a cross-thread attach made and never freed (`replace_creator_tstate`)
 is raw malloc, which these counts don't see: `crates/subinterp/src/attach.rs` counts the
-interpreter's thread states before and after N visits from other threads instead (b/441). The
-12 s concurrent RSS soak that guarded it here runs before a release (`dev/release_soak.sh`).
+interpreter's thread states before and after N visits from other threads instead.
 """
 
 from __future__ import annotations
@@ -56,7 +55,7 @@ _server_port: int | None = None
 
 SERVER_SCRIPT = '''
 import gc, sys, os
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 from mipyre.cookies import Cookie
 from mipyre.engine import Response
 
@@ -179,7 +178,7 @@ def lowercase_route_match(req):
     return "matched"
 
 if __name__ == "__main__":
-    app.run(host="{HOST}", port={PORT}, threads={WORKERS})
+    app.run(ServerFlags(host="{HOST}", port={PORT}, threads={WORKERS}))
 '''
 
 
@@ -327,7 +326,7 @@ def test_cookie_plain_still_works(server):
 
 
 def test_a_lowercase_method_is_not_the_route_registered_in_uppercase(server):
-    """A method is case-sensitive (RFC 9110 §9.1, b/945): `get` is not `GET`, so the `GET`
+    """A method is case-sensitive (RFC 9110 §9.1): `get` is not `GET`, so the `GET`
     route answers it 405 and names the spellings it does serve."""
     import socket
 
@@ -382,9 +381,7 @@ def test_request_response_lock_out_dynamic_attrs(server):
 def test_mipyrerequest_does_not_accumulate(one_interpreter):
     """A request does not outlive itself: after `_REQUESTS` requests the interpreter that served
     them all holds exactly as many `Request`s as before, and twice the requests leave the same
-    (none). Before the Vectorcall fix every request leaked one. Until b/441 this was 2 050 serial
-    requests, one connection each, over many workers, the worst of 30 probes under the baseline
-    + 20."""
+    (none)."""
     once = _left_behind(one_interpreter, "/", _REQUESTS)
     assert once.requests == 0, f"{once.requests} more Requests alive after {_REQUESTS} requests"
     assert _left_behind(one_interpreter, "/", 2 * _REQUESTS).requests == once.requests

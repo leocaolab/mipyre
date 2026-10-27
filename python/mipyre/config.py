@@ -23,62 +23,28 @@ Subclasses override any of these via the usual ``model_config``::
         model_config = SettingsConfigDict(env_prefix="APP_")
         port: int = 8000
 
-``pydantic-settings`` is an optional dependency. Import is deferred so
-users who don't opt in don't pay the cost.
+``pydantic-settings`` is an optional dependency: importing this module without it raises
+``ImportError`` saying how to install it.
 """
 
 from __future__ import annotations
 
-import threading
+try:
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+except ImportError as e:  # pragma: no cover — clear install guidance
+    raise ImportError(
+        "mipyre.config requires pydantic-settings. Install with:\n"
+        "    pip install 'pydantic-settings>=2'"
+    ) from e
 
 
-def _load_pydantic_settings():
-    try:
-        from pydantic_settings import BaseSettings, SettingsConfigDict
-    except ImportError as e:  # pragma: no cover — clear install guidance
-        raise ImportError(
-            "mipyre.config requires pydantic-settings. Install with:\n"
-            "    pip install 'pydantic-settings>=2'"
-        ) from e
-    return BaseSettings, SettingsConfigDict
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
 
 
-_BaseSettings, _SettingsConfigDict = None, None
-_Settings = None
-_lock = threading.Lock()
-
-
-def _build_settings():
-    """Build the Settings class once, under lock, and cache it.
-
-    PEP 562 ``__getattr__`` does not memoize: without the cache every import would
-    mint a new class, breaking ``isinstance``, class identity and pickling. The lock
-    keeps concurrent first imports from building two.
-    """
-    global _BaseSettings, _SettingsConfigDict, _Settings
-    with _lock:
-        if _Settings is not None:
-            return _Settings
-        if _BaseSettings is None:
-            _BaseSettings, _SettingsConfigDict = _load_pydantic_settings()
-
-        class Settings(_BaseSettings):
-            model_config = _SettingsConfigDict(
-                env_file=".env",
-                env_file_encoding="utf-8",
-                extra="ignore",
-                case_sensitive=False,
-            )
-
-        _Settings = Settings
-        return _Settings
-
-
-def __getattr__(name: str):
-    """Lazy-import pydantic_settings only when Settings is touched."""
-    if name == "Settings":
-        return _build_settings()
-    raise AttributeError(f"module 'mipyre.config' has no attribute {name!r}")
-
-
-__all__ = ["Settings"]  # noqa: F822 — `Settings` is served by the module __getattr__ above, built on first use
+__all__ = ["Settings"]

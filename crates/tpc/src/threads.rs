@@ -29,7 +29,7 @@ mod os_thread;
 
 pub(crate) use os_thread::into_panic_message;
 use os_thread::JOIN_TIMEOUT;
-pub use os_thread::{panic_message, spawn, OsThread, ThreadJoinError};
+pub use os_thread::{spawn, OsThread, ThreadJoinError};
 
 /// Why a thread run under this crate failed: the caller's code returned an error or panicked, or
 /// this crate could not build the thread's runtime.
@@ -63,7 +63,7 @@ pub trait ThreadHooks: Send + Sync + 'static {
 /// [`pin_and_raise_qos`] makes one, on the thread it describes, and it cannot leave that thread,
 /// so a runtime served with it is built on the placed thread.
 #[derive(Debug)]
-pub struct Placement {
+pub struct AffinityOutcome {
     pub pin: Result<(), mipyre_cpu::PinError>,
     /// Raising the QoS class matters on macOS only, where a thread left at the default class may
     /// run on the efficiency cores; elsewhere it is always `Ok`.
@@ -74,19 +74,19 @@ pub struct Placement {
 /// Pins this thread to `core` (`None` leaves it where the OS put it) and raises its QoS class,
 /// and returns what happened; only the caller knows what an unpinned thread means and how to say
 /// so.
-pub fn pin_and_raise_qos(core: Option<CoreId>) -> Placement {
+pub fn pin_and_raise_qos(core: Option<CoreId>) -> AffinityOutcome {
     place_with(&HostOs, core)
 }
 
-fn place_with(os: &impl ThreadOs, core: Option<CoreId>) -> Placement {
-    Placement {
+fn place_with(os: &impl ThreadOs, core: Option<CoreId>) -> AffinityOutcome {
+    AffinityOutcome {
         pin: os.pin(core),
         qos: os.raise_qos(),
         on_this_thread: PhantomData,
     }
 }
 
-/// Serves `serve` on this thread, placed by `placement`, on a current-thread runtime and
+/// Serves `serve` on this thread, placed by `affinity`, on a current-thread runtime and
 /// `LocalSet` that are gone when this returns; the runtime's memory is first touched on the
 /// placed CPU.
 ///
@@ -102,7 +102,7 @@ fn place_with(os: &impl ThreadOs, core: Option<CoreId>) -> Placement {
 /// [`ThreadError::Panicked`] when `serve` or a hook panics, and otherwise `serve`'s own error as
 /// [`ThreadError::Returned`].
 pub fn serve_on_this_thread<H, Fut, E, C>(
-    placement: Placement,
+    affinity: AffinityOutcome,
     blocking_stack: usize,
     hooks: H,
     stop: &ThreadStop<C>,
@@ -113,13 +113,13 @@ where
     H: ThreadHooks + Clone,
     Fut: Future<Output = Result<(), E>>,
 {
-    serve_with(&HostOs, placement, blocking_stack, hooks, stop, teardown, serve)
+    serve_with(&HostOs, affinity, blocking_stack, hooks, stop, teardown, serve)
 }
 
 /// Serves as [`serve_on_this_thread`] does, building the runtime through `os`.
 fn serve_with<O, H, Fut, E, C, S>(
     os: &O,
-    placement: Placement,
+    affinity: AffinityOutcome,
     blocking_stack: usize,
     hooks: H,
     stop: &ThreadStop<C, S>,
@@ -133,7 +133,7 @@ where
     S: Cancellable,
 {
     // It is consumed so the runtime is built only on the thread it placed.
-    drop(placement);
+    drop(affinity);
     // tokio's callbacks must be `'static`, so each owns a copy of the hooks.
     let (park, unpark) = (hooks.clone(), hooks.clone());
     // A current-thread runtime starts threads only for its blocking pool, so the thread's count,
@@ -619,6 +619,12 @@ where
 /// Blocks this runtime-less thread until `token` is cancelled, parked in between, with no timer
 /// and no wakeups; a server's main thread waits here for the server's whole life.
 pub fn block_until_cancelled(token: &CancellationToken) {
+    block_on(token.cancelled());
+}
+
+/// Runs `future` to its end on this thread, parked between wakes, with no runtime and no timer;
+/// it is polled once at the start and once per wake.
+pub fn block_on<F: Future>(future: F) -> F::Output {
     struct Unpark(std::thread::Thread);
     impl std::task::Wake for Unpark {
         fn wake(self: Arc<Self>) {
@@ -627,9 +633,12 @@ pub fn block_until_cancelled(token: &CancellationToken) {
     }
     let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
     let mut cx = std::task::Context::from_waker(&waker);
-    let mut cancelled = std::pin::pin!(token.cancelled());
-    // `park` may return spuriously, so the poll says whether it was the cancel.
-    while cancelled.as_mut().poll(&mut cx).is_pending() {
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+        // `park` may return spuriously; the next poll then finds the future still pending.
         std::thread::park();
     }
 }
@@ -906,6 +915,7 @@ impl<C> Drop for StopWatcher<C> {
 mod loom_model;
 
 #[cfg(test)]
+#[cfg(not(sync_model))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1188,7 +1198,7 @@ mod tests {
         }
     }
 
-    /// The order is the types': a serve takes the `Placement` only placing the thread makes.
+    /// The order is the types': a serve takes the `AffinityOutcome` only placing the thread makes.
     #[test]
     fn the_thread_is_pinned_before_its_runtime_is_built() {
         let steps = Steps::default();
@@ -1247,13 +1257,13 @@ mod tests {
         within_10s(|| {
             let served = Arc::new(AtomicUsize::new(0));
             let ran = Arc::clone(&served);
-            let placement = pin_and_raise_qos(Some(CoreId {
+            let affinity = pin_and_raise_qos(Some(CoreId {
                 id: mipyre_cpu::MAX_CPUS,
             }));
-            let refused = placement.pin.as_ref().expect_err("no host has this CPU").to_string();
+            let refused = affinity.pin.as_ref().expect_err("no host has this CPU").to_string();
             assert!(refused.contains("CPU 8192"), "{refused}");
             let outcome: Result<(), ThreadError<BodyError>> = serve_on_this_thread(
-                placement,
+                affinity,
                 BLOCKING_STACK,
                 HookRecorder::default(),
                 &own_stop("t"),
@@ -1270,8 +1280,8 @@ mod tests {
 
     #[test]
     fn a_thread_with_no_pin_to_make_is_placed_with_no_failure() {
-        let placement = pin_and_raise_qos(None);
-        assert!(placement.pin.is_ok(), "{:?}", placement.pin);
+        let affinity = pin_and_raise_qos(None);
+        assert!(affinity.pin.is_ok(), "{:?}", affinity.pin);
     }
 
     #[test]
@@ -1769,7 +1779,7 @@ mod tests {
         assert_eq!(failure.error.thread, "s-0");
     }
 
-    /// Covers both stop-watcher tests of the arm's failure (b/636 ⑱): it names the watcher and the
+    /// Covers both stop-watcher tests of the arm's failure: it names the watcher and the
     /// cause, runs nothing, starts no thread and leaves the stop alone.
     #[test]
     fn a_stop_watcher_whose_arm_fails_starts_no_thread_and_does_not_stop() {
@@ -1936,7 +1946,14 @@ mod tests {
         )
         .ok()
         .unwrap();
-        let joined = join(handles, &run, Duration::from_millis(10));
+        // The failed thread has ended before the join, so the deadline, already past, can only
+        // leave the held one behind; a deadline counted from now would race the failed thread's
+        // exit on a loaded machine.
+        block_until_cancelled(&run.token());
+        while !handles[0].thread.is_finished() {
+            std::thread::yield_now();
+        }
+        let joined = join_until(handles, Instant::now());
         release.open();
         assert_eq!(
             joined.left_running,

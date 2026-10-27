@@ -1,8 +1,9 @@
-"""How a process-lane start fails, with what really happened (b/363, b/364): a worker that
+"""How a process-lane start fails, with what really happened: a worker that
 ends before it is ready, and a fork the OS refuses."""
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import json
 import os
@@ -10,6 +11,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import threading
 
 import pytest
 
@@ -102,6 +104,47 @@ def test_a_command_frame_past_the_limit_or_with_no_tag_is_refused_from_its_heade
     for n in (0, MAX_FRAME_BYTES + 1):
         with pytest.raises(CommandFrameError):
             split_frame(n.to_bytes(4, "little"))
+
+
+@pytest.mark.parametrize("over", [0, 1])
+def test_the_setup_is_read_up_to_the_frame_limit_and_refused_past_it_from_its_header(over):
+    import socket
+
+    from mipyre._process_lane.server import LaneSetup
+    from mipyre._process_lane.template import _recv_setup, frame
+    from mipyre.engine import StartStrategy
+
+    setup = LaneSetup(
+        start=StartStrategy.Import,
+        workers=1,
+        depth=8,
+        slot_bytes=4096,
+        worker_spin_us=50,
+        target="app:app",
+        routers=("app",),
+        sys_path=("x" * (MAX_FRAME_BYTES - 400),),
+        cwd="/srv",
+        thread_limits={},
+        log_level="WARN",
+        log_format="json",
+        run_dir="/run",
+    )
+    sent = frame(SETUP, setup.encode())
+    pad = MAX_FRAME_BYTES - (len(sent) - 4)
+    setup = dataclasses.replace(setup, sys_path=(setup.sys_path[0] + "x" * (pad + over),))
+    sent = frame(SETUP, setup.encode())
+    assert len(sent) - 4 == MAX_FRAME_BYTES + over
+    template_end, server_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with template_end, server_end:
+        if over:
+            server_end.sendall(sent[:4])
+            with pytest.raises(CommandFrameError, match=f"frames are 1 to {MAX_FRAME_BYTES}"):
+                _recv_setup(template_end)
+        else:
+            writer = threading.Thread(target=server_end.sendall, args=(sent,))
+            writer.start()
+            assert _recv_setup(template_end) == setup
+            writer.join()
 
 
 def test_a_frame_other_than_a_start_request_is_refused_where_one_comes():

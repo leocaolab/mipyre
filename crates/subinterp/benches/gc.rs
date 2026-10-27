@@ -1,6 +1,6 @@
 //! Counts the instructions of `GcSchedule::after_unit` when no collection is due.
 //!
-//! The merge gate runs it through `benchmarks/bench_micro_count.py`. By hand:
+//! Run it with:
 //!
 //!   BENCH_N=2000000 cargo bench -p mipyre_subinterp --bench gc -- gc_after_unit
 

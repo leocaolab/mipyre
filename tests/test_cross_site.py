@@ -1,4 +1,4 @@
-"""The engine's site check (docs/design/cross-site-check.md): a request's host must be one of
+"""The engine's site check: a request's host must be one of
 the server's names, which stops DNS rebinding, and a request that acts must come from this site
 or one `enable_cors(allow_origins=...)` lists. Each test starts a real server on the serving
 path it names and sends the raw headers a browser would."""
@@ -12,8 +12,8 @@ import pytest
 from mipyre import Mipyre
 from mipyre.engine import ServerFlags
 from mipyre.testing import TestClient, TestServer
-from tests.test_final_w2 import raw_exchange, ws_request
-from tests.test_review_ra import RUN, serve
+from tests.test_request_path import raw_exchange, ws_request
+from tests.test_dispatch_paths import RUN, serve
 
 SITE_SCRIPT = """
 import os
@@ -35,8 +35,8 @@ def run_main(req):
     return {"ran": True}
 
 @app.websocket("/ws")
-def ws(ws):
-    ws.send("hello")
+async def ws(ws):
+    await ws.send("hello")
     ws.close()
 
 @app.get("/runs")
@@ -195,8 +195,8 @@ def _trusting_app() -> Mipyre:
     app.enable_cors(allow_origins=["https://app.test"], allow_credentials=True)
 
     @app.websocket("/ws")
-    def ws(ws):
-        ws.send("hello")
+    async def ws(ws):
+        await ws.send("hello")
         ws.close()
 
     return app

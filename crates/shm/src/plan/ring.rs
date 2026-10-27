@@ -259,6 +259,51 @@ pub fn exit_split(w: &Window, published: Seq, taken: Seq) -> Result<ExitSplit, P
     })
 }
 
+/// Where a request's slot is in the lap of the ring that starts at the host's `read`, as the counters say.
+///
+/// The design's seven states are these five and two held by a handle, not by a counter: the host writes an `Empty`
+/// slot while it holds the `RequestSlot` for `sent` (Writing), and the peer runs a `TakenByPeer` request while it
+/// holds its `PeerRequest` (Processing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotState {
+    /// The request is not sent, and its slot is free for it.
+    Empty,
+    /// The host sent the request and the peer has not taken it.
+    Committed,
+    /// The peer marked the request taken and has not published its answer.
+    TakenByPeer,
+    /// The peer published the answer and the host has not read it.
+    AnswerCommitted,
+    /// The request lies outside the lap: its answer was read, and its slot is free for the request `depth` after it.
+    Consumed,
+}
+
+/// Returns the state of request `seq`'s slot in a ring of `depth`, from the `published` and `taken` counters the peer
+/// wrote, which must fit the window as [`running`] checks them. Sequences wrap, so a request `depth` or more past
+/// `read` is one whose answer was read.
+#[inline]
+pub fn slot_state(
+    w: &Window,
+    depth: RingDepth,
+    published: Seq,
+    taken: Seq,
+    seq: Seq,
+) -> Result<SlotState, PeerCounterError> {
+    running(w, published, taken)?;
+    let at = seq.since(w.read);
+    Ok(if at < published.since(w.read) {
+        SlotState::AnswerCommitted
+    } else if at < taken.since(w.read) {
+        SlotState::TakenByPeer
+    } else if at < w.in_flight() {
+        SlotState::Committed
+    } else if at < depth.get() {
+        SlotState::Empty
+    } else {
+        SlotState::Consumed
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +516,56 @@ mod tests {
             running(&w(10, 15), Seq(15), Seq(16)),
             fault(15, 16),
             "answered all, then took one never sent"
+        );
+    }
+
+    /// Read at 10 with 15 sent in a ring of 8, the peer answered up to 12 and took 12: each boundary falls between two
+    /// requests.
+    #[test]
+    fn each_request_of_the_lap_is_named_by_where_it_falls_against_the_counters() {
+        let state = |seq| slot_state(&w(10, 15), depth(8), Seq(12), Seq(13), Seq(seq));
+        let named: Vec<_> = (8..=19).map(|seq| state(seq).unwrap()).collect();
+        use SlotState::*;
+        assert_eq!(
+            named,
+            [
+                Consumed,
+                Consumed,
+                AnswerCommitted,
+                AnswerCommitted,
+                TakenByPeer,
+                Committed,
+                Committed,
+                Empty,
+                Empty,
+                Empty,
+                Consumed,
+                Consumed,
+            ]
+        );
+    }
+
+    #[test]
+    fn slot_states_are_named_across_the_wrap() {
+        let state = |seq| slot_state(&w(u32::MAX, 1), depth(4), Seq(u32::MAX), Seq(0), Seq(seq)).unwrap();
+        assert_eq!(state(u32::MAX), SlotState::TakenByPeer);
+        assert_eq!(state(0), SlotState::Committed);
+        assert_eq!(state(1), SlotState::Empty);
+        assert_eq!(state(2), SlotState::Empty);
+        assert_eq!(state(3), SlotState::Consumed);
+        assert_eq!(state(u32::MAX - 1), SlotState::Consumed);
+    }
+
+    #[test]
+    fn a_slot_state_is_not_named_from_counters_past_belief() {
+        assert_eq!(
+            slot_state(&w(10, 15), depth(8), Seq(12), Seq(16), Seq(12)),
+            Err(PeerCounterError::TakenOutOfRange {
+                read: Seq(10),
+                sent: Seq(15),
+                published: Seq(12),
+                taken: Seq(16)
+            })
         );
     }
 

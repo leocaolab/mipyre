@@ -18,8 +18,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer, Registry};
 
-use super::access_line::{JsonLines, ACCESS_TARGET};
-use super::log_writer::{FenceError, LogChannel, LogQueue, LogWriter};
+use super::log_writer::{FenceError, LogChannel, LogDrops, LogQueue, LogWriter};
+use mipyre_server::{JsonLines, ACCESS_TARGET};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogFormat {
@@ -156,7 +156,7 @@ pub(crate) enum LoggerError {
          or `log` logger is already set: {0}"
     )]
     SubscriberAlreadySet(#[from] tracing_subscriber::util::TryInitError),
-    /// The log is configured once per process (b/335 D14): a second, different configuration
+    /// The log is configured once per process: a second, different configuration
     /// is refused rather than silently ignored or applied.
     #[error(
         "the log is already configured in this process ({installed}); a different configuration \
@@ -192,7 +192,7 @@ impl From<LoggerError> for PyErr {
 }
 
 /// The process-wide subscriber, installed by the first `init_logger` call: tracing allows one
-/// global subscriber per process, and this process has one log configuration (b/335 D14).
+/// global subscriber per process, and this process has one log configuration.
 struct GlobalSubscriber {
     config: LoggerConfig,
     queue: LogQueue,
@@ -292,7 +292,7 @@ fn install(config: &LoggerConfig) -> Result<GlobalSubscriber, LoggerError> {
 }
 
 /// Installs the log once; the same configuration again does nothing, and a different one is
-/// refused (D14).
+/// refused.
 fn apply(config: &LoggerConfig) -> Result<(), LoggerError> {
     let mut slot = LOGGER.lock();
     match slot.as_ref() {
@@ -348,6 +348,14 @@ pub(crate) fn flush_logs(py: Python<'_>) -> Result<(), LoggerError> {
     };
     py.detach(move || channel.fence())?;
     Ok(())
+}
+
+/// Returns how many lines the log dropped, by cause, and none before it is installed.
+pub(crate) fn log_lines_dropped() -> LogDrops {
+    LOGGER
+        .lock()
+        .as_ref()
+        .map_or(LogDrops::default(), |installed| installed.queue.channel().dropped())
 }
 
 /// Stops the log's writer thread, so the process runs no thread of the logger's, and returns

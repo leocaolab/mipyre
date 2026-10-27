@@ -1,4 +1,4 @@
-"""Runtimes declared by the user (docs/process-lanes-declared-design.md): where each route
+"""Runtimes an app declares per route: where each route
 runs, what each runtime imports, and the errors for declarations that can't be served."""
 
 from __future__ import annotations
@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 
 import pytest
@@ -73,8 +74,27 @@ def test_a_mixed_app_runs_each_router_in_its_runtime_and_imports_it_only_there(t
         stop(proc)
 
 
+def test_an_included_router_serves_under_its_prefix_and_is_imported_only_where_it_runs(tmp_path):
+    proc, port, log = serve(tmp_path, "tests.apps.declared_runtime.prefixed:app")
+    try:
+        server = proc.pid
+        assert get(port, "/v1/api") == {"pid": server, "subinterp": True}
+        analytics = get(port, "/stats/analytics")
+        assert analytics["pid"] != server and analytics["subinterp"] is False and analytics["mean"] == 2.0
+        assert get(port, "/stats/analytics/main") == {"pid": server, "subinterp": False}
+        assert get(port, "/routers") == {"pid": server, "subinterp": True, "loaded": ["api"]}
+        with pytest.raises(urllib.error.HTTPError) as unprefixed:
+            get(port, "/api")
+        assert unprefixed.value.code == 404
+        seen = imports(tmp_path)
+        assert {m for m, _, w in seen if w == "subinterp"} == {"prefixed", "api"}, seen
+        assert {m for m, p, w in seen if p != server} == {"prefixed", "analytics"}, seen
+    finally:
+        stop(proc)
+
+
 def test_an_app_with_no_sub_interpreter_route_builds_no_sub_interpreter(tmp_path):
-    """b/34: the app module (and whatever it imports) is never imported by a sub-interpreter
+    """The app module (and whatever it imports) is never imported by a sub-interpreter
     when none of its routes runs on one."""
     proc, port, log = serve(tmp_path, "tests.apps.declared_runtime.process_only:app")
     try:
@@ -85,7 +105,7 @@ def test_an_app_with_no_sub_interpreter_route_builds_no_sub_interpreter(tmp_path
         assert not [s for s in seen if s[2] == "subinterp"], seen
         banner = read_file(log)()
         assert "Sub-interpreters: none (no route runs on one)" in banner, banner
-        assert "Routes: 0 sub-interp + 1 GIL + 1 process + 0 async" in banner, banner
+        assert "Routes: 0 sub-interp + 1 main + 1 process + 0 async" in banner, banner
     finally:
         stop(proc)
 
@@ -122,15 +142,3 @@ def test_a_router_has_every_method_decorator_the_app_has():
     assert [(r.method, r.path) for r in router._routes] == [
         (m.upper(), f"/{m}") for m in ("get", "post", "put", "delete", "patch", "options", "head")
     ]
-
-
-def test_the_removed_route_flags_are_errors_quoting_the_new_spelling():
-    from mipyre import Mipyre
-
-    app = Mipyre()
-    with pytest.raises(TypeError, match=r'GET /x: gil=True was replaced by runtime=\'main\''):
-        app.get("/x", lambda req: 1, gil=True)
-    with pytest.raises(TypeError, match=r"POST /y: process=True was replaced by runtime='process'"):
-        app.post("/y", lambda req: 1, process=True)
-    assert app.routes == []
-

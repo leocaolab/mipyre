@@ -1,11 +1,11 @@
 [package]
 name = "mipyre_util"
-description = "Tools below every layer of pyre that know no business: the monotonic clock log throttles run on, and the log throttles (LogThrottle, and ThrottleState for callers that keep many under a lock)"
+description = "Tools below every layer of pyre that know no business: the monotonic clock log throttles run on, the log throttles (LogThrottle, and ThrottleState for callers that keep many under a lock), and a panic payload's text"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# Nothing but std, as README.md says and dev/archcheck.toml E-P13 checks.
+# Nothing but std.
 [dependencies]
 
 [dev-dependencies]

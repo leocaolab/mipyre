@@ -19,7 +19,7 @@ from mipyre.testing import TestClient
 def _log_lines_with(capfd, needle: str) -> list[str]:
     """The process-log lines containing `needle`. The server runs in this process and logs
     them before it answers; its log writer is a background thread, so `flush_logs()` is the
-    fence: past it, every line logged before is on stderr, and stderr is read once (b/497). Read
+    fence: past it, every line logged before is on stderr, and stderr is read once. Read
     while the writer writes, a line can be lost: `readouterr()` reads the capture file and then
     truncates it, and a line written in between is gone."""
     flush_logs()
@@ -44,7 +44,7 @@ def test_readyz_ok_when_no_checks():
         r = c.get("/readyz")
         assert r.status_code == 200
         data = r.json()
-        assert data == {"status": "ready", "checks": {}}
+        assert data == {"status": "ready", "checks": {"abandoned_workers": {"ok": True}}}
 
 
 def test_readyz_ok_with_passing_checks():

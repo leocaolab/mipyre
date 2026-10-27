@@ -1,5 +1,5 @@
-//! Builds one server's workers, pools and bridge on the main interpreter and runs the TPC or
-//! multi-thread server that `Server.serve()` starts.
+//! Builds one server's workers, pools and main-interpreter threads on the main interpreter and
+//! runs the TPC or multi-thread server that `Server.serve()` starts.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -8,15 +8,17 @@ use pyo3::prelude::*;
 use tokio_util::sync::CancellationToken;
 
 use crate::boot::config::EngineSettings;
+use crate::boot::serve_exception::serve_exception;
 use crate::boot::topology::Topology;
-use crate::runtime::{
-    AbandonedWorker, CommandLine, InterpreterPool, LiveWorkers, PoolError, PoolThreads, ServerRunStop, WorkerCounts,
-    WorkerKind, WorkerProgram, WorkerRecipe,
-};
-use crate::serve::AcceptMode;
-use crate::serve::{handle_request, handle_request_subinterp, upgrade_site, Site};
 use mipyre_cpu::{Cpus, PinOrder, PinOrderError};
 use mipyre_http::plan::route::{PlaceCounts, RouteManifest};
+use mipyre_process::LaneRunEvent;
+use mipyre_runtime::{
+    AbandonedWorker, CommandLine, InterpreterPool, LiveWorkers, MainThreadHandles, MainThreads, PoolError, PoolThreads,
+    WorkerCounters, WorkerCounts, WorkerKind, WorkerKindLoss, WorkerProgram, WorkerRecipe,
+};
+use mipyre_server::{upgrade_target, IoThreadServers, MultiThreadServer, Site};
+use mipyre_server::{AcceptMode, Disposition, ServerRunStop, ServerStop, StopSignalDispositions};
 use mipyre_subinterp::gc::GcPolicy;
 use mipyre_tpc::ShutdownDeadline;
 use mipyre_transport::driver::TransportDriver;
@@ -62,10 +64,7 @@ impl AppSource {
             (true, Some(dir)) => Some(dir.to_path_buf()),
             (true, None) => return Err(pyo3::exceptions::PyRuntimeError::new_err(NoIsolateDirError.to_string())),
         };
-        let script_path = match &self.script_path {
-            Some(path) => path.clone(),
-            None => crate::runtime::main_script(py)?,
-        };
+        let script_path = mipyre_runtime::app_file(py, self.script_path.as_deref())?;
         let program = WorkerProgram::read(py, script_path, command_line, self.routers.clone(), isolation)?;
         for skipped in &program.skipped_import_path {
             tracing::warn!(
@@ -94,6 +93,14 @@ impl AbandonedWorkers {
         abandoned
     }
 
+    /// Joins the main interpreter's threads by `deadline` and keeps the ones still running then.
+    /// Every [`MainThreads`] must be gone, and the caller must be detached from Python.
+    fn join_main(&self, handles: Option<MainThreadHandles>, deadline: &ShutdownDeadline) {
+        if let Some(handles) = handles {
+            self.keep_threads(handles.join(deadline));
+        }
+    }
+
     /// Keeps `workers`, which a failed pool start left running.
     fn keep(&self, workers: &[AbandonedWorker]) {
         self.0.lock().extend(workers.iter().cloned());
@@ -113,6 +120,10 @@ impl AbandonedWorkers {
     /// Takes the workers kept so far, leaving the list empty.
     pub(crate) fn take(&self) -> Vec<AbandonedWorker> {
         std::mem::take(&mut *self.0.lock())
+    }
+
+    fn any(&self) -> bool {
+        !self.0.lock().is_empty()
     }
 }
 
@@ -177,16 +188,37 @@ pub(crate) struct ServerRun<D: TransportDriver> {
     /// Is what this run's workers get as their `sys.argv` and flag values.
     pub(crate) command_line: CommandLine,
     /// Holds the app's key-value store, which every worker of this server sees.
-    pub(crate) store: crate::runtime::AppStore,
+    pub(crate) store: mipyre_runtime::AppStore,
     /// Collects the app's abandoned workers, which this server's pools add theirs to.
     pub(crate) abandoned: AbandonedWorkers,
     /// Is told when the server is ready; `serve()` sets it.
     pub(crate) readiness: ReadinessCallback,
+    /// Counts this run's workers; the server's own counts are its site's.
+    pub(crate) workers: Arc<WorkerCounters>,
+}
+
+/// Reads how Python handles SIGINT and SIGTERM: `SIG_DFL` is the OS default; a handler, `SIG_IGN`
+/// or a handler Python did not install (`None`) is another.
+fn stop_signal_dispositions(py: Python<'_>) -> PyResult<StopSignalDispositions> {
+    let signal = py.import("signal")?;
+    let default = signal.getattr("SIG_DFL")?;
+    let disposition = |name: &str| -> PyResult<Disposition> {
+        let handler = signal.call_method1("getsignal", (signal.getattr(name)?,))?;
+        Ok(if handler.is(&default) {
+            Disposition::Default
+        } else {
+            Disposition::Other
+        })
+    };
+    Ok(StopSignalDispositions {
+        interrupt: disposition("SIGINT")?,
+        terminate: disposition("SIGTERM")?,
+    })
 }
 
 /// Closes a run's Postgres pools when it drops, waiting with the GIL released.
 struct RunPoolsGuard<'py> {
-    pools: Arc<crate::runtime::RunPools>,
+    pools: Arc<mipyre_pg::RunPools>,
     py: Python<'py>,
 }
 
@@ -204,7 +236,7 @@ impl<D: TransportDriver> ServerRun<D> {
         // The route table holds main-interpreter `Py<T>`s, and other threads may drop their
         // clones anywhere, so this reference is the last one and drops here, attached.
         let _site_keepalive = Keepalive::new(vec![Arc::clone(&self.site)]);
-        // The run's Postgres pools close when it stops, however it stops (b/335 D17).
+        // The run's Postgres pools close when it stops, however it stops.
         let _pg = self.site.pg.clone().map(|pools| RunPoolsGuard { pools, py });
         if self.stop.is_cancelled() {
             // A stop during start, such as `TestClient.close()`, leaves nothing to build.
@@ -215,14 +247,28 @@ impl<D: TransportDriver> ServerRun<D> {
         // `serve` returns it. `Server.shutdown()` and the stop signals cancel the token itself.
         let server_stop = ServerRunStop::new(self.stop.clone());
         let deadline = ShutdownDeadline::new(self.site.rules.settings.limits.shutdown_timeout.get());
-        let counters = Arc::clone(&self.site.counters);
+        let counters = Arc::clone(&self.site.counters.run);
+        let abandoned = self.abandoned.clone();
         // Watched from here, a stop signal that comes while the lanes or the workers start stops
         // the run once they are up, rather than reaching only Python, which would not see it
         // until the server it never stopped ends.
-        crate::serve::watching_stop_signals(&server_stop, &counters, &deadline, || {
+        let before = stop_signal_dispositions(py)?;
+        let served = mipyre_server::watching_stop_signals(&server_stop, &counters, &deadline, before, || {
             self.start_and_serve(py, &server_stop, &deadline)
         })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        if !abandoned.any() {
+            return served;
+        }
+        // Armed before returning to Python, where a shutdown hook may hang or exit the process.
+        match (served, super::exit::decide_exit_before_finalizing(py)) {
+            (served, Ok(())) => served,
+            (Ok(()), Err(unarmed)) => Err(unarmed),
+            (Err(failed), Err(unarmed)) => {
+                unarmed.set_cause(py, Some(failed));
+                Err(unarmed)
+            }
+        }
     }
 
     /// Starts the lanes and the workers and serves until `server_stop`; the run's own cause, if
@@ -233,14 +279,14 @@ impl<D: TransportDriver> ServerRun<D> {
             Some(lanes) if self.site.rules.routes.uses_lane() => {
                 let lanes = Arc::clone(lanes);
                 let hosting = match self.topology {
-                    Topology::Tpc { threads, .. } => crate::runtime::process::HostKind::Tpc { threads: threads.get() },
-                    _ => crate::runtime::process::HostKind::Dedicated,
+                    Topology::Tpc { threads, .. } => mipyre_process::HostKind::Tpc { threads: threads.get() },
+                    _ => mipyre_process::HostKind::Dedicated,
                 };
-                py.detach(|| lanes.start_run(hosting, server_stop.clone(), Arc::clone(&self.site.counters)))
-                    .map_err(|e| {
-                        lanes.stop_run(deadline);
-                        pyo3::exceptions::PyRuntimeError::new_err(format!("process lanes could not start: {e}"))
-                    })?;
+                let tell_run = lane_run_listener(server_stop.clone(), Arc::clone(&self.workers));
+                py.detach(|| lanes.start_run(hosting, tell_run)).map_err(|e| {
+                    lanes.stop_run(deadline);
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("process lanes could not start: {e}"))
+                })?;
                 Some(LaneRun { lanes, deadline })
             }
             _ => None,
@@ -270,10 +316,20 @@ impl<D: TransportDriver> ServerRun<D> {
                 deadline,
                 &mut mipyre_tpc::OsSpawner,
             ),
-            Topology::MultiThreadGil { io_threads, .. } => run_gil(py, self, io_threads, deadline),
+            Topology::MultiThreadGil { io_threads, .. } => {
+                run_gil(py, self, io_threads, deadline, &mut mipyre_tpc::OsSpawner)
+            }
             Topology::Pool {
                 workers, io_threads, ..
-            } => run_subinterp(py, self, workers, io_threads, server_stop, deadline),
+            } => run_subinterp(
+                py,
+                self,
+                workers,
+                io_threads,
+                server_stop,
+                deadline,
+                &mut mipyre_tpc::OsSpawner,
+            ),
         };
         stopped_by(server_stop, served)
     }
@@ -282,7 +338,7 @@ impl<D: TransportDriver> ServerRun<D> {
 /// Stops a server run's process lanes by the run's stop deadline when it drops, however the run
 /// ends.
 struct LaneRun<'a> {
-    lanes: Arc<crate::runtime::process::ServerLanes>,
+    lanes: Arc<mipyre_process::ServerLanes>,
     deadline: &'a ShutdownDeadline,
 }
 
@@ -292,49 +348,85 @@ impl Drop for LaneRun<'_> {
     }
 }
 
-/// Runs the multi-thread GIL-mode server with every handler on the main interpreter.
+/// Starts watching the static mounts' files in the background, so a mount that cannot be watched
+/// says so before the first request and is served uncached. It is called once the workers have
+/// made their interpreters: the watch's thread ends whenever its watch is up, a thread started
+/// around then either takes over that stack or maps a new one, and which of the two happens would
+/// move the workers' Python arenas and with them how many instructions freeing an object takes.
+fn start_static_watches(site: &Site) {
+    for mount in site.rules.routes.static_mounts() {
+        mount.start_watching();
+    }
+}
+
+/// Starts the main interpreter's threads when the table has a main-interpreter route.
+///
+/// # Errors
+///
+/// Returns why a thread did not start, with the ones started joined.
+fn spawn_main(
+    py: Python<'_>,
+    site: &Site,
+    tuning: &EngineSettings,
+    spawner: &mut impl mipyre_tpc::Spawner,
+) -> PyResult<(Option<MainThreads>, Option<MainThreadHandles>)> {
+    if !site.rules.routes.uses_main() {
+        return Ok((None, None));
+    }
+    let (main, handles) = MainThreads::spawn(py, &site.rules, tuning.main, spawner)?;
+    Ok((Some(main), Some(handles)))
+}
+
+/// Runs the multi-thread GIL-mode server with every handler on the main interpreter's threads.
 fn run_gil<D: TransportDriver>(
     py: Python<'_>,
     run: ServerRun<D>,
     io_threads: NonZeroUsize,
     deadline: &ShutdownDeadline,
+    spawner: &mut impl mipyre_tpc::Spawner,
 ) -> PyResult<()> {
     let ServerRun {
         transport,
         site,
         stop,
+        tuning,
         cpus,
+        abandoned,
         readiness,
         ..
     } = run;
-    let (io_threads, num_cpus) = (io_threads.get(), cpus.logical().get());
+    let (main, main_handles) = spawn_main(py, &site, &tuning, spawner)?;
+    let num_cpus = cpus.logical().get();
     let listening = transport.listening();
     tracing::info!(
         target: "mipyre::server",
         version = env!("CARGO_PKG_VERSION"),
         listening = %listening.join(", "),
-        io_threads,
+        io_threads = io_threads.get(),
         cpus = num_cpus,
         topology = "main",
         "Mipyre started"
     );
     println!("\n  Mipyre v{}", env!("CARGO_PKG_VERSION"));
-    crate::serve::print_listening(&listening);
+    mipyre_server::print_listening(&listening);
     println!("  IO threads: {io_threads} (CPUs: {num_cpus})\n");
-    readiness.call()?;
+    start_static_watches(&site);
+    if let Err(failed) = readiness.call() {
+        drop(main);
+        py.detach(|| abandoned.join_main(main_handles, deadline));
+        return Err(failed);
+    }
 
-    let counters = Arc::clone(&site.counters);
-    py.detach(move || {
-        crate::serve::serve_multi_thread(
-            transport,
-            io_threads,
-            stop,
-            deadline,
-            counters,
-            upgrade_site(&site),
-            move |req, peer| handle_request(req, Arc::clone(&site), peer),
-        )
-    })
+    let counters = Arc::clone(&site.counters.run);
+    let ws = upgrade_target(&site, None, main.as_ref());
+    let servers = io_thread_servers(py, &site, io_threads, None, main.map(Arc::new));
+    // The copies' last references drop here, attached, as `ServerRun::serve`'s keepalive does.
+    let _io_thread_sites_keepalive = Keepalive::new(servers.sites());
+    let served = py.detach(move || mipyre_server::serve_multi_thread(transport, servers, stop, deadline, counters, ws));
+    // The serving closures held every reference to the main interpreter's threads, so they now
+    // finish.
+    py.detach(|| abandoned.join_main(main_handles, deadline));
+    served.map_err(|e| serve_exception(py, e))
 }
 
 /// Runs the multi-thread sub-interpreter server: a channel pool of workers behind Tokio accept
@@ -346,6 +438,7 @@ fn run_subinterp<D: TransportDriver>(
     io_threads: NonZeroUsize,
     server_stop: &ServerRunStop,
     deadline: &ShutdownDeadline,
+    spawner: &mut impl mipyre_tpc::Spawner,
 ) -> PyResult<()> {
     let ServerRun {
         transport,
@@ -359,13 +452,14 @@ fn run_subinterp<D: TransportDriver>(
         store,
         abandoned,
         readiness,
+        workers: worker_counters,
         ..
     } = run;
-    let (workers, io_threads, num_cpus) = (workers.get(), io_threads.get(), cpus.logical().get());
+    let (workers, num_cpus) = (workers.get(), cpus.logical().get());
     let program = app.program(py, command_line, isolate_dir.as_deref())?;
 
     let counts = PlaceCounts::of(&site.rules.routes);
-    let split = crate::runtime::split_workers_for_routes(workers, &counts)
+    let split = mipyre_runtime::split_workers_for_routes(workers, &counts)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     let gil_count = counts.main();
@@ -373,11 +467,19 @@ fn run_subinterp<D: TransportDriver>(
     let process_count = counts.lane;
     let subinterp_count = counts.worker_sync + counts.worker_async;
     let has_async = async_count_routes > 0;
-    let topology = if has_async { "hybrid-async" } else { "hybrid" };
+    let topology = if has_async { "pool-async" } else { "pool" };
 
-    let (pool, threads) = build_pool(py, split, &site, &tuning, &program, &store, server_stop)
+    let recipe = Arc::new(worker_recipe(&program, &site, tuning.gc, &store));
+    let (pool, threads) = build_pool(py, split, &recipe, &site, &tuning, server_stop, &worker_counters)
         .map_err(|e| pool_failure(py, e, &abandoned))?;
-    let pool = Arc::new(pool);
+    let (main, main_handles) = match spawn_main(py, &site, &tuning, spawner) {
+        Ok(spawned) => spawned,
+        Err(failed) => {
+            drop(pool);
+            let abandoned = py.detach(|| abandoned.join(threads, deadline));
+            return Err(noting_abandoned(py, failed, &abandoned));
+        }
+    };
     // The banner comes after the pool starts, so a failed start never says "Listening on".
     let listening = transport.listening();
     tracing::info!(
@@ -392,40 +494,41 @@ fn run_subinterp<D: TransportDriver>(
         async_routes = async_count_routes,
         "Mipyre started"
     );
-    println!("\n  Mipyre v{} [{topology} mode]", env!("CARGO_PKG_VERSION"));
-    crate::serve::print_listening(&listening);
+    println!("\n  Mipyre v{}", env!("CARGO_PKG_VERSION"));
+    mipyre_server::print_listening(&listening);
     println!("  Sub-interpreters: {workers} | IO threads: {io_threads} (CPUs: {num_cpus})");
     if split.async_workers > 0 {
         println!("  Workers: {} sync + {} async", split.sync_workers, split.async_workers);
     }
     println!(
-        "  Routes: {subinterp_count} sub-interp + {gil_count} GIL + {process_count} process + {async_count_routes} async"
+        "  Routes: {subinterp_count} sub-interp + {gil_count} main + {process_count} process + {async_count_routes} async"
     );
     println!("  Script: {}\n", program.script_path.display());
+    start_static_watches(&site);
     if let Err(failed) = readiness.call() {
-        // Nothing serves yet, so the pool's last reference drops here and its workers finish.
-        drop(pool);
-        let abandoned = py.detach(|| abandoned.join(threads, deadline));
+        // Nothing serves yet, so the backends' last references drop here and their threads finish.
+        drop((pool, main));
+        let abandoned = py.detach(|| {
+            abandoned.join_main(main_handles, deadline);
+            abandoned.join(threads, deadline)
+        });
         return Err(noting_abandoned(py, failed, &abandoned));
     }
 
-    let counters = Arc::clone(&site.counters);
-    let served = py.detach(move || {
-        crate::serve::serve_multi_thread(
-            transport,
-            io_threads,
-            stop,
-            deadline,
-            counters,
-            upgrade_site(&site),
-            move |req, peer| handle_request_subinterp(req, Arc::clone(&pool), Arc::clone(&site), peer),
-        )
+    let counters = Arc::clone(&site.counters.run);
+    let ws = upgrade_target(&site, Some(&pool), main.as_ref());
+    let servers = io_thread_servers(py, &site, io_threads, Some(Arc::new(pool)), main.map(Arc::new));
+    // The copies' last references drop here, attached, as `ServerRun::serve`'s keepalive does.
+    let _io_thread_sites_keepalive = Keepalive::new(servers.sites());
+    let served = py.detach(move || mipyre_server::serve_multi_thread(transport, servers, stop, deadline, counters, ws));
+    // The serving closures held every reference to the backends, so their threads now finish.
+    let abandoned = py.detach(|| {
+        abandoned.join_main(main_handles, deadline);
+        abandoned.join(threads, deadline)
     });
-    // The serving closures held every pool reference, so the workers now finish.
-    let abandoned = py.detach(|| abandoned.join(threads, deadline));
     // The failure is not logged here, because the caller gets it with the list and logging it
     // too would record it twice.
-    served.map_err(|e| noting_abandoned(py, e, &abandoned))
+    served.map_err(|e| noting_abandoned(py, serve_exception(py, e), &abandoned))
 }
 
 /// Returns `failed` as itself, with the abandoned workers added as a note so the caller keeps
@@ -451,6 +554,25 @@ fn noting_abandoned(py: Python<'_>, failed: PyErr, abandoned: &[AbandonedWorker]
     }
 }
 
+/// Hears what a server's lanes tell their run: a worker's death counts in the run's worker counts,
+/// and the lanes' failure stops the server with its cause.
+fn lane_run_listener(stop: ServerRunStop, workers: Arc<WorkerCounters>) -> Box<dyn Fn(LaneRunEvent) + Send + Sync> {
+    Box::new(move |event| match event {
+        LaneRunEvent::WorkerDied => workers.process_worker_died(),
+        LaneRunEvent::Failed(cause) => stop.stop(ServerStop::LanesFailed(cause)),
+    })
+}
+
+/// Hears a kind of workers' loss: its routes can never be served again, so the server stops with
+/// it.
+pub(crate) fn worker_loss_listener(stop: ServerRunStop) -> Arc<dyn Fn(WorkerKindLoss) + Send + Sync> {
+    Arc::new(move |loss| {
+        let cause = ServerStop::NoWorkerLeft(loss);
+        tracing::error!(target: "mipyre::server", error = %cause, "the server stops");
+        stop.stop(cause);
+    })
+}
+
 /// Returns the server's own cause `stop` was stopped for, so the process exits non-zero, or else
 /// `served`, which carries a failed TPC thread or start itself.
 fn stopped_by(stop: &ServerRunStop, served: PyResult<()>) -> PyResult<()> {
@@ -465,12 +587,11 @@ fn stopped_by(stop: &ServerRunStop, served: PyResult<()>) -> PyResult<()> {
     }
 }
 
-/// Runs the TPC server, its bridge threads and then its TPC threads started by `spawner`. With a
+/// Runs the TPC server, its main-interpreter threads and then its TPC threads started by `spawner`. With a
 /// sub-interpreter route each TPC thread has a worker and runs `def` routes inline on it, and
 /// `async def` routes go to an async pool so their awaits overlap and their 504 is sent on time;
 /// without one the threads have no worker. Either way `runtime="main"` routes and the fallback go
-/// to the main-interpreter bridge: the main interpreter has one line of execution, and the
-/// bridge's full queue answers 503.
+/// to the main interpreter's threads, whose full queue answers 503.
 fn serve_tpc<D: TransportDriver>(
     py: Python<'_>,
     run: ServerRun<D>,
@@ -492,6 +613,7 @@ fn serve_tpc<D: TransportDriver>(
         store,
         abandoned,
         readiness,
+        workers: worker_counters,
         ..
     } = run;
     let counts = PlaceCounts::of(&site.rules.routes);
@@ -502,12 +624,13 @@ fn serve_tpc<D: TransportDriver>(
     let (tpc_threads, async_pool, async_threads) = if site.rules.routes.uses_workers() {
         let program = app.program(py, command_line, isolate_dir.as_deref())?;
         let (async_pool, async_threads) = if counts.worker_async > 0 {
-            let kinds = crate::runtime::RouteKinds::of(&counts);
+            let kinds = mipyre_runtime::RouteKinds::of(&counts);
             let split = WorkerCounts {
                 sync_workers: 0,
                 async_workers: crate::boot::topology::tpc_async_workers(threads, kinds).get(),
             };
-            let (pool, threads) = build_pool(py, split, &site, &tuning, &program, &store, server_stop)
+            let recipe = Arc::new(worker_recipe(&program, &site, tuning.gc, &store));
+            let (pool, threads) = build_pool(py, split, &recipe, &site, &tuning, server_stop, &worker_counters)
                 .map_err(|e| pool_failure(py, e, &abandoned))?;
             (Some(Arc::new(pool)), Some(threads))
         } else {
@@ -517,80 +640,73 @@ fn serve_tpc<D: TransportDriver>(
         let (_, lives) = LiveWorkers::new(
             WorkerKind::TpcThread,
             sites.len(),
-            server_stop.clone(),
-            Arc::clone(&site.counters),
+            worker_loss_listener(server_stop.clone()),
+            &worker_counters,
         );
-        let with_workers = crate::serve::TpcThreads::WithWorkers {
+        let with_workers = mipyre_server::TpcThreads::WithWorkers {
             threads: sites.into_iter().zip(lives).collect(),
             recipe: Arc::new(worker_recipe(&program, &site, tuning.gc, &store)),
         };
         (with_workers, async_pool, async_threads)
     } else {
-        // The TPC threads parse HTTP, host the lanes and feed the bridge.
+        // The TPC threads parse HTTP, host the lanes and feed the main interpreter's threads.
         (
-            crate::serve::TpcThreads::NoWorkers(thread_sites(py, &site, threads.get())),
+            mipyre_server::TpcThreads::NoWorkers(thread_sites(py, &site, threads.get())),
             None,
             None,
         )
     };
-    let end_async_pool = |async_pool: Option<Arc<crate::runtime::InterpreterPool>>, threads: Option<PoolThreads>| {
+    let end_async_pool = |async_pool: Option<Arc<mipyre_runtime::InterpreterPool>>, threads: Option<PoolThreads>| {
         drop(async_pool);
         if let Some(threads) = threads {
             abandoned.join(threads, deadline);
         }
     };
 
-    let spawned = site
-        .rules
-        .routes
-        .uses_main()
-        .then(|| crate::runtime::MainInterpBridge::spawn(py, &site.rules, tuning.bridge, spawner));
-    let (bridge, bridge_threads) = match spawned.transpose() {
-        Ok(Some((bridge, threads))) => (Some(bridge), Some(threads)),
-        Ok(None) => (None, None),
-        Err(e) => {
+    let (main, main_handles) = match spawn_main(py, &site, &tuning, spawner) {
+        Ok((main, handles)) => (main.map(Arc::new), handles),
+        Err(failed) => {
             py.detach(|| end_async_pool(async_pool, async_threads));
-            return Err(e.into());
+            return Err(failed);
         }
     };
     // The copies' last references drop here, attached, as `ServerRun::serve`'s keepalive does.
     let _thread_sites_keepalive = Keepalive::new(tpc_threads.sites());
-    crate::serve::report_pinning(&pin_order, threads.get(), &site.counters);
-    let thread_cpus = crate::serve::thread_cpus(&pin_order);
-    let banner = crate::serve::tpc_banner(
+    mipyre_server::report_pinning(&pin_order, threads.get(), &site.counters.run);
+    let thread_cpus = mipyre_server::thread_cpus(&pin_order);
+    let banner = mipyre_server::tpc_banner(
         threads.get(),
         cpus.logical(),
         &pin_order,
         site.rules.routes.uses_workers(),
         async_pool
             .as_deref()
-            .map_or(0, crate::runtime::InterpreterPool::async_workers),
+            .map_or(0, mipyre_runtime::InterpreterPool::async_workers),
         counts,
     );
-    let server = crate::serve::TpcServer {
+    let server = mipyre_server::TpcServer {
         threads: tpc_threads,
-        main_bridge: bridge.clone(),
+        main: main.clone(),
         async_pool: async_pool.clone(),
         gc: tuning.gc,
         cpus: thread_cpus,
-        counters: Arc::clone(&site.counters),
+        counters: Arc::clone(&site.counters.run),
     };
 
     let announce = |topology: &'static str, listening: &[String]| {
-        crate::serve::log_startup(topology, listening, &banner);
+        mipyre_server::log_startup(topology, listening, &banner);
+        start_static_watches(&site);
         readiness.call_or_stop(server_stop);
     };
     let served = py
         .detach(|| {
-            let served = crate::serve::run_tpc(transport, server, accept, announce, server_stop, deadline, spawner);
+            let served = mipyre_server::run_tpc(transport, server, accept, announce, server_stop, deadline, spawner);
             // The TPC threads are joined, so these are the last references to the pool and
-            // the bridge. Both are joined by the deadline the TPC threads were, so the three
-            // groups together take at most the stop's grace.
+            // the main interpreter's threads. Both are joined by the deadline the TPC threads
+            // were, so the three groups together take at most the stop's grace.
             end_async_pool(async_pool, async_threads);
-            drop(bridge);
-            if let Some(threads) = bridge_threads {
-                abandoned.keep_threads(threads.join(deadline));
-            }
+            drop(main);
+            abandoned.join_main(main_handles, deadline);
             served
         })
         .map_err(|e| tpc_failure(py, e, &abandoned));
@@ -599,9 +715,9 @@ fn serve_tpc<D: TransportDriver>(
 
 /// Keeps the TPC threads a stopped run left running with the app's abandoned workers and notes
 /// them on the error that stopped the run.
-fn tpc_failure(py: Python<'_>, failed: crate::serve::ServeError, abandoned: &AbandonedWorkers) -> PyErr {
+fn tpc_failure(py: Python<'_>, failed: mipyre_server::ServeError, abandoned: &AbandonedWorkers) -> PyErr {
     let kept = abandoned.keep_threads(failed.abandoned_threads().to_vec());
-    noting_abandoned(py, failed.into_pyerr(py), &kept)
+    noting_abandoned(py, serve_exception(py, failed), &kept)
 }
 
 /// Holds a run's references to shared values with main-interpreter `Py<T>`s, so the last
@@ -631,7 +747,25 @@ impl<T> Drop for Keepalive<T> {
 /// Makes `n` copies of `site`, one per TPC thread, each with its own references to the
 /// handlers.
 pub(crate) fn thread_sites(py: Python<'_>, site: &Site, n: usize) -> Vec<Arc<Site>> {
-    (0..n).map(|_| Arc::new(site.for_thread(py))).collect()
+    (0..n)
+        .map(|_| Arc::new(site.for_thread(|rules| mipyre_runtime::copy_rules(rules, py))))
+        .collect()
+}
+
+/// Makes one server per IO thread of the multi-thread server, each with its own copy of `site`
+/// and its own references to the handlers, all sharing the backends.
+fn io_thread_servers(
+    py: Python<'_>,
+    site: &Site,
+    io_threads: NonZeroUsize,
+    pool: Option<Arc<InterpreterPool>>,
+    main: Option<Arc<MainThreads>>,
+) -> IoThreadServers {
+    IoThreadServers::build(io_threads, || MultiThreadServer {
+        site: Arc::new(site.for_io_thread(|rules| mipyre_runtime::copy_rules(rules, py))),
+        pool: pool.clone(),
+        main: main.clone(),
+    })
 }
 
 /// Builds the recipe every worker of a server is created from.
@@ -639,7 +773,7 @@ pub(crate) fn worker_recipe(
     program: &WorkerProgram,
     site: &Site,
     gc: GcPolicy,
-    store: &crate::runtime::AppStore,
+    store: &mipyre_runtime::AppStore,
 ) -> WorkerRecipe {
     let expected = RouteManifest::of(&site.rules.routes);
     WorkerRecipe::new(
@@ -662,7 +796,7 @@ fn pool_failure(py: Python<'_>, failed: PoolError, abandoned: &AbandonedWorkers)
 
 /// Builds a channel pool of `split` workers, each on its own thread, and returns its threads to
 /// join once every reference to the pool is gone. When a kind of worker has none left serving,
-/// `stop` is stopped.
+/// `stop` is stopped. The site gets a large-body permit per queue slot of the pool.
 ///
 /// # Errors
 ///
@@ -670,19 +804,29 @@ fn pool_failure(py: Python<'_>, failed: PoolError, abandoned: &AbandonedWorkers)
 fn build_pool(
     py: Python<'_>,
     split: WorkerCounts,
+    recipe: &Arc<WorkerRecipe>,
     site: &Site,
     tuning: &EngineSettings,
-    program: &WorkerProgram,
-    store: &crate::runtime::AppStore,
     stop: &ServerRunStop,
+    workers: &Arc<WorkerCounters>,
 ) -> Result<(InterpreterPool, PoolThreads), PoolError> {
-    let recipe = Arc::new(worker_recipe(program, site, tuning.gc, store));
-    InterpreterPool::new(py, split, &recipe, tuning.async_queue_capacity, stop, &site.counters)
+    let (pool, threads) = InterpreterPool::new(
+        py,
+        split,
+        recipe,
+        tuning.async_queue_capacity,
+        &worker_loss_listener(stop.clone()),
+        workers,
+    )?;
+    site.large_body_permits.add(pool.queue_slots());
+    Ok((pool, threads))
 }
 
 #[cfg(test)]
+#[cfg(not(sync_model))]
 mod tests {
     use super::*;
+    use mipyre_process::{LaneIndex, LaneLossError, LaneRunError};
     use mipyre_transport::driver::AcceptError;
     use std::time::Duration;
 
@@ -691,6 +835,89 @@ mod tests {
     impl Drop for Counted {
         fn drop(&mut self) {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_lane_worker_death_counts_in_the_run_and_a_lane_failure_stops_the_server_with_its_cause() {
+        let stop = ServerRunStop::default();
+        let counters = Arc::new(WorkerCounters::new());
+        let tell_run = lane_run_listener(stop.clone(), Arc::clone(&counters));
+
+        tell_run(LaneRunEvent::WorkerDied);
+        tell_run(LaneRunEvent::WorkerDied);
+        assert_eq!(counters.read().process_workers_died, 2);
+        assert!(!stop.is_stopped());
+
+        tell_run(LaneRunEvent::Failed(LaneRunError::LaneLost {
+            lane: LaneIndex(0),
+            why: Arc::new(LaneLossError::ReplacementNotStarted {
+                failure: "ImportError: 9d2c".into(),
+            }),
+        }));
+        assert!(stop.is_stopped());
+        match stop.cause() {
+            Some(mipyre_tpc::StopCause::Caller(cause @ ServerStop::LanesFailed(_))) => {
+                assert!(cause.to_string().contains("ImportError: 9d2c"), "{cause}");
+            }
+            other => panic!("expected the lanes' failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_last_worker_of_a_kind_stops_the_server_with_the_first_cause_and_says_so() {
+        let stop = ServerRunStop::default();
+        let counters = Arc::new(WorkerCounters::new());
+        let (_, lives) = LiveWorkers::new(WorkerKind::TpcThread, 2, worker_loss_listener(stop.clone()), &counters);
+        let mut lives = lives.into_iter();
+        lives
+            .next()
+            .expect("worker 0's life")
+            .died("gc.collect() raised A".into());
+        assert!(!stop.is_stopped(), "one worker of two is left serving");
+
+        let log = mipyre_runtime::testkit::captured_log(|| {
+            lives
+                .next()
+                .expect("worker 1's life")
+                .died("gc.collect() raised B".into());
+        });
+        assert!(stop.is_stopped());
+        let Some(mipyre_tpc::StopCause::Caller(cause)) = stop.cause() else {
+            panic!("expected the server's own cause, got {:?}", stop.cause());
+        };
+        let said = "the server stopped: no TPC thread worker is left serving; the first stopped: gc.collect() raised A";
+        assert_eq!(cause.to_string(), said);
+        let line = log
+            .lines()
+            .find(|l| l.contains("the server stops"))
+            .unwrap_or_else(|| panic!("the stop was not said:\n{log}"));
+        assert!(line.contains(said), "{line}");
+        assert!(line.contains("\"level\":\"ERROR\""), "{line}");
+    }
+
+    #[test]
+    fn of_two_kinds_lost_the_first_loss_is_the_servers_cause() {
+        let stop = ServerRunStop::default();
+        let counters = Arc::new(WorkerCounters::new());
+        let (_, sync) = LiveWorkers::new(WorkerKind::PoolSync, 1, worker_loss_listener(stop.clone()), &counters);
+        let (_, r#async) = LiveWorkers::new(WorkerKind::PoolAsync, 1, worker_loss_listener(stop.clone()), &counters);
+        for (lives, cause) in [(sync, "sync gone"), (r#async, "async gone")] {
+            for life in lives {
+                life.died(cause.into());
+            }
+        }
+        match stop.cause() {
+            Some(mipyre_tpc::StopCause::Caller(ServerStop::NoWorkerLeft(loss))) => {
+                assert_eq!(
+                    loss,
+                    WorkerKindLoss {
+                        kind: WorkerKind::PoolSync,
+                        first: "sync gone".into(),
+                    }
+                );
+            }
+            other => panic!("expected the sync kind's loss, got {other:?}"),
         }
     }
 
@@ -746,7 +973,7 @@ mod tests {
     /// Builds an in-memory one-thread TPC run whose only handler is a main-interpreter fallback,
     /// already stopped, so it stops as soon as it is up. The returned connector keeps its
     /// in-memory listener open.
-    fn bridge_only_run(
+    fn main_only_run(
         py: Python<'_>,
     ) -> (
         ServerRun<mipyre_transport::memory::MemorySource>,
@@ -760,9 +987,12 @@ mod tests {
                 settings: mipyre_http::plan::site::ServeSettings::defaults(),
                 access_log: None,
             },
-            ws_connections: crate::serve::OpenConnections::default(),
+            ws_connections: mipyre_server::OpenConnections::default(),
+            large_body_permits: mipyre_server::LargeBodyPermits::none(),
             process: None,
-            counters: Arc::new(crate::telemetry::RunCounters::new(false)),
+            counters: Arc::new(mipyre_server::SiteCounters::new(Arc::new(
+                mipyre_server::ServerCounters::new(false),
+            ))),
             pg: None,
             clock: quanta::Clock::new(),
         });
@@ -772,9 +1002,9 @@ mod tests {
         )
         .expect("no flag at all is a recipe")
         .tuning;
-        tuning.bridge = crate::runtime::BridgeConfig {
-            workers: NonZeroUsize::new(2).unwrap(),
-            capacity: one,
+        tuning.main = mipyre_runtime::MainSizes {
+            max_threads: NonZeroUsize::new(2).unwrap(),
+            queue: one,
         };
         let crate::boot::ServerCpus { cpus, pin_order, .. } = crate::boot::host_cpus();
         let (transport, connector) = mipyre_transport::memory::memory_listeners(one);
@@ -799,26 +1029,17 @@ mod tests {
             },
             isolate_dir: None,
             command_line: CommandLine::default(),
-            store: crate::runtime::AppStore::default(),
+            store: mipyre_runtime::AppStore::default(),
             abandoned: AbandonedWorkers::default(),
             readiness: ReadinessCallback::default(),
+            workers: Arc::new(WorkerCounters::new()),
         };
         (run, connector)
     }
 
     /// Returns the messages of the events `f` emits on this thread.
-    ///
-    /// A callsite caches its interest the first time any thread reaches it. While this capture is
-    /// the only subscriber alive, tracing-core asks only the reaching thread's default, so a
-    /// parallel test reaching `log_startup` first, with no subscriber of its own, caches `never`
-    /// and this capture loses the event (b/998). A global default that wants every event keeps a
-    /// second subscriber alive, so the interest is asked of every live subscriber, this one too.
     fn events_of<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-        static EVERY_THREAD: std::sync::Once = std::sync::Once::new();
-        EVERY_THREAD.call_once(|| {
-            tracing::subscriber::set_global_default(tracing_subscriber::registry())
-                .expect("no other test in this binary sets the global subscriber");
-        });
+        mipyre_runtime::testkit::ask_every_subscriber();
         #[derive(Clone, Default)]
         struct Messages(Arc<std::sync::Mutex<Vec<String>>>);
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Messages {
@@ -843,10 +1064,10 @@ mod tests {
     }
 
     #[test]
-    fn a_bridge_thread_that_cannot_start_fails_the_start_before_the_server_announces_itself() {
+    fn a_main_thread_that_cannot_start_fails_the_start_before_the_server_announces_itself() {
         Python::initialize();
         mipyre_subinterp::attach::with_main(|py| {
-            let (run, _connector) = bridge_only_run(py);
+            let (run, _connector) = main_only_run(py);
             let server_stop = ServerRunStop::new(run.stop.clone());
             let (served, events) = events_of(|| {
                 serve_tpc(
@@ -856,15 +1077,15 @@ mod tests {
                     AcceptMode::PerThreadListener,
                     &server_stop,
                     &ShutdownDeadline::new(Duration::from_secs(5)),
-                    &mut RefuseAt::new(1, "no thread for the bridge"),
+                    &mut RefuseAt::new(1, "no thread for the main interpreter"),
                 )
             });
             let Err(raised) = served else {
-                panic!("the second bridge thread was refused, and the start went on: {events:?}");
+                panic!("the second main-interpreter thread was refused, and the start went on: {events:?}");
             };
             assert_eq!(
                 raised.value(py).str().unwrap().to_string(),
-                "could not start main-interpreter bridge thread 1 of 2: no thread for the bridge"
+                "could not start main-interpreter thread 1 of 2: no thread for the main interpreter"
             );
             assert!(!events.iter().any(|m| m == "Mipyre started"), "{events:?}");
         });
@@ -872,10 +1093,10 @@ mod tests {
 
     /// Proves the event the test above looks for is the one a successful start emits.
     #[test]
-    fn a_tpc_start_whose_bridge_starts_announces_itself() {
+    fn a_tpc_start_whose_main_threads_start_announces_itself() {
         Python::initialize();
         mipyre_subinterp::attach::with_main(|py| {
-            let (run, _connector) = bridge_only_run(py);
+            let (run, _connector) = main_only_run(py);
             let server_stop = ServerRunStop::new(run.stop.clone());
             let (served, events) = events_of(|| {
                 serve_tpc(
@@ -897,11 +1118,11 @@ mod tests {
     fn a_tpc_thread_that_cannot_start_fails_the_start_before_the_server_announces_itself() {
         Python::initialize();
         mipyre_subinterp::attach::with_main(|py| {
-            let (run, _connector) = bridge_only_run(py);
+            let (run, _connector) = main_only_run(py);
             let server_stop = ServerRunStop::new(run.stop.clone());
             let deadline = ShutdownDeadline::new(Duration::from_secs(5));
             let one = NonZeroUsize::new(1).unwrap();
-            // The bridge's two threads start first, so the third thread asked for is the TPC thread.
+            // The two main-interpreter threads start first, so the third thread asked for is the TPC thread.
             let refuse = &mut RefuseAt::new(2, "no thread for TPC");
             let (served, events) = events_of(|| {
                 serve_tpc(
@@ -939,7 +1160,7 @@ mod tests {
     fn a_tpc_start_tells_its_readiness_callback_once() {
         Python::initialize();
         mipyre_subinterp::attach::with_main(|py| {
-            let (mut run, _connector) = bridge_only_run(py);
+            let (mut run, _connector) = main_only_run(py);
             let (readiness, calls) = readiness_callback(py, false);
             run.readiness = readiness;
             let server_stop = ServerRunStop::new(run.stop.clone());
@@ -963,7 +1184,7 @@ mod tests {
     fn a_readiness_callback_that_raises_is_the_runs_error() {
         Python::initialize();
         mipyre_subinterp::attach::with_main(|py| {
-            let (mut run, _connector) = bridge_only_run(py);
+            let (mut run, _connector) = main_only_run(py);
             let (readiness, calls) = readiness_callback(py, true);
             run.readiness = readiness;
             let server_stop = ServerRunStop::new(run.stop.clone());
@@ -1023,7 +1244,7 @@ mod tests {
         Python::initialize();
         mipyre_subinterp::attach::with_main(|py| {
             let abandoned = AbandonedWorkers::default();
-            let failed = crate::serve::ServeError::ThreadsStopped {
+            let failed = mipyre_server::ServeError::ThreadsStopped {
                 root: None,
                 abandoned: vec!["mipyre-tpc-1".to_string()],
             };
@@ -1040,7 +1261,7 @@ mod tests {
         mipyre_subinterp::attach::with_main(|py| {
             let abandoned = AbandonedWorkers::default();
             let failed = PoolError::ThreadNotSpawned {
-                index: crate::runtime::WorkerIndex::new(1),
+                index: mipyre_runtime::WorkerIndex::new(1),
                 source: std::io::Error::other("no more threads"),
                 abandoned: vec![stuck("mipyre-worker-0")],
             };
@@ -1078,11 +1299,12 @@ mod tests {
     fn a_tpc_accept_loop_that_stopped_raises_the_multi_thread_oserror() {
         Python::initialize();
         mipyre_subinterp::attach::with_main(|py| {
-            let multi_thread = crate::serve::accept_stopped_error(&AcceptError::ConnectorsGone);
+            let multi_thread =
+                "OSError: the server stopped: accept loop stopped: every connector of this in-memory server is gone";
             let failures = [
-                crate::serve::ServeError::AcceptStopped(AcceptError::ConnectorsGone),
-                crate::serve::ServeError::ThreadsStopped {
-                    root: Some(Box::new(crate::serve::ServeError::AcceptStopped(
+                mipyre_server::ServeError::AcceptStopped(AcceptError::ConnectorsGone),
+                mipyre_server::ServeError::ThreadsStopped {
+                    root: Some(Box::new(mipyre_server::ServeError::AcceptStopped(
                         AcceptError::ConnectorsGone,
                     ))),
                     abandoned: vec![],
@@ -1091,7 +1313,7 @@ mod tests {
             for failed in failures {
                 let raised = tpc_failure(py, failed, &AbandonedWorkers::default());
                 assert!(raised.is_instance_of::<pyo3::exceptions::PyOSError>(py), "{raised}");
-                assert_eq!(raised.to_string(), multi_thread.to_string());
+                assert_eq!(raised.to_string(), multi_thread);
             }
         });
     }

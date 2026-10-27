@@ -1,9 +1,9 @@
-//! Every mipyre setting, declared once: its name, the keys each deployment source writes it under
-//! (command line, environment, `pyproject.toml`), the places app code gives it, the shape its
-//! value has, its default and its help (b/335 C1).
+//! Every mipyre setting, declared once: its name, from which its command-line option and its
+//! environment variable are spelled, its `pyproject.toml` key, the places app code gives it, the
+//! shape its value has, its default and its help.
 //!
 //! A value the deployment must be able to override is a flag and has one entry here; one it must
-//! not is a constant where it is used (D10). The `--help` text, the settings table in the docs and
+//! not is a constant where it is used. The `--help` text, the settings table in the docs and
 //! the Python-side declarations are read from this table, never written a second time.
 
 use std::fmt::Display;
@@ -15,16 +15,16 @@ use std::time::Duration;
 use mipyre_subinterp::gc::GcMode;
 use pyo3::prelude::*;
 
-use crate::runtime::process::{FailurePolicy, LaneSlotBytes, StartStrategy};
+use mipyre_process::{FailurePolicy, LaneSlotBytes, StartStrategy};
 
 use super::config::{
     code_value, given_line, read_flag, settled_line, take, CodeValue, DeploymentSources, DeploymentValue, FlagError,
     FlagSource, FlagValue, ServerFlagsError,
 };
-use crate::serve::AcceptMode;
+use mipyre_server::AcceptMode;
 
-/// Prefixes of `MIPYRE_` variables that are not ours to read: the test and benchmark tools' own
-/// (FR-12). Written here so that a deployment that sets one is not refused as unknown (D19).
+/// Prefixes of `MIPYRE_` variables that are not ours to read: the test and benchmark tools' own.
+/// Written here so that a deployment that sets one is not refused as unknown.
 pub(crate) const RESERVED_PREFIXES: [&str; 2] = ["MIPYRE_TEST_", "MIPYRE_BENCH_"];
 
 /// One setting, declared once: every source's key, its shape, its default and its help. Python
@@ -34,10 +34,6 @@ pub(crate) const RESERVED_PREFIXES: [&str; 2] = ["MIPYRE_TEST_", "MIPYRE_BENCH_"
 pub(crate) struct Flag {
     /// What docs, errors and summaries call it: `threads`, `process.workers`.
     pub(crate) name: &'static str,
-    /// The `mipyre run` / `mipyre dev` option: `--threads`.
-    pub(crate) cli: &'static str,
-    /// The environment variable: `MIPYRE_THREADS`.
-    pub(crate) env: &'static str,
     /// The key in `pyproject.toml`, in its table.
     pub(crate) file: PyprojectKey,
     /// Every place app code gives it; empty when code cannot.
@@ -47,12 +43,24 @@ pub(crate) struct Flag {
     pub(crate) default: &'static str,
     pub(crate) scope: FlagScope,
     /// When a server uses the flag's value; a value given for a server that does not use it is
-    /// an error (D19).
+    /// an error.
     pub(crate) used: FlagUse,
     pub(crate) doc: &'static str,
 }
 
-/// When a flag's value is used: by any server, or only by one of a kind (design §8.5).
+/// Returns a setting's `mipyre run` / `mipyre dev` option: `process.queue_per_worker` is
+/// `--process-queue-per-worker`.
+pub(crate) fn cli_option(setting: &str) -> String {
+    format!("--{}", setting.replace(['.', '_'], "-"))
+}
+
+/// Returns a setting's environment variable: `process.queue_per_worker` is
+/// `MIPYRE_PROCESS_QUEUE_PER_WORKER`.
+pub(crate) fn env_variable(setting: &str) -> String {
+    format!("MIPYRE_{}", setting.replace('.', "_").to_ascii_uppercase())
+}
+
+/// When a flag's value is used: by any server, or only by one of a kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlagUse {
     /// Every server, or (a process-wide flag) every process.
@@ -64,9 +72,8 @@ pub(crate) enum FlagUse {
     MacosTpc,
     /// A server with sub-interpreter workers, which collect garbage and keep isolated copies.
     SubinterpreterWorkers,
-    /// A server whose main-interpreter routes are run by the bridge (every one but the
-    /// multi-thread GIL server, which runs them on its own threads).
-    MainBridge,
+    /// A server with main-interpreter routes (or a fallback).
+    MainRoutes,
     /// A sub-interpreter pool with `async def` routes, whose queue the capacity sizes.
     PoolAsyncRoutes,
     /// A server with `runtime="process"` routes.
@@ -89,10 +96,7 @@ impl FlagUse {
             }
             FlagUse::MacosTpc => "the thread-per-core server on macOS",
             FlagUse::SubinterpreterWorkers => "a server with sub-interpreter workers",
-            FlagUse::MainBridge => {
-                "a server that runs main-interpreter routes on its bridge (any but the multi-thread \
-                 GIL server)"
-            }
+            FlagUse::MainRoutes => "a server with main-interpreter routes",
             FlagUse::PoolAsyncRoutes => "the sub-interpreter pool (tpc off) with async def routes",
             FlagUse::ProcessRoutes => "a server with runtime=\"process\" routes",
             FlagUse::TcpTransport => "a server taking TCP connections",
@@ -148,7 +152,7 @@ pub(crate) struct CodeKey {
 /// The calls through which app code gives flag values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodeCall {
-    /// `app.run(...)`.
+    /// `app.run(reload=)`.
     Run,
     /// `ProcessLanes(...)`.
     ProcessLanes,
@@ -227,7 +231,7 @@ pub(crate) enum FlagShape {
     Proxies,
     /// A filesystem path.
     Path,
-    /// A process lane's slot size in bytes, at least [`crate::runtime::process::MIN_SLOT_BYTES`].
+    /// A process lane's slot size in bytes, at least [`mipyre_process::MIN_SLOT_BYTES`].
     SlotBytes,
     GcMode,
     AcceptMode,
@@ -274,7 +278,7 @@ impl FlagShape {
             FlagShape::Path => "expected a path".into(),
             FlagShape::SlotBytes => format!(
                 "expected a number of bytes, at least {}",
-                crate::runtime::process::MIN_SLOT_BYTES
+                mipyre_process::MIN_SLOT_BYTES
             ),
             FlagShape::GcMode => one_of::<GcMode>(),
             #[cfg(target_os = "macos")]
@@ -592,8 +596,6 @@ const fn process_lanes(keyword: &'static str) -> CodeKey {
 macro_rules! flags {
     (@flag $scope:ident {
         name: $name:literal,
-        cli: $cli:literal,
-        env: $env:literal,
         file: $file:expr,
         code: [$($code:expr),* $(,)?],
         shape: $shape:expr,
@@ -603,8 +605,6 @@ macro_rules! flags {
     }) => {
         Flag {
             name: $name,
-            cli: $cli,
-            env: $env,
             file: $file,
             code: &[$($code),*],
             shape: $shape,
@@ -635,16 +635,15 @@ macro_rules! flags {
             $(pub(crate) $pfield: Option<DeploymentValue<$pty>>,)*
         }
 
-        /// The flag values app code gives one server (`run(...)`, `ServerFlags(...)`, the
-        /// `ProcessLanes`), each with the place in the code that gave it; `None` where code gave
-        /// nothing.
+        /// The flag values app code gives one server (`ServerFlags(...)`, the `ProcessLanes`), each
+        /// with the place in the code that gave it; `None` where code gave nothing.
         #[pyclass(module = "mipyre.engine", frozen)]
         #[derive(Debug, Clone, Default)]
         pub(crate) struct ServerFlags {
             $(pub(crate) $sfield: Option<CodeValue<$sty>>,)*
         }
 
-        /// One server's flag values once the deployment is laid over the code (D7): from the
+        /// One server's flag values once the deployment is laid over the code: from the
         /// deployment (with the code's different value it overrode), from code, or `None` for
         /// the default, which the owner of each value works out.
         #[derive(Debug, Clone)]
@@ -672,7 +671,7 @@ macro_rules! flags {
                 lines
             }
 
-            /// Lays this deployment over `code`, one server's flags: a deployment value wins (D7)
+            /// Lays this deployment over `code`, one server's flags: a deployment value wins
             /// and keeps the code's value it replaced when the two differ.
             pub(crate) fn over(&self, code: &ServerFlags) -> ServerFlagValues {
                 ServerFlagValues {
@@ -721,24 +720,24 @@ macro_rules! flags {
 flags! {
     server {
     threads: NonZeroUsize = {
-        name: "threads", cli: "--threads", env: "MIPYRE_THREADS", file: PyprojectKey::Top("threads"),
-        code: [run("threads"), server_flags("threads")],
+        name: "threads", file: PyprojectKey::Top("threads"),
+        code: [server_flags("threads")],
         shape: FlagShape::Positive,
         used: Always,
         default: "one per physical core (thread-per-core); with tpc off, one per logical CPU",
         doc: "the server's threads: thread-per-core threads, or with tpc off the I/O threads",
     },
     subinterpreters: NonZeroUsize = {
-        name: "subinterpreters", cli: "--subinterpreters", env: "MIPYRE_SUBINTERPRETERS",
+        name: "subinterpreters",
         file: PyprojectKey::Top("subinterpreters"),
-        code: [run("subinterpreters"), server_flags("subinterpreters")],
+        code: [server_flags("subinterpreters")],
         shape: FlagShape::Positive,
         used: Pool,
         default: "one per logical CPU",
         doc: "the sub-interpreter pool's size, with tpc off; thread-per-core runs one per thread",
     },
     tpc: bool = {
-        name: "tpc", cli: "--tpc", env: "MIPYRE_TPC", file: PyprojectKey::Top("tpc"),
+        name: "tpc", file: PyprojectKey::Top("tpc"),
         code: [server_flags("tpc")],
         shape: FlagShape::Bool,
         used: Always,
@@ -746,7 +745,7 @@ flags! {
         doc: "thread-per-core; off runs the multi-thread server",
     },
     tpc_accept: AcceptMode = {
-        name: "tpc_accept", cli: "--tpc-accept", env: "MIPYRE_TPC_DARWIN", file: PyprojectKey::Top("tpc_accept"),
+        name: "tpc_accept", file: PyprojectKey::Top("tpc_accept"),
         code: [server_flags("tpc_accept")],
         shape: FlagShape::AcceptMode,
         used: MacosTpc,
@@ -754,7 +753,7 @@ flags! {
         doc: "how thread-per-core threads take connections on macOS: a listener each, or one fanout acceptor",
     },
     gc_mode: GcMode = {
-        name: "gc_mode", cli: "--gc-mode", env: "MIPYRE_GC_MODE", file: PyprojectKey::Top("gc_mode"),
+        name: "gc_mode", file: PyprojectKey::Top("gc_mode"),
         code: [server_flags("gc_mode")],
         shape: FlagShape::GcMode,
         used: SubinterpreterWorkers,
@@ -762,7 +761,7 @@ flags! {
         doc: "when a sub-interpreter worker runs gc.collect()",
     },
     gc_threshold: u64 = {
-        name: "gc_threshold", cli: "--gc-threshold", env: "MIPYRE_GC_THRESHOLD",
+        name: "gc_threshold",
         file: PyprojectKey::Top("gc_threshold"),
         code: [server_flags("gc_threshold")],
         shape: FlagShape::Count,
@@ -771,7 +770,7 @@ flags! {
         doc: "requests between collections in count mode; 0 never collects",
     },
     gc_idle_ms: Duration = {
-        name: "gc_idle_ms", cli: "--gc-idle-ms", env: "MIPYRE_GC_IDLE_MS", file: PyprojectKey::Top("gc_idle_ms"),
+        name: "gc_idle_ms", file: PyprojectKey::Top("gc_idle_ms"),
         code: [server_flags("gc_idle_ms")],
         shape: FlagShape::PositiveDuration { unit: TimeUnit::Millis },
         used: SubinterpreterWorkers,
@@ -779,7 +778,7 @@ flags! {
         doc: "the lull, in milliseconds, after which idle mode collects",
     },
     gc_oom_failsafe: u64 = {
-        name: "gc_oom_failsafe", cli: "--gc-oom-failsafe", env: "MIPYRE_GC_OOM_FAILSAFE",
+        name: "gc_oom_failsafe",
         file: PyprojectKey::Top("gc_oom_failsafe"),
         code: [server_flags("gc_oom_failsafe")],
         shape: FlagShape::Count,
@@ -788,34 +787,34 @@ flags! {
         doc: "requests after which idle mode collects even without a lull; 0 collects only in lulls",
     },
     bridge_workers: NonZeroUsize = {
-        name: "bridge_workers", cli: "--bridge-workers", env: "MIPYRE_GIL_BRIDGE_WORKERS",
+        name: "bridge_workers",
         file: PyprojectKey::Top("bridge_workers"),
         code: [server_flags("bridge_workers")],
         shape: FlagShape::Positive,
-        used: MainBridge,
-        default: "4",
-        doc: "threads that run main-interpreter routes for a thread-per-core server",
+        used: MainRoutes,
+        default: "4 (thread-per-core) / 512 (tpc off)",
+        doc: "most threads that run main-interpreter def routes",
     },
     bridge_capacity: NonZeroUsize = {
-        name: "bridge_capacity", cli: "--bridge-capacity", env: "MIPYRE_GIL_BRIDGE_CAPACITY",
+        name: "bridge_capacity",
         file: PyprojectKey::Top("bridge_capacity"),
         code: [server_flags("bridge_capacity")],
         shape: FlagShape::Positive,
-        used: MainBridge,
-        default: "16 per bridge worker",
-        doc: "main-interpreter requests queued before 503",
+        used: MainRoutes,
+        default: "16 per main-interpreter thread",
+        doc: "main-interpreter requests queued (async def: queued or running) before 503",
     },
     async_queue_capacity: NonZeroUsize = {
-        name: "async_queue_capacity", cli: "--async-queue-capacity", env: "MIPYRE_ASYNC_QUEUE_CAPACITY",
+        name: "async_queue_capacity",
         file: PyprojectKey::Top("async_queue_capacity"),
         code: [server_flags("async_queue_capacity")],
         shape: FlagShape::Positive,
         used: PoolAsyncRoutes,
         default: "the async pool's own",
-        doc: "async def requests queued before 503",
+        doc: "async def requests queued or running before 503",
     },
     metrics: bool = {
-        name: "metrics", cli: "--metrics", env: "MIPYRE_METRICS", file: PyprojectKey::Top("metrics"),
+        name: "metrics", file: PyprojectKey::Top("metrics"),
         code: [server_flags("metrics")],
         shape: FlagShape::Bool,
         used: Always,
@@ -823,75 +822,75 @@ flags! {
         doc: "count every answer and sample RSS",
     },
     host: String = {
-        name: "host", cli: "--host", env: "MIPYRE_HOST", file: PyprojectKey::Top("host"),
-        code: [run("host"), server_flags("host")],
+        name: "host", file: PyprojectKey::Top("host"),
+        code: [server_flags("host")],
         shape: FlagShape::Host,
         used: TcpTransport,
         default: "127.0.0.1",
         doc: "the address to bind",
     },
     port: u16 = {
-        name: "port", cli: "--port", env: "MIPYRE_PORT", file: PyprojectKey::Top("port"),
-        code: [run("port"), server_flags("port")],
+        name: "port", file: PyprojectKey::Top("port"),
+        code: [server_flags("port")],
         shape: FlagShape::Port,
         used: TcpTransport,
         default: "8000",
         doc: "the port to bind",
     },
     tls_cert: PathBuf = {
-        name: "tls_cert", cli: "--tls-cert", env: "MIPYRE_TLS_CERT", file: PyprojectKey::Top("tls_cert"),
-        code: [run("tls_cert"), server_flags("tls_cert")],
+        name: "tls_cert", file: PyprojectKey::Top("tls_cert"),
+        code: [server_flags("tls_cert")],
         shape: FlagShape::Path,
         used: TcpTransport,
         default: "none (plain HTTP)",
         doc: "the TLS certificate chain (PEM); given with tls_key",
     },
     tls_key: PathBuf = {
-        name: "tls_key", cli: "--tls-key", env: "MIPYRE_TLS_KEY", file: PyprojectKey::Top("tls_key"),
-        code: [run("tls_key"), server_flags("tls_key")],
+        name: "tls_key", file: PyprojectKey::Top("tls_key"),
+        code: [server_flags("tls_key")],
         shape: FlagShape::Path,
         used: TcpTransport,
         default: "none (plain HTTP)",
         doc: "the TLS private key (PEM); given with tls_cert",
     },
     extra_tls_ports: Vec<NonZeroU16> = {
-        name: "extra_tls_ports", cli: "--extra-tls-ports", env: "MIPYRE_TLS_PORTS",
+        name: "extra_tls_ports",
         file: PyprojectKey::Top("extra_tls_ports"),
-        code: [run("extra_tls_ports"), server_flags("extra_tls_ports")],
+        code: [server_flags("extra_tls_ports")],
         shape: FlagShape::Ports,
         used: TcpTransport,
         default: "none",
         doc: "more ports served over TLS",
     },
     extra_plain_ports: Vec<NonZeroU16> = {
-        name: "extra_plain_ports", cli: "--extra-plain-ports", env: "MIPYRE_PLAIN_PORTS",
+        name: "extra_plain_ports",
         file: PyprojectKey::Top("extra_plain_ports"),
-        code: [run("extra_plain_ports"), server_flags("extra_plain_ports")],
+        code: [server_flags("extra_plain_ports")],
         shape: FlagShape::Ports,
         used: TcpTransport,
         default: "none",
         doc: "more ports served over plain HTTP",
     },
     allowed_hosts: Vec<String> = {
-        name: "allowed_hosts", cli: "--allowed-host", env: "MIPYRE_ALLOWED_HOSTS",
+        name: "allowed_hosts",
         file: PyprojectKey::Top("allowed_hosts"),
-        code: [run("allowed_hosts"), server_flags("allowed_hosts")],
+        code: [server_flags("allowed_hosts")],
         shape: FlagShape::Hosts,
         used: TcpTransport,
         default: "localhost and IP addresses",
         doc: "DNS names this server is reached by, besides localhost and IP addresses ('*' for any)",
     },
     trusted_proxies: Vec<String> = {
-        name: "trusted_proxies", cli: "--trusted-proxy", env: "MIPYRE_TRUSTED_PROXIES",
+        name: "trusted_proxies",
         file: PyprojectKey::Top("trusted_proxies"),
-        code: [run("trusted_proxies"), server_flags("trusted_proxies")],
+        code: [server_flags("trusted_proxies")],
         shape: FlagShape::Proxies,
         used: TcpTransport,
         default: "none: the TCP peer is the client",
         doc: "reverse proxies (IP addresses and CIDR blocks) whose X-Forwarded-For names the client",
     },
     isolate_dir: PathBuf = {
-        name: "isolate_dir", cli: "--isolate-dir", env: "MIPYRE_ISOLATE_DIR", file: PyprojectKey::Top("isolate_dir"),
+        name: "isolate_dir", file: PyprojectKey::Top("isolate_dir"),
         code: [server_flags("isolate_dir")],
         shape: FlagShape::Path,
         used: SubinterpreterWorkers,
@@ -899,7 +898,7 @@ flags! {
         doc: "where each sub-interpreter worker keeps its copy of an isolated extension",
     },
     process_workers: NonZeroUsize = {
-        name: "process.workers", cli: "--process-workers", env: "MIPYRE_PROCESS_WORKERS",
+        name: "process.workers",
         file: PyprojectKey::Process("workers"),
         code: [process_lanes("workers"), server_flags("process_workers")],
         shape: FlagShape::Positive,
@@ -908,7 +907,7 @@ flags! {
         doc: "worker processes for runtime=\"process\" routes",
     },
     process_queue: NonZeroUsize = {
-        name: "process.queue_per_worker", cli: "--process-queue", env: "MIPYRE_PROCESS_QUEUE",
+        name: "process.queue_per_worker",
         file: PyprojectKey::Process("queue_per_worker"),
         code: [process_lanes("queue_per_worker"), server_flags("process_queue_per_worker")],
         shape: FlagShape::Positive,
@@ -917,7 +916,7 @@ flags! {
         doc: "requests each process worker holds before 503",
     },
     process_slot_bytes: LaneSlotBytes = {
-        name: "process.slot_bytes", cli: "--process-slot-bytes", env: "MIPYRE_PROCESS_SLOT_BYTES",
+        name: "process.slot_bytes",
         file: PyprojectKey::Process("slot_bytes"),
         code: [process_lanes("slot_bytes"), server_flags("process_slot_bytes")],
         shape: FlagShape::SlotBytes,
@@ -926,7 +925,7 @@ flags! {
         doc: "the largest request and answer a process worker takes, in bytes",
     },
     process_start: StartStrategy = {
-        name: "process.start", cli: "--process-start", env: "MIPYRE_PROCESS_START", file: PyprojectKey::Process("start"),
+        name: "process.start", file: PyprojectKey::Process("start"),
         code: [process_lanes("start"), server_flags("process_start")],
         shape: FlagShape::StartStrategy,
         used: ProcessRoutes,
@@ -934,7 +933,7 @@ flags! {
         doc: "how a process worker gets the app: import it, or fork from a template that did",
     },
     process_timeout: Duration = {
-        name: "process.timeout", cli: "--process-timeout", env: "MIPYRE_PROCESS_TIMEOUT",
+        name: "process.timeout",
         file: PyprojectKey::Process("timeout"),
         code: [process_lanes("timeout"), server_flags("process_timeout")],
         shape: FlagShape::PositiveDuration { unit: TimeUnit::Seconds },
@@ -943,7 +942,7 @@ flags! {
         doc: "a process handler's time, in seconds; past it the worker is killed and the request answered 504",
     },
     process_spin_us: Duration = {
-        name: "process.spin_us", cli: "--process-spin-us", env: "MIPYRE_PROCESS_SPIN_US",
+        name: "process.spin_us",
         file: PyprojectKey::Process("spin_us"),
         code: [server_flags("process_spin_us")],
         shape: FlagShape::Duration { unit: TimeUnit::Micros },
@@ -952,7 +951,7 @@ flags! {
         doc: "how long a process worker spins for the next request, in microseconds, before it sleeps",
     },
     process_host_failure: FailurePolicy = {
-        name: "process.host_failure", cli: "--process-host-failure", env: "MIPYRE_LANE_HOST_FAILURE",
+        name: "process.host_failure",
         file: PyprojectKey::Process("host_failure"),
         code: [server_flags("process_host_failure")],
         shape: FlagShape::FailurePolicy,
@@ -963,7 +962,7 @@ flags! {
     }
     process {
     reload: bool = {
-        name: "reload", cli: "--reload", env: "MIPYRE_RELOAD", file: PyprojectKey::Top("reload"),
+        name: "reload", file: PyprojectKey::Top("reload"),
         code: [run("reload")],
         shape: FlagShape::Bool,
         used: ReloadingEntry,
@@ -971,7 +970,7 @@ flags! {
         doc: "restart the app when its files change",
     },
     log: bool = {
-        name: "log", cli: "--log", env: "MIPYRE_LOG", file: PyprojectKey::Top("log"),
+        name: "log", file: PyprojectKey::Top("log"),
         code: [CodeKey { call: CodeCall::AppConstructor, keyword: "debug" }],
         shape: FlagShape::Bool,
         used: Always,
@@ -991,8 +990,8 @@ mod tests {
     fn every_source_key_names_one_flag() {
         let unique = |keys: Vec<String>| keys.len() == keys.iter().collect::<HashSet<_>>().len();
         assert!(unique(FLAGS.iter().map(|f| f.name.to_string()).collect()));
-        assert!(unique(FLAGS.iter().map(|f| f.cli.to_string()).collect()));
-        assert!(unique(FLAGS.iter().map(|f| f.env.to_string()).collect()));
+        assert!(unique(FLAGS.iter().map(|f| cli_option(f.name)).collect()));
+        assert!(unique(FLAGS.iter().map(|f| env_variable(f.name)).collect()));
         assert!(unique(FLAGS.iter().map(|f| format!("{:?}", f.file)).collect()));
         assert!(unique(
             FLAGS.iter().flat_map(|f| f.code).map(ToString::to_string).collect()
@@ -1020,11 +1019,14 @@ mod tests {
     }
 
     #[test]
-    fn each_flag_is_ours_on_every_source() {
-        for flag in FLAGS {
-            assert!(flag.env.starts_with("MIPYRE_"), "{}", flag.env);
-            assert!(flag.cli.starts_with("--"), "{}", flag.cli);
-        }
+    fn a_settings_option_and_variable_are_spelled_from_its_name() {
+        assert_eq!(cli_option("process.queue_per_worker"), "--process-queue-per-worker");
+        assert_eq!(
+            env_variable("process.queue_per_worker"),
+            "MIPYRE_PROCESS_QUEUE_PER_WORKER"
+        );
+        assert_eq!(cli_option("tpc"), "--tpc");
+        assert_eq!(env_variable("tpc"), "MIPYRE_TPC");
     }
 
     #[test]
@@ -1103,7 +1105,7 @@ mod tests {
 
     #[test]
     fn a_slot_starts_at_the_lane_minimum() {
-        let min = crate::runtime::process::MIN_SLOT_BYTES;
+        let min = mipyre_process::MIN_SLOT_BYTES;
         assert!(read::<LaneSlotBytes>(&(min - 1).to_string(), FlagShape::SlotBytes).is_none());
         assert!(read::<LaneSlotBytes>(&min.to_string(), FlagShape::SlotBytes).is_some());
     }

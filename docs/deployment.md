@@ -15,10 +15,10 @@ mipyre run app:app --host 0.0.0.0 --port 8000
 The server prints what it started with, here on a 4-CPU Linux machine:
 
 ```text
-  Mipyre v2.0.0 [TPC mode, hybrid-inline]
+  Mipyre v3.0.0
   Listening on http://0.0.0.0:8000
   TPC threads: 4 (CPUs: 4, pinned)
-  Routes: 1 sub-interp + 1 GIL + 0 process + 0 async
+  Routes: 1 sub-interp + 1 main + 0 process + 0 async
 ```
 
 An app with process routes also prints a `Process lanes:` line with the workers, the handler timeout and the queue size.
@@ -103,7 +103,7 @@ HTTP/2 200
 
 `MIPYRE_TLS_CERT` and `MIPYRE_TLS_KEY` do the same. Set both or neither: one without the other stops the start.
 
-A plain-HTTP port also serves HTTP/2 to a client that speaks it from the start (prior knowledge, `curl --http2-prior-knowledge`). To serve TLS and plain HTTP side by side, list more ports: `run(extra_tls_ports=[...])` / `MIPYRE_TLS_PORTS` (the main `port` then serves plain HTTP), and `run(extra_plain_ports=[...])` / `MIPYRE_PLAIN_PORTS`.
+A plain-HTTP port also serves HTTP/2 to a client that speaks it from the start (prior knowledge, `curl --http2-prior-knowledge`). To serve TLS and plain HTTP side by side, list more ports: `ServerFlags(extra_tls_ports=[...])` / `MIPYRE_EXTRA_TLS_PORTS` (the main `port` then serves plain HTTP), and `ServerFlags(extra_plain_ports=[...])` / `MIPYRE_EXTRA_PLAIN_PORTS`.
 
 ## systemd
 

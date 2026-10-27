@@ -15,7 +15,7 @@ use pyo3::types::{PyTuple, PyType};
 
 use super::numeric::NumericError;
 use super::query::QueryMethod;
-use crate::runtime::{OwnPoolError, PoolSettingDifferences, TaskError};
+use mipyre_pg::{OwnPoolError, PoolSettingDifferences, TaskError};
 
 pyo3::create_exception!(
     mipyre.engine,

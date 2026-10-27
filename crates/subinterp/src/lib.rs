@@ -5,6 +5,8 @@
 //! no other thread state is current on a thread entering a worker, is checked by CPython, which
 //! aborts.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod attach;
 pub mod context;
 mod entry;
@@ -16,10 +18,8 @@ mod sync;
 
 #[cfg(feature = "startup_trace")]
 pub use interp::trace;
-pub use interp::{
-    detach_for_idle, keep_attached_until_idle, InterruptError, InterruptTarget, NewInterpreterError, Releasable,
-    SubInterpreter, ThreadStateCreationFailure, WorkUnit,
-};
+pub use interp::unit::{InterruptError, InterruptTarget, ThreadStateCreationFailure, UnitEnd, WorkUnit};
+pub use interp::{detach_for_idle, keep_attached_until_idle, NewInterpreterError, Releasable, SubInterpreter};
 
 pub use finalization::ExitDecision;
 

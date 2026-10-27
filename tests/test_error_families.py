@@ -1,4 +1,4 @@
-"""The public errors, by who decides (b/845, design §6 C3): each importable from `mipyre`, each
+"""The public errors, by who decides: each importable from `mipyre`, each
 in its family."""
 
 from __future__ import annotations

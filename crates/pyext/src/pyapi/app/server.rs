@@ -74,7 +74,7 @@ pub(super) fn listener_set(values: &ServerFlagValues) -> PyResult<ListenerSet> {
                 &key.value().to_string_lossy(),
                 Protocols::Http2AndHttp1.alpn(),
             )
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
+            .map_err(|e| tls_exception(&e, cert, key))?,
         ),
         _ => None,
     };
@@ -90,6 +90,27 @@ pub(super) fn listener_set(values: &ServerFlagValues) -> PyResult<ListenerSet> {
         &ports(&values.extra_plain_ports),
     )
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+/// Raises a TLS file that cannot be used as a `ConfigError` naming its flag and where it was given,
+/// and a failure of neither file (the system's random source) as `RuntimeError`.
+fn tls_exception(
+    e: &mipyre_transport::tls::TlsError,
+    cert: &crate::boot::FlagValue<std::path::PathBuf>,
+    key: &crate::boot::FlagValue<std::path::PathBuf>,
+) -> PyErr {
+    use mipyre_transport::tls::PemFile;
+    let (flag, given) = match e.file() {
+        Some(PemFile::Certificate) => ("tls_cert", cert),
+        Some(PemFile::PrivateKey) => ("tls_key", key),
+        None => return pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
+    };
+    crate::boot::ConfigError::from(crate::boot::FlagError::TlsFileUnusable {
+        flag,
+        from: given.source(),
+        reason: e.to_string(),
+    })
+    .into()
 }
 
 /// The flags that name the addresses a server binds: the `.socket` unit names them instead
@@ -110,15 +131,15 @@ pub(super) fn address_flags(values: &ServerFlagValues) -> Vec<(&'static crate::b
 /// this call's `OSError(EADDRINUSE)` rather than a log line from a serving thread.
 ///
 /// Sockets systemd handed over are served instead, each with the server's TLS; then every
-/// address flag that was given (`addresses`) is unused, and the start fails naming each (D19).
+/// address flag that was given (`addresses`) is unused, and the start fails naming each.
 pub(super) fn bind(
     specs: &ListenerSet,
     copies: NonZeroUsize,
     addresses: &[(&'static crate::boot::Flag, crate::boot::FlagSource)],
 ) -> PyResult<Endpoints> {
     let tls = specs.specs().first().and_then(|spec| spec.tls.clone());
-    match crate::serve::handed_by_systemd(tls, copies)? {
-        None => Endpoints::bind(specs, copies, crate::serve::bind_options()).map_err(crate::serve::listener_error),
+    match mipyre_server::handed_by_systemd(tls, copies).map_err(crate::boot::passed_exception)? {
+        None => Endpoints::bind(specs, copies, mipyre_server::bind_options()).map_err(crate::boot::listener_exception),
         Some(handed) => match crate::boot::ConfigError::of(handed_socket_errors(addresses)) {
             Some(unused) => Err(unused.into()),
             None => {
@@ -226,25 +247,34 @@ pub(crate) struct Server {
     parts: RunSources,
 }
 
-/// The parts of one run its metrics are read from, which say what it did and what it runs without: its counts (which also
-/// hold why its threads run unpinned), its process lanes, and its static mounts.
+/// The parts of one run its metrics are read from, which say what it did and what it runs without: the server's counts
+/// (which also hold why its threads run unpinned), its workers' counts, its process lanes, and its static mounts.
 pub(super) struct RunSources {
-    counters: std::sync::Arc<crate::telemetry::RunCounters>,
-    lanes: Option<std::sync::Arc<crate::runtime::process::ServerLanes>>,
+    counters: std::sync::Arc<mipyre_server::ServerCounters>,
+    workers: std::sync::Arc<mipyre_runtime::WorkerCounters>,
+    lanes: Option<std::sync::Arc<mipyre_process::ServerLanes>>,
     mounts: Vec<mipyre_http::io::static_files::StaticMount>,
 }
 
 impl RunSources {
-    pub(super) fn of(site: &crate::serve::Site) -> Self {
+    pub(super) fn of(site: &mipyre_server::Site, workers: &std::sync::Arc<mipyre_runtime::WorkerCounters>) -> Self {
         RunSources {
-            counters: std::sync::Arc::clone(&site.counters),
+            counters: std::sync::Arc::clone(&site.counters.run),
+            workers: std::sync::Arc::clone(workers),
             lanes: site.process.clone(),
             mounts: site.rules.routes.static_mounts().to_vec(),
         }
     }
 
+    fn static_bytes_in_flight(&self) -> u64 {
+        self.mounts
+            .iter()
+            .map(mipyre_http::io::static_files::StaticMount::bytes_in_flight)
+            .sum()
+    }
+
     /// Returns each part the run runs without, as `component: reason`, asking each owner.
-    fn degraded(&self, counts: &crate::telemetry::RunCounts) -> Vec<String> {
+    fn degraded(&self, counts: &mipyre_server::ServerCounts) -> Vec<String> {
         let pinning = counts.unpinned_because.iter().map(|why| format!("cpu_pinning: {why}"));
         let lanes = self
             .lanes
@@ -289,7 +319,12 @@ impl Server {
     fn metrics(&self) -> crate::pyapi::config::RunMetrics {
         let counts = self.parts.counters.read();
         let degraded = self.parts.degraded(&counts);
-        crate::pyapi::config::RunMetrics { counts, degraded }
+        crate::pyapi::config::RunMetrics {
+            counts,
+            workers: self.parts.workers.read(),
+            static_bytes_in_flight: self.parts.static_bytes_in_flight(),
+            degraded,
+        }
     }
 
     /// Stop this server the way SIGINT does; it may be called from any thread, any number of
@@ -361,7 +396,7 @@ mod tests {
         let given = |pairs: &[(&str, &str)]| {
             let mut code = crate::boot::ServerFlags::default();
             for (keyword, raw) in pairs {
-                code.give(crate::boot::CodeCall::Run, keyword, raw).unwrap();
+                code.give(crate::boot::CodeCall::ServerFlags, keyword, raw).unwrap();
             }
             socket_flags_given(&crate::boot::Deployment::default().over(&code))
         };

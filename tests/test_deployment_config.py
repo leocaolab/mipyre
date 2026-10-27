@@ -1,5 +1,5 @@
-"""The deployment's settings: the app's runtime (its code's alone, b/335 D9), and the process
-lanes' settings the engine reads once at the entry point (b/335) and lays over the app's
+"""The deployment's settings: the app's runtime (its code's alone), and the process
+lanes' settings the engine reads once at the entry point and lays over the app's
 ``ProcessLanes``. The rules each value is held to are tested on the engine's pure resolve
 (crates/pyext/src/boot/config.rs); these check what the app sees."""
 
@@ -19,9 +19,9 @@ from mipyre.engine import ConfigError, Deployment, EntryPoint, FailurePolicy, La
 
 
 # -- the app's runtime -------------------------------------------------------------------
-# An app's runtime is its code's (b/335 D9): no deployment value replaces it. What a deployment
-# used to give it (MIPYRE_RUNTIME, `mipyre run --runtime`, [tool.mipyre] runtime) is gone; the
-# environment variable is now an unknown one (test_review_m5), the key an unknown key (the engine's
+# An app's runtime is its code's: no deployment value replaces it. MIPYRE_RUNTIME,
+# `mipyre run --runtime` and [tool.mipyre] runtime do not exist; the
+# environment variable is an unknown one (test_engine_config), the key an unknown key (the engine's
 # resolve unit tests).
 
 
@@ -38,8 +38,8 @@ def test_tool_mipyre_that_is_not_a_table_is_an_error(tmp_path, monkeypatch):
 
 
 # -- process-lane settings --------------------------------------------------------------
-# The deployment is read once at the entry point (Rust, b/335); the app's ProcessLanes is the code
-# underneath it (D7: a deployment value wins). Each read here is the process's environment and
+# The deployment is read once at the entry point (Rust); the app's ProcessLanes is the code
+# underneath it (a deployment value wins). Each read here is the process's environment and
 # working directory, set by monkeypatch.
 
 
@@ -79,9 +79,9 @@ def test_each_lane_setting_comes_from_flags_then_env_then_pyproject_then_code(mo
 
 
 def test_an_unknown_host_failure_policy_names_what_was_written(monkeypatch, tmp_path):
-    with pytest.raises(ConfigError, match="MIPYRE_LANE_HOST_FAILURE: \"bogus\" is invalid"):
-        _lanes(monkeypatch, tmp_path, env={"MIPYRE_LANE_HOST_FAILURE": "bogus"})
-    assert _lanes(monkeypatch, tmp_path, env={"MIPYRE_LANE_HOST_FAILURE": "exit"}).host_failure == FailurePolicy.Exit
+    with pytest.raises(ConfigError, match="MIPYRE_PROCESS_HOST_FAILURE: \"bogus\" is invalid"):
+        _lanes(monkeypatch, tmp_path, env={"MIPYRE_PROCESS_HOST_FAILURE": "bogus"})
+    assert _lanes(monkeypatch, tmp_path, env={"MIPYRE_PROCESS_HOST_FAILURE": "exit"}).host_failure == FailurePolicy.Exit
 
 
 def test_the_timeout_is_in_seconds_in_the_environment_too(monkeypatch, tmp_path):
@@ -104,11 +104,11 @@ def test_an_unknown_start_strategy_is_an_error_with_what_was_written(monkeypatch
 
 @pytest.mark.parametrize("raw", ["0", "two"])
 def test_a_lane_size_below_one_or_not_a_number_is_an_error(monkeypatch, tmp_path, raw):
-    with pytest.raises(ConfigError, match=f'MIPYRE_PROCESS_QUEUE: "{raw}" is invalid for process.queue_per_worker'):
-        _lanes(monkeypatch, tmp_path, env={"MIPYRE_PROCESS_QUEUE": raw})
+    with pytest.raises(ConfigError, match=f'MIPYRE_PROCESS_QUEUE_PER_WORKER: "{raw}" is invalid for process.queue_per_worker'):
+        _lanes(monkeypatch, tmp_path, env={"MIPYRE_PROCESS_QUEUE_PER_WORKER": raw})
 
 
-# b/421: a bad value names the place it was written and quotes it as written.
+# A bad value names the place it was written and quotes it as written.
 
 
 @pytest.mark.parametrize(
@@ -140,12 +140,12 @@ def test_a_bad_lane_value_in_pyproject_names_the_file_and_quotes_the_seconds_wri
 def test_a_bad_lane_value_in_the_code_or_the_flags_names_which(monkeypatch, tmp_path):
     with pytest.raises(ConfigError, match=r'ProcessLanes\(workers=\): "0" is invalid'):
         _lanes(monkeypatch, tmp_path, declared=ProcessLanes(workers=0))
-    with pytest.raises(ConfigError, match=r'mipyre run --process-queue: "0" is invalid'):
+    with pytest.raises(ConfigError, match=r'mipyre run --process-queue-per-worker: "0" is invalid'):
         _lanes(monkeypatch, tmp_path, flags={"process.queue_per_worker": "0"})
 
 
 def test_the_lanes_read_the_deployment_the_entry_point_read(monkeypatch, tmp_path):
-    # b/421: not the process's os.environ at the time the lanes start.
+    # Not the process's os.environ at the time the lanes start.
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MIPYRE_PROCESS_WORKERS", "3")
     deployment = Deployment.from_process({}, EntryPoint.CliRun)
@@ -162,3 +162,29 @@ def test_the_cli_process_flags_are_the_deployment_s_lane_settings(monkeypatch, t
     })
     s = _lanes(monkeypatch, tmp_path, flags=_given_flags(args), env={"MIPYRE_PROCESS_WORKERS": "6"})
     assert (s.start, s.workers, s.timeout_ms, s.queue_per_worker, s.slot_bytes) == (StartStrategy.Fork, 3, 1500, 9, 4096)
+
+
+def _mipyre_run(tmp_path, args: list[str], env: dict[str, str]):
+    import subprocess
+    import sys
+
+    (tmp_path / "app.py").write_text("from mipyre import Mipyre\napp = Mipyre()\n")
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("MIPYRE_")}
+    return subprocess.run(
+        [sys.executable, "-m", "mipyre", "run", "app:app", *args],
+        cwd=tmp_path, env=clean | env, capture_output=True, text=True, timeout=60,
+    )
+
+
+def test_a_former_option_stops_mipyre_run_as_an_unrecognized_argument(tmp_path):
+    done = _mipyre_run(tmp_path, ["--allowed-host", "a.example", "--process-queue", "8"], {})
+    assert done.returncode == 2, done.stderr
+    assert "error: unrecognized arguments: --allowed-host a.example --process-queue 8" in done.stderr
+
+
+def test_a_former_variable_stops_mipyre_run_as_an_unknown_variable(tmp_path):
+    done = _mipyre_run(tmp_path, [], {"MIPYRE_TPC_DARWIN": "listener"})
+    assert done.returncode == 2, done.stderr
+    assert done.stderr.startswith(
+        "mipyre: MIPYRE_TPC_DARWIN is set, but it is not one of mipyre's settings"
+    ), done.stderr

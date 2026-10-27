@@ -1,5 +1,5 @@
 """``Deployment.from_process`` reads this process's environment and the ``pyproject.toml`` in its
-working directory once, with the command line's flags (b/335 M4.3). The rules themselves (the order
+working directory once, with the command line's flags. The rules themselves (the order
 of the sources, each shape) are tested on the pure ``Deployment::resolve`` in
 crates/pyext/src/boot/config.rs; these check the wiring: a real environment, a real file, the
 Python face."""

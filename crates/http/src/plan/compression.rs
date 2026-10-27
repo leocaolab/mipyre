@@ -214,7 +214,7 @@ pub fn negotiate(accept_encoding: &str, allowed: CodingSet) -> Option<Coding> {
 }
 
 /// Holds the q-value a client's `Accept-Encoding` gives each coding; a coding neither named nor
-/// covered by `*` is below zero.
+/// covered by `*` holds [`UNNAMED`].
 #[derive(Clone, Copy, Debug)]
 struct CodingWeights {
     br_q: f32,
@@ -239,12 +239,16 @@ impl CodingWeights {
     }
 }
 
+/// The weight of a coding the header does not name. No client can send it, because [`q_value`]
+/// returns only weights from 0 to 1.
+const UNNAMED: f32 = -1.0;
+
 fn accepted(accept_encoding: &str) -> CodingWeights {
     // A coding named twice keeps its highest q-value. `identity` is not negotiated, because
     // with no shared coding the body goes out uncompressed anyway.
-    let mut br_q = -1.0f32;
-    let mut gz_q = -1.0f32;
-    let mut star_q = -1.0f32;
+    let mut br_q = UNNAMED;
+    let mut gz_q = UNNAMED;
+    let mut star_q = UNNAMED;
 
     for raw in accept_encoding.split(',') {
         let part = raw.trim();
@@ -257,8 +261,7 @@ fn accepted(accept_encoding: &str) -> CodingWeights {
                 for param in rest.split(';') {
                     let p = param.trim();
                     if let Some(value) = strip_prefix_ignore_ascii_case(p, "q=") {
-                        // A malformed q-value disables the coding rather than preferring it.
-                        q = value.trim().parse().unwrap_or(0.0);
+                        q = q_value(value);
                         // The first `q=` wins, so a later duplicate cannot flip the preference.
                         break;
                     }
@@ -283,6 +286,17 @@ fn accepted(accept_encoding: &str) -> CodingWeights {
         gz_q = star_q;
     }
     CodingWeights { br_q, gz_q }
+}
+
+/// Returns the weight a `q=` parameter gives, from 0 to 1 (RFC 9110 section 12.4.2); a value
+/// that is not a number in that range disables the coding rather than preferring it.
+// Out of line, it keeps the loop of a header with no `q=` as short as it was before the range check.
+#[inline(never)]
+fn q_value(text: &str) -> f32 {
+    match text.trim().parse::<f32>() {
+        Ok(q) if (0.0..=1.0).contains(&q) => q,
+        Ok(_) | Err(_) => 0.0,
+    }
 }
 
 /// Strips an ASCII `prefix` case-insensitively; it compares bytes, so a multi-byte character
@@ -550,6 +564,9 @@ pub fn apply(data: &mut HandlerResponse, compressed: Bytes, codec: Codec) {
 }
 
 #[cfg(test)]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::plan::response::HeaderLines;
@@ -693,6 +710,24 @@ mod tests {
     #[test]
     fn negotiate_respects_q_zero() {
         assert_eq!(negotiate("br;q=0, gzip", CodingSet::ALL), Some(Coding::Gzip));
+    }
+
+    #[test]
+    fn a_q_value_from_zero_to_one_is_kept_and_one_past_either_end_is_zero() {
+        assert_eq!(q_value("0"), 0.0);
+        assert_eq!(q_value("1"), 1.0);
+        assert_eq!(q_value("1.001"), 0.0);
+        assert_eq!(q_value("-0.001"), 0.0);
+        assert_eq!(q_value("NaN"), 0.0);
+    }
+
+    #[test]
+    fn a_coding_named_with_an_out_of_range_q_is_refused_not_left_to_the_wildcard() {
+        assert_eq!(negotiate("br;q=1, gzip;q=0.5", CodingSet::ALL), Some(Coding::Brotli));
+        assert_eq!(negotiate("br;q=1.001, gzip;q=0.5", CodingSet::ALL), Some(Coding::Gzip));
+        assert_eq!(negotiate("br;q=-0.001, gzip;q=0.5", CodingSet::ALL), Some(Coding::Gzip));
+        assert_eq!(negotiate("br;q=NaN, gzip;q=0.5", CodingSet::ALL), Some(Coding::Gzip));
+        assert_eq!(negotiate("br;q=-1, *", CodingSet::ALL), Some(Coding::Gzip));
     }
 
     #[test]

@@ -5,8 +5,7 @@ server is idle, not wait for the next request; and the server must still stop cl
 
 The worker's thread says how far it got through a file, so the test watches it without sending
 a request (a request would wake the worker and let the thread run for that reason). It waits for
-the steps to arrive, not for a fixed time: under a loaded gate the thread is slower, not stuck
-(b/286).
+the steps to arrive, not for a fixed time: under a loaded gate the thread is slower, not stuck.
 """
 
 import http.client
@@ -64,7 +63,7 @@ def test_a_python_thread_of_the_worker_runs_while_the_server_is_idle(tmp_path):
         assert _get(conn, f"/start?progress={urllib.parse.quote(str(progress))}") == (200, "started")
         # Idle: no request for this worker. Its thread must have let the GIL go, or no step
         # after the first request's is ever taken.
-        # Waits for the steps, for no length of time (b/441 D9): a thread that never gets the GIL never takes
+        # Waits for the steps, for no length of time: a thread that never gets the GIL never takes
         # them, and pytest-timeout ends the wait.
         steps = read_file(str(progress))
         poll_until(lambda: steps() == str(STEPS), timeout=None, what=f"the worker's thread taking {STEPS} steps")

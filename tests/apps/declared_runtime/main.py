@@ -10,13 +10,10 @@ from tests.apps.declared_runtime import imports_log
 
 imports_log.record("main")
 
-app = Mipyre(
-    routers=[
-        "tests.apps.declared_runtime.api:router",
-        "tests.apps.declared_runtime.analytics:router",
-        "tests.apps.declared_runtime.admin:router",
-    ]
-)
+app = Mipyre()
+app.include_router("tests.apps.declared_runtime.api:router")
+app.include_router("tests.apps.declared_runtime.analytics:router")
+app.include_router("tests.apps.declared_runtime.admin:router")
 
 
 @app.get("/where")

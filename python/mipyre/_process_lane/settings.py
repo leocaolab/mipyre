@@ -1,4 +1,4 @@
-"""The process lanes' settings as the app's code gives them (docs/process-lanes-declared-design.md)."""
+"""The process lanes' settings as the app's code gives them."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ class ProcessLanes:
     handler timeout (in seconds wherever it is written; the worker is killed, 504), 128
     requests per worker before 503, 256 KiB per request and per answer.
 
-    ``host_failure``: what a failed host or lane does (``MIPYRE_LANE_HOST_FAILURE``,
+    ``host_failure``: what a failed host or lane does (``MIPYRE_PROCESS_HOST_FAILURE``,
     ``host_failure`` in the table). ``"isolate"`` (default): the failed part is taken out of
     service, the other hosts keep serving, and the server ends only once no lane is left.
     ``"exit"``: the server ends at the first one, as ``panic_on_oops`` does. Either way the

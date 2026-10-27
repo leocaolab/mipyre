@@ -3,7 +3,7 @@ inside a handler, so its workers make no event loop; `asyncio.get_event_loop()` 
 not supported and fails with mipyre's own error. Run as a script (port 0): the test
 reads the server's log."""
 
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 app = Mipyre()
 
@@ -16,4 +16,4 @@ def late_loop(req):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0, threads=1)
+    app.run(ServerFlags(host="127.0.0.1", port=0, threads=1))

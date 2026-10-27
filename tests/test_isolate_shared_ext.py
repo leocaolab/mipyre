@@ -24,6 +24,7 @@ import urllib.request
 import pytest
 
 from tests._helpers import FINALIZE_MARK_SNIPPET, bound_port, finalized, listening_ports, poll_until, set_subinterpreters
+from tests.conftest import TEST_SHUTDOWN_GRACE_S
 
 _supported = pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"),
@@ -31,9 +32,11 @@ _supported = pytest.mark.skipif(
 )
 
 def _start(script_text, tmp_path, name, workers, env_extra=None):
-    """Launches the script on port 0; `_base` reads the port it bound from the log."""
+    """Launches the script on port 0; `_base` reads the port it bound from the log. Its stop gets the
+    tests' shutdown grace: these tests check that the stop finalizes cleanly, not how long it takes, and
+    on a loaded machine a worker ending its scipy interpreter outlasted the default 5 s."""
     script = tmp_path / f"{name}.py"
-    script.write_text(script_text.replace("{port}", "0"))
+    script.write_text(script_text.replace("{port}", "0").replace("{grace}", repr(TEST_SHUTDOWN_GRACE_S)))
     log = tmp_path / f"{name}.log"
     env = dict(os.environ, MIPYRE_ISOLATE_DIR=str(tmp_path / "copies"), **(env_extra or {}))
     set_subinterpreters(env, str(workers))
@@ -50,7 +53,7 @@ def _base(log) -> str | None:
 
 def _get(path, proc, log):
     """`path`'s JSON once the server answers it 200: waits for its startup line, then for the answer, for no length
-    of time (workers importing numpy and scipy start when the machine lets them, b/441 T2). An HTTP error or the
+    of time (workers importing numpy and scipy start when the machine lets them). An HTTP error or the
     server exiting fails the test at once."""
 
     def read() -> str:
@@ -75,7 +78,7 @@ def _get(path, proc, log):
 def _sigint(proc):
     proc.send_signal(signal.SIGINT)
     try:
-        return proc.wait(timeout=60)
+        return proc.wait()
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -83,8 +86,9 @@ def _sigint(proc):
 
 _SCIPY_LAZY = '''
 import os
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
+app.shutdown_timeout = {grace}
 _D = os.path.realpath(os.environ["MIPYRE_ISOLATE_DIR"])
 
 @app.get("/sp")
@@ -97,7 +101,7 @@ def sp(req):
             "fblas_isolated": os.path.realpath(fb.__file__).startswith(_D)}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={port})
+    app.run(ServerFlags(host="127.0.0.1", port={port}))
 '''
 
 
@@ -122,13 +126,11 @@ def test_shared_single_phase_ext_is_cloned_not_loaded_shared(tmp_path):
     assert "Fatal Python error" not in text, text[-3000:]
 
 
-# Worker code that makes requests reach every worker (b/441): `meet()` writes the serving
+# Worker code that makes requests reach every worker: `meet()` writes the serving
 # interpreter's id into `MEET_DIR`, then holds the worker until `MEET_WORKERS` ids are there.
 # While a worker is held it takes no other request, so the requests in flight go to the others,
 # until each worker has served one. A worker that never gets one holds the rest forever: the test
-# then fails at the suite's timeout instead of passing without having tested that worker. Until
-# b/441 a handler slept 20 ms to spread requests, and the tests asserted that two of the workers
-# had been reached.
+# then fails at the suite's timeout instead of passing without having tested that worker.
 MEET = '''
 def meet():
     import _interpreters, os, time
@@ -172,8 +174,9 @@ def test_meet_holds_a_worker_until_every_worker_has_served(tmp_path, monkeypatch
 
 _ORJSON_TOP = '''
 import os
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
+app.shutdown_timeout = {grace}
 import orjson   # not declared; orjson has no load-once guard of its own
 _D = os.path.realpath(os.environ["MIPYRE_ISOLATE_DIR"])
 MEET_SRC
@@ -188,7 +191,7 @@ def oj(req):
             "dumps": orjson.dumps({"a": 1}).decode()}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={port})
+    app.run(ServerFlags(host="127.0.0.1", port={port}))
 '''.replace("MEET_SRC", MEET)
 
 
@@ -224,8 +227,9 @@ def test_undeclared_ext_without_own_guard_is_isolated_in_every_worker(tmp_path):
 
 _FINALIZE = FINALIZE_MARK_SNIPPET + '''
 import os
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
+app.shutdown_timeout = {grace}
 import numpy as np
 import scipy.linalg
 import orjson
@@ -238,7 +242,7 @@ def x(req):
             "o": len(orjson.dumps([1, 2]))}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={port})
+    app.run(ServerFlags(host="127.0.0.1", port={port}))
 '''
 
 
@@ -266,15 +270,16 @@ def test_graceful_sigint_finalizes_isolated_workers(tmp_path):
 
 
 _ISOLATED_PLAIN = '''
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="isolated")
+app.shutdown_timeout = {grace}
 
 @app.get("/up")
 def up(req):
     return {"up": True}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port={port})
+    app.run(ServerFlags(host="127.0.0.1", port={port}))
 '''
 
 

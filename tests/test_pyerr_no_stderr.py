@@ -1,14 +1,8 @@
-"""Regression for the PyErr_Print stderr storm (benchmark-17 audit bug #6).
+"""A handler that raises does not write to stderr.
 
-Before the fix, a Python exception in a sub-interpreter handler ran
-`PyErr_Print`, which writes synchronously and unbuffered to the
-process's stderr fd. Under a 500k-rps flood that triggered many
-exceptions, every worker serialized on the kernel stdio lock and
-throughput collapsed.
-
-Now handler exceptions are taken as PyO3 errors and logged through Rust's
-`tracing` pipeline (non-blocking writer). We verify behaviourally that a
-handler that raises does not spam stderr.
+`PyErr_Print` writes synchronously and unbuffered to the process's stderr fd: under a flood
+of raising requests every worker would serialize on the kernel stdio lock. Handler exceptions
+are taken as PyO3 errors and logged through Rust's `tracing` pipeline (non-blocking writer).
 """
 
 import os
@@ -25,8 +19,8 @@ from tests._helpers import bound_port, poll_until, read_file
 def test_raising_handler_does_not_spam_stderr(tmp_path):
     """Run a child Mipyre process that serves a route which raises, hit
     it a few times, and verify stderr stays quiet. The child runs with
-    the default runtime ("subinterp") so the PyErr_Print path is the one that would
-    have been hit before the fix.
+    the default runtime ("subinterp"), whose handlers are the ones a
+    `PyErr_Print` would report.
 
     The server runs from a script file, not `python -c`: workers re-run the
     app's `__file__`, so `app.run()` needs one to serve at all.
@@ -38,7 +32,7 @@ def test_raising_handler_does_not_spam_stderr(tmp_path):
     """
     script = tmp_path / "raising_app.py"
     script.write_text(textwrap.dedent("""
-        from mipyre import Mipyre
+        from mipyre import Mipyre, ServerFlags
 
         app = Mipyre()
 
@@ -51,7 +45,7 @@ def test_raising_handler_does_not_spam_stderr(tmp_path):
             raise RuntimeError("deliberate test failure")
 
         if __name__ == "__main__":
-            app.run(host="127.0.0.1", port=0)
+            app.run(ServerFlags(host="127.0.0.1", port=0))
     """))
     stdout_path = tmp_path / "stdout.log"
     stderr_path = tmp_path / "stderr.log"

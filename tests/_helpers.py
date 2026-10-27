@@ -2,19 +2,28 @@
 
 Every test server binds port 0 and the test reads back the port the kernel picked, so
 suites can run concurrently: `TestClient.port` in-process, `bound_port` for a subprocess
-server (from its "Listening on" startup line).
+server (from its "Listening on" startup line). A test that names the port before the server
+starts, or checks that a stopped server let it go, draws one below the ephemeral range instead
+(`free_port_below_ephemeral`): a port 0 bind or a connect anywhere on the machine can take a
+port inside it.
 """
 
 from __future__ import annotations
 
+import itertools
 import os
+import random
 import re
 import signal
+import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from typing import Callable, MutableMapping, TypeVar
+
+import pytest
 
 from tests._test_cost import polling
 
@@ -31,7 +40,7 @@ def set_subinterpreters(env: MutableMapping[str, str], count: str) -> None:
     """Sets in `env` how many sub-interpreters a server started with it runs: the thread-per-core
     server runs one per thread (`MIPYRE_THREADS`), the `MIPYRE_TPC=0` server a pool of
     `MIPYRE_SUBINTERPRETERS`. A `MIPYRE_TPC=0` server of a script given `MIPYRE_TEST_MODE=main`
-    runs no sub-interpreter, so nothing is set: a size it does not use is an error (b/335 D19)."""
+    runs no sub-interpreter, so nothing is set: a size it does not use is an error."""
     if env.get("MIPYRE_TPC") != "0":
         env["MIPYRE_THREADS"] = count
     elif env.get("MIPYRE_TEST_MODE") != "main":
@@ -49,7 +58,7 @@ def poll_until(
 
     Raises `TimeoutError` naming `what` and the last value `fetch` returned when
     `timeout` seconds pass first. `timeout=None` waits for the value alone, for no length of
-    time: for a wait whose length is not what the test checks (a server starting, b/325).
+    time: for a wait whose length is not what the test checks (a server starting).
     """
     deadline = None if timeout is None else time.monotonic() + timeout
     while True:
@@ -99,7 +108,7 @@ def bound_port(read_output: Callable[[], str], proc: subprocess.Popen) -> int:
     output `read_output` returns.
 
     Waits for one of two events, the line or `proc` exiting, and for no length of time: a
-    loaded machine starts a server late, and that is not the server failing (b/325). Raises
+    loaded machine starts a server late, and that is not the server failing. Raises
     `RuntimeError` carrying the output when `proc` exits first.
     """
     while True:
@@ -150,7 +159,7 @@ def kill_session(proc: subprocess.Popen) -> None:
     proc.wait(timeout=10)
 
 
-# --- b/441 B block: waits for an event, for no length of time -----------------------------------------------------
+# --- waits for an event, for no length of time ---------------------------------------------------------------------
 # A wait here has no deadline of its own: how long a server takes to start or a line to land is the machine's, not a
 # fact the test checks. A wait that never ends is pytest-timeout's (pyproject.toml, the one hang guard).
 
@@ -191,7 +200,7 @@ def text_appears(read_output: Callable[[], str], text: str, proc: subprocess.Pop
 # Put at the top of a server script: writes "finalized" to the file named by the script's
 # FINALIZE_MARK environment variable from an atexit callback. CPython runs atexit callbacks
 # as it finalizes and `os._exit` skips them, so the mark says the process finalized instead
-# of exiting hard (b/402). No braces: scripts are `.format`ted.
+# of exiting hard. No braces: scripts are `.format`ted.
 FINALIZE_MARK_SNIPPET = """
 import atexit as _atexit, os as _os
 def _write_finalize_mark(path=_os.environ["FINALIZE_MARK"]):
@@ -257,3 +266,47 @@ def metric_value(body: str, name: str, **labels: str) -> float:
 
 def metric_count(body: str, name: str, **labels: str) -> int:
     return int(metric_value(body, name, **labels))
+
+
+def port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+# Ports below this need privileges to bind.
+_FIRST_UNPRIVILEGED_PORT = 1024
+_LINUX_PORT_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
+_DARWIN_PORT_RANGE_FIRST = "net.inet.ip.portrange.first"
+
+
+def _ephemeral_first() -> int:
+    """Return the lowest port the OS hands out to a bind to port 0 or to a connect."""
+    if sys.platform == "linux":
+        with open(_LINUX_PORT_RANGE) as f:
+            text = f.read()
+        return int(text.split()[0])
+    done = subprocess.run(["sysctl", "-n", _DARWIN_PORT_RANGE_FIRST], capture_output=True, text=True)
+    if done.returncode != 0:
+        pytest.fail(f"sysctl -n {_DARWIN_PORT_RANGE_FIRST} exited {done.returncode}: {done.stdout}{done.stderr}")
+    return int(done.stdout)
+
+
+def port_below(ephemeral_first: int, draw: int) -> int:
+    """Return the port that ``draw`` picks among the unprivileged ports below ``ephemeral_first``."""
+    span = ephemeral_first - _FIRST_UNPRIVILEGED_PORT
+    if span <= 0:
+        pytest.fail(f"no unprivileged port lies below the ephemeral range, which starts at {ephemeral_first}")
+    return _FIRST_UNPRIVILEGED_PORT + draw % span
+
+
+def free_port_below_ephemeral() -> int:
+    """Return a free port the OS never hands out to a bind to port 0 or to a connect, so between
+    the draw and the server's bind, and once the server lets it go, only a process of the test can
+    be holding it."""
+    first = _ephemeral_first()
+    drawn = (port_below(first, random.getrandbits(32)) for _ in itertools.count())
+    return next(port for port in drawn if port_free(port))

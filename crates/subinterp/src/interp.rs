@@ -2,19 +2,20 @@
 
 use std::cell::Cell;
 use std::ffi::CStr;
-use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
-use std::sync::Arc;
 
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::sync::InterpreterHandle;
 
 use crate::entry::{marked, ThreadAtExit, IN_PYTHON, WATCHED};
 use crate::finalization::{FinalizationHold, Ownership, FINALIZATION};
 use crate::sync::AtomicPtr;
-use crate::sync::{AtomicU64, Condvar, Mutex, Ordering};
+use crate::sync::Ordering;
+
+pub(super) mod unit;
+
+use self::unit::{UnitSlot, WorkUnit};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NewInterpreterError {
@@ -51,8 +52,13 @@ impl NewInterpreterError {
     ///
     /// `status.func` and `status.err_msg` must be NULL or NUL-terminated, as CPython guarantees.
     unsafe fn from_status(status: &ffi::PyStatus) -> Self {
-        let text =
-            |p: *const std::ffi::c_char| (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned());
+        let text = |p: *const std::ffi::c_char| {
+            (!p.is_null()).then(|| {
+                // SAFETY: `p` is non-null here and NUL-terminated by the caller's contract, and the
+                // borrow ends once the text is copied, while `status` is still borrowed.
+                unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            })
+        };
         NewInterpreterError::Refused {
             func: text(status.func),
             message: text(status.err_msg),
@@ -119,9 +125,10 @@ impl TemporaryMainThreadState {
     ///
     /// No thread state may be current on the calling thread.
     unsafe fn make() -> Result<TemporaryMainThreadState, NewInterpreterError> {
-        // SAFETY: The main interpreter lives for the process, and `PyThreadState_New` does not
-        // need the GIL.
-        let tstate = ffi::PyThreadState_New(ffi::PyInterpreterState_Main());
+        // SAFETY: `PyInterpreterState_Main` only reads the runtime's pointer to the main
+        // interpreter, which lives for the process; `PyThreadState_New` does not need the GIL and
+        // leaves the state it makes detached.
+        let tstate = unsafe { ffi::PyThreadState_New(ffi::PyInterpreterState_Main()) };
         NonNull::new(tstate)
             .map(TemporaryMainThreadState)
             .ok_or_else(NewInterpreterError::no_main_thread_state)
@@ -133,7 +140,9 @@ impl TemporaryMainThreadState {
     ///
     /// No thread state may be current on the calling thread.
     unsafe fn attach(&self) {
-        ffi::PyEval_RestoreThread(self.0.as_ptr());
+        // SAFETY: No thread state is current on this thread (the contract), and `self.0` is a live
+        // main-interpreter thread state, made by `make` and deleted only by consuming `self`.
+        unsafe { ffi::PyEval_RestoreThread(self.0.as_ptr()) };
     }
 
     /// Clears and deletes the thread state, leaving none current.
@@ -142,18 +151,26 @@ impl TemporaryMainThreadState {
     ///
     /// This thread state must be current on the calling thread.
     unsafe fn dispose_attached(self) {
-        ffi::PyThreadState_Clear(self.0.as_ptr());
-        let detached = ffi::PyEval_SaveThread();
+        // SAFETY: `self.0` is current (the contract), so the main GIL is held as clearing needs.
+        unsafe { ffi::PyThreadState_Clear(self.0.as_ptr()) };
+        // SAFETY: `self.0` is still current: clearing does not detach it.
+        let detached = unsafe { ffi::PyEval_SaveThread() };
         debug_assert_eq!(detached, self.0.as_ptr());
-        ffi::PyThreadState_Delete(self.0.as_ptr());
+        // SAFETY: `self.0` was cleared and then detached above, and `self` is consumed here, so
+        // nothing uses the deleted state again.
+        unsafe { ffi::PyThreadState_Delete(self.0.as_ptr()) };
     }
 
     /// # Safety
     ///
     /// No thread state may be current on the calling thread.
     unsafe fn dispose(self) {
-        self.attach();
-        self.dispose_attached();
+        // SAFETY: No thread state is current (the contract), as `attach` needs, and the attach
+        // makes `self.0` current, as `dispose_attached` needs.
+        unsafe {
+            self.attach();
+            self.dispose_attached();
+        }
     }
 }
 
@@ -233,28 +250,35 @@ impl<R: Releasable> SubInterpreter<R> {
     ) -> Result<Self, E> {
         #[cfg(feature = "startup_trace")]
         trace("create_begin");
-        let main = match TemporaryMainThreadState::make() {
+        // SAFETY: No thread state of this thread's is current: `create_on_this_thread` detached
+        // the kept one before calling, and one current from elsewhere makes CPython abort on the
+        // attach below.
+        let main = match unsafe { TemporaryMainThreadState::make() } {
             Ok(main) => main,
             Err(e) => return Err(refused(e)),
         };
-        main.attach();
+        // SAFETY: `make` left `main` detached and nothing else was current (above).
+        unsafe { main.attach() };
         #[cfg(feature = "startup_trace")]
         trace("main_attached");
         // SAFETY: The main interpreter's thread state was attached above.
-        let armed = with_assumed_attached(|py| {
-            FINALIZATION.arm(py).map_err(|e| {
-                NewInterpreterError::new(
-                    Some("atexit.register".into()),
-                    Some(format!(
-                        "could not register the finalization hook (b/496): {}: {}",
-                        e.get_type(py),
-                        e.value(py)
-                    )),
-                )
+        let armed = unsafe {
+            with_assumed_attached(|py| {
+                FINALIZATION.arm(py).map_err(|e| {
+                    NewInterpreterError::new(
+                        Some("atexit.register".into()),
+                        Some(format!(
+                            "could not register the finalization hook: {}: {}",
+                            e.get_type(py),
+                            e.value(py)
+                        )),
+                    )
+                })
             })
-        });
+        };
         if let Err(error) = armed {
-            main.dispose_attached();
+            // SAFETY: `main` is still current: registering the hook does not detach it.
+            unsafe { main.dispose_attached() };
             return Err(refused(error));
         }
 
@@ -271,12 +295,19 @@ impl<R: Releasable> SubInterpreter<R> {
 
         // On success the main thread state is detached and the new one is current; on failure
         // the main one is attached again.
-        let status = ffi::Py_NewInterpreterFromConfig(&mut new_tstate, &config);
+        // SAFETY: The main thread state is current, so the main GIL is held; the main interpreter
+        // is not finalizing (the contract); both pointers are to live locals.
+        let status = unsafe { ffi::Py_NewInterpreterFromConfig(&mut new_tstate, &config) };
         let new_tstate = match NonNull::new(new_tstate) {
-            Some(tstate) if ffi::PyStatus_IsError(status) == 0 => tstate,
+            // SAFETY: `PyStatus_IsError` reads only the status it is passed by value.
+            Some(tstate) if unsafe { ffi::PyStatus_IsError(status) } == 0 => tstate,
             _ => {
-                let error = NewInterpreterError::from_status(&status);
-                main.dispose_attached();
+                // SAFETY: CPython sets a status's `func` and `err_msg` to NULL or to static
+                // NUL-terminated strings.
+                let error = unsafe { NewInterpreterError::from_status(&status) };
+                // SAFETY: The creation failed, and a failed creation attaches the main thread
+                // state again, so `main` is current.
+                unsafe { main.dispose_attached() };
                 return Err(refused(error));
             }
         };
@@ -287,7 +318,8 @@ impl<R: Releasable> SubInterpreter<R> {
             main: ManuallyDrop::new(main),
             armed: true,
         };
-        let built = with_assumed_attached(prepare);
+        // SAFETY: The new interpreter's thread state is current after a successful creation.
+        let built = unsafe { with_assumed_attached(prepare) };
         unwind_guard.armed = false;
         // SAFETY: The guard is disarmed, so nothing else takes `main` out of it.
         let main = unsafe { ManuallyDrop::take(&mut unwind_guard.main) };
@@ -295,7 +327,9 @@ impl<R: Releasable> SubInterpreter<R> {
         trace("prepared");
         let result = match built {
             Ok(held) => {
-                let saved = ffi::PyEval_SaveThread();
+                // SAFETY: The new interpreter's thread state is still current: `prepare` got only a
+                // token for it, and a detach inside `prepare` restores it before returning.
+                let saved = unsafe { ffi::PyEval_SaveThread() };
                 debug_assert_eq!(saved, new_tstate.as_ptr());
                 debug_assert!(
                     crate::entry::aligned(saved),
@@ -310,11 +344,16 @@ impl<R: Releasable> SubInterpreter<R> {
                 })
             }
             Err(e) => {
-                ffi::Py_EndInterpreter(ffi::PyThreadState_Get());
+                // SAFETY: `PyThreadState_Get` returns the current thread state, which is the new
+                // interpreter's for the same reason as in the `Ok` arm, and that is the state
+                // `Py_EndInterpreter` must be given; ending it leaves none current.
+                unsafe { ffi::Py_EndInterpreter(ffi::PyThreadState_Get()) };
                 Err(e)
             }
         };
-        main.dispose();
+        // SAFETY: No thread state is current: the save or the end above left none, and the
+        // successful creation detached `main`.
+        unsafe { main.dispose() };
         #[cfg(feature = "startup_trace")]
         trace("main_disposed");
         result
@@ -418,7 +457,7 @@ impl<R: Releasable> SubInterpreter<R> {
     /// Aborts as [`Self::with_gil`] does.
     pub fn with_unit<T>(
         &mut self,
-        f: impl for<'py> FnOnce(&mut R, WorkUnit<'py>, Python<'py>) -> T,
+        f: impl for<'s, 'py> FnOnce(&mut R, WorkUnit<'s, 'py>, Python<'py>) -> T,
     ) -> std::thread::Result<T> {
         let held = &mut *self.held;
         let units = &mut self.units;
@@ -453,7 +492,9 @@ unsafe fn enter<T>(
     if kept != tstate {
         // Null, or this thread already in a unit: CPython aborts on the restore below then.
         if kept.addr() & !IN_PYTHON.addr() == 0 {
-            ffi::PyEval_RestoreThread(tstate);
+            // SAFETY: `tstate` is this thread's saved worker state (the contract), and the word
+            // kept none current; if this thread is already in a unit, CPython aborts here.
+            unsafe { ffi::PyEval_RestoreThread(tstate) };
         } else {
             if kept.addr() & WATCHED != 0 {
                 kept = python_entered_while_watched(kept);
@@ -461,20 +502,26 @@ unsafe fn enter<T>(
             if kept != tstate {
                 // Another worker kept on this thread is saved first, though a TPC thread has one.
                 if !kept.is_null() {
-                    ffi::PyEval_SaveThread();
+                    // SAFETY: The word holds a thread state only while it is current on this
+                    // thread, so `kept` is current and is the state saved here.
+                    unsafe { ffi::PyEval_SaveThread() };
                 }
-                ffi::PyEval_RestoreThread(tstate);
+                // SAFETY: None is current now, kept or just saved, and `tstate` is this thread's
+                // saved worker state (the contract).
+                unsafe { ffi::PyEval_RestoreThread(tstate) };
             }
         }
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: This worker's thread state is current and stays current for `f`.
-        Python::attach_current(f)
+        unsafe { Python::attach_current(f) }
     }));
     if KEEP.with(Cell::get) {
         ENTRY.with(|e| e.store(tstate, Ordering::Relaxed));
     } else {
-        let saved = ffi::PyEval_SaveThread();
+        // SAFETY: `tstate` is current: `attach_current` leaves it so, also when `f` panicked,
+        // which `catch_unwind` caught.
+        let saved = unsafe { ffi::PyEval_SaveThread() };
         debug_assert_eq!(saved, tstate);
         ENTRY.with(|e| e.store(std::ptr::null_mut(), Ordering::Relaxed));
     }
@@ -555,76 +602,6 @@ pub fn detach_for_idle() {
     });
 }
 
-/// One unit of work of a worker, which another thread may interrupt through its
-/// [`InterruptTarget`].
-///
-/// It cannot leave [`SubInterpreter::with_unit`]'s closure and is neither `Send` nor `Sync`, so
-/// wherever it is ended or dropped the thread is attached to the unit's own interpreter. Ending
-/// or dropping it takes back an interruption that was set and not yet raised, and none lands
-/// after.
-///
-/// Leaving the closure does not compile:
-///
-/// ```compile_fail,E0521
-/// # use mipyre_subinterp::{Releasable, SubInterpreter};
-/// # use pyo3::Python;
-/// # struct Nothing;
-/// # impl Releasable for Nothing { fn release(self, _py: Python<'_>) {} }
-/// fn escape(worker: &mut SubInterpreter<Nothing>) {
-///     let mut kept = None;
-///     let _ = worker.with_unit(|_held, unit, _py| kept = Some(unit));
-/// }
-/// ```
-///
-/// ```compile_fail
-/// # use mipyre_subinterp::{Releasable, SubInterpreter};
-/// # use pyo3::Python;
-/// # struct Nothing;
-/// # impl Releasable for Nothing { fn release(self, _py: Python<'_>) {} }
-/// fn escape(worker: &mut SubInterpreter<Nothing>) {
-///     let unit = worker.with_unit(|_held, unit, _py| unit);
-/// }
-/// ```
-///
-/// Nor does taking it into another interpreter from a `detach`:
-///
-/// ```compile_fail,E0277
-/// # use mipyre_subinterp::{Releasable, SubInterpreter};
-/// # use pyo3::sync::InterpreterHandle;
-/// # use pyo3::Python;
-/// # struct Nothing;
-/// # impl Releasable for Nothing { fn release(self, _py: Python<'_>) {} }
-/// fn into_main(worker: &mut SubInterpreter<Nothing>) {
-///     let _ = worker.with_unit(|_held, unit, py| {
-///         py.detach(move || InterpreterHandle::main().attach(move |_main| unit.end()))
-///     });
-/// }
-/// ```
-///
-/// Ending it in its own attach compiles:
-///
-/// ```no_run
-/// # use mipyre_subinterp::{Releasable, SubInterpreter};
-/// # use pyo3::Python;
-/// # struct Nothing;
-/// # impl Releasable for Nothing { fn release(self, _py: Python<'_>) {} }
-/// fn served(worker: &mut SubInterpreter<Nothing>) -> bool {
-///     let ran = worker.with_unit(|_held, unit, py| {
-///         let target = unit.target();
-///         py.detach(|| ());
-///         unit.end();
-///         target.interrupted()
-///     });
-///     ran.is_ok_and(|interrupted| !interrupted)
-/// }
-/// ```
-#[must_use = "a unit of work ends when it is ended or dropped"]
-pub struct WorkUnit<'py> {
-    state: Arc<UnitState>,
-    run: RunId,
-    py: Python<'py>,
-}
-
 // This compiles only while `WorkUnit`, `UnitSlot` and `SubInterpreter` are neither `Send` nor
 // `Sync`: for a `Send` type both `NotSend` impls apply and the path is ambiguous.
 const _: () = {
@@ -640,8 +617,8 @@ const _: () = {
     impl<T: ?Sized> NotSync<()> for T {}
     struct IsSync;
     impl<T: ?Sized + Sync> NotSync<IsSync> for T {}
-    let () = <WorkUnit<'static> as NotSend<_>>::CHECK;
-    let () = <WorkUnit<'static> as NotSync<_>>::CHECK;
+    let () = <WorkUnit<'static, 'static> as NotSend<_>>::CHECK;
+    let () = <WorkUnit<'static, 'static> as NotSync<_>>::CHECK;
     let () = <UnitSlot as NotSend<_>>::CHECK;
     let () = <UnitSlot as NotSync<_>>::CHECK;
     struct Nothing;
@@ -652,566 +629,6 @@ const _: () = {
     <SubInterpreter<Nothing> as NotSync<_>>::CHECK
 };
 
-/// A handle another thread uses to interrupt one run of a [`WorkUnit`] and read its state.
-#[derive(Clone, Debug)]
-pub struct InterruptTarget {
-    state: Arc<UnitState>,
-    run: RunId,
-}
-
-/// The state of one worker's slot, whose `host` is fixed while the worker is served.
-#[derive(Debug)]
-struct UnitState<H = SlotThread> {
-    host: H,
-    /// Packs the run in the high bits, the interruptions in flight in the middle and the
-    /// [`UnitPhase`] in the low bits, so every change is one atomic update.
-    ///
-    /// Every write is a read-modify-write on this one word, so all threads agree on a single
-    /// order without `SeqCst`. If an interruption counts in first, the end waits for it; if the
-    /// end or the next begin comes first, the interruption sees that and leaves without entering
-    /// the interpreter. `AcqRel` and `Acquire` carry the writes made under the GIL.
-    state: mipyre_cpu::CacheLine<AtomicU64>,
-    /// A waiter checks the count under this lock before it sleeps, and the last visit to leave
-    /// takes it before notifying, so no wake-up is lost.
-    idle_lock: Mutex<()>,
-    idle: Condvar,
-}
-
-#[derive(Debug)]
-struct SlotThread {
-    interp: InterpreterHandle,
-    /// The `PyThread_get_thread_ident()` value that `PyThreadState_SetAsyncExc` takes.
-    thread: std::ffi::c_ulong,
-}
-
-/// The interpreter operations the slot protocol needs, abstracted so the tests and the Loom model
-/// run the protocol code itself rather than a copy of it.
-trait UnitHost {
-    /// The value proves that the calling thread holds the unit's GIL.
-    type Gil<'py>: Copy;
-    type Exception: Copy;
-
-    /// Runs `f` holding the unit's GIL from another thread, or returns `None` without running it
-    /// when no thread state could be made.
-    fn visit<R>(&self, f: impl for<'py> FnOnce(Self::Gil<'py>) -> R) -> Option<R>;
-
-    /// Sets `exc` pending on the unit's thread, or clears it on `None`, and returns whether the
-    /// thread was found; nothing changes when it was not.
-    fn set_raise(&self, gil: Self::Gil<'_>, exc: Option<Self::Exception>) -> bool;
-
-    /// Runs `f` with the GIL released and takes it back after.
-    fn without_gil(&self, gil: Self::Gil<'_>, f: impl FnOnce());
-
-    /// Builds the [`InterruptError::UnitThreadGone`] that says where the unit is.
-    fn thread_gone(&self, gil: Self::Gil<'_>) -> InterruptError;
-}
-
-impl UnitHost for SlotThread {
-    type Gil<'py> = Python<'py>;
-    type Exception = *mut ffi::PyObject;
-
-    fn visit<R>(&self, f: impl for<'py> FnOnce(Python<'py>) -> R) -> Option<R> {
-        self.interp.try_attach(f)
-    }
-
-    fn set_raise(&self, _attached: Python<'_>, exc: Option<*mut ffi::PyObject>) -> bool {
-        // SAFETY: The token proves a thread state is current, NULL clears, and the only exception
-        // set is the static `KeyboardInterrupt` type.
-        let reached = unsafe {
-            ffi::PyThreadState_SetAsyncExc(self.thread as std::ffi::c_long, exc.unwrap_or(std::ptr::null_mut()))
-        };
-        reached != 0
-    }
-
-    fn without_gil(&self, _attached: Python<'_>, f: impl FnOnce()) {
-        // SAFETY: The token proves a thread state is current, and it is restored below.
-        let saved = unsafe { ffi::PyEval_SaveThread() };
-        f();
-        // SAFETY: `saved` is this thread's, saved above.
-        unsafe { ffi::PyEval_RestoreThread(saved) };
-    }
-
-    fn thread_gone(&self, _attached: Python<'_>) -> InterruptError {
-        InterruptError::UnitThreadGone {
-            thread: self.thread,
-            interp: self.interp.id(),
-        }
-    }
-}
-
-/// The count of runs begun on a slot, which an interruption must match to land.
-///
-/// It wraps after `2^RUN_BITS` runs, which is safe because the watchdog holds a target for at
-/// most one request, far short of `2^53`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RunId(u64);
-
-const RUN_BITS: u32 = 64 - PHASE_BITS - COUNT_BITS;
-const RUN_MASK: u64 = (1 << RUN_BITS) - 1;
-
-impl RunId {
-    fn next(self) -> RunId {
-        RunId((self.0 + 1) & RUN_MASK)
-    }
-}
-
-const PHASE_BITS: u32 = 3;
-const PHASE_MASK: u64 = (1 << PHASE_BITS) - 1;
-const COUNT_BITS: u32 = 8;
-const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
-const VISIT: u64 = 1 << PHASE_BITS;
-const RUN_SHIFT: u32 = PHASE_BITS + COUNT_BITS;
-
-const _: () = assert!(UnitPhase::ALL.len() as u64 <= PHASE_MASK + 1);
-
-fn run_of(word: u64) -> RunId {
-    RunId(word >> RUN_SHIFT)
-}
-
-fn in_flight_of(word: u64) -> u64 {
-    (word >> PHASE_BITS) & COUNT_MASK
-}
-
-/// Counts one interruption in flight until dropped; the last drop wakes a waiting end.
-struct VisitPass<'a, H: UnitHost>(&'a UnitState<H>);
-
-impl<H: UnitHost> Drop for VisitPass<'_, H> {
-    fn drop(&mut self) {
-        let before = self.0.state.fetch_sub(VISIT, Ordering::AcqRel);
-        if in_flight_of(before) == 1 {
-            self.0.wake_waiters();
-        }
-    }
-}
-
-/// Says whether a unit is running or ended and whether it was interrupted, with no value for an
-/// outstanding interruption on a unit never interrupted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-enum UnitPhase {
-    Running = 0,
-    /// The interruption set on the thread may or may not have been raised since.
-    RunningInterruptOutstanding = 1,
-    RunningInterruptTakenBack = 2,
-    Ended = 3,
-    EndedInterrupted = 4,
-}
-
-impl UnitPhase {
-    /// Every phase is indexed by its discriminant, which a const assertion checks.
-    const ALL: [UnitPhase; 5] = [
-        UnitPhase::Running,
-        UnitPhase::RunningInterruptOutstanding,
-        UnitPhase::RunningInterruptTakenBack,
-        UnitPhase::Ended,
-        UnitPhase::EndedInterrupted,
-    ];
-
-    fn from_word(word: u64) -> UnitPhase {
-        UnitPhase::ALL[(word & PHASE_MASK) as usize]
-    }
-
-    fn has_ended(self) -> bool {
-        matches!(self, UnitPhase::Ended | UnitPhase::EndedInterrupted)
-    }
-
-    fn was_interrupted(self) -> bool {
-        !matches!(self, UnitPhase::Running | UnitPhase::Ended)
-    }
-
-    /// Only a unit ended without the GIL while the interruption was being set is ended here.
-    fn interrupt(self) -> UnitPhase {
-        if self.has_ended() {
-            UnitPhase::EndedInterrupted
-        } else {
-            UnitPhase::RunningInterruptOutstanding
-        }
-    }
-
-    /// Returns `None` when no interruption is outstanding.
-    fn take_back(self) -> Option<UnitPhase> {
-        (self == UnitPhase::RunningInterruptOutstanding).then_some(UnitPhase::RunningInterruptTakenBack)
-    }
-
-    /// Returns whether an exception set on the unit's thread may still be there, including one set
-    /// on a unit that had ended without the GIL.
-    fn exception_may_be_pending(self) -> bool {
-        matches!(
-            self,
-            UnitPhase::RunningInterruptOutstanding | UnitPhase::EndedInterrupted
-        )
-    }
-
-    fn end(self) -> UnitPhase {
-        if self.was_interrupted() {
-            UnitPhase::EndedInterrupted
-        } else {
-            UnitPhase::Ended
-        }
-    }
-}
-
-const _: () = {
-    let mut i = 0;
-    while i < UnitPhase::ALL.len() {
-        assert!(
-            UnitPhase::ALL[i] as usize == i,
-            "UnitPhase::ALL is not in discriminant order"
-        );
-        i += 1;
-    }
-};
-
-/// One worker's reusable unit, made once on the serving thread and begun for each request without
-/// allocating.
-#[derive(Debug)]
-struct UnitSlot(
-    Arc<UnitState>,
-    // The take-back relies on every run being begun on the thread the slot was made on.
-    PhantomData<*const ()>,
-);
-
-impl UnitSlot {
-    fn new(py: Python<'_>) -> UnitSlot {
-        UnitSlot(
-            Arc::new(UnitState::new(SlotThread {
-                interp: InterpreterHandle::current(py),
-                thread: this_thread(),
-            })),
-            PhantomData,
-        )
-    }
-
-    /// Begins the next run; the previous run must have ended, so any count kept is stale visits
-    /// that will see another run and leave.
-    #[inline]
-    fn begin<'py>(&self, py: Python<'py>) -> WorkUnit<'py> {
-        let (run, before) = self.0.begin_run();
-        debug_assert!(
-            UnitPhase::from_word(before).has_ended(),
-            "a slot began a run while its previous run had not ended"
-        );
-        WorkUnit {
-            state: Arc::clone(&self.0),
-            run,
-            py,
-        }
-    }
-
-    /// Ends the last run as a drop would, if a leaked [`WorkUnit`] left it unended.
-    fn end_leaked_run(self, py: Python<'_>) {
-        if !self.0.phase().has_ended() {
-            self.0.end_attached(py);
-        }
-    }
-}
-
-impl std::fmt::Debug for WorkUnit<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkUnit")
-            .field("state", &self.state)
-            .field("run", &self.run)
-            .finish_non_exhaustive()
-    }
-}
-
-impl WorkUnit<'_> {
-    pub fn target(&self) -> InterruptTarget {
-        InterruptTarget {
-            state: Arc::clone(&self.state),
-            run: self.run,
-        }
-    }
-
-    /// Returns whether the unit was interrupted since it last asked, clearing the unraised
-    /// exception.
-    ///
-    /// A worker waiting outside bytecode uses this to raise its own exception, since the pending
-    /// one would land only after the wait.
-    pub fn take_interruption(&self) -> bool {
-        self.state.take_interruption(self.py)
-    }
-
-    /// Ends this unit and takes back an unraised interruption, so it cannot land in whatever the
-    /// thread runs next.
-    #[inline]
-    pub fn end(self) {
-        let unit = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `unit` is never used or dropped again, so the `Arc` is moved out once, and the
-        // other fields are `Copy`.
-        let state = unsafe { std::ptr::read(&unit.state) };
-        state.end_attached(unit.py);
-    }
-}
-
-impl Drop for WorkUnit<'_> {
-    fn drop(&mut self) {
-        let unit = &*self.state;
-        let py = self.py;
-        // Only the worker ends its unit, so an unended phase stays unended while this runs.
-        let before = unit.end_phase();
-        // Not finding this thread breaks an invariant that `end` panics on, but a drop may run
-        // during an unwind, where a second panic aborts, so this logs it instead.
-        if before.exception_may_be_pending() && !unit.clear_raise(py) {
-            let host = &unit.host;
-            tracing::error!(
-                thread = host.thread,
-                interp = ?host.interp,
-                attached_interp = InterpreterHandle::current(py).id(),
-                "a unit of work dropped on its own thread in its interpreter, where CPython does \
-                 not find that thread: an exception set on it could not be cleared"
-            );
-            debug_assert!(
-                std::thread::panicking(),
-                "a unit of work of thread {} in interpreter {:?} was dropped there, but CPython \
-                 does not find that thread in it",
-                host.thread,
-                host.interp,
-            );
-        }
-        unit.wait_for_visits(py);
-    }
-}
-
-impl InterruptTarget {
-    /// Raises `KeyboardInterrupt` at the unit's next bytecode boundary if it is still running,
-    /// and marks it [interrupted][Self::interrupted] in the same GIL.
-    ///
-    /// `PyThreadState_SetAsyncExc` only finds threads of the current interpreter, so this enters
-    /// the unit's interpreter and waits for its GIL; a worker inside one long C call keeps it
-    /// waiting, as that call would ignore a signal. The visit is counted before it enters, and
-    /// both the run's end and finalization wait for it, so the interpreter stays alive.
-    ///
-    /// A caller detached from an interpreter of its own briefly takes that interpreter's GIL on
-    /// the way out, so it must not hold a lock that a thread of that interpreter may wait on
-    /// with that GIL held.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`InterruptError`] when no thread state could be made, when a leaked unit's
-    /// thread state is gone, or once finalization has begun; nothing was set in any case.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the calling thread is attached, not merely detached, to another interpreter.
-    pub fn interrupt(&self) -> Result<(), InterruptError> {
-        // The hold is taken before the visit is counted, so a beginning finalization never waits
-        // on a visit that waits on this hold.
-        let Some(_not_finalizing) = FINALIZATION.not_begun() else {
-            return Err(InterruptError::Finalizing);
-        };
-        // SAFETY: This reads the address of a built-in type object, static for the process.
-        let exc = unsafe { ffi::PyExc_KeyboardInterrupt };
-        self.state.interrupt(self.run, exc)
-    }
-
-    /// Returns whether the targeted run has not ended, which is false once the slot began another.
-    pub fn is_running(&self) -> bool {
-        self.state
-            .phase_of_run(self.run)
-            .is_some_and(|phase| !phase.has_ended())
-    }
-
-    /// Returns whether an interruption was set during the targeted run.
-    ///
-    /// It stays true after the worker takes the interruption back, and becomes false once the
-    /// slot begins another run, since earlier runs' state is not kept.
-    pub fn interrupted(&self) -> bool {
-        self.state
-            .phase_of_run(self.run)
-            .is_some_and(UnitPhase::was_interrupted)
-    }
-}
-
-impl<H: UnitHost> UnitState<H> {
-    fn new(host: H) -> Self {
-        UnitState {
-            host,
-            state: mipyre_cpu::CacheLine(AtomicU64::new(UnitPhase::Ended as u64)),
-            idle_lock: Mutex::new(()),
-            idle: Condvar::new(),
-        }
-    }
-
-    /// Ends the run, takes back an unraised interruption, and waits for visits in flight to leave.
-    fn end_attached(&self, gil: H::Gil<'_>) {
-        // `interrupt` sets under the same GIL, so nothing is set between the phase step and the
-        // take-back.
-        let before = self.end_phase();
-        if before.exception_may_be_pending() {
-            self.take_back_raise(gil);
-        }
-        // Visits in flight need this GIL, and the interpreter may end right after this returns.
-        self.wait_for_visits(gil);
-    }
-
-    /// Takes back an interruption set since the last call and returns whether there was one.
-    fn take_interruption(&self, gil: H::Gil<'_>) -> bool {
-        // `interrupt` sets under the same GIL, so nothing is set between the step and the clear.
-        if !self.step(UnitPhase::take_back) {
-            return false;
-        }
-        self.take_back_raise(gil);
-        true
-    }
-
-    /// Interrupts `run` with `exc` from another thread, as [`InterruptTarget::interrupt`] does.
-    fn interrupt(&self, run: RunId, exc: H::Exception) -> Result<(), InterruptError> {
-        // Counting in before entering keeps the run's end, and so the interpreter, waiting.
-        let Some(_pass) = self.enter_visit(run) else {
-            return Ok(());
-        };
-        self.host
-            .visit(|gil| {
-                // A counted visit fixes the run, so only its end can have happened.
-                if self.phase().has_ended() {
-                    return Ok(());
-                }
-                if !self.host.set_raise(gil, Some(exc)) {
-                    return Err(self.host.thread_gone(gil));
-                }
-                self.step(|phase| Some(phase.interrupt()));
-                Ok(())
-            })
-            .ok_or(InterruptError::NoThreadState(ThreadStateCreationFailure))?
-    }
-
-    /// Waits with the GIL released until no interruption is in flight, without locking if none is.
-    fn wait_for_visits(&self, gil: H::Gil<'_>) {
-        if self.in_flight() == 0 {
-            return;
-        }
-        self.host.without_gil(gil, || self.wait_until_idle());
-    }
-
-    fn phase(&self) -> UnitPhase {
-        UnitPhase::from_word(self.state.load(Ordering::Acquire))
-    }
-
-    /// Returns the phase of `run`, or `None` if it is no longer the current run.
-    fn phase_of_run(&self, run: RunId) -> Option<UnitPhase> {
-        let word = self.state.load(Ordering::Acquire);
-        (run_of(word) == run).then(|| UnitPhase::from_word(word))
-    }
-
-    fn in_flight(&self) -> u64 {
-        in_flight_of(self.state.load(Ordering::Acquire))
-    }
-
-    /// Begins the next run, keeping the count, and returns it with the word before.
-    fn begin_run(&self) -> (RunId, u64) {
-        let before = match self.state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
-            let next = run_of(word).next().0;
-            Some((next << RUN_SHIFT) | (word & (COUNT_MASK << PHASE_BITS)) | UnitPhase::Running as u64)
-        }) {
-            Ok(before) | Err(before) => before,
-        };
-        (run_of(before).next(), before)
-    }
-
-    /// Ends the run, keeping the run and the count, and returns the phase before.
-    fn end_phase(&self) -> UnitPhase {
-        let before = match self.state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
-            Some((word & !PHASE_MASK) | UnitPhase::from_word(word).end() as u64)
-        }) {
-            Ok(before) | Err(before) => before,
-        };
-        UnitPhase::from_word(before)
-    }
-
-    /// Counts an interruption in on `run`, which keeps the interpreter alive until the pass drops.
-    ///
-    /// Returns `None` when the run has ended or is not current, or when the count is full;
-    /// one interruption per run is sent, so a full count is refused rather than wrapped.
-    fn enter_visit(&self, run: RunId) -> Option<VisitPass<'_, H>> {
-        // The run and the phase are read from the same update that counts in.
-        let before = self
-            .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
-                (in_flight_of(word) < COUNT_MASK).then_some(word + VISIT)
-            })
-            .ok()?;
-        let pass = VisitPass(self);
-        if run_of(before) != run || UnitPhase::from_word(before).has_ended() {
-            return None;
-        }
-        Some(pass)
-    }
-
-    /// Waits until no interruption is in flight; the caller must not hold the unit's GIL, which a
-    /// visit needs to finish.
-    fn wait_until_idle(&self) {
-        let mut guard = self.idle_lock.lock();
-        while self.in_flight() > 0 {
-            self.idle.wait(&mut guard);
-        }
-    }
-
-    /// Notifies under the lock, so a waiter that checked the count and has not slept yet is woken.
-    fn wake_waiters(&self) {
-        let _guard = self.idle_lock.lock();
-        self.idle.notify_all();
-    }
-
-    /// Applies `step` to the phase atomically and returns `false`, unchanged, when it gives none.
-    fn step(&self, step: impl Fn(UnitPhase) -> Option<UnitPhase>) -> bool {
-        self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
-                let next = step(UnitPhase::from_word(word))?;
-                Some((word & !PHASE_MASK) | next as u64)
-            })
-            .is_ok()
-    }
-
-    /// Clears an unraised exception and returns whether the unit's thread was found.
-    #[must_use]
-    fn clear_raise(&self, gil: H::Gil<'_>) -> bool {
-        self.host.set_raise(gil, None)
-    }
-
-    /// Clears as [`Self::clear_raise`] does and panics if the unit's own thread was not found.
-    fn take_back_raise(&self, gil: H::Gil<'_>) {
-        let found = self.clear_raise(gil);
-        assert!(
-            found,
-            "a take-back runs on the unit's own thread (`UnitSlot` and `WorkUnit` are neither \
-             Send nor Sync: a unit is begun, ended and asked on the thread its slot was made \
-             on), attached to an interpreter; that interpreter holds the thread's current \
-             thread state, which CPython bound to the thread that made it (this one), so \
-             PyThreadState_SetAsyncExc finds a thread state with the unit's thread's ident"
-        );
-    }
-}
-
-fn this_thread() -> std::ffi::c_ulong {
-    // SAFETY: This has no precondition and reads the OS thread's id.
-    unsafe { ffi::PyThread_get_thread_ident() }
-}
-
-/// In every case nothing was set, and the unit does not read
-/// [interrupted][InterruptTarget::interrupted].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum InterruptError {
-    #[error(transparent)]
-    NoThreadState(ThreadStateCreationFailure),
-    #[error(
-        "a unit of work of thread {thread} in interpreter {interp} has not ended, but that \
-         thread has no thread state in it any more (the unit was leaked, not ended): nothing \
-         was interrupted"
-    )]
-    UnitThreadGone {
-        /// The value is `PyThread_get_thread_ident()`.
-        thread: std::ffi::c_ulong,
-        interp: i64,
-    },
-    #[error("the process is finalizing: no interpreter is entered to interrupt work any more")]
-    Finalizing,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("PyThreadState_New returned NULL (the runtime is out of memory)")]
-pub struct ThreadStateCreationFailure;
-
 /// Runs `f` with a token for a thread state PyO3 does not know is attached.
 ///
 /// `Python::attach` would switch to the thread's gilstate thread state instead. A `Py<T>`
@@ -1221,177 +638,17 @@ pub struct ThreadStateCreationFailure;
 ///
 /// A thread state must be current on this thread.
 unsafe fn with_assumed_attached<T>(f: impl for<'py> FnOnce(Python<'py>) -> T) -> T {
-    f(Python::assume_attached())
+    // SAFETY: A thread state is current on this thread (the contract), which is all
+    // `assume_attached` asks.
+    f(unsafe { Python::assume_attached() })
 }
-
-#[cfg(test)]
-mod test_gil;
-
-#[cfg(test)]
-#[cfg(sync_model)]
-mod model_host;
-
-#[cfg(test)]
-#[cfg(all(sync_model, not(sync_shuttle)))]
-mod loom_model;
-
-#[cfg(test)]
-#[cfg(all(sync_model, sync_shuttle))]
-mod shuttle_model;
-
-#[cfg(test)]
-#[cfg(not(sync_model))]
-mod unit_protocol_tests;
 
 #[cfg(test)]
 #[cfg(not(sync_model))]
 mod tests {
+    use pyo3::sync::InterpreterHandle;
+
     use super::*;
-
-    /// A new phase fails to compile here until its row is written.
-    #[test]
-    fn every_phase_has_a_pinned_row_of_transitions() {
-        for phase in UnitPhase::ALL {
-            let (interrupt, take_back, end, has_ended, was_interrupted, pending) = match phase {
-                UnitPhase::Running => (
-                    UnitPhase::RunningInterruptOutstanding,
-                    None,
-                    UnitPhase::Ended,
-                    false,
-                    false,
-                    false,
-                ),
-                UnitPhase::RunningInterruptOutstanding => (
-                    UnitPhase::RunningInterruptOutstanding,
-                    Some(UnitPhase::RunningInterruptTakenBack),
-                    UnitPhase::EndedInterrupted,
-                    false,
-                    true,
-                    true,
-                ),
-                UnitPhase::RunningInterruptTakenBack => (
-                    UnitPhase::RunningInterruptOutstanding,
-                    None,
-                    UnitPhase::EndedInterrupted,
-                    false,
-                    true,
-                    false,
-                ),
-                UnitPhase::Ended => (UnitPhase::EndedInterrupted, None, UnitPhase::Ended, true, false, false),
-                UnitPhase::EndedInterrupted => (
-                    UnitPhase::EndedInterrupted,
-                    None,
-                    UnitPhase::EndedInterrupted,
-                    true,
-                    true,
-                    true,
-                ),
-            };
-            assert_eq!(phase.interrupt(), interrupt, "interrupt on {phase:?}");
-            assert_eq!(phase.take_back(), take_back, "take_back on {phase:?}");
-            assert_eq!(phase.end(), end, "end on {phase:?}");
-            assert_eq!(phase.has_ended(), has_ended, "has_ended on {phase:?}");
-            assert_eq!(phase.was_interrupted(), was_interrupted, "was_interrupted on {phase:?}");
-            assert_eq!(phase.exception_may_be_pending(), pending, "pending on {phase:?}");
-        }
-        assert_eq!(UnitPhase::ALL.len(), 5);
-    }
-
-    /// Runs on a real sub-interpreter, because the async-exception slot lives only in CPython.
-    #[test]
-    fn a_pending_interruption_is_taken_back_by_the_unit_end_or_drop() {
-        Python::initialize();
-        let serve = crate::python_thread("take-back-serve".into()).spawn(|| {
-            let mut worker = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                "take-back".into(),
-                std::convert::identity,
-                |_py| Ok(Nothing),
-            )
-            .expect("a sub-interpreter on its serving thread");
-            worker.with_gil(|_held, _py| ()).expect("no panic");
-            assert!(!worker.unit_slot_made(), "with_gil makes no unit slot");
-            for dropped in [false, true] {
-                let interrupted_then_ended = |_held: &mut Nothing, unit: WorkUnit<'_>, py: Python<'_>| {
-                    let target = unit.target();
-                    let interrupting = crate::python_thread("interrupting".into())
-                        .spawn(move || {
-                            target.interrupt().expect("set");
-                            target
-                        })
-                        .expect("spawn the interrupting thread");
-                    let target = py.detach(|| interrupting.join().expect("the interruption ends"));
-                    if dropped {
-                        drop(unit);
-                    } else {
-                        unit.end();
-                    }
-                    assert!(target.interrupted(), "the interruption was not recorded");
-                    let two: i32 = py
-                        .eval(c"1 + 1", None, None)
-                        .expect("no exception left pending on the thread")
-                        .extract()
-                        .expect("an int");
-                    assert_eq!(two, 2);
-                };
-                let ran = worker.with_unit(interrupted_then_ended);
-                ran.expect("no panic in the unit");
-                assert!(worker.unit_slot_made(), "the first unit makes the slot");
-            }
-            worker.end_on_own_thread();
-        });
-        serve
-            .expect("spawn the worker thread")
-            .join()
-            .expect("the worker thread's assertions hold");
-    }
-
-    #[test]
-    fn the_unit_phase_transitions_are_the_table() {
-        use UnitPhase::*;
-        let table = [
-            (Running, RunningInterruptOutstanding, None, Ended, false, false, false),
-            (
-                RunningInterruptOutstanding,
-                RunningInterruptOutstanding,
-                Some(RunningInterruptTakenBack),
-                EndedInterrupted,
-                false,
-                true,
-                true,
-            ),
-            (
-                RunningInterruptTakenBack,
-                RunningInterruptOutstanding,
-                None,
-                EndedInterrupted,
-                false,
-                true,
-                false,
-            ),
-            (Ended, EndedInterrupted, None, Ended, true, false, false),
-            (
-                EndedInterrupted,
-                EndedInterrupted,
-                None,
-                EndedInterrupted,
-                true,
-                true,
-                true,
-            ),
-        ];
-        for (phase, interrupted, taken_back, ended, has_ended, was_interrupted, pending) in table {
-            assert_eq!(phase.interrupt(), interrupted, "interrupt on {phase:?}");
-            assert_eq!(phase.take_back(), taken_back, "take_back on {phase:?}");
-            assert_eq!(phase.end(), ended, "end on {phase:?}");
-            assert_eq!(phase.has_ended(), has_ended, "has_ended on {phase:?}");
-            assert_eq!(phase.was_interrupted(), was_interrupted, "was_interrupted on {phase:?}");
-            assert_eq!(
-                phase.exception_may_be_pending(),
-                pending,
-                "exception_may_be_pending on {phase:?}"
-            );
-        }
-    }
 
     /// The exit, on another thread, finds the unit running and leaves the word alone; once the
     /// unit is over it marks the word, and the next unit removes the mark as it enters.
@@ -1533,38 +790,6 @@ mod tests {
                 .expect("an int");
             assert_eq!(two, 2);
         });
-    }
-
-    /// An interruption entering the ended interpreter would be a use-after-free of its
-    /// `PyInterpreterState`.
-    #[test]
-    fn a_leaked_unit_is_ended_by_its_workers_end() {
-        Python::initialize();
-        let target = crate::python_thread("leak-serve".into())
-            .spawn(|| {
-                let mut worker = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                    "leak".into(),
-                    std::convert::identity,
-                    |_py| Ok(Nothing),
-                )
-                .expect("a sub-interpreter on its serving thread");
-                let target = worker
-                    .with_unit(|_held, unit, _py| {
-                        let target = unit.target();
-                        std::mem::forget(unit);
-                        target
-                    })
-                    .expect("no panic in the unit");
-                assert!(target.is_running(), "a leaked unit has not ended");
-                worker.end_on_own_thread();
-                target
-            })
-            .expect("spawn the worker thread")
-            .join()
-            .expect("the worker thread ends");
-        assert!(!target.is_running(), "the worker's end ended its leaked unit");
-        assert_eq!(target.interrupt(), Ok(()));
-        assert!(!target.interrupted(), "nothing was interrupted");
     }
 
     #[derive(Debug)]

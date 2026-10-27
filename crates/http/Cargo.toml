@@ -5,16 +5,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# No pyo3 and no `#[global_allocator]`, here or in anything this crate depends on (`deny.toml`
-# bans pyo3 under this crate). Taking these files from a crate that had pyo3 and a global
-# allocator once put all of libpython and mimalloc into a process that linked only the network
-# floor (`ldd` showed libpython3.14, `nm -D` 303 `Py*`).
+# No pyo3 and no `#[global_allocator]`, here or in anything this crate depends on. Taking these
+# files from a crate that had pyo3 and a global allocator once put all of libpython and mimalloc
+# into a process that linked only the network floor (`ldd` showed libpython3.14, `nm -D` 303 `Py*`).
 #
 # plan/ needs only the first nine below. Nothing in this list keeps it off the rest: clippy.toml
-# and dev/archcheck.toml do (src/plan/mod.rs says how).
+# does (src/plan/mod.rs says how).
 #
-# tokio's features are this crate's own, not a consumer's: `cargo check -p mipyre_http` in the
-# merge gate builds it alone, so a feature it uses without naming fails there.
+# tokio's features are this crate's own, not a consumer's: `cargo check -p mipyre_http` builds it
+# alone, so a feature it uses without naming fails there.
 [dependencies]
 http = "1"
 bytes = "1"
@@ -24,7 +23,7 @@ percent-encoding = "2"
 httpdate = "1"
 thiserror = "2"
 serde_json = "1"
-# zlib-rs, not the default miniz_oxide (b/606): from 4.8 KiB of JSON up, 1.4–1.7x fewer instructions
+# zlib-rs, not the default miniz_oxide: from 4.8 KiB of JSON up, 1.4–1.7x fewer instructions
 # per body; its stream is reset per body (plan/compression.rs, GzipStream).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 brotli = "7"
@@ -32,10 +31,13 @@ brotli = "7"
 mipyre_transport = { path = "../transport" }
 mipyre_util = { path = "../util" }
 tokio = { version = "1", features = ["net", "time", "sync", "rt", "io-util", "macros"] }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper = { version = "1.11", features = ["server", "http1", "http2"] }
 http-body-util = "0.1"
 parking_lot = "0.12"
 libc = "0.2"
+# The task a connection's deadline wakes, registered on the request path and woken by the clock's thread
+# (src/io/clock.rs). Already under hyper and h2.
+atomic-waker = "1"
 tracing = "0.1"
 dashmap = "6"
 # Static-file cache invalidation: a mount's cache follows the disk through it, so a cached
@@ -49,6 +51,11 @@ notify = { version = "8", default-features = false, features = ["macos_kqueue"] 
 # The microbenches' harness and counting allocator.
 mipyre_microbench = { path = "../microbench" }
 proptest = "1"
+# The fuzz targets of the request-header decisions (src/plan/*/fuzz.rs): `cargo test` replays their committed
+# corpora, `cargo bolero test` mutates them under libFuzzer.
+# Exactly 0.13.4: from 0.13.5 on its derive crate pins indexmap to =2.11.2, which would move the workspace's
+# shipping indexmap (h2, sqlx) back from 2.14.
+bolero = "=0.13.4"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "test-util", "fs"] }
 tokio-stream = "0.1"
 # A real `hyper::Error` for the body feeder's tests: hyper serving a request over an in-memory pipe.
@@ -82,6 +89,10 @@ harness = false
 
 [[bench]]
 name = "body"
+harness = false
+
+[[bench]]
+name = "body_frames"
 harness = false
 
 [[bench]]

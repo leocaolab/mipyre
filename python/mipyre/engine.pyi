@@ -3,20 +3,20 @@
 import socket
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Iterator, List, Literal, Optional, Tuple, final
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Literal, NoReturn, Optional, Tuple, final
 
 from typing_extensions import disjoint_base
 
 __all__ = [
-    "_mimalloc_purge_delay", "MipyreApp", "RuntimeChoice", "Server", "LaneSet", "CommandLine", "StartStrategy", "FailurePolicy", "BUILD_ID", "_driver_name",
+    "_mimalloc_purge_delay", "MipyreApp", "RuntimeChoice", "Server", "_LaneSet", "_create_lanes", "CommandLine", "StartStrategy", "FailurePolicy", "BUILD_ID", "VALIDATION_DETAIL_LIMIT", "_driver_name",
     "_driver_start_template", "_driver_spawn_template", "_driver_start_import_worker", "_driver_fork_worker",
     "_routers_to_load",
     "_set_routers_to_load", "DeclarationError", "MissingAppFileError", "LateRegistrationError", "LogLevel",
     "Compression", "Request", "Response", "Cookie", "SameSite", "Headers", "WebSocket", "SharedState", "Stream", "BodyStream",
     "AbandonedWorker", "WorkerException", "BodyReadError", "HTTPException", "PgPool", "PgCursor", "DatabaseError", "IntegrityError",
     "UniqueViolation", "ParamError", "Metrics", "RunMetrics", "Flag", "_flags", "Deployment", "EntryPoint", "ConfigError", "ServerFlags", "LaneRecipe", "get_gil_metrics", "reset_peaks", "init_logger", "flush_logs", "_stop_log_writer", "_start_log_writer", "_user_cache_dir", "_log_writer_thread",
-    "emit_python_log", "_python_log_level", "workrequest_counts", "_in_worker", "_interpreters_running_python_at_exit", "_physical_cores", "_route_params", "encode_json", "_is_async_handler",
-    "_worker_recv", "_worker_close", "_worker_send", "_worker_fail", "_worker_timed_out", "_worker_to_response",
+    "emit_python_log", "_python_log_level", "workrequest_counts", "_in_worker", "_exit_without_finalization", "_physical_cores", "_route_params", "encode_json", "_is_async_handler",
+    "_worker_take", "_worker_send", "_worker_fail", "_worker_to_response", "_LoopWaits", "_WsJob", "_ConnectionInbox",
     "_note_isolated",
 ]
 
@@ -129,10 +129,12 @@ class Metrics:
     """Static mounts served uncached because their file watch failed or was lost."""
     static_answers_cut: int
     """Static answers sent from disk that were cut off because the file changed or failed while it was sent."""
-    static_bytes_in_flight: int
-    """Bytes static answers sent from disk hold now, read and not yet written out."""
     db_results_undeliverable: int
     """Async database results that could not reach a closed asyncio loop."""
+    log_lines_dropped: int
+    """Log lines dropped, because the log's writer could not keep up or stderr refused them."""
+    log_lines_write_failed: int
+    """Of ``log_lines_dropped``, the lines stderr refused (EPIPE, a closed or full disk)."""
     gil_congested_waits: int
     """GIL acquisition waits past the congestion threshold (50 ms)."""
     client_disconnects: int
@@ -159,6 +161,10 @@ class Metrics:
     """Listeners without TCP_DEFER_ACCEPT (the cold-connect mitigation is off)."""
     nodelay_failures: int
     """Connections without TCP_NODELAY (they keep Nagle's algorithm)."""
+    workers_abandoned: int
+    """Sync workers the pools abandoned after an interruption did not end their request, whose threads still run."""
+    pools_at_abandon_limit: int
+    """Pools at their limit of abandoned workers (as many as their sync workers): a stuck worker keeps its lane, and ``HealthProbes``' ``/readyz`` is not ready."""
 
 @final
 class RunMetrics:
@@ -189,8 +195,12 @@ class RunMetrics:
     """Workers retired because their ``gc.collect()`` failed: they take no more requests."""
     last_worker_retirement: Optional[str]
     """Why the last worker retired, in its own words; ``None`` while none has."""
+    static_bytes_in_flight: int
+    """Bytes this server's static answers sent from disk hold now, read and not yet written out."""
     validation_failures: int
     """Requests answered 422 because their ``body=`` model or ``query=`` string failed validation."""
+    ws_keepalive_timeouts: int
+    """WebSocket clients pinged and then closed with 1011 because no frame came in time."""
     cpu_pin_failures: int
     """Threads that could not be pinned to their core (they run unpinned)."""
     cpu_qos_failures: int
@@ -236,7 +246,7 @@ class Flag:
         """The ``pyproject.toml`` key in its table, ``[tool.mipyre] threads``."""
     @property
     def code(self) -> list[str]:
-        """Every place app code gives it, ``run(threads=)``."""
+        """Every place app code gives it, ``ServerFlags(threads=)``."""
     @property
     def shape(self) -> str:
         """The shape of its value in one word: ``bool``, ``count``, ``positive``,
@@ -278,7 +288,7 @@ class EntryPoint:
 @final
 class ServerFlags:
     """The flags app code gives one server, each a keyword named as the flag
-    (``ServerFlags(threads=2, port=0)``): the programmatic configuration of
+    (``ServerFlags(threads=2, port=0)``): the programmatic configuration of ``app.run()``,
     ``TestClient(config=)``, ``TestServer(config=)`` and ``MipyreApp.start(config=)``. A
     deployment value of the same flag wins over it.
 
@@ -290,9 +300,6 @@ class ServerFlags:
         """These flags with ``given`` set as well."""
     def _with_lanes(self, **given: Any) -> ServerFlags:
         """These flags with the app's ``ProcessLanes`` fields (``given``) as well."""
-    @staticmethod
-    def _from_run(**given: Any) -> ServerFlags:
-        """``run()``'s keywords, each named as ``run(name=)``."""
 
 @final
 class LaneRecipe:
@@ -412,6 +419,7 @@ class Request:
     method: str
     path: str
     params: dict[str, str]
+    """The path params, percent-decoded on the first access; every access returns a new ``dict``."""
     query: str
     authority: str | None
     """The ``host[:port]`` the request was sent to: the HTTP/2 ``:authority`` or an
@@ -468,7 +476,10 @@ class Response:
 
     The body's content type comes from what it is, never from its text: a
     ``dict`` / ``list`` is JSON, a ``str`` is ``text/plain``, ``bytes`` are
-    ``application/octet-stream`` — unless ``content_type`` names one.
+    ``application/octet-stream`` — unless ``content_type`` names one. A body,
+    or a handler's return value, of any other type (a tuple, a set, another
+    object) answers 500 and logs its type and ``repr``, as a handler that
+    raises does.
 
     A header value is a ``str``, or a list of them to send the name on
     several lines; under ``set-cookie`` a value may also be a ``Cookie``. A
@@ -551,10 +562,14 @@ class Cookie:
 
 @final
 class WebSocket:
-    """One WebSocket connection, handed to an ``@app.websocket`` handler.
+    """One WebSocket connection, handed to an ``@app.websocket`` handler, which is an
+    ``async def``: every receive and send is awaited.
 
     Every receive returns ``None`` once the connection has ended (the peer
-    closed it, or it was dropped after a read error, which the server logs).
+    closed it, or it was dropped after a read error, which the server logs);
+    ``async for msg in ws`` yields each message (``str`` or ``bytes``) until then.
+    One task receives at a time: a receive while another task awaits one raises
+    ``RuntimeError``.
 
     The ``before_request`` hooks run on the upgrade request before the 101 is
     sent; a hook that returns a response refuses the upgrade with it.
@@ -564,36 +579,40 @@ class WebSocket:
     """The upgrade request (method, path, query, headers such as ``Origin``
     and ``Cookie``, client IP); the object the ``before_request`` hooks saw."""
 
-    def recv_message(self) -> Optional[str | bytes]:
+    def recv_message(self) -> Awaitable[Optional[str | bytes]]:
         """Receive the next message: ``str`` for text, ``bytes`` for binary."""
         ...
-    def recv(self) -> Optional[str]:
+    def recv(self) -> Awaitable[Optional[str]]:
         """Receive the next text message.
 
         :raises TypeError: if the next message is binary; it stays queued for
             ``recv_bytes()`` / ``recv_message()``.
         """
         ...
-    def recv_bytes(self) -> Optional[bytes]:
+    def recv_bytes(self) -> Awaitable[Optional[bytes]]:
         """Receive the next binary message.
 
         :raises TypeError: if the next message is text; it stays queued for
             ``recv()`` / ``recv_message()``.
         """
         ...
-    def send(self, msg: str) -> None:
-        """Queue a text message. Never blocks.
+    def __aiter__(self) -> WebSocket: ...
+    def __anext__(self) -> Awaitable[str | bytes]: ...
+    def send(self, msg: str) -> Awaitable[None]:
+        """Queue a text message; while a slow client has let the connection's buffer fill,
+        the await lasts until there is room.
 
         :raises ValueError: the message exceeds ``max_websocket_message_size``.
-        :raises BlockingIOError: the send buffer is full (the client reads
-            slowly); retry after a pause.
         :raises ConnectionError: the connection is closed.
         """
         ...
-    def send_bytes(self, data: bytes) -> None:
+    def send_bytes(self, data: bytes) -> Awaitable[None]:
         """Queue a binary message. Same errors as ``send``."""
         ...
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """Close the connection once what is queued has been sent; a send still waiting for
+        room raises ``ConnectionError`` when it wakes, and any later send at once."""
+        ...
 
 @final
 class Stream:
@@ -617,13 +636,37 @@ class Stream:
     def send(self, data: str) -> None:
         """Sends a raw chunk. Never blocks.
 
-        :raises BlockingIOError: the buffer is full (a slow client); retry after a pause.
-        :raises ConnectionError: the stream is closed.
+        :raises BlockingIOError: the buffer is full (a slow client); wait for room with
+            ``wait_writable()`` (or ``await wait_writable_async()``), then send it again.
+        :raises ConnectionError: the stream is closed, or the client is gone.
         """
         ...
-    def send_event(self, data: str, event: Optional[str] = None, id: Optional[str] = None) -> None:
-        """Sends one SSE event: ``id:`` / ``event:`` lines if given, a ``data:`` line per
-        line of ``data``. ``ValueError`` for a line break in ``id`` or ``event``."""
+    def wait_writable(self) -> None:
+        """Blocks, with the GIL released, until a chunk would fit: the client took one, or
+        it never filled. Blocks the calling thread, so not for an ``async def`` producer.
+
+        :raises ConnectionError: the stream is closed (also by ``close()`` from another
+            thread while this waits), or the client is gone.
+        """
+        ...
+    def wait_writable_async(self) -> Awaitable[None]:
+        """As ``wait_writable``, as a future on the running event loop; cancelling it stops
+        the wait.
+
+        :raises RuntimeError: no running event loop.
+        :raises OSError: no file descriptor for the loop to wait on.
+        """
+        ...
+    def send_event(
+        self,
+        data: Optional[str] = None,
+        event: Optional[str] = None,
+        id: Optional[str] = None,
+        retry: Optional[int] = None,
+    ) -> None:
+        """Sends one SSE event: ``id:`` / ``event:`` / ``retry:`` lines for those given, a
+        ``data:`` line per line of ``data`` (none without ``data``). ``ValueError`` for a line
+        break in ``id`` or ``event``; ``OverflowError`` for a negative ``retry``; else as ``send``."""
         ...
     def close(self) -> None:
         """Ends the response; a later ``send`` raises ``ConnectionError``."""
@@ -633,8 +676,10 @@ class Stream:
 class SharedState:
     """Concurrent key-value store shared across all workers / sub-interpreters.
 
-    Backed by a single lock-free concurrent map (Rust ``DashMap``) held behind
-    an ``Arc``, so every worker observes the same state in shared memory.
+    Backed by a single concurrent map (Rust ``DashMap``, which locks one shard per
+    call) held behind an ``Arc``, so every worker observes the same state in shared
+    memory. A read or write raises ``RuntimeError`` in a ``runtime="process"``
+    worker, a process apart from the server's state.
 
     Concurrency contract:
 
@@ -733,10 +778,11 @@ class RuntimeChoice:
 class MipyreApp:
     """The engine app ``Mipyre`` wraps: routes, hooks, limits, and ``start``/``run``.
 
-    Route registration raises ``ValueError`` for a bad path, a duplicate route, or
+    Route registration raises ``ValueError`` for a bad path, a duplicate route,
     ``stream=True`` without ``runtime="main"`` or on an ``async def`` handler (a streamed body
-    is fed only to a sync handler on the main interpreter); ``LateRegistrationError`` for a
-    route other than ``runtime="main"`` registered after the first server started.
+    is fed only to a sync handler on the main interpreter), or an ``async def`` handler on
+    ``RuntimeChoice.Lane``; ``LateRegistrationError`` for a route other than ``runtime="main"``
+    registered after the first server started.
     """
 
     def __init__(self) -> None: ...
@@ -760,9 +806,9 @@ class MipyreApp:
     # Called by mipyre.app and mipyre._process_lane; not a public API.
     def _set_subinterp_routers(self, routers: List[str]) -> None: ...
     def _use_isolation(self) -> None: ...
-    def _set_process_lanes(self, lanes: LaneSet) -> None: ...
+    def _set_process_lanes(self, lanes: _LaneSet) -> None: ...
     def _has_process_routes(self) -> bool: ...
-    def _serve_lane_worker(self, lanes: LaneSet, template_pid: int) -> None: ...
+    def _serve_lane_worker(self, lanes: _LaneSet, template_pid: int) -> None: ...
     def add_fast_response(
         self,
         method: str,
@@ -785,29 +831,36 @@ class MipyreApp:
     def fallback(self, handler: Callable[..., Any]) -> None:
         """:raises LateRegistrationError: registered after the first server started."""
         ...
-    def websocket(self, path: str, handler: Callable[..., Any]) -> None:
+    def websocket(self, path: str, handler: Callable[..., Any], runtime: RuntimeChoice = ...) -> None:
         """:raises ValueError: a handler is already registered for ``path``, or ``path`` is
         not a valid route path (``{name}`` parameters land in ``ws.request.params``)."""
         ...
     def set_max_body_size(self, size: int) -> None:
-        """This app's largest request body, in bytes (413 above it). Per app."""
+        """This app's largest request body, in bytes (413 above it). Per app; raises
+        ``ValueError`` below 0, ``TypeError`` unless an ``int`` (a ``bool`` is refused)."""
         ...
     def configure_compression(self, settings: Compression | None) -> None:
         """This app's response compression; ``None`` turns it off. Per app."""
         ...
     def max_body_size(self) -> int: ...
     def set_request_timeout(self, seconds: float) -> None:
-        """Seconds each step of a request may take (body: 408, handler: 504). Per app;
-        raises ``ValueError`` unless finite and above 0."""
+        """Seconds a handler may take to answer (504), and to take each chunk of a streamed
+        body. Per app; raises ``ValueError`` unless finite and above 0."""
         ...
     def request_timeout(self) -> float: ...
+    def set_body_grace(self, seconds: float) -> None:
+        """Seconds a request body may take to arrive however slowly it comes (408 past it,
+        unless it keeps up the minimum rate). Per app; raises ``ValueError`` unless finite and
+        above 0."""
+        ...
+    def body_grace(self) -> float: ...
     def set_body_min_rate(self, bytes_per_second: int) -> None:
-        """Bytes per second at which a request body earns a second past the request timeout.
-        Per app; raises ``ValueError`` below 1."""
+        """The average bytes per second below which a request body is refused once its grace
+        has passed. Per app; raises ``ValueError`` below 1."""
         ...
     def body_min_rate(self) -> int: ...
     def set_body_time_limit(self, seconds: float) -> None:
-        """The most seconds a request body may take, whatever it earns. Per app; raises
+        """The most seconds a request body may take, however fast it arrives. Per app; raises
         ``ValueError`` unless finite and above 0."""
         ...
     def body_time_limit(self) -> float: ...
@@ -819,6 +872,16 @@ class MipyreApp:
         """Per app (counted per server run); raises ``ValueError`` below 1."""
         ...
     def max_websocket_connections(self) -> int: ...
+    def set_websocket_ping_interval(self, seconds: float) -> None:
+        """Seconds a WebSocket client may go unheard before it is pinged. Per app; raises
+        ``ValueError`` unless finite and above 0."""
+        ...
+    def websocket_ping_interval(self) -> float: ...
+    def set_websocket_ping_timeout(self, seconds: float) -> None:
+        """Seconds a pinged WebSocket client has to send a frame before it is closed with 1011.
+        Per app; raises ``ValueError`` unless finite and above 0."""
+        ...
+    def websocket_ping_timeout(self) -> float: ...
     def static_dir(self, prefix: str, directory: str, precompressed: bool = False) -> None:
         """Serve files under ``directory`` at URL ``prefix``.
 
@@ -899,6 +962,9 @@ class MipyreApp:
         """The script sub-interpreter workers execute, when it isn't
         ``__main__.__file__`` (the CLI sets it to the app's module)."""
         ...
+    def app_file(self) -> str:
+        """Return the app's source file, absolute: the one ``set_script_path`` set, else
+        ``__main__.__file__``. Raise ``MissingAppFileError`` when there is neither."""
         ...
     def _add_home_module(self, globals: dict[str, Any]) -> None:
         """Record a module whose code makes this app's ``PgPool`` handles, by its globals."""
@@ -963,10 +1029,9 @@ class MipyreApp:
         starts: a port another server listens on (in this process or another, with or
         without ``SO_REUSEPORT``) raises ``OSError`` (``errno.EADDRINUSE``)."""
         ...
-    def run(self, **given: Any) -> None:
+    def run(self, config: Optional[ServerFlags] = None) -> None:
         """``start(...).serve()`` from a script: this process's deployment laid over
-        ``given``, ``run()``'s keywords (``host``, ``port``, ``threads``, ...). Bind, then
-        serve until SIGINT."""
+        ``config``. Bind, then serve until SIGINT."""
         ...
     # Feature-gated: present only in an engine built with
     # `maturin develop --release --features bench` (absent from the default build and
@@ -974,13 +1039,13 @@ class MipyreApp:
     def bench_inmem(
         self,
         duration_s: int = 10,
-        workers: Optional[int] = None,
-        conns_per_worker: int = 8,
+        threads: Optional[int] = None,
+        conns_per_thread: int = 8,
     ) -> Tuple[int, float]:
         """``--features bench`` only. In-memory bench (no TCP): pipelines ``GET /``.
         Returns ``(requests, elapsed_s)``.
 
-        :raises ValueError: ``workers`` is 0.
+        :raises ValueError: ``threads`` is 0.
         :raises RuntimeError: a route is ``runtime="main"``, ``async def`` or ``stream=True``;
             a worker failed to start; or a worker or client failed during the run (a
             non-200 response included).
@@ -989,13 +1054,13 @@ class MipyreApp:
     def bench_loopback(
         self,
         duration_s: int = 10,
-        workers: Optional[int] = None,
+        threads: Optional[int] = None,
         client_conns: int = 32,
     ) -> Tuple[int, float, int]:
         """``--features bench`` only. Real TCP on an ephemeral 127.0.0.1 port, client in
         this process: pipelines ``GET /``. Returns ``(requests, elapsed_s, port)``.
 
-        :raises ValueError: ``workers`` is 0.
+        :raises ValueError: ``threads`` is 0.
         :raises RuntimeError: as for :meth:`bench_inmem`.
         """
         ...
@@ -1072,10 +1137,9 @@ def _in_worker() -> bool:
     """Whether this code runs in a sub-interpreter worker (not the main interpreter)."""
     ...
 
-def _interpreters_running_python_at_exit() -> int:
-    """Return how many threads that own a sub-interpreter run Python; when none does, wait
-    without a deadline until every one has ended its interpreter (0) or one enters Python
-    (GIL released while waiting)."""
+def _exit_without_finalization(why: str, error: BaseException | None) -> NoReturn:
+    """End the process with status 1 and no finalization, after the log lines so far, `error`'s
+    whole chain when there is one, and `why`."""
     ...
 
 def _mimalloc_purge_delay() -> int:
@@ -1217,18 +1281,39 @@ def workrequest_counts() -> Optional[Tuple[int, int]]:
     engine was built with ``--features leak_detect`` (nothing is counted then)."""
     ...
 
-# Called by the async engine in sub-interpreter workers; not a public API.
-class _AsyncInbox: ...
+# Called by the async engine (sub-interpreter workers, and main's async def routes); not a public API.
+class _AsyncInbox:
+    @property
+    def doorbell(self) -> int: ...
 class _AsyncJob:
     @property
     def route(self) -> int: ...
     @property
     def request(self) -> Request: ...
-def _worker_recv(inbox: _AsyncInbox) -> Optional[_AsyncJob]: ...
-def _worker_close(inbox: _AsyncInbox) -> None: ...
+def _worker_take(inbox: _AsyncInbox) -> Optional[List[_AsyncJob]]: ...
+@final
+class _LoopWaits:
+    def __new__(cls, event_loop: Any) -> _LoopWaits: ...
+    @property
+    def doorbell(self) -> int: ...
+    def run(self) -> None: ...
+@final
+class _WsJob:
+    @property
+    def route(self) -> int: ...
+    @property
+    def request(self) -> Request: ...
+    def accept(self, waits: _LoopWaits) -> Optional[WebSocket]: ...
+    def refuse(self, value: Any) -> None: ...
+    def fail(self, exception: BaseException) -> None: ...
+    def raised(self, exception: BaseException) -> None: ...
+@final
+class _ConnectionInbox:
+    @property
+    def doorbell(self) -> int: ...
+    def take(self) -> List[_WsJob]: ...
 def _worker_send(job: _AsyncJob, response: Any) -> None: ...
 def _worker_fail(job: _AsyncJob, exception: BaseException) -> None: ...
-def _worker_timed_out(job: _AsyncJob) -> None: ...
 def _worker_to_response(value: Any) -> Response: ...
 
 def _note_isolated(lib: str, bytes: int, why: str) -> None:
@@ -1303,21 +1388,11 @@ class CommandLine:
     def __eq__(self, value: object, /) -> bool: ...
 
 @final
-class LaneSet:
+class _LaneSet:
     """The process lanes of an app: the server's, or one worker's lane."""
 
-    def __new__(
-        cls,
-        workers: int,
-        slot_bytes: int = ...,
-        depth: int = 8,
-        timeout_ms: int = 30000,
-        queue_per_worker: int = 128,
-        server_spin_us: int = 20,
-        on_failure: FailurePolicy = ...,
-    ) -> LaneSet: ...
     @staticmethod
-    def _attach(lane: int, attempt: int, depth: int, slot_bytes: int, worker_spin_us: int, shm_fd: int, bell_fd: int) -> LaneSet: ...
+    def _attach(lane: int, attempt: int, depth: int, slot_bytes: int, worker_spin_us: int, shm_fd: int, bell_fd: int) -> _LaneSet: ...
     def _setup_template(self, message: bytes) -> None: ...
     def _template_run(self, command_line: CommandLine) -> None: ...
     @property
@@ -1329,8 +1404,23 @@ class LaneSet:
     def _report_start_failure(self, text: str) -> None: ...
     def stats(self) -> Dict[str, Any]: ...
 
+def _create_lanes(
+    workers: int,
+    slot_bytes: int = ...,
+    depth: int = 8,
+    timeout_ms: int = 30000,
+    queue_per_worker: int = 128,
+    server_spin_us: int = 20,
+    on_failure: FailurePolicy = ...,
+) -> _LaneSet:
+    """Makes the server's lanes; raises ``ValueError`` saying which setting they refuse."""
+    ...
+
 BUILD_ID: str
 """This build of the engine: the package version and a hash of the source tree it was built from."""
+
+VALIDATION_DETAIL_LIMIT: int
+"""How many validation errors a 422 lists at most; its ``error_count`` still counts them all."""
 
 def _driver_name() -> str:
     """The process driver: ``"fork"`` or ``"spawn"``."""

@@ -2,8 +2,7 @@
 //! GIL round trip, and the GIL save/restore pair a park does.
 //!
 //! A unit includes a GIL round trip, so the unit's own cost is the difference of the two.
-//! `work_unit_begin_end` also prints `ALLOCATIONS_IN_LOOP=<n>`. The merge gate runs these through
-//! `benchmarks/bench_micro_count.py`. By hand:
+//! `work_unit_begin_end` also prints `ALLOCATIONS_IN_LOOP=<n>`. Run them with:
 //!
 //!   BENCH_N=2000000 cargo bench -p mipyre_subinterp --bench interp -- work_unit_begin_end
 

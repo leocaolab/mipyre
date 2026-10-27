@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::stream::peer_gone;
 use crate::tcp::events::{self, TcpEvent};
+use crate::tcp::loops::{socket_loops, SocketLoops};
 use crate::tcp::os;
 
 /// Counts `event` when `set` failed and returns the errno when the warning is due, once a minute
@@ -65,8 +66,7 @@ pub struct BindOptions {
     pub defer_accept: Duration,
 }
 
-/// Creates a nonblocking listener with SO_REUSEPORT, so the kernel spreads connections over
-/// every listener on the port.
+/// Creates a nonblocking listener with SO_REUSEPORT, so more sockets can join its port.
 ///
 /// # Errors
 ///
@@ -197,6 +197,25 @@ fn probe_free(addr: SocketAddr) -> Result<SocketAddr, ListenerError> {
         })
 }
 
+/// How the accept loops of one address share its port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PortLayout {
+    /// Each loop has its own `SO_REUSEPORT` socket, and the kernel spreads connections over them.
+    SocketPerLoop,
+    /// The loops accept from one socket, each through its own descriptor, so whichever loop is
+    /// idle takes the next connection.
+    SharedSocket,
+}
+
+/// Returns how many sockets one address needs for `loops` accept loops laid out on its port as
+/// `layout` says.
+fn sockets_per_address(layout: PortLayout, loops: NonZeroUsize) -> NonZeroUsize {
+    match layout {
+        PortLayout::SocketPerLoop => loops,
+        PortLayout::SharedSocket => NonZeroUsize::MIN,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PortClaim {
     /// A port 0 is resolved by the first copy's own bind, which is kept; the others join the
@@ -235,13 +254,23 @@ impl BoundListeners {
         self.groups
     }
 
-    /// Binds `copies` `SO_REUSEPORT` sockets for each of `addrs`, one group per accept loop, so
-    /// the kernel spreads connections over the loops. A named port is first proven free.
+    /// Gives each of `copies` accept loops one listener for each of `addrs`, one group per loop,
+    /// laid out as this platform's [`os::PORT_LAYOUT`] says. A named port is first proven free.
     ///
     /// # Errors
     ///
     /// Returns the first failed socket call, such as `AddrInUse`, before any thread exists.
     pub fn bind(addrs: &[SocketAddr], copies: NonZeroUsize, options: BindOptions) -> Result<Self, ListenerError> {
+        Self::bind_laid_out(addrs, copies, os::PORT_LAYOUT, options)
+    }
+
+    fn bind_laid_out(
+        addrs: &[SocketAddr],
+        copies: NonZeroUsize,
+        layout: PortLayout,
+        options: BindOptions,
+    ) -> Result<Self, ListenerError> {
+        let sockets = sockets_per_address(layout, copies);
         let mut groups: Vec<Vec<Listener>> = (0..copies.get()).map(|_| Vec::new()).collect();
         for &asked in addrs {
             // The kernel never picks a port another `SO_REUSEPORT` socket holds, so the first
@@ -258,12 +287,20 @@ impl BoundListeners {
                 }
                 PortClaim::ProbedFree => (probe_free(asked)?, None),
             };
-            for group in &mut groups {
+            for SocketLoops { home, duplicates } in socket_loops(sockets.get(), copies) {
                 let socket = match first.take() {
                     Some(socket) => socket,
                     None => create_reuseport_listener(addr, options)?,
                 };
-                group.push(Listener { socket, addr });
+                for i in duplicates {
+                    let socket = socket.try_clone().map_err(|source| ListenerError {
+                        call: SocketCall::TryClone,
+                        addr,
+                        source,
+                    })?;
+                    groups[i].push(Listener { socket, addr });
+                }
+                groups[home].push(Listener { socket, addr });
             }
         }
         Ok(BoundListeners::of_groups(groups))
@@ -521,6 +558,55 @@ mod tests {
             assert_eq!(group[0].socket.local_addr().unwrap().port(), port);
             assert_eq!(group[0].addr.port(), port);
         }
+    }
+
+    #[test]
+    fn a_shared_port_binds_one_socket_and_a_port_per_loop_one_per_loop() {
+        let n = |n| NonZeroUsize::new(n).unwrap();
+        for loops in [1, 2, 8] {
+            assert_eq!(sockets_per_address(PortLayout::SharedSocket, n(loops)), n(1));
+            assert_eq!(sockets_per_address(PortLayout::SocketPerLoop, n(loops)), n(loops));
+        }
+    }
+
+    #[test]
+    fn every_loop_of_a_shared_port_accepts_from_its_one_queue() {
+        let bound = BoundListeners::bind_laid_out(
+            &[loopback(0)],
+            NonZeroUsize::new(3).unwrap(),
+            PortLayout::SharedSocket,
+            OPTIONS,
+        )
+        .unwrap();
+        let addr = bound.groups[0][0].addr;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let acceptors: Vec<TcpAcceptor> = bound
+                .into_groups()
+                .into_iter()
+                .map(|mut group| {
+                    assert_eq!(group.len(), 1);
+                    TcpAcceptor::register(group.remove(0)).unwrap()
+                })
+                .collect();
+            for acceptor in &acceptors {
+                use tokio::io::AsyncWriteExt;
+                // Linux holds a silent connection until its first byte (`TCP_DEFER_ACCEPT`).
+                let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+                client.write_all(b"x").await.unwrap();
+                let accepted = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    std::future::poll_fn(|cx| acceptor.poll_accept(cx)),
+                )
+                .await
+                .expect("every loop's descriptor reaches the one queue")
+                .unwrap();
+                assert_eq!(accepted.remote, client.local_addr().unwrap());
+            }
+        });
     }
 
     #[test]

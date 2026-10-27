@@ -1,84 +1,87 @@
 """Async engine — run in each async sub-interpreter worker, and on the main interpreter for
-its `async def` routes on the thread-per-core server.
+its `async def` routes, on one thread with one stock asyncio loop.
 
-It drives a Python asyncio event loop that runs the requests a fetcher thread pulls from
-Rust through `mipyre.engine._worker_recv`. It runs as the module
-`__mipyre_async_engine__`, in its own namespace; Rust sets in it before it runs:
+Rust's queue of requests sits under the loop as a doorbell fd the loop waits on with its other
+readers; when it is readable the engine takes what is queued and starts a Task per request
+(`async_requests.serve`). It runs as the module `__mipyre_async_engine__`, in its own namespace;
+Rust sets in it before it runs:
 
-- `ENGINE`: which engine this is, `worker-<index>` or `main` (thread names, log records);
-- `CHANNEL`: this engine's request inbox;
-- `TASK_TIMEOUT`: seconds a request's task may run, a little under the request budget
-  Rust answers 504 at, so the task is cancelled rather than left computing a result
-  nobody takes;
+- `INBOX`: this engine's end of its request queue;
 - `HANDLERS`: the handlers indexed like main's route table, `None` for a route this engine
   does not serve;
 - `BEFORE_HOOKS`, `AFTER_HOOKS`: the app's hooks;
 - `UNHOOKED`: the types of a handler's value sent as returned, after hooks unrun: main's
-  `Stream`, none in a worker (which cannot stream).
+  `Stream`, none in a worker (which cannot stream);
+- `WEBSOCKETS`: `None` when the engine serves no WebSocket route, else this engine's end of the
+  connections handed to it and the WebSocket handlers indexed like main's WebSocket routes,
+  `None` for one this engine does not serve.
+
+Each WebSocket connection runs as a Task too (`async_requests.connection_runner`), for as long
+as its handler runs; its receives and sends wait on the loop through one doorbell for all of
+them (`_LoopWaits`).
 
 Each request comes as a job that carries where its answer goes; the engine answers it
-with `_worker_send` / `_worker_fail` / `_worker_timed_out`. A job the engine lets go of
-unanswered (its task cancelled when the engine stops) answers itself with an error, so
-no caller waits for a request that will never run.
+with `_worker_send` / `_worker_fail`. A job the engine lets go of unanswered (its task
+cancelled when the loop stops) answers itself with an error, so no caller waits for a
+request that will never run. The request budget is Rust's: past it the caller answers 504.
 
 In a worker the handlers and hooks are the ones the user's script registered on the
 worker's app; on main they are the app's own.
 """
 
 import asyncio
-import functools
 
 import mipyre.engine as _engine
 from mipyre._worker import async_requests
 
 # Set in this namespace by Rust before the module runs (see the docstring); read here by name, so a
 # missing one is a KeyError naming it when the worker starts, and each has its type.
-ENGINE: str = globals()["ENGINE"]
-CHANNEL: _engine._AsyncInbox = globals()["CHANNEL"]
-TASK_TIMEOUT: float = globals()["TASK_TIMEOUT"]
+INBOX: _engine._AsyncInbox = globals()["INBOX"]
 HANDLERS: list = globals()["HANDLERS"]
 BEFORE_HOOKS: list = globals()["BEFORE_HOOKS"]
 AFTER_HOOKS: list = globals()["AFTER_HOOKS"]
 UNHOOKED: tuple = globals()["UNHOOKED"]
+WEBSOCKETS: tuple[_engine._ConnectionInbox, list] | None = globals()["WEBSOCKETS"]
 
 
 # One job's coroutine. Each runs as its own Task, so per-request state kept in ContextVars
 # (observability's request id, mipyre.context) stays apart from concurrent requests on this
 # loop. How the request ends is `async_requests.job_runner`'s; the engine logs a failure
-# once, with its traceback and the request id (the client gets a generic 500), and answers a
-# timeout 504.
+# once, with its traceback and the request id (the client gets a generic 500).
 _process_request = async_requests.job_runner(
-    HANDLERS, BEFORE_HOOKS, AFTER_HOOKS, _engine._worker_to_response, TASK_TIMEOUT,
-    _engine._worker_send, _engine._worker_fail, _engine._worker_timed_out,
+    HANDLERS, BEFORE_HOOKS, AFTER_HOOKS, _engine._worker_to_response,
+    _engine._worker_send, _engine._worker_fail,
     unhooked=UNHOOKED,
 )
 
 
-async def _mipyre_engine():
-    loop = asyncio.get_running_loop()
-    t = async_requests.Fetcher(
-        f"mipyre-async-fetcher-{ENGINE}",
-        functools.partial(_engine._worker_recv, CHANNEL),
-        _process_request,
-        async_requests.scheduler(loop),
-    )
-    t.start()
-    try:
-        # The fetcher returns when the inbox closes: at shutdown, or when this engine
-        # stops (below). No timeout: this wait lasts the worker's whole serving life.
-        await t.returned()
-    finally:
-        # However the engine stops (shutdown, the fetcher failing, the loop dying), close
-        # the inbox so the fetcher returns: the interpreter waits for it at its end.
-        _engine._worker_close(CHANNEL)
-        # Pending tasks and async generators end before Py_EndInterpreter tears the loop
-        # down (`end_pending`: cancelled, waited for at most TASK_TIMEOUT).
-        loop = asyncio.get_running_loop()
-        pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
-        await async_requests.end_pending(pending, TASK_TIMEOUT, ENGINE)
-        await loop.shutdown_asyncgens()
-    if t.error is not None:
-        raise t.error
+def _take():
+    return _engine._worker_take(INBOX)
 
 
-asyncio.run(_mipyre_engine())
+def _watch_connections(loop: asyncio.AbstractEventLoop, inbox: _engine._ConnectionInbox, handlers: list) -> None:
+    waits = _engine._LoopWaits(loop)
+    loop.add_reader(waits.doorbell, waits.run)
+    run = async_requests.connection_runner(handlers, BEFORE_HOOKS, waits)
+    task = asyncio.Task
+
+    def start() -> None:
+        try:
+            jobs = inbox.take()
+        except BaseException:
+            # The doorbell stays readable, and looking again would spin.
+            loop.remove_reader(inbox.doorbell)
+            raise
+        for job in jobs:
+            task(run(job), loop=loop, eager_start=True)
+
+    loop.add_reader(inbox.doorbell, start)
+
+
+async def _serve() -> None:
+    if WEBSOCKETS is not None:
+        _watch_connections(asyncio.get_running_loop(), *WEBSOCKETS)
+    await async_requests.serve(INBOX.doorbell, _take, _process_request)
+
+
+asyncio.run(_serve())

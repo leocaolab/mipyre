@@ -19,7 +19,7 @@ from mipyre import Mipyre
 
 def _serve_in_own_process(module: str, requests: int) -> None:
     """Serves ``module``'s app in its own process: it turns the access log on, and a process has
-    one log configuration (b/335 D14), which another test's app in this one may have set."""
+    one log configuration, which another test's app in this one may have set."""
     script = f"""
 from tests.{module} import app
 from mipyre.testing import TestClient

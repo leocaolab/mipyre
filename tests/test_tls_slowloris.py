@@ -1,13 +1,8 @@
-"""Regression for the TLS Slowloris DoS (benchmark-17 audit bug #9).
+"""The TLS handshake is bounded at 10 s (Slowloris).
 
-Before the fix `tls::wrap_tls` awaited `acceptor.accept(stream)` with no
-timeout — a client that opened a TCP connection and never finished the
-TLS handshake pinned an async task and an fd indefinitely. With 65k
-half-open connections from one laptop the server ran out of fds while
-idling at 0% CPU.
-
-Now the handshake is bounded at 10 s; a client that doesn't complete
-in that window has its connection closed. We can't wait 10 s in a
+A client that opens a TCP connection and never finishes the handshake would otherwise pin an
+async task and an fd indefinitely, and enough half-open connections run the server out of fds.
+A client that doesn't complete in that window has its connection closed. We can't wait 10 s in a
 unit test, so we verify the bound is *present* in the source (a real
 end-to-end test needs a malicious client that never sends ClientHello).
 
@@ -18,8 +13,7 @@ it is present in the source rather than wait out the 10 s against a client that 
 import pathlib
 
 
-# The TLS code is mipyre_transport's (b/570): same code, new path. Rooted at this file instead of the
-# process's cwd, like the other source rules.
+# Rooted at this file instead of the process's cwd, like the other source rules.
 TLS = pathlib.Path(__file__).resolve().parent.parent / "crates" / "transport" / "src" / "tls" / "mod.rs"
 
 

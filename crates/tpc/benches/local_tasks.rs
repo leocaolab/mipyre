@@ -1,9 +1,9 @@
 //! Measures a connection-sized task (spawn, run, end) in `LocalTasks`, on a current-thread
 //! runtime and `LocalSet`.
 //!
-//! With the case `local_task`, it runs `BENCH_N` tasks for `benchmarks/bench_micro_count.py` to
-//! count instructions per task. With no case, `cargo bench -p mipyre_tpc --bench local_tasks`
-//! prints ns per task beside tokio-util's `TaskTracker` doing the same.
+//! With the case `local_task`, it runs `BENCH_N` tasks, for counting instructions per task. With
+//! no case, `cargo bench -p mipyre_tpc --bench local_tasks` prints ns per task beside
+//! tokio-util's `TaskTracker` doing the same.
 
 use std::time::Instant;
 
@@ -11,7 +11,6 @@ use mipyre_microbench::calls;
 use mipyre_tpc::LocalTasks;
 
 fn main() {
-    // `benchmarks/bench_micro_count.py` reads the case names from `--list`.
     if std::env::args().any(|a| a == "--list") {
         println!("local_task");
         return;

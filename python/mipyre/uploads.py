@@ -23,7 +23,6 @@ UUID, a content hash) and keep the client's name only as data.
 from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from urllib.parse import unquote_to_bytes
 
 from mipyre.engine import HTTPException
 
@@ -202,6 +201,10 @@ _EXT_VALUE_CHARSETS = {"utf-8": "utf-8", "iso-8859-1": "latin-1"}
 
 def _ext_value(value: str) -> str:
     """An RFC 8187 (RFC 5987) ext-value, ``charset'language'pct-encoded``, decoded."""
+    # Imported here: every worker imports this module with mipyre, and urllib.parse brings
+    # ipaddress with it (about 1 ms an interpreter) for the rare filename* parameter.
+    from urllib.parse import unquote_to_bytes
+
     charset, sep1, rest = value.partition("'")
     _language, sep2, encoded = rest.partition("'")
     codec = _EXT_VALUE_CHARSETS.get(charset.strip().lower())

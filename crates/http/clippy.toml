@@ -1,5 +1,5 @@
 # plan/ decides; it does not do. Every call that reads or writes the world is named here, one path at
-# a time (clippy takes no `std::fs::*`), and the merge gate's clippy runs with -D warnings. Measured on
+# a time (clippy takes no `std::fs::*`), and clippy runs with -D warnings. Measured on
 # clippy 0.1.97: each std entry below fires on a probe that uses it.
 #
 # clippy reads one of these per package, so it binds io/ too: src/io/mod.rs, and each bench and
@@ -55,7 +55,7 @@ disallowed-types = [
   { path = "socket2::SockAddr", reason = "plan/ does no network IO" },
 ]
 # `thread_local!` is not here: clippy reports it at the crate root, out of reach of io/'s expect, and
-# io/request_id.rs needs it. dev/archcheck.toml (E-P1c) refuses it in plan/'s text instead.
+# io/request_id.rs needs it.
 disallowed-macros = [
   { path = "std::println", reason = "plan/ prints nothing: it returns what it decided" },
   { path = "std::print", reason = "plan/ prints nothing" },

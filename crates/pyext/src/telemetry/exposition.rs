@@ -1,14 +1,15 @@
-//! Renders the metrics page in the Prometheus text format: one run's answers and counts, and the
-//! counts the process keeps. Every family's name, help and type is written here and nowhere else,
-//! and both inputs are taken apart field by field, so a counter added to either does not compile
+//! Renders the metrics page in the Prometheus text format: one run's server and worker counts, and
+//! the counts the process keeps. Every family's name, help and type is written here and nowhere
+//! else, and every input is taken apart field by field, so a counter added to any does not compile
 //! until this page shows it or says why not.
 
 use std::fmt::Display;
 
 use mipyre_http::plan::answer::{MethodKind, StatusClass, DURATION_BOUNDS_US};
 
-use super::run_counters::{AnswerCounts, RunCounts};
 use super::Counters;
+use mipyre_runtime::WorkerTally;
+use mipyre_server::{AnswerCounts, ServerCounts};
 
 pub(crate) const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -106,17 +107,10 @@ fn answers(out: &mut String, counts: &AnswerCounts) {
     sample(out, &format!("{name}_count"), "", all);
 }
 
-fn run_counts(out: &mut String, run: &RunCounts) {
-    let RunCounts {
+fn run_counts(out: &mut String, run: &ServerCounts, workers: &WorkerTally) {
+    let ServerCounts {
         answers: answer_counts,
         refused,
-        workers_serving,
-        workers_died,
-        process_workers_died,
-        gc_failures,
-        workers_retired,
-        // The reason is a log line's text, not a number; the count is `workers_retired`.
-        last_worker_retirement: _,
         // Why the threads run unpinned is words; the counts are `mipyre_cpu_degraded_total`.
         unpinned_because: _,
         cpu_pin_failures,
@@ -129,8 +123,18 @@ fn run_counts(out: &mut String, run: &RunCounts) {
         stop_watcher_failures,
         blocking_calls_left,
         validation_failures,
+        ws_keepalive_timeouts,
         cpu_sizing_fallback,
     } = run;
+    let gc_failures = workers.gc_failures();
+    let WorkerTally {
+        workers_serving,
+        workers_died,
+        process_workers_died,
+        workers_retired,
+        // The reason is a log line's text, not a number; the count is `workers_retired`.
+        last_worker_retirement: _,
+    } = workers;
 
     // A run that does not count its answers has none to show; its refusals are still counted.
     if let Some(counts) = answer_counts {
@@ -227,6 +231,13 @@ fn run_counts(out: &mut String, run: &RunCounts) {
         "Requests answered 422 because their body= model or query= string failed validation.",
         [("", validation_failures)],
     );
+    family(
+        out,
+        "mipyre_websocket_keepalive_timeouts_total",
+        MetricType::Counter,
+        "WebSocket clients the server pinged and then closed with 1011 because no frame came in time.",
+        [("", ws_keepalive_timeouts)],
+    );
     if let Some(reason) = cpu_sizing_fallback {
         let name = "mipyre_cpu_sizing_fallback_info";
         header(
@@ -253,8 +264,8 @@ fn process_counts(out: &mut String, process: &Counters) {
         precompressed_fallbacks,
         static_unwatched_mounts,
         static_answers_cut,
-        static_bytes_in_flight,
         db_results_undeliverable,
+        log_lines_dropped,
         gil_congested_waits,
         client_disconnects,
         accept_failures,
@@ -268,6 +279,8 @@ fn process_counts(out: &mut String, process: &Counters) {
         quickack_failures,
         defer_accept_failures,
         nodelay_failures,
+        workers_abandoned,
+        pools_at_abandon_limit,
         // Each line is a component's reason in words; the counts above say how often.
         degraded: _,
     } = process;
@@ -295,17 +308,20 @@ fn process_counts(out: &mut String, process: &Counters) {
     );
     family(
         out,
-        "mipyre_static_bytes_in_flight",
-        MetricType::Gauge,
-        "Bytes static answers sent from disk hold now, read and not yet written out.",
-        [("", static_bytes_in_flight)],
-    );
-    family(
-        out,
         "mipyre_db_results_undeliverable_total",
         MetricType::Counter,
         "Async database results that could not reach a closed asyncio loop.",
         [("", db_results_undeliverable)],
+    );
+    family(
+        out,
+        "mipyre_log_lines_dropped_total",
+        MetricType::Counter,
+        "Log lines dropped: the log's writer could not keep up (queue_full), or stderr refused them (write_failed).",
+        [
+            ("{reason=\"queue_full\"}", log_lines_dropped.queue_full),
+            ("{reason=\"write_failed\"}", log_lines_dropped.write_failed),
+        ],
     );
     family(
         out,
@@ -383,12 +399,39 @@ fn process_counts(out: &mut String, process: &Counters) {
             ("{option=\"nodelay\"}", nodelay_failures),
         ],
     );
+    family(
+        out,
+        "mipyre_workers_abandoned",
+        MetricType::Gauge,
+        "Sync workers the pool abandoned after an interruption did not end their request, whose threads still run.",
+        [("", workers_abandoned)],
+    );
+    family(
+        out,
+        "mipyre_pools_at_abandon_limit",
+        MetricType::Gauge,
+        "Pools at their limit of abandoned workers: a stuck worker keeps its lane, and /readyz is not ready.",
+        [("", pools_at_abandon_limit)],
+    );
 }
 
-/// Returns the page for one run's counts and the process's.
-pub(crate) fn render(run: &RunCounts, process: &Counters) -> String {
+/// Returns the page for one run's server and worker counts, the bytes its static answers sent
+/// from disk hold, and the process's counts.
+pub(crate) fn render(
+    run: &ServerCounts,
+    workers: &WorkerTally,
+    static_bytes_in_flight: u64,
+    process: &Counters,
+) -> String {
     let mut out = String::new();
-    run_counts(&mut out, run);
+    run_counts(&mut out, run, workers);
+    family(
+        &mut out,
+        "mipyre_static_bytes_in_flight",
+        MetricType::Gauge,
+        "Bytes the server's static answers sent from disk hold now, read and not yet written out.",
+        [("", static_bytes_in_flight)],
+    );
     process_counts(&mut out, process);
     out
 }
@@ -396,6 +439,7 @@ pub(crate) fn render(run: &RunCounts, process: &Counters) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::log_writer::LogDrops;
 
     fn process() -> Counters {
         Counters {
@@ -409,8 +453,8 @@ mod tests {
             precompressed_fallbacks: 0,
             static_unwatched_mounts: 0,
             static_answers_cut: 0,
-            static_bytes_in_flight: 0,
             db_results_undeliverable: 0,
+            log_lines_dropped: LogDrops::default(),
             gil_congested_waits: 0,
             client_disconnects: 0,
             accept_failures: 0,
@@ -424,11 +468,13 @@ mod tests {
             quickack_failures: 0,
             defer_accept_failures: 0,
             nodelay_failures: 0,
+            workers_abandoned: 0,
+            pools_at_abandon_limit: 0,
             degraded: Vec::new(),
         }
     }
 
-    fn run_with_answers() -> RunCounts {
+    fn run_with_answers() -> ServerCounts {
         let mut counts = AnswerCounts::default();
         let get = MethodKind::Get.index();
         counts.answers[get][1] = 2;
@@ -437,10 +483,10 @@ mod tests {
         counts.duration_buckets[6] = 1;
         counts.duration_buckets[16] = 1;
         counts.duration_sum_us = 100 + 7_000 + 12_000_001;
-        RunCounts {
+        ServerCounts {
             answers: Some(counts),
             refused: 1,
-            ..RunCounts::default()
+            ..ServerCounts::default()
         }
     }
 
@@ -450,7 +496,7 @@ mod tests {
 
     #[test]
     fn only_the_answers_given_are_on_the_page() {
-        let page = render(&run_with_answers(), &process());
+        let page = render(&run_with_answers(), &WorkerTally::default(), 0, &process());
         assert_eq!(
             lines_of(&page, "mipyre_http_requests_total"),
             [
@@ -463,7 +509,7 @@ mod tests {
 
     #[test]
     fn the_buckets_add_up_to_the_count_and_never_fall() {
-        let page = render(&run_with_answers(), &process());
+        let page = render(&run_with_answers(), &WorkerTally::default(), 0, &process());
         let buckets = lines_of(&page, "mipyre_http_request_duration_seconds_bucket");
         assert_eq!(buckets.len(), DURATION_BOUNDS_US.len() + 1);
         assert_eq!(
@@ -486,7 +532,7 @@ mod tests {
 
     #[test]
     fn every_family_has_one_help_and_one_type_line() {
-        let page = render(&run_with_answers(), &process());
+        let page = render(&run_with_answers(), &WorkerTally::default(), 0, &process());
         let names: Vec<&str> = page
             .lines()
             .filter_map(|l| l.strip_prefix("# TYPE "))
@@ -503,18 +549,18 @@ mod tests {
 
     #[test]
     fn a_label_value_is_escaped() {
-        let run = RunCounts {
+        let run = ServerCounts {
             cpu_sizing_fallback: Some("cgroup quota \"max\"\nunread\\".into()),
-            ..RunCounts::default()
+            ..ServerCounts::default()
         };
-        let page = render(&run, &process());
+        let page = render(&run, &WorkerTally::default(), 0, &process());
         assert!(page.contains("mipyre_cpu_sizing_fallback_info{reason=\"cgroup quota \\\"max\\\"\\nunread\\\\\"} 1\n"));
         assert!(page.contains("mipyre_bad_requests_total{kind=\"malformed\"} 3\n"));
     }
 
     #[test]
     fn a_run_that_does_not_count_its_answers_shows_none() {
-        let page = render(&RunCounts::default(), &process());
+        let page = render(&ServerCounts::default(), &WorkerTally::default(), 0, &process());
         assert!(!page.contains("mipyre_http_requests_total"));
         assert!(!page.contains("mipyre_http_request_duration_seconds"));
         assert!(page.contains("\nmipyre_http_requests_refused_total 0\n"));

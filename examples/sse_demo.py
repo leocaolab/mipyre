@@ -7,10 +7,10 @@ Open http://127.0.0.1:8000/ in a browser, or:
   curl -N http://127.0.0.1:8000/stream
 """
 
-import threading
 import time
+from collections.abc import Iterator
 
-from mipyre import Mipyre, Response, Stream
+from mipyre import EventSourceResponse, Mipyre, Response, ServerSentEvent
 
 app = Mipyre()
 
@@ -38,22 +38,16 @@ def index(req):
     return Response(PAGE, content_type="text/html; charset=utf-8")
 
 
-def send_tokens(stream: Stream) -> None:
-    try:
-        for n, token in enumerate(TOKENS):
-            stream.send_event(token, id=str(n))
-            time.sleep(TOKEN_DELAY_SECONDS)
-        stream.send_event("[DONE]", event="done")
-    except ConnectionError:
-        return  # the client went away; nobody is left to read the rest
-    stream.close()
+def token_events() -> Iterator[ServerSentEvent]:
+    for n, token in enumerate(TOKENS):
+        yield ServerSentEvent(token, id=str(n))
+        time.sleep(TOKEN_DELAY_SECONDS)
+    yield ServerSentEvent("[DONE]", event="done")
 
 
 @app.get("/stream", runtime="main")
 def stream_tokens(req):
-    stream = Stream()
-    threading.Thread(target=send_tokens, args=(stream,), daemon=True).start()
-    return stream
+    return EventSourceResponse(token_events())
 
 
 @app.get("/fast")

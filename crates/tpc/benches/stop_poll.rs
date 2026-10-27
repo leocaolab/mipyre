@@ -3,8 +3,7 @@
 //! one waiter's whole life, its first pending poll (which takes a waker slot) and its drop (which
 //! gives the slot back), which every connection goes through once.
 //!
-//! `cargo bench -p mipyre_tpc --bench stop_poll [CASE]` prints ns per call over `BENCH_N` calls;
-//! `benchmarks/bench_micro_count.py` counts its instructions for the merge gate.
+//! `cargo bench -p mipyre_tpc --bench stop_poll [CASE]` prints ns per call over `BENCH_N` calls.
 
 use std::alloc::System;
 use std::future::Future;

@@ -7,24 +7,24 @@ use pyo3::prelude::*;
 
 use super::App;
 use crate::boot::{thread_sites, Deployment, EntryPoint, ServerCpus, ServerFlags};
-use crate::serve::Site;
 use mipyre_cpu::CoreId;
+use mipyre_server::Site;
 
-/// Returns how many workers to run, one per physical core by default, and the CPUs to pin
+/// Returns how many threads to run, one per physical core by default, and the CPUs to pin
 /// them to; a pinning failure is counted in `counters`.
-fn bench_workers(
-    workers: Option<usize>,
+fn bench_threads(
+    threads: Option<usize>,
     server_cpus: ServerCpus,
-    counters: &crate::telemetry::RunCounters,
+    counters: &mipyre_server::ServerCounters,
 ) -> PyResult<(NonZeroUsize, Vec<CoreId>)> {
     let ServerCpus { cpus, pin_order, .. } = server_cpus;
-    let n = match workers {
+    let n = match threads {
         None => cpus.physical(),
         Some(n) => NonZeroUsize::new(n)
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("bench workers must be at least 1"))?,
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("bench threads must be at least 1"))?,
     };
-    crate::serve::report_pinning(&pin_order, n.get(), counters);
-    Ok((n, crate::serve::thread_cpus(&pin_order)))
+    mipyre_server::report_pinning(&pin_order, n.get(), counters);
+    Ok((n, mipyre_server::thread_cpus(&pin_order)))
 }
 
 impl App {
@@ -32,25 +32,28 @@ impl App {
         &self,
         py: Python<'_>,
         duration_s: u64,
-        workers: Option<usize>,
-        conns_per_worker: usize,
+        threads: Option<usize>,
+        conns_per_thread: usize,
     ) -> PyResult<(u64, f64)> {
         let env = crate::boot::ServerRecipe::of(
             Deployment::from_process(&[], EntryPoint::Embedded)?.over(&ServerFlags::default()),
         )?;
         let server_cpus = crate::boot::host_cpus();
         let counters = self.start_counters(env.tuning.metrics, &server_cpus);
-        let (n, core_ids) = bench_workers(workers, server_cpus, &counters)?;
-        let first = Arc::new(self.bench_site(py, Arc::clone(&counters))?);
+        let worker_counts = Arc::new(mipyre_runtime::WorkerCounters::new());
+        let (n, core_ids) = bench_threads(threads, server_cpus, &counters)?;
+        let first = Arc::new(self.bench_site(py, Arc::clone(&counters), Arc::clone(&worker_counts))?);
         let program = self.source.program(
             py,
-            crate::runtime::CommandLine::of_main(py)?,
+            mipyre_runtime::CommandLine::of_main(py)?,
             env.isolate_dir(crate::boot::user_cache_dir().as_deref()).as_deref(),
         )?;
         let recipe = Arc::new(crate::boot::worker_recipe(&program, &first, env.tuning.gc, &self.store));
         // Each worker gets its own copy of the site so no two cores share its refcount cache
         // line, while all copies share the run's counters.
-        let sites: Vec<Arc<Site>> = (1..n.get()).map(|_| Arc::new(first.for_thread(py))).collect();
+        let sites: Vec<Arc<Site>> = (1..n.get())
+            .map(|_| Arc::new(first.for_thread(|rules| mipyre_runtime::copy_rules(rules, py))))
+            .collect();
         let sites: Vec<Arc<Site>> = std::iter::once(first).chain(sites).collect();
 
         // The sites hold main-interpreter `Py<T>`s, so their last references must be dropped
@@ -60,12 +63,13 @@ impl App {
             recipe,
             sites,
             counters,
+            workers: worker_counts,
         };
         let duration = std::time::Duration::from_secs(duration_s);
         let measured = py
             .detach(move || {
                 crate::bench::run_inmem_bench(
-                    conns_per_worker,
+                    conns_per_thread,
                     duration,
                     paired,
                     &core_ids,
@@ -90,11 +94,12 @@ impl App {
         )?;
         let server_cpus = crate::boot::host_cpus();
         let counters = self.start_counters(env.tuning.metrics, &server_cpus);
-        let (_, core_ids) = bench_workers(Some(1), server_cpus, &counters)?;
-        let site: Arc<Site> = Arc::new(self.bench_site(py, counters)?);
+        let worker_counts = Arc::new(mipyre_runtime::WorkerCounters::new());
+        let (_, core_ids) = bench_threads(Some(1), server_cpus, &counters)?;
+        let site: Arc<Site> = Arc::new(self.bench_site(py, counters, Arc::clone(&worker_counts))?);
         let program = self.source.program(
             py,
-            crate::runtime::CommandLine::of_main(py)?,
+            mipyre_runtime::CommandLine::of_main(py)?,
             env.isolate_dir(crate::boot::user_cache_dir().as_deref()).as_deref(),
         )?;
         let recipe = Arc::new(crate::boot::worker_recipe(&program, &site, env.tuning.gc, &self.store));
@@ -102,7 +107,8 @@ impl App {
         let paired = crate::bench::BenchWorkers {
             recipe,
             sites: vec![Arc::clone(&site)],
-            counters: Arc::clone(&site.counters),
+            counters: Arc::clone(&site.counters.run),
+            workers: worker_counts,
         };
         drop(site);
         let duration = std::time::Duration::from_secs(duration_s);
@@ -142,7 +148,7 @@ impl App {
         &self,
         py: Python<'_>,
         duration_s: u64,
-        workers: Option<usize>,
+        threads: Option<usize>,
         client_conns: usize,
     ) -> PyResult<(u64, f64, u16)> {
         let env = crate::boot::ServerRecipe::of(
@@ -150,11 +156,12 @@ impl App {
         )?;
         let server_cpus = crate::boot::host_cpus();
         let counters = self.start_counters(env.tuning.metrics, &server_cpus);
-        let (n, core_ids) = bench_workers(workers, server_cpus, &counters)?;
-        let site: Arc<Site> = Arc::new(self.bench_site(py, counters)?);
+        let worker_counts = Arc::new(mipyre_runtime::WorkerCounters::new());
+        let (n, core_ids) = bench_threads(threads, server_cpus, &counters)?;
+        let site: Arc<Site> = Arc::new(self.bench_site(py, counters, Arc::clone(&worker_counts))?);
         let program = self.source.program(
             py,
-            crate::runtime::CommandLine::of_main(py)?,
+            mipyre_runtime::CommandLine::of_main(py)?,
             env.isolate_dir(crate::boot::user_cache_dir().as_deref()).as_deref(),
         )?;
         let recipe = Arc::new(crate::boot::worker_recipe(&program, &site, env.tuning.gc, &self.store));
@@ -166,7 +173,8 @@ impl App {
         let workers = crate::bench::BenchWorkers {
             recipe,
             sites,
-            counters: Arc::clone(&site.counters),
+            counters: Arc::clone(&site.counters.run),
+            workers: worker_counts,
         };
         let duration = std::time::Duration::from_secs(duration_s);
         let (measured, port) = py
@@ -178,9 +186,14 @@ impl App {
 
     /// Returns the sealed site a bench serves; every route must be sync, off the GIL and not
     /// streaming, because the benches run only the TPC inline path.
-    fn bench_site(&self, py: Python<'_>, counters: Arc<crate::telemetry::RunCounters>) -> PyResult<Site> {
+    fn bench_site(
+        &self,
+        py: Python<'_>,
+        counters: Arc<mipyre_server::ServerCounters>,
+        workers: Arc<mipyre_runtime::WorkerCounters>,
+    ) -> PyResult<Site> {
         self.seal_if_unsealed();
-        let site = self.snapshot(py, counters)?;
+        let site = self.snapshot(py, counters, workers)?;
         if !mipyre_http::plan::route::PlaceCounts::of(&site.rules.routes).all_inline_sync() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "the benches support only sync, non-GIL, non-stream routes",

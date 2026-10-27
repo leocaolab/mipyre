@@ -1,4 +1,4 @@
-"""Flags the app declares (docs/design/flags.md, b/890): declared where they are used, parsed once on
+"""Flags the app declares: declared where they are used, parsed once on
 main, and the same in every interpreter that runs the app — main, each sub-interpreter, each process
 worker started by import or by fork. Each end-to-end test runs a real `mipyre run`, a script, or a test
 process of its own (a template forks only from a single-threaded process); the rest feed the pure parts
@@ -34,7 +34,7 @@ from mipyre.flags import (
     _Site,
     _split_command_line,
 )
-from tests._helpers import bound_port, read_file
+from tests._helpers import bound_port, free_port_below_ephemeral, read_file
 
 STARTS = ["import", "fork"]
 
@@ -175,7 +175,7 @@ GIVEN = ["--db-dsn", "x", "--n", "7", "--ratio", "0.25", "--on", "--tags", "a,b"
 
 @pytest.mark.parametrize("start", STARTS)
 def test_every_interpreter_reads_the_flags_mipyre_run_parsed(tmp_path, start):
-    """E2E-1: main, a sub-interpreter and a process worker read the same values and argv, and the
+    """main, a sub-interpreter and a process worker read the same values and argv, and the
     app's runtime came from a flag read at module level."""
     app_file = _write(tmp_path, "app.py", _RUN_APP)
     seen = _answers(
@@ -190,11 +190,9 @@ def test_every_interpreter_reads_the_flags_mipyre_run_parsed(tmp_path, start):
 
 
 def test_a_mistyped_flag_refuses_the_command_line_before_anything_binds(tmp_path):
-    """E2E-3: exit status 2 naming the argument, and the port is still free."""
+    """exit status 2 naming the argument, and the port is still free."""
     _write(tmp_path, "app.py", _RUN_APP)
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
+    port = free_port_below_ephemeral()
     proc, output = _serve(tmp_path, _mipyre_run("--port", str(port), "--db-dns", "x"))
     assert proc.wait() == 2
     assert "unrecognized arguments: --db-dns x" in output(), output()
@@ -203,7 +201,6 @@ def test_a_mistyped_flag_refuses_the_command_line_before_anything_binds(tmp_path
 
 
 def test_help_lists_mipyre_s_options_and_the_app_s_flags(tmp_path):
-    """E2E-4."""
     _write(tmp_path, "app.py", _RUN_APP)
     done = subprocess.run(_mipyre_run("--help"), cwd=tmp_path, capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
@@ -219,7 +216,7 @@ def test_help_without_a_target_lists_mipyre_s_options():
 
 @pytest.mark.parametrize("start", STARTS)
 def test_a_script_that_parses_its_flags_shares_them_with_every_interpreter(tmp_path, start):
-    """E2E-5: `python app.py` with `flags.parse()`; what follows `--` is the script's."""
+    """`python app.py` with `flags.parse()`; what follows `--` is the script's."""
     _write(tmp_path, "app.py", _RUN_APP)
     seen = _answers(
         tmp_path,
@@ -233,7 +230,7 @@ def test_a_script_that_parses_its_flags_shares_them_with_every_interpreter(tmp_p
 
 
 def test_a_script_that_declares_no_flag_keeps_its_own_command_line(tmp_path):
-    """E2E-5: mipyre does not read the argv of a script that never declared a flag."""
+    """mipyre does not read the argv of a script that never declared a flag."""
     _write(tmp_path, "app.py", textwrap.dedent('''
         import argparse
         import sys
@@ -255,7 +252,7 @@ def test_a_script_that_declares_no_flag_keeps_its_own_command_line(tmp_path):
 
 
 def test_a_script_that_never_parses_reads_no_flag_in_any_interpreter(tmp_path):
-    """q/116 A, unchanged by b/912: `python app.py` without `flags.parse()` serves, and a flag read
+    """`python app.py` without `flags.parse()` serves, and a flag read
     on main, in a sub-interpreter or in a process worker raises UnparsedFlagError; its default is
     a test's only."""
     _write(tmp_path, "app.py", _FLAGS + '''
@@ -276,7 +273,7 @@ if __name__ == "__main__":
 
 
 def test_a_flag_declared_only_where_a_worker_imports_it_fails_naming_it(tmp_path):
-    """E2E-6: the lazy import in a process handler raises, naming the flag and its module."""
+    """the lazy import in a process handler raises, naming the flag and its module."""
     _write(tmp_path, "app.py", _RUN_APP)
     lazy = _write(tmp_path, "lazy_flag.py", _LAZY_FLAG)
     seen = _answers(tmp_path, _mipyre_run("--port", "0", "--process-workers", "1"), ("/lazy",))
@@ -285,7 +282,7 @@ def test_a_flag_declared_only_where_a_worker_imports_it_fails_naming_it(tmp_path
 
 
 def test_a_worker_declaring_another_default_fails_to_start_naming_the_flag(tmp_path):
-    """E2E-6: the same flag with another default in a sub-interpreter is refused, not given main's value."""
+    """the same flag with another default in a sub-interpreter is refused, not given main's value."""
     _write(tmp_path, "app.py", textwrap.dedent('''
         from mipyre import Mipyre, flags
         from mipyre.engine import _in_worker
@@ -368,9 +365,9 @@ _DEFAULTS: dict[str, object] = {"db_dsn": None, "n": 3, "ratio": 0.5, "on": Fals
 
 
 def test_a_test_s_overrides_reach_every_runtime_of_each_run(tmp_path):
-    """E2E-7, E2E-9 and test-server.md FR-7: each run's workers get that run's overrides (process
+    """Each run's workers get that run's overrides (process
     workers too: one template starts every run's), and every flag no override sets is its
-    declared default (b/912: the test runner's argv is never read); none survive their `with`
+    declared default (the test runner's argv is never read); none survive their `with`
     (outside a server an unparsed flag still raises), and none can change while a server holds
     the values. Process workers that import the app: a fork template's runs must all have the same
     values (the next test)."""
@@ -542,7 +539,7 @@ def test_a_server_gets_the_overridden_values_and_holds_them():
 
 
 def test_a_test_s_server_gives_every_flag_nothing_parsed_its_default():
-    """b/912: the empty command line, parsed; an override still goes over it. While the server
+    """The empty command line, parsed; an override still goes over it. While the server
     holds the values main reads them too, and after it stops an unparsed read raises again."""
     registry = _Registry()
     dsn = registry.declare(_decl(default="d"))

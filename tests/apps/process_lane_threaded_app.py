@@ -3,7 +3,7 @@ thread pools in the importing process) and serves one process route."""
 
 import polars as pl
 
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 df = pl.DataFrame({"k": [1, 1, 2], "v": [1.0, 2.0, 3.0]})
 df.group_by("k").agg(pl.col("v").sum())
@@ -17,4 +17,4 @@ def q(req):
 
 
 if __name__ == "__main__":
-    app.run(port=0)
+    app.run(ServerFlags(port=0))

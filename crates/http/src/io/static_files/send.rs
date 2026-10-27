@@ -9,6 +9,7 @@ use std::hash::{DefaultHasher, Hasher};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -40,11 +41,11 @@ impl HeldBytes {
 /// count when the connection drops the last reference.
 struct HeldChunk {
     bytes: Vec<u8>,
-    held: &'static HeldBytes,
+    held: Arc<HeldBytes>,
 }
 
 impl HeldChunk {
-    fn into_bytes(bytes: Vec<u8>, held: &'static HeldBytes) -> Bytes {
+    fn into_bytes(bytes: Vec<u8>, held: Arc<HeldBytes>) -> Bytes {
         held.0.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Bytes::from_owner(Self { bytes, held })
     }
@@ -183,13 +184,13 @@ struct Transfer {
     path: PathBuf,
     disk: Disk,
     check: SendCheck,
-    held: &'static HeldBytes,
+    held: Arc<HeldBytes>,
 }
 
 impl FileBody {
     /// Sends `len` bytes of `file` from where it stands; they must hash to `announced`. `len` is
     /// not zero: an empty file is answered with an empty whole body.
-    pub(super) fn new(file: File, path: PathBuf, len: u64, announced: u64, held: &'static HeldBytes) -> Self {
+    pub(super) fn new(file: File, path: PathBuf, len: u64, announced: u64, held: Arc<HeldBytes>) -> Self {
         Self(Box::new(Transfer {
             path,
             disk: Disk::Idle(file),
@@ -212,6 +213,19 @@ fn read_chunk(file: File, want: u64) -> (File, io::Result<Vec<u8>>) {
 }
 
 impl Transfer {
+    /// Takes a finished read: the frame of its chunk, or the cut that ends the answer.
+    #[inline]
+    fn take_read(&mut self, file: File, read: io::Result<Vec<u8>>) -> Result<Frame<Bytes>, FileSendError> {
+        let chunk = read.map_err(|source| self.cut(ChunkError::Unreadable(source)))?;
+        match self.check.on_chunk(&chunk) {
+            ChunkVerdict::More => self.disk = Disk::Idle(file),
+            ChunkVerdict::Last => {}
+            ChunkVerdict::Changed => return Err(self.cut(ChunkError::Changed)),
+            ChunkVerdict::EndedEarly => return Err(self.cut(ChunkError::EndedEarly)),
+        }
+        Ok(Frame::data(HeldChunk::into_bytes(chunk, Arc::clone(&self.held))))
+    }
+
     /// Ends the answer; the state is already `Done`, since every poll takes the disk out first.
     fn cut(&mut self, cause: ChunkError) -> FileSendError {
         FileSendError {
@@ -219,6 +233,27 @@ impl Transfer {
             sent: self.check.sent,
             len: self.check.len,
             cause,
+        }
+    }
+}
+
+/// Lets a bench count a send's reads and checks apart from the hand-offs to the blocking pool,
+/// whose wake-ups follow timing.
+impl FileBody {
+    /// Reads and judges the next chunk on the calling thread, as a trip to the blocking pool
+    /// does; `None` once the body has ended or while a read is on the pool.
+    #[doc(hidden)]
+    pub fn next_frame_here(&mut self) -> Option<Result<Frame<Bytes>, FileSendError>> {
+        let transfer = &mut *self.0;
+        match std::mem::replace(&mut transfer.disk, Disk::Done) {
+            Disk::Idle(file) => {
+                let (file, read) = read_chunk(file, transfer.check.next_read());
+                Some(transfer.take_read(file, read))
+            }
+            other => {
+                transfer.disk = other;
+                None
+            }
         }
     }
 }
@@ -241,22 +276,11 @@ impl Body for FileBody {
                         transfer.disk = Disk::Reading(read);
                         return Poll::Pending;
                     };
-                    let (file, chunk) = match finished {
-                        Ok((file, Ok(chunk))) => (file, chunk),
-                        Ok((_, Err(source))) => {
-                            return Poll::Ready(Some(Err(transfer.cut(ChunkError::Unreadable(source)))))
-                        }
+                    let (file, read) = match finished {
+                        Ok(done) => done,
                         Err(join) => return Poll::Ready(Some(Err(transfer.cut(ChunkError::Unfinished(join))))),
                     };
-                    match transfer.check.on_chunk(&chunk) {
-                        ChunkVerdict::More => transfer.disk = Disk::Idle(file),
-                        ChunkVerdict::Last => {}
-                        ChunkVerdict::Changed => return Poll::Ready(Some(Err(transfer.cut(ChunkError::Changed)))),
-                        ChunkVerdict::EndedEarly => {
-                            return Poll::Ready(Some(Err(transfer.cut(ChunkError::EndedEarly))))
-                        }
-                    }
-                    return Poll::Ready(Some(Ok(Frame::data(HeldChunk::into_bytes(chunk, transfer.held)))));
+                    return Poll::Ready(Some(transfer.take_read(file, read)));
                 }
             }
         }
@@ -337,6 +361,14 @@ mod tests {
         assert_eq!(check.on_chunk(&file[..CHUNK]), ChunkVerdict::More);
         assert_eq!(check.next_read(), 1);
         assert_eq!(check.on_chunk(&file[CHUNK..]), ChunkVerdict::Last);
+    }
+
+    #[test]
+    fn a_file_of_one_chunk_is_read_in_one_trip() {
+        let file = vec![1u8; CHUNK];
+        let mut check = check(file.len() as u64, &file);
+        assert_eq!(check.next_read(), CHUNK as u64);
+        assert_eq!(check.on_chunk(&file), ChunkVerdict::Last);
     }
 
     /// One byte changed in the first chunk is caught at the last one, before it is sent.

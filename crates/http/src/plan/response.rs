@@ -1,6 +1,5 @@
 //! Builds the HTTP responses for a handler's result and for the errors the engine answers by itself.
 
-use std::fmt::Display;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -9,6 +8,7 @@ use http::{Response, StatusCode};
 
 use crate::plan::header::MAX_HEADER_LINES;
 use crate::plan::reject::{RouteMiss, SiteMiss};
+use crate::plan::request_id::RequestId;
 
 pub const SERVER_HEADER: &str = concat!("Mipyre/", env!("CARGO_PKG_VERSION"));
 
@@ -22,7 +22,7 @@ const SERVER_LINES: usize = 16;
 
 /// The most header lines a handler's response carries (`Response`, a stream, an `HTTPException`,
 /// a route's fast response), so that with the server's own lines the response's header map stays
-/// within [`MAX_HEADER_LINES`]; past it the handler gets an error, never a panic (b/927).
+/// within [`MAX_HEADER_LINES`]; past it the handler gets an error, never a panic.
 pub const MAX_HANDLER_LINES: usize = MAX_HEADER_LINES - SERVER_LINES;
 
 /// The `Retry-After` of an overload 503, in seconds.
@@ -134,7 +134,7 @@ pub fn build_response(data: HandlerResponse) -> Response<Bytes> {
 
 /// Returns a 500 carrying the request id, which the client can quote to an operator to find
 /// the real error in the log.
-pub fn error_response(msg: &str, request_id: &impl Display) -> Response<Bytes> {
+pub fn error_response(msg: &str, request_id: &RequestId) -> Response<Bytes> {
     json_error(StatusCode::INTERNAL_SERVER_ERROR, server_error_body(msg, request_id))
 }
 
@@ -154,7 +154,7 @@ fn error_json_body(msg: &str) -> Vec<u8> {
     reason = "JsonEscaper never fails a write, so only a Display impl that fails on its own could: \
               that is a broken Display, which `to_string` panics on too"
 )]
-fn server_error_body(msg: &str, request_id: &impl Display) -> Vec<u8> {
+fn server_error_body(msg: &str, request_id: &RequestId) -> Vec<u8> {
     use std::fmt::Write as _;
     let mut body = Vec::with_capacity(ERROR_BODY_ROOM + msg.len());
     body.extend_from_slice(b"{\"detail\":\"");
@@ -215,7 +215,7 @@ fn escape_json_into(out: &mut Vec<u8>, s: &str) {
 
 /// Returns a 503 for a request no queue slot or permit was free for.
 #[inline]
-pub fn overloaded_response(msg: &str, request_id: &impl Display) -> Response<Bytes> {
+pub fn overloaded_response(msg: &str, request_id: &RequestId) -> Response<Bytes> {
     let mut resp = json_error(StatusCode::SERVICE_UNAVAILABLE, server_error_body(msg, request_id));
     resp.headers_mut().insert(RETRY_AFTER, OVERLOAD_RETRY_AFTER_SECS);
     resp
@@ -230,7 +230,7 @@ pub fn retry_after_secs(wait: Duration) -> u64 {
 
 /// Returns a 503 for a request whose workers come back after `wait`.
 #[inline]
-pub fn retry_later_response(msg: &str, request_id: &impl Display, wait: Duration) -> Response<Bytes> {
+pub fn retry_later_response(msg: &str, request_id: &RequestId, wait: Duration) -> Response<Bytes> {
     let mut resp = json_error(StatusCode::SERVICE_UNAVAILABLE, server_error_body(msg, request_id));
     resp.headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from(retry_after_secs(wait)));
@@ -239,7 +239,7 @@ pub fn retry_later_response(msg: &str, request_id: &impl Display, wait: Duration
 
 /// Returns a 503 for a request whose workers are gone because the server is shutting down.
 #[inline]
-pub fn unavailable_response(msg: &str, request_id: &impl Display) -> Response<Bytes> {
+pub fn unavailable_response(msg: &str, request_id: &RequestId) -> Response<Bytes> {
     json_error(StatusCode::SERVICE_UNAVAILABLE, server_error_body(msg, request_id))
 }
 
@@ -272,7 +272,7 @@ pub fn payload_too_large_response() -> Response<Bytes> {
 
 /// Returns a 502 for a request whose process-lane worker died while running it.
 #[inline]
-pub fn bad_gateway_response(request_id: &impl Display) -> Response<Bytes> {
+pub fn bad_gateway_response(request_id: &RequestId) -> Response<Bytes> {
     json_error(
         StatusCode::BAD_GATEWAY,
         server_error_body("worker process died", request_id),
@@ -280,7 +280,7 @@ pub fn bad_gateway_response(request_id: &impl Display) -> Response<Bytes> {
 }
 
 #[inline]
-pub fn gateway_timeout_response(request_id: &impl Display) -> Response<Bytes> {
+pub fn gateway_timeout_response(request_id: &RequestId) -> Response<Bytes> {
     json_error(
         StatusCode::GATEWAY_TIMEOUT,
         server_error_body("request timeout", request_id),
@@ -362,6 +362,8 @@ pub fn head_headers(headers: &mut HeaderMap, status: StatusCode, body_len: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::request_id::{ClientRequestId, ServerRequestId};
+
     fn body_bytes(resp: Response<Bytes>) -> Vec<u8> {
         resp.into_body().to_vec()
     }
@@ -404,7 +406,10 @@ mod tests {
         assert_eq!(not_modified.get(CONTENT_LENGTH), None);
     }
 
-    const REQUEST_ID: &str = "7f3c0a5e9b1d4e2f";
+    const REQUEST_ID: RequestId = RequestId::Server(ServerRequestId {
+        process: 0x7f3c_0a5e_9b1d_4e2f,
+        number: 42,
+    });
 
     #[test]
     fn not_found_status_and_body() {
@@ -425,10 +430,11 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({ "detail": msg })).unwrap(),
                 "{msg:?}"
             );
-            for id in [REQUEST_ID, nasty.as_str()] {
+            let client = RequestId::Client(ClientRequestId::parse("Root=1-5759e988;a_b.c:d/e+f@g~h").unwrap());
+            for id in [REQUEST_ID, client] {
                 assert_eq!(
                     server_error_body(msg, &id),
-                    serde_json::to_vec(&serde_json::json!({ "detail": msg, "request_id": id })).unwrap(),
+                    serde_json::to_vec(&serde_json::json!({ "detail": msg, "request_id": id.to_string() })).unwrap(),
                     "{msg:?} {id:?}"
                 );
             }

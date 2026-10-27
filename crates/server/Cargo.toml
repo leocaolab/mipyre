@@ -1,0 +1,70 @@
+[package]
+name = "mipyre_server"
+description = "The HTTP server: turns HTTP on a connection into requests and writes the answers back, on the TPC or the multi-thread topology, with WebSocket, gRPC, compression and the stop signal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# The in-process throughput harnesses' entry points (`drive_conn`, `serve_on_workers`, the inline accept loop); the
+# engine's `bench` turns it on.
+bench = []
+
+# No pyo3: a handler is held as mipyre_runtime's `Handler` / `Routes`.
+[dependencies]
+mipyre_cpu = { path = "../cpu" }
+mipyre_tpc = { path = "../tpc" }
+# The stack a thread that may run Python gets, the GC policy of a TPC thread, and its attach and detach around idle.
+mipyre_subinterp = { path = "../subinterp" }
+mipyre_http = { path = "../http" }
+mipyre_transport = { path = "../transport" }
+mipyre_util = { path = "../util" }
+mipyre_core = { path = "../core" }
+mipyre_process = { path = "../process" }
+mipyre_runtime = { path = "../runtime" }
+# The run's Postgres pools a site hands its handlers.
+mipyre_pg = { path = "../pg" }
+# Not "full": its "process" feature makes every runtime's driver call
+# `GlobalOrphanQueue::reap_orphans` on each park, which try-locks and locks two
+# process-wide mutexes — every TPC thread, every time it waits for IO (seen as the
+# top user-space HITM line in `perf c2c`). Nothing here spawns child processes
+# through tokio.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util", "io-std", "fs", "parking_lot"] }
+hyper = { version = "1.11", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+http-body-util = "0.1"
+bytes = "1"
+serde_json = "1"
+# The access log's numbers, as serde_json writes them (access_line.rs).
+itoa = "1"
+parking_lot = "0.12"
+percent-encoding = "2"
+crossbeam-utils = "0.8"
+tokio-tungstenite = "0.26"
+tungstenite = "0.26"
+futures-util = "0.3"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+libc = "0.2"
+# A run's own stop signals (`stop.rs`): a byte on its own socket for each one.
+signal-hook = { version = "0.3", default-features = false }
+# Times answers by the CPU's counter (`site.rs`).
+quanta = { version = "0.12", default-features = false }
+thiserror = "2"
+core_affinity = "0.8"
+tokio-rustls = "0.26"
+pin-project-lite = "0.2"
+
+[dev-dependencies]
+mipyre_runtime = { path = "../runtime", features = ["testkit"] }
+# Two tests only (error_response.rs, tpc/threads.rs): they hold the GIL or read CPython's thread state to show a
+# panic leaves no Python attached. The package itself names no pyo3.
+pyo3 = "0.29"
+mipyre_shm = { path = "../shm" }
+proptest = "1"
+tokio = { version = "1", features = ["test-util"] }
+
+[lints]
+workspace = true

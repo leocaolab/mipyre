@@ -20,6 +20,7 @@ Step-by-step tutorials.
 | [Compatibility](compatibility.md) | which libraries load in a sub-interpreter, how to check one, and the PyO3 fork mipyre is built with |
 | [Integrations](integrations.md) | mipyre with proxies, databases, caches, Kubernetes and cloud services |
 | [Observability](observability.md) | logs, metrics and tracing |
+| [Troubleshooting](troubleshooting.md) | the common errors when installing, starting, serving TLS and logging: what each means and how to fix it |
 | [Limitations](limitations.md) | platforms, per-runtime limits, missing command-line flags, and known issues |
 
 ## Elsewhere in the repository

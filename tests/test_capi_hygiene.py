@@ -1,20 +1,14 @@
 """Integration tests for CPython C-API hygiene on the handler call path.
 
-These exercise edge cases that a Haskell-style linearity / exception-state
-audit flagged as latent SystemError / segfault bombs:
+These exercise edge cases that would surface as SystemError or a segfault:
 
-  1. `parse_sky_response` iterates response.headers with PyDict_Next and
-     calls PyObject_Str on each key/value. PyObject_Str runs user
-     __str__ which could mutate the dict (CPython docs forbid this
-     during iteration). Fix: snapshot borrowed refs, iterate after.
+  - Reading response.headers calls PyObject_Str on each key/value, which runs
+    app `__str__` code that could mutate the dict; it must not run inside a
+    PyDict_Next loop.
+  - `PyObject_IsInstance` returning -1 (error) must clear the pending exception.
 
-  4. `parse_result` used `PyObject_IsInstance(ptr, resp_cls) == 1`;
-     the `-1` (error) case silently fell through without clearing the
-     pending exception. Fix: handle -1 explicitly.
-
-Bugs #2 and #3 (py_str_dict exception clearing + PyDict_SetItem return
-value) are hard to force without OOM injection; those paths are
-defensively fixed in the source but not directly tested here.
+Exception clearing in the str-dict conversion and PyDict_SetItem's return value
+are hard to force without OOM injection and are not tested here.
 """
 
 import http.client
@@ -35,7 +29,7 @@ PYTHON = sys.executable
 def _launch(script: str) -> tuple[subprocess.Popen, int]:
     """Start a Mipyre server with `script` contents on port 0, wait for its /health answer.
     Returns the process and the port it bound."""
-    # Mipyre needs `__main__.__file__` to locate the user script for its
+    # Mipyre needs `__main__.__file__` to locate the app script for its
     # sub-interp loader. `python -c` leaves __file__ unset, so we write
     # the script to a temp file and run it as a module file.
     tf = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
@@ -57,7 +51,7 @@ def _launch(script: str) -> tuple[subprocess.Popen, int]:
         proc.wait()
         raise RuntimeError(f"server failed to start:\n{e}") from None
     # Listening means its sockets are bound and its workers started: one request, waited for
-    # by its answer, not for a length of time (b/325).
+    # by its answer, not for a length of time.
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as r:
         assert r.status == 200, r.status
     return proc, port
@@ -83,22 +77,18 @@ def _kill(proc: subprocess.Popen) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Bug #1 — PyDict_Next + PyObject_Str reentrancy
+# PyDict_Next + PyObject_Str reentrancy
 # -----------------------------------------------------------------------------
 #
 # A handler returns a _Response whose `headers` dict contains a key
-# whose `__str__` mutates the headers dict. Before the fix, the Rust
-# iterator inside parse_sky_response called PyObject_Str inside the
-# PyDict_Next loop — the user's __str__ mutation would invalidate the
-# dict's internal pointers → segfault / UB.
-#
-# After the fix: we snapshot borrowed refs during iteration and call
-# PyObject_Str afterwards, so the mutation (if any) happens on an
-# unrelated state. The server stays up.
+# whose `__str__` mutates the headers dict. Calling PyObject_Str inside
+# the PyDict_Next loop would let that mutation invalidate the dict's
+# internal pointers; the keys are taken first and converted afterwards,
+# so the server stays up.
 
 REENTRANCY_SERVER = """
 from mipyre import Mipyre
-from mipyre.engine import Response
+from mipyre.engine import Response, ServerFlags
 import os
 
 app = Mipyre()
@@ -125,7 +115,7 @@ def reentrant(req):
     return Response(body='ok', status_code=200, headers=resp_headers)
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=int(os.environ['MIPYRE_PORT']))
+    app.run(ServerFlags(host='127.0.0.1', port=int(os.environ['MIPYRE_PORT'])))
 """
 
 
@@ -151,21 +141,17 @@ def test_pydict_next_mutating_str_does_not_crash():
 
 
 # -----------------------------------------------------------------------------
-# Bug #4 — PyObject_IsInstance returning -1
+# PyObject_IsInstance returning -1
 # -----------------------------------------------------------------------------
 #
 # A handler returns a custom object whose metaclass raises in
-# __instancecheck__. The `isinstance(x, _Response)` check inside
-# parse_result would observe return value -1. Before the fix the code
-# treated -1 as "not an instance" but left a pending exception — the
-# next C-API call then raised SystemError.
-#
-# After the fix: -1 clears the pending exception and falls through to
-# the duck-type path. The server returns a 500 cleanly (not SystemError
-# spam or a crash).
+# __instancecheck__, so the `isinstance(x, _Response)` check sees -1.
+# Treating -1 as "not an instance" would leave a pending exception for
+# the next C-API call to raise as SystemError; the server returns a 500
+# cleanly instead.
 
 INSTANCECHECK_SERVER = """
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 import os
 
 app = Mipyre()
@@ -192,11 +178,11 @@ def badcheck(req):
     # that's a per-class thing we can't inject from user land.
     #
     # So this test just verifies the duck-type path handles a non-
-    # response cleanly as a sanity check alongside bug #1.
+    # response cleanly as a sanity check.
     return NotQuiteResponse.__class__.__call__(NotQuiteResponse)
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=int(os.environ['MIPYRE_PORT']))
+    app.run(ServerFlags(host='127.0.0.1', port=int(os.environ['MIPYRE_PORT'])))
 """
 
 
@@ -219,17 +205,15 @@ def test_handler_returns_weird_object_server_stays_up():
 
 
 # -----------------------------------------------------------------------------
-# Bug #26 — PyDict_Clear assumes dict type
+# PyDict_Clear on a slot that is not a dict
 # -----------------------------------------------------------------------------
 #
 # `_Request.__init__` accepts 7 positional PyObject* args via
-# PyArg_ParseTuple "OOOOOOO" — no type checks. User code could stash a
-# string where a dict is expected. tp_dealloc previously called
-# PyDict_Clear unconditionally → segfault on non-dict slot.
-# Fix: PyDict_Check guard before PyDict_Clear.
+# PyArg_ParseTuple "OOOOOOO" — no type checks. App code could stash a
+# string where a dict is expected; tp_dealloc must not PyDict_Clear it.
 
 WRONG_TYPE_SERVER = """
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 import os
 
 app = Mipyre()
@@ -241,7 +225,6 @@ def health(req):
 @app.get("/abuse")
 def abuse(req):
     # Construct _Request with a string where headers dict is expected.
-    # Before the fix, tp_dealloc would PyDict_Clear the string → segfault.
     from builtins import type as _type
     try:
         cls = _type(req)   # _Request class
@@ -254,7 +237,7 @@ def abuse(req):
     return {"ok": True}
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=int(os.environ['MIPYRE_PORT']))
+    app.run(ServerFlags(host='127.0.0.1', port=int(os.environ['MIPYRE_PORT'])))
 """
 
 
@@ -274,11 +257,11 @@ def test_mipyrerequest_constructed_with_wrong_types_does_not_crash():
 
 
 # -----------------------------------------------------------------------------
-# Bug #22 — path params URL-decoded
+# Path params URL-decoded
 # -----------------------------------------------------------------------------
 
 URL_DECODE_SERVER = """
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 import json, os
 
 app = Mipyre()
@@ -292,7 +275,7 @@ def user(req):
     return {"name": req.params["name"]}
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=int(os.environ['MIPYRE_PORT']))
+    app.run(ServerFlags(host='127.0.0.1', port=int(os.environ['MIPYRE_PORT'])))
 """
 
 
@@ -304,7 +287,7 @@ def test_path_params_are_url_decoded():
             import json as _json
             body = _json.loads(r.read())
             assert body["name"] == "john doe", body
-        # %E4%B8%AD → 中 (UTF-8)
+        # Percent-encoded UTF-8 in a path param comes out decoded.
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/user/%E4%B8%AD%E6%96%87") as r:
             import json as _json
             body = _json.loads(r.read())
@@ -314,11 +297,11 @@ def test_path_params_are_url_decoded():
 
 
 # -----------------------------------------------------------------------------
-# Bug #27 — async before_request hook
+# Async before_request hook
 # -----------------------------------------------------------------------------
 
 ASYNC_HOOK_SERVER = """
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 import os
 
 app = Mipyre()
@@ -340,7 +323,7 @@ def hi(req):
     return "hello"
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=int(os.environ['MIPYRE_PORT']))
+    app.run(ServerFlags(host='127.0.0.1', port=int(os.environ['MIPYRE_PORT'])))
 """
 
 
@@ -349,9 +332,8 @@ def test_async_before_request_hook_does_not_short_circuit():
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/hi") as r:
             body = r.read()
-            # Before the fix: body == b"<coroutine object audit at 0x...>"
-            # After the fix: the coroutine was awaited, returned None, main
-            # handler ran, body == "hello".
+            # The coroutine was awaited and returned None, so the handler ran; a
+            # hook's coroutine taken as the response would be "<coroutine object ...>".
             assert body == b"hello", body
     finally:
         _kill(proc)

@@ -1,4 +1,4 @@
-"""`runtime="isolated"` (design §14), the main interpreter's side: BLAS threads.
+"""`runtime="isolated"`, the main interpreter's side: BLAS threads.
 
 With isolated libraries every sub-interpreter calls into the same BLAS library, whose pool
 is sized to all cores by default: the server process limits it to one thread per worker

@@ -1,12 +1,13 @@
-"""E2E-8 (Layer 2, M0): main-side routes keep working once workers execute the engine.
+"""Main-side routes keep working once workers execute the engine.
 
 Runs `_l2_main_side_app.py`, whose workers load the real `mipyre.engine`, then drives
 worker routes, sync and async `runtime="main"` routes, a WebSocket echo and `/metrics`
 concurrently, stops the server with SIGINT, and scans the whole log for the PyO3 fork's
 panic texts.
 
-Before M0 this failed: the GIL-bridge and WebSocket threads attached with a bare
-`Python::attach` and the fork refused it (`spike/layer2-r3`, `spike/R3-RESULTS.md`).
+
+GIL-bridge and WebSocket threads must not attach with a bare `Python::attach`: the fork
+refuses it.
 """
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATHS = ("/w", "/g", "/ga", "/metrics")
-# The load, by count (b/441; until then 8 s of it, as many requests as the machine managed):
+# The load, by count, not by time:
 # each of `CLIENTS` threads sends every path `ROUNDS` times.
 CLIENTS = 16
 ROUNDS = 25

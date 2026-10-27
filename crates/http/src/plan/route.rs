@@ -4,7 +4,9 @@
 //! The table is generic over the handler `H` and the static mount `D` without bounds, because
 //! nothing here calls a handler or reads a file.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::Range;
 
 use bytes::Bytes;
 use http::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, SERVER};
@@ -195,6 +197,28 @@ pub enum WsRouteError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WsRouteId(usize);
 
+/// Where a WebSocket route's handler runs: on a sub-interpreter worker's async engine, or on
+/// main's (`runtime="main"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WsPlace {
+    Worker,
+    Main,
+}
+
+/// A WebSocket route as a worker must have it at the same index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WsRoute {
+    pub path: String,
+    pub place: WsPlace,
+}
+
+impl WsRouteId {
+    /// Returns the position among the table's WebSocket routes in registration order.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// A route's index in its [`RouteTable`]; only the table makes one, so it always names one of its
 /// routes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,8 +371,75 @@ impl std::fmt::Display for RouteKey {
     }
 }
 
-/// The path parameters of a matched route, percent-decoded.
-pub type Params = Vec<(String, String)>;
+/// The path parameters of a matched route: each one's name, and where its value sits in the
+/// path, still percent-encoded, so a value is decoded only when a handler reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Params {
+    found: Vec<Param>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Param {
+    name: Box<str>,
+    value: Range<usize>,
+}
+
+impl Params {
+    pub fn new() -> Self {
+        Params::default()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.found.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.found.is_empty()
+    }
+
+    /// Adds the parameter `name`, whose value is the bytes at `value` in the path.
+    pub fn push(&mut self, name: &str, value: Range<usize>) {
+        self.found.push(Param {
+            name: name.into(),
+            value,
+        });
+    }
+
+    /// Returns each parameter's name and where its value sits in the path, in the template's order.
+    pub fn located(&self) -> impl Iterator<Item = (&str, Range<usize>)> {
+        self.found.iter().map(|p| (&*p.name, p.value.clone()))
+    }
+
+    /// Returns each parameter's name and its value in `path` percent-decoded, invalid UTF-8 as
+    /// U+FFFD so a literal `%` from `%25` cannot be confused with a failed decode; a value is
+    /// `None` when its place is not in `path`, which is not the path the route matched.
+    pub fn decoded<'a>(&'a self, path: &'a str) -> impl Iterator<Item = (&'a str, Option<Cow<'a, str>>)> {
+        self.located().map(move |(name, at)| {
+            let value = path
+                .get(at)
+                .map(|raw| percent_encoding::percent_decode_str(raw).decode_utf8_lossy());
+            (name, value)
+        })
+    }
+
+    /// Records where each matched value sits in `path`. matchit hands every value as a slice of
+    /// the path it matched; were one not, its place would lie outside the path, and reading it
+    /// says so rather than handing out bytes from elsewhere.
+    fn of_match(path: &str, matched: &matchit::Params<'_, '_>) -> Params {
+        let mut params = Params::new();
+        if matched.is_empty() {
+            return params;
+        }
+        params.found.reserve_exact(matched.len());
+        for (name, value) in matched.iter() {
+            let start = value.as_ptr().addr().wrapping_sub(path.as_ptr().addr());
+            params.push(name, start..start.wrapping_add(value.len()));
+        }
+        params
+    }
+}
 
 const GET_SLOT: usize = 0;
 const HEAD_SLOT: usize = 5;
@@ -392,18 +483,28 @@ impl<T> ByMethod<T> {
     /// case-sensitive (RFC 9110 §9.1); a `HEAD` it finds nothing for takes the `GET` one, whose
     /// body the pipeline drops (RFC 9110 §9.3.2).
     // The engine's request pipeline is one large async fn, where the inliner otherwise leaves
-    // this a call per request.
+    // this a call per request. The two rare branches stay calls, so only the lookup that hits
+    // lands in that function.
     #[inline(always)]
     fn serving<'s, R>(&'s self, method: &Method, at: impl Fn(&'s T) -> Option<R>) -> Option<R> {
         let Some(slot) = standard_slot(method) else {
-            let (_, value) = self.other.iter().find(|(m, _)| m == method)?;
-            return at(value);
+            return self.serving_other(method, at);
         };
-        let found = self.standard[slot].as_ref().and_then(&at);
-        if found.is_none() && slot == HEAD_SLOT {
-            return self.standard[GET_SLOT].as_ref().and_then(at);
+        match self.standard[slot].as_ref().and_then(&at) {
+            None if slot == HEAD_SLOT => self.serving_head_as_get(at),
+            found => found,
         }
-        found
+    }
+
+    #[cold]
+    fn serving_other<'s, R>(&'s self, method: &Method, at: impl Fn(&'s T) -> Option<R>) -> Option<R> {
+        let (_, value) = self.other.iter().find(|(m, _)| m == method)?;
+        at(value)
+    }
+
+    #[cold]
+    fn serving_head_as_get<'s, R>(&'s self, at: impl Fn(&'s T) -> Option<R>) -> Option<R> {
+        self.standard[GET_SLOT].as_ref().and_then(at)
     }
 
     fn get_or_default(&mut self, method: &Method) -> &mut T
@@ -484,6 +585,8 @@ pub struct RouteTable<H, D> {
     /// WebSocket routes have their own router because one may share a path with a `GET` route;
     /// the `Upgrade` header picks between them.
     ws_handlers: Vec<H>,
+    /// Is indexed like `ws_handlers`.
+    ws_routes: Vec<WsRoute>,
     ws_router: Router<WsRouteId>,
     /// It is private and only added to, so the sealed counts never exceed the hooks.
     before_hooks: Vec<H>,
@@ -515,6 +618,7 @@ impl GrpcMethod {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RouteCounts {
     routes: usize,
+    websockets: usize,
     before_hooks: usize,
     after_hooks: usize,
 }
@@ -541,6 +645,7 @@ impl ExpectedRoute {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouteManifest {
     pub routes: Vec<ExpectedRoute>,
+    pub websockets: Vec<WsRoute>,
     pub before_hooks: usize,
     pub after_hooks: usize,
 }
@@ -551,13 +656,14 @@ impl RouteManifest {
         let sealed = table.sealed.unwrap_or_else(|| table.counts());
         RouteManifest {
             routes: table.routes[..sealed.routes].iter().map(ExpectedRoute::of).collect(),
+            websockets: table.ws_routes[..sealed.websockets].to_vec(),
             before_hooks: sealed.before_hooks,
             after_hooks: sealed.after_hooks,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty() && self.before_hooks == 0 && self.after_hooks == 0
+        self.routes.is_empty() && self.websockets.is_empty() && self.before_hooks == 0 && self.after_hooks == 0
     }
 
     /// Lists both manifests one route per line, marking the first differing index.
@@ -575,6 +681,14 @@ impl RouteManifest {
                 let mark = if i == first_diff { "  <-- first difference" } else { "" };
                 let place = if *on_worker { "" } else { " (not on a sub-interpreter)" };
                 out.push_str(&format!("    [{i}] {key}{place}{mark}\n"));
+            }
+            for (i, WsRoute { path, place }) in s.websockets.iter().enumerate() {
+                let place = if *place == WsPlace::Worker {
+                    ""
+                } else {
+                    " (not on a sub-interpreter)"
+                };
+                out.push_str(&format!("    websocket [{i}] {path}{place}\n"));
             }
             out.push_str(&format!(
                 "    before_request hooks: {}, after_request hooks: {}\n",
@@ -598,6 +712,7 @@ impl<H, D> Default for RouteTable<H, D> {
             routers: ByMethod::default(),
             fallback: None,
             ws_handlers: Vec::new(),
+            ws_routes: Vec::new(),
             ws_router: Router::new(),
             before_hooks: Vec::new(),
             after_hooks: Vec::new(),
@@ -657,6 +772,10 @@ impl<H, D> RouteTable<H, D> {
         &self.static_mounts
     }
 
+    pub fn static_mounts_mut(&mut self) -> &mut [D] {
+        &mut self.static_mounts
+    }
+
     pub fn is_sealed(&self) -> bool {
         self.sealed.is_some()
     }
@@ -664,6 +783,7 @@ impl<H, D> RouteTable<H, D> {
     fn counts(&self) -> RouteCounts {
         RouteCounts {
             routes: self.routes.len(),
+            websockets: self.ws_routes.len(),
             before_hooks: self.before_hooks.len(),
             after_hooks: self.after_hooks.len(),
         }
@@ -705,6 +825,7 @@ impl<H, D> RouteTable<H, D> {
             routers: self.routers.clone(),
             fallback: self.fallback,
             ws_handlers: copy_all(&self.ws_handlers),
+            ws_routes: self.ws_routes.clone(),
             ws_router: self.ws_router.clone(),
             before_hooks: copy_all(&self.before_hooks),
             after_hooks: copy_all(&self.after_hooks),
@@ -773,7 +894,7 @@ impl<H, D> RouteTable<H, D> {
     ///
     /// Returns an error when `path` already has a handler, or the router would read it
     /// differently from what it says.
-    pub fn add_websocket(&mut self, path: &str, handler: H) -> Result<(), WsRouteError> {
+    pub fn add_websocket(&mut self, path: &str, handler: H, place: WsPlace) -> Result<(), WsRouteError> {
         template_params(path).map_err(|source| WsRouteError::MisreadPath {
             path: path.to_string(),
             source,
@@ -786,6 +907,10 @@ impl<H, D> RouteTable<H, D> {
                 source,
             })?;
         self.ws_handlers.push(handler);
+        self.ws_routes.push(WsRoute {
+            path: path.to_string(),
+            place,
+        });
         Ok(())
     }
 
@@ -804,11 +929,29 @@ impl<H, D> RouteTable<H, D> {
             Ok(matched) => matched,
             Err(matchit::MatchError::NotFound) => return None,
         };
-        Some((*matched.value, decode_params(&matched.params)))
+        Some((*matched.value, Params::of_match(path, &matched.params)))
     }
 
     pub fn ws_handler(&self, id: WsRouteId) -> &H {
         &self.ws_handlers[id.0]
+    }
+
+    /// Returns the WebSocket handlers, indexed by [`WsRouteId::index`].
+    pub fn ws_handlers(&self) -> &[H] {
+        &self.ws_handlers
+    }
+
+    /// Returns the WebSocket routes, indexed by [`WsRouteId::index`].
+    pub fn ws_routes(&self) -> &[WsRoute] {
+        &self.ws_routes
+    }
+
+    pub fn ws_place(&self, id: WsRouteId) -> WsPlace {
+        self.ws_routes[id.0].place
+    }
+
+    fn has_websockets_on(&self, place: WsPlace) -> bool {
+        self.ws_routes.iter().any(|r| r.place == place)
     }
 
     /// Sets the handler for a request no route matched; a second one replaces the first.
@@ -842,17 +985,22 @@ impl<H, D> RouteTable<H, D> {
 
     /// Returns whether any route runs on a sub-interpreter worker; only then does a server build
     /// sub-interpreters.
+    /// Returns whether any request or WebSocket connection runs on a sub-interpreter worker.
     pub fn uses_workers(&self) -> bool {
-        self.routes.iter().any(|r| matches!(r.runtime, HandlerPlace::Worker(_)))
+        self.has_websockets_on(WsPlace::Worker)
+            || self.routes.iter().any(|r| matches!(r.runtime, HandlerPlace::Worker(_)))
     }
 
     pub fn uses_lane(&self) -> bool {
         self.routes.iter().any(|r| r.runtime == HandlerPlace::Lane)
     }
 
-    /// Returns whether any request can run on the main interpreter, counting the fallback.
+    /// Returns whether any request can run on the main interpreter, counting the fallback and the
+    /// `runtime="main"` WebSocket handlers, which run on main's async engine.
     pub fn uses_main(&self) -> bool {
-        self.fallback.is_some() || self.routes.iter().any(|r| matches!(r.runtime, HandlerPlace::Main(_)))
+        self.fallback.is_some()
+            || self.has_websockets_on(WsPlace::Main)
+            || self.routes.iter().any(|r| matches!(r.runtime, HandlerPlace::Main(_)))
     }
 
     #[inline]
@@ -911,7 +1059,7 @@ fn matched_route(router: &Router<RouteId>, path: &str) -> Option<(RouteId, Param
         Ok(matched) => matched,
         Err(matchit::MatchError::NotFound) => return None,
     };
-    Some((*matched.value, decode_params(&matched.params)))
+    Some((*matched.value, Params::of_match(path, &matched.params)))
 }
 
 /// Parses `method` from its uppercase spelling, so a lowercase registration names the standard
@@ -923,18 +1071,6 @@ fn parse_method(method: &str, path: &str) -> Result<Method, RouteError> {
         path: path.to_string(),
         source,
     })
-}
-
-/// Percent-decodes every matched value, mapping invalid UTF-8 to U+FFFD, so a literal `%` from
-/// `%25` cannot be confused with a failed decode.
-fn decode_params(params: &matchit::Params<'_, '_>) -> Params {
-    params
-        .iter()
-        .map(|(k, v)| {
-            let decoded = percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned();
-            (k.to_string(), decoded)
-        })
-        .collect()
 }
 
 /// Returns `methods` as a sorted `Allow` value with `HEAD` wherever `GET` is, because the `GET`
@@ -956,7 +1092,8 @@ fn allow_value<'a>(methods: impl Iterator<Item = &'a str>) -> Option<HeaderValue
     Some(HeaderValue::from_str(&methods.join(", ")).expect("HTTP method names are tokens, valid in a header value"))
 }
 
-/// How many of a table's routes run in each place.
+/// How many of a table's routes run in each place; a WebSocket route counts as an `async def`
+/// one where it runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlaceCounts {
     pub worker_sync: usize,
@@ -981,6 +1118,13 @@ impl PlaceCounts {
             };
             *count += 1;
         }
+        // A WebSocket handler is an `async def` that runs on an async engine.
+        for route in &table.ws_routes {
+            match route.place {
+                WsPlace::Worker => counts.worker_async += 1,
+                WsPlace::Main => counts.main_async += 1,
+            }
+        }
         counts
     }
 
@@ -997,6 +1141,9 @@ impl PlaceCounts {
         self.main() == 0 && self.worker_async == 0
     }
 }
+
+#[cfg(test)]
+mod fuzz;
 
 #[cfg(test)]
 mod route_model;
@@ -1399,6 +1546,7 @@ mod insert_tests {
 
 #[cfg(test)]
 mod ws_route_tests {
+    use super::route_model::decoded_pairs;
     use super::*;
 
     fn table() -> RouteTable<u32, ()> {
@@ -1409,25 +1557,47 @@ mod ws_route_tests {
     fn a_table_has_websocket_routes_once_one_is_added() {
         let mut t = table();
         assert!(!t.has_websocket_routes());
-        t.add_websocket("/ws", 1).unwrap();
+        t.add_websocket("/ws", 1, WsPlace::Main).unwrap();
         assert!(t.has_websocket_routes());
+    }
+
+    #[test]
+    fn a_param_is_where_its_value_sits_in_the_path_and_decoded_only_when_read() {
+        let mut t = table();
+        t.add_websocket("/img{id}.png/{*rest}", 1, WsPlace::Main).unwrap();
+        let path = "/img%2542.png/a/b";
+        let (_, params) = t.websocket(path).unwrap();
+        let located: Vec<(&str, Range<usize>)> = params.located().collect();
+        assert_eq!(located, [("id", 4..9), ("rest", 14..17)]);
+        assert_eq!(
+            decoded_pairs(&params, path),
+            [
+                ("id".to_string(), "%42".to_string()),
+                ("rest".to_string(), "a/b".to_string())
+            ]
+        );
+        let short: Vec<Option<Cow<'_, str>>> = params.decoded("/img").map(|(_, v)| v).collect();
+        assert_eq!(short, [None, None], "a path the route did not match holds no value");
     }
 
     #[test]
     fn a_websocket_path_is_a_template_with_decoded_params() {
         let mut t = table();
-        t.add_websocket("/chat/{room}", 7).unwrap();
+        t.add_websocket("/chat/{room}", 7, WsPlace::Main).unwrap();
         let (id, params) = t.websocket("/chat/a%20b").unwrap();
         assert_eq!(*t.ws_handler(id), 7);
-        assert_eq!(params, vec![("room".to_string(), "a b".to_string())]);
+        assert_eq!(
+            decoded_pairs(&params, "/chat/a%20b"),
+            vec![("room".to_string(), "a b".to_string())]
+        );
         assert!(t.websocket("/chat").is_none());
     }
 
     #[test]
     fn a_duplicate_websocket_path_is_refused_and_keeps_the_first() {
         let mut t = table();
-        t.add_websocket("/ws", 1).unwrap();
-        let err = t.add_websocket("/ws", 2).unwrap_err();
+        t.add_websocket("/ws", 1, WsPlace::Main).unwrap();
+        let err = t.add_websocket("/ws", 2, WsPlace::Main).unwrap_err();
         assert!(err.to_string().contains("/ws"), "{err}");
         let (id, _) = t.websocket("/ws").unwrap();
         assert_eq!(*t.ws_handler(id), 1);
@@ -1436,7 +1606,7 @@ mod ws_route_tests {
     #[test]
     fn a_colon_websocket_path_is_refused() {
         let mut t = table();
-        let err = t.add_websocket("/ws/:id", 1).unwrap_err();
+        let err = t.add_websocket("/ws/:id", 1, WsPlace::Main).unwrap_err();
         assert!(err.to_string().contains("{id}"), "{err}");
         assert!(t.websocket("/ws/:id").is_none());
     }
@@ -1452,7 +1622,7 @@ mod ws_route_tests {
             HandlerPlace::Main(MainHandler::Sync(BodyMode::Buffered)),
         )
         .unwrap();
-        t.add_websocket("/ws", 2).unwrap();
+        t.add_websocket("/ws", 2, WsPlace::Main).unwrap();
         let (id, _) = t.websocket("/ws").unwrap();
         assert_eq!(*t.ws_handler(id), 2);
         assert!(t.resolve(&Method::GET, "/ws").is_some());
@@ -1461,11 +1631,14 @@ mod ws_route_tests {
     #[test]
     fn a_copy_keeps_the_websocket_routes() {
         let mut t = table();
-        t.add_websocket("/ws/{id}", 3).unwrap();
+        t.add_websocket("/ws/{id}", 3, WsPlace::Main).unwrap();
         let copy = t.copy_with(|h| h + 10);
         let (id, params) = copy.websocket("/ws/9").unwrap();
         assert_eq!(*copy.ws_handler(id), 13);
-        assert_eq!(params, vec![("id".to_string(), "9".to_string())]);
+        assert_eq!(
+            decoded_pairs(&params, "/ws/9"),
+            vec![("id".to_string(), "9".to_string())]
+        );
     }
 }
 

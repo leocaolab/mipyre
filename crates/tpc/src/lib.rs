@@ -13,8 +13,8 @@ mod threads;
 pub use stop::{LocalStop, StopWaiter};
 pub use tasks::{IdleWaiter, LocalTasks};
 pub use threads::{
-    block_until_cancelled, join_until, panic_message, pin_and_raise_qos, serve_on_this_thread, spawn, spawn_in_run,
-    spawn_per_core, spawn_stop_watcher, Cancellable, CoreSlot, Leftover, OsSpawner, OsThread, Placement, RunStop,
+    block_on, block_until_cancelled, join_until, pin_and_raise_qos, serve_on_this_thread, spawn, spawn_in_run,
+    spawn_per_core, spawn_stop_watcher, AffinityOutcome, Cancellable, CoreSlot, Leftover, OsSpawner, OsThread, RunStop,
     ShutdownDeadline, SpawnError, SpawnFailure, Spawner, StopCause, StopWatcher, StopWatcherError, ThreadError,
     ThreadFailure, ThreadHandle, ThreadHooks, ThreadJoinError, ThreadLeftover, ThreadResults, ThreadStop,
 };

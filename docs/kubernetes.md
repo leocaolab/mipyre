@@ -172,7 +172,7 @@ spec:
 
 ```text
 /livez {"status": "alive"}
-/readyz {"status": "ready", "checks": {}}
+/readyz {"status": "ready", "checks": {"abandoned_workers": {"ok": true}}}
 ```
 
 ## Rolling updates

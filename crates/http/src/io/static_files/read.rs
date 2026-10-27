@@ -398,7 +398,9 @@ pub(super) fn read_contents(
             limit: cap,
         });
     }
-    Ok(Some(Bytes::from(contents)))
+    // The cache hands every hit a clone. An owned `Bytes` clones by one count; one made from a
+    // `Vec` would first promote itself and then check on every clone whether it has.
+    Ok(Some(Bytes::from_owner(contents)))
 }
 
 #[cfg(test)]

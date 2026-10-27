@@ -74,16 +74,21 @@ mipyre_stop_watcher_failures_total 0
 mipyre_blocking_calls_left_total 0
 # TYPE mipyre_validation_failures_total counter
 mipyre_validation_failures_total 0
+# TYPE mipyre_websocket_keepalive_timeouts_total counter
+mipyre_websocket_keepalive_timeouts_total 0
+# TYPE mipyre_static_bytes_in_flight gauge
+mipyre_static_bytes_in_flight 0
 # TYPE mipyre_precompressed_fallbacks_total counter
 mipyre_precompressed_fallbacks_total 0
 # TYPE mipyre_static_unwatched_mounts_total counter
 mipyre_static_unwatched_mounts_total 0
 # TYPE mipyre_static_answers_cut_total counter
 mipyre_static_answers_cut_total 0
-# TYPE mipyre_static_bytes_in_flight gauge
-mipyre_static_bytes_in_flight 0
 # TYPE mipyre_db_results_undeliverable_total counter
 mipyre_db_results_undeliverable_total 0
+# TYPE mipyre_log_lines_dropped_total counter
+mipyre_log_lines_dropped_total{reason="queue_full"} 0
+mipyre_log_lines_dropped_total{reason="write_failed"} 0
 # TYPE mipyre_gil_congested_waits_total counter
 mipyre_gil_congested_waits_total 0
 # TYPE mipyre_client_disconnects_total counter
@@ -106,12 +111,16 @@ mipyre_forwarded_for_unreadable_total 0
 mipyre_socket_option_failures_total{option="quickack"} 0
 mipyre_socket_option_failures_total{option="defer_accept"} 0
 mipyre_socket_option_failures_total{option="nodelay"} 0
+# TYPE mipyre_workers_abandoned gauge
+mipyre_workers_abandoned 0
+# TYPE mipyre_pools_at_abandon_limit gauge
+mipyre_pools_at_abandon_limit 0
 ```
 
 Two groups:
 
 - **Request counters** (`mipyre_http_*`): every response the server gave, by method and status class (`mipyre_http_requests_total`), and a histogram of the time from a request's arrival to its response's head (`mipyre_http_request_duration_seconds`; a streamed body's sending is not in it). The engine counts each response as it leaves, whoever answered it: a handler, a `before_request` hook, a raised exception's 500, or the engine's own 404 or 503. `mipyre_http_requests_refused_total` counts the requests the server answered by itself instead of the handler (503 overloaded or shutting down, 504 past the request budget, 502 a process-lane worker died). `mipyre_validation_failures_total` counts the 422s answered because a `body=` model or `query=` string failed validation. The counts are the server's run: a restart starts them from zero.
-- **Server counters** (everything else): the server's own events, process-wide: sub-interpreter workers serving and lost, accept failures, malformed or oversized request heads, request-head timeouts, unreadable `X-Forwarded-For` headers from a trusted proxy, TLS handshake failures, socket options that couldn't be set, CPU pinning that failed, drains that ran out of time. Each `# HELP` line says what one counts.
+- **Server counters** (everything else): the server's own events, process-wide: sub-interpreter workers serving and lost, accept failures, malformed or oversized request heads, request-head timeouts, unreadable `X-Forwarded-For` headers from a trusted proxy, TLS handshake failures, socket options that couldn't be set, CPU pinning that failed, drains that ran out of time, WebSocket clients closed for silence, log lines dropped (`reason="queue_full"` when the writer fell behind, `"write_failed"` when stderr refused them), and sub-interpreter workers abandoned to a handler that never returned (`mipyre_workers_abandoned`; `mipyre_pools_at_abandon_limit` counts the pools that can abandon no more, and while it is above zero `/readyz` is not ready). Each `# HELP` line says what one counts.
 
 Every runtime is counted the same way, `runtime="process"` routes included, and so are `/livez`, `/readyz` and the scrapes of `/metrics` themselves (a scrape is counted as it leaves, so the next one shows it). `mipyre_workers_died_total` counts the workers that stopped on their own, by runtime: `runtime="subinterp"` for sub-interpreter workers, `runtime="process"` for worker processes that crashed, were killed or timed out, each of which the server replaces.
 
@@ -128,7 +137,7 @@ scrape_configs:
       - targets: ["host.docker.internal:18000"]
 ```
 
-The server must listen on an address the container can reach and accept the name Prometheus sends as `Host`: `mipyre run app:app --host 0.0.0.0 --allowed-host host.docker.internal`; without `--allowed-host` every scrape is answered `421`. After the test's requests on `subinterp` (20 to `/hello`, a few others, a `GET /nope` and its own start-up poll, both 404), with Prometheus's scrapes counted too:
+The server must listen on an address the container can reach and accept the name Prometheus sends as `Host`: `mipyre run app:app --host 0.0.0.0 --allowed-hosts host.docker.internal`; without `--allowed-hosts` every scrape is answered `421`. After the test's requests on `subinterp` (20 to `/hello`, a few others, a `GET /nope` and its own start-up poll, both 404), with Prometheus's scrapes counted too:
 
 ```bash
 curl -s 'localhost:59090/api/v1/query' --data-urlencode 'query=sum by (status_class) (mipyre_http_requests_total)'
@@ -142,7 +151,7 @@ curl -s 'localhost:59090/api/v1/query' --data-urlencode 'query=sum by (status_cl
 
 ## Logs
 
-The server writes one JSON object per line to standard output. By default it logs errors only, with no access log; `app.enable_access_log()` turns the access log on and raises the level to INFO. The other settings (`log_config`, `MIPYRE_LOG=1`, `debug=True`) are in the [fortune codelab](codelabs/fortune.md), step 10. Every run on this page used `app.enable_access_log()` and the default JSON format.
+The server writes one JSON object per line to standard output. By default it logs warnings and errors, with no access log; `app.enable_access_log()` turns the access log on and raises the level to INFO. The other settings (`log_config`, `MIPYRE_LOG=1`, `debug=True`) are in the [fortune codelab](codelabs/fortune.md), step 10. Every run on this page used `app.enable_access_log()` and the default JSON format.
 
 Every line has `timestamp`, `level`, `fields` (with `message`) and `target`. The targets seen in the runs:
 
@@ -354,7 +363,7 @@ def database_ready():
     pool.fetch_scalar("SELECT 1")
 ```
 
-`GET /livez` answers `200 {"status": "alive"}` without entering Python. `GET /readyz` runs every readiness check, on the main interpreter, and answers `200 {"status": "ready", "checks": {...}}`, one entry per check, when all pass. With a check that raises:
+`GET /livez` answers `200 {"status": "alive"}` without entering Python. `GET /readyz` runs every readiness check, on the main interpreter, and answers `200 {"status": "ready", "checks": {...}}`, one entry per check, when all pass. Probes on the main interpreter (the default) add a check of their own, `abandoned_workers`, which fails while a sub-interpreter pool has abandoned as many stuck workers as it has, so the orchestrator restarts the process. With a check that raises:
 
 ```python
 @probes.check("db")
@@ -366,9 +375,9 @@ three probes in a row answered, on each runtime:
 
 ```text
 GET /livez: 200 {"status": "alive"}
-GET /readyz #1: 503 {"status": "not_ready", "checks": {"db": {"ok": false}}, "request_id": "178b6f0e74f708670000000000000000"}
-GET /readyz #2: 503 {"status": "not_ready", "checks": {"db": {"ok": false}}, "request_id": "178b6f0e74f708670000000000000000"}
-GET /readyz #3: 503 {"status": "not_ready", "checks": {"db": {"ok": false}}, "request_id": "178b6f0e74f708670000000000000000"}
+GET /readyz #1: 503 {"status": "not_ready", "checks": {"abandoned_workers": {"ok": true}, "db": {"ok": false}}, "request_id": "178b6f0e74f708670000000000000000"}
+GET /readyz #2: 503 {"status": "not_ready", "checks": {"abandoned_workers": {"ok": true}, "db": {"ok": false}}, "request_id": "178b6f0e74f708670000000000000000"}
+GET /readyz #3: 503 {"status": "not_ready", "checks": {"abandoned_workers": {"ok": true}, "db": {"ok": false}}, "request_id": "178b6f0e74f708670000000000000000"}
 ```
 
 The reason is not in the response, which anyone who can reach the port can read. It is in the log, once, under the `request_id` the response gives:
@@ -383,7 +392,7 @@ Probe settings for Kubernetes are in [Kubernetes](kubernetes.md#deployment-servi
 
 ## CloudWatch Logs and metrics
 
-Vector can send the same parsed log lines to CloudWatch Logs, and the `/metrics` counters to CloudWatch metrics, with no code in the app. Add to the Vector configuration above (start the server with `--allowed-host host.docker.internal`, as for Prometheus; here pointed at LocalStack; on AWS, leave out `endpoint` and `auth` and give Vector an IAM role):
+Vector can send the same parsed log lines to CloudWatch Logs, and the `/metrics` counters to CloudWatch metrics, with no code in the app. Add to the Vector configuration above (start the server with `--allowed-hosts host.docker.internal`, as for Prometheus; here pointed at LocalStack; on AWS, leave out `endpoint` and `auth` and give Vector an IAM role):
 
 ```yaml
 sources:

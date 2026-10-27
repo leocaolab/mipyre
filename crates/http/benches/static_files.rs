@@ -1,10 +1,9 @@
-//! Measures answering a request no route matched from the static file cache, and from disk for
-//! a file the cache has no room for.
+//! Measures answering a request no route matched from the static file cache, and the work a
+//! miss of a file the cache does not keep does on the blocking pool.
 // The package's clippy.toml is plan/'s list; a bench measures the world through io/.
 #![expect(
     clippy::disallowed_methods,
     clippy::disallowed_macros,
-    clippy::disallowed_types,
     reason = "a bench writes the files it serves and prints"
 )]
 
@@ -225,92 +224,52 @@ fn static_refused(n: u64) {
     );
 }
 
-/// Each file fills an eighth of a server's 128 MiB cache budget. They are sparse, so writing
-/// them costs no disk.
-const FILLER_BYTES: u64 = 16 * 1024 * 1024;
-const FILLERS: usize = 8;
-
-/// Answers `GET /static/hello.txt` from disk, the cache being full: each call opens the file,
-/// reads it once for its `ETag`, answers, and sends its one chunk, as a miss of a file the cache
-/// has no room for does. Every call takes two trips to the blocking pool.
+/// Answers `GET /static/hello.txt` from disk on the calling thread, as a miss of a file the
+/// cache does not keep does on the blocking pool: each call opens the file, reads it once for
+/// its `ETag`, answers, and reads and checks its one chunk. The two hand-offs to the pool, one
+/// for the open and one per 64 KiB chunk, are left out, since their wake-ups follow timing; the
+/// mount is never watched, since its watcher would wake on every open.
 fn static_sent_from_disk(n: u64) {
     let name = "static_sent_from_disk";
     let dir = StaticDir::new();
-    for i in 0..FILLERS {
-        let filler = dir.must(
-            std::fs::File::create(dir.0.join(format!("filler-{i}.bin"))),
-            "create a filler",
-        );
-        dir.must(filler.set_len(FILLER_BYTES), "size a filler");
-    }
     let mount = dir.must(
         StaticMount::new("/static", &dir.0.to_string_lossy(), Copies::Original),
         "mount the static directory",
     );
-    mount.cache_within(&std::sync::Arc::new(CacheBudget::new(DEFAULT_CACHE_BUDGET_BYTES)));
-    let watched = mount.clone();
-    let mut table: RouteTable<(), StaticMount> = RouteTable::new();
-    table.add_static_mount(mount);
     let headers = HeaderMap::new();
-    let rt = dir.must(
-        tokio::runtime::Builder::new_current_thread().enable_all().build(),
-        "build the runtime",
-    );
-    let answer = |path: &str| rt.block_on(sent(&table, path, &headers));
-    answer("/static/hello.txt");
-    let mut watch = watched.watch();
-    for _ in 0..1000 {
-        if watch != MountWatch::Started {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        watch = watched.watch();
+    let chunks = sent_from_disk(name, &mount, &headers);
+    if chunks != 1 {
+        stop(&format!("{name}: a 1 KiB file was read in {chunks} chunks, not one"));
     }
-    if watch != MountWatch::Active {
-        stop(&format!(
-            "{name}: the mount's watch is {watch:?}, so nothing would fill the cache"
-        ));
-    }
-    for i in 0..FILLERS {
-        answer(&format!("/static/filler-{i}.bin"));
-    }
-    if answer("/static/hello.txt") != Origin::FromDisk {
-        stop(&format!(
-            "{name}: hello.txt is kept: the fillers did not fill the cache"
-        ));
+    if mount.watch() != MountWatch::Unstarted {
+        stop(&format!("{name}: the mount's watch is {:?}", mount.watch()));
     }
     measure(name, n, |_| {
-        black_box(rt.block_on(sent(
-            black_box(&table),
-            black_box("/static/hello.txt"),
-            black_box(&headers),
-        )));
+        black_box(sent_from_disk(name, black_box(&mount), black_box(&headers)));
     });
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Origin {
-    FromMemory,
-    FromDisk,
-}
-
-/// Answers `GET path` and reads the answer's body to its end.
-async fn sent(table: &RouteTable<(), StaticMount>, path: &str, headers: &HeaderMap) -> Origin {
-    use http_body_util::BodyExt;
-    let Some(resp) = unrouted(table, path, headers).await else {
-        stop(&format!("{path} is not served"))
+/// Answers `GET /static/hello.txt` from disk and reads the body's chunks to its end; returns how
+/// many chunks it read.
+fn sent_from_disk(name: &str, mount: &StaticMount, headers: &HeaderMap) -> usize {
+    let resp = match mount.answer_from_disk_here(b"hello.txt", None, headers) {
+        Some(resp) if resp.status().as_u16() == 200 => resp,
+        other => stop(&format!("{name}: answered {:?}, not 200", other.map(|r| r.status()))),
     };
-    let from = match resp.body() {
-        ResponseBody::File(_) => Origin::FromDisk,
-        _ => Origin::FromMemory,
+    let ResponseBody::File(mut body) = resp.into_body() else {
+        stop(&format!("{name}: the answer is not sent from disk"))
     };
-    match resp.into_body().collect().await {
-        Ok(body) => {
-            black_box(body);
+    let mut chunks = 0;
+    while let Some(frame) = body.next_frame_here() {
+        match frame {
+            Ok(frame) => {
+                black_box(frame);
+            }
+            Err(error) => stop(&format!("{name}: {error}")),
         }
-        Err(error) => stop(&format!("{path}: {error}")),
+        chunks += 1;
     }
-    from
+    chunks
 }
 
 fn main() {

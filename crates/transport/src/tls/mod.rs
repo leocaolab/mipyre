@@ -34,22 +34,27 @@ impl std::fmt::Display for PemFile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
-    #[error("open {what} {path:?}: {source}")]
+    #[error("cannot open {path:?}: {source}")]
     Unreadable {
         what: PemFile,
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("parse {what} {path:?}: {source}")]
+    #[error("{path:?} is not PEM: {source}")]
     NotPem {
         what: PemFile,
         path: PathBuf,
         source: pem::Error,
     },
-    #[error("no certificates found in {0:?}")]
+    #[error("no PEM certificate in {0:?}")]
     NoCertificate(PathBuf),
-    #[error("no private key found in {0:?}")]
+    #[error("no PEM private key in {0:?}")]
     NoKey(PathBuf),
+    #[error("the key in {key:?} is not the private key of the certificate in {cert:?}")]
+    KeyMismatch { cert: PathBuf, key: PathBuf },
+    /// rustls refused the key: its type is one rustls does not take, or it does not match.
+    #[error("rustls refuses the key: {0}")]
+    KeyRefused(rustls::Error),
     #[error("TLS config error: {0}")]
     RejectedByRustls(#[from] rustls::Error),
     /// The system's random source failed.
@@ -73,6 +78,20 @@ const CIPHER_SUITES: &[rustls::SupportedCipherSuite] = &[
     rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
     rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 ];
+
+impl TlsError {
+    /// Returns the file at fault, or `None` when neither is (the system's random source failed,
+    /// or rustls refused its own protocol settings).
+    #[must_use]
+    pub fn file(&self) -> Option<PemFile> {
+        match self {
+            TlsError::Unreadable { what, .. } | TlsError::NotPem { what, .. } => Some(*what),
+            TlsError::NoCertificate(_) => Some(PemFile::Certificate),
+            TlsError::NoKey(_) | TlsError::KeyMismatch { .. } | TlsError::KeyRefused(_) => Some(PemFile::PrivateKey),
+            TlsError::RejectedByRustls(_) | TlsError::TicketKeyNotGenerated(_) => None,
+        }
+    }
+}
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -124,7 +143,15 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
 pub fn build_acceptor(cert_path: &str, key_path: &str, alpn: &[&[u8]]) -> Result<Arc<TlsAcceptor>, TlsError> {
     let certs = load_certs(Path::new(cert_path))?;
     let key = load_key(Path::new(key_path))?;
-    acceptor_from(certs, key, alpn)
+    acceptor_from(certs, key, alpn).map_err(|e| match e {
+        TlsError::KeyRefused(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch)) => {
+            TlsError::KeyMismatch {
+                cert: PathBuf::from(cert_path),
+                key: PathBuf::from(key_path),
+            }
+        }
+        e => e,
+    })
 }
 
 /// Builds a `TlsAcceptor` from a certificate chain and key already in memory.
@@ -146,7 +173,8 @@ pub fn acceptor_from(
     let mut cfg = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+        .with_single_cert(certs, key)
+        .map_err(TlsError::KeyRefused)?;
 
     cfg.alpn_protocols = alpn.iter().map(|id| id.to_vec()).collect();
     cfg.ignore_client_order = true;
@@ -265,6 +293,21 @@ mod tests {
             matches!(err, TlsError::NotPem { what: PemFile::PrivateKey, ref path, .. } if path == &key),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn another_certificates_key_is_a_mismatch_naming_both_files() {
+        let (a, b) = (TestCert::new("mismatch-a"), TestCert::new("mismatch-b"));
+        let (cert, key) = (a.dir.join("cert.pem"), b.dir.join("key.pem"));
+        let err = build_acceptor(cert.to_str().unwrap(), key.to_str().unwrap(), HTTP1)
+            .err()
+            .expect("the key is another certificate's");
+        assert!(
+            matches!(err, TlsError::KeyMismatch { cert: ref c, key: ref k } if c == &cert && k == &key),
+            "{err:?}"
+        );
+        assert_eq!(err.file(), Some(PemFile::PrivateKey));
+        b.acceptor(HTTP1);
     }
 
     /// Holds a self-signed `localhost` certificate as PEM files in a directory removed on drop.

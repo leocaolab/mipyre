@@ -61,8 +61,11 @@ _MAX_BYTES = 64 * 1024 * 1024
 
 class _Entries:
     """One handler's cached bodies, each with the time it expires. Time is a value the
-    caller reads (``time.monotonic()``) and passes in; nothing here reads a clock. Locked:
-    one route's handler runs on several threads at once."""
+    caller reads (``time.monotonic()``) and passes in; nothing here reads a clock. One
+    route's handler runs on several threads at once, so ``put`` is locked: it keeps ``_size``
+    in step with the dict. ``get`` is not: one ``dict.get`` is atomic under the GIL and
+    internally locked on a free-threaded build, and the entry it returns is an immutable
+    pair, so a read racing a ``put`` sees the old entry, the new one, or none."""
 
     def __init__(self, ttl: float, max_entries: int = _MAX_ENTRIES, max_bytes: int = _MAX_BYTES) -> None:
         self._ttl = ttl
@@ -75,8 +78,7 @@ class _Entries:
 
     def get(self, key: str, now: float) -> bytes | None:
         """The body stored under ``key``, while ``now`` is before its expiry."""
-        with self._lock:
-            entry = self._entries.get(key)
+        entry = self._entries.get(key)
         if entry is not None and now < entry[1]:
             return entry[0]
         return None

@@ -28,7 +28,7 @@ By submitting a contribution you agree that it is licensed under the Apache Lice
 
 ## Building from source
 
-You need a stable Rust toolchain, Python 3.14 (the regular build with the GIL, not the free-threaded one) and [maturin](https://www.maturin.rs/).
+You need [rustup](https://rustup.rs/) (it installs the Rust version `rust-toolchain.toml` names, the one CI uses), Python 3.14 (the regular build with the GIL, not the free-threaded one) and [maturin](https://www.maturin.rs/).
 
 ```bash
 python3.14 -m venv .venv

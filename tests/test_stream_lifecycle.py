@@ -136,7 +136,7 @@ def test_custom_content_type_and_status(client):
     {"event": "a\ndata: injected"},
 ])
 def test_send_event_rejects_a_line_break_in_id_or_event(field):
-    # b/390 (4d7346d5 / 1fbf5a9b): every SSE field is one line, so a CR or LF in `id` or
+    # Every SSE field is one line, so a CR or LF in `id` or
     # `event` would start a field of the caller's choosing. The call raises and queues
     # nothing: the client sees only the events sent around it.
     app = Mipyre(runtime="main")

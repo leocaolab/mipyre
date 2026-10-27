@@ -5,9 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# No pyo3: what runs on the threads is the caller's (`deny.toml` bans pyo3 under this crate).
-# Depends on `mipyre_cpu` for pinning — the one edge between the shared crates
-# (`dev/archcheck.toml`).
+# No pyo3: what runs on the threads is the caller's.
+# Depends on `mipyre_cpu` for pinning — the one edge between the shared crates.
 [dependencies]
 mipyre_cpu = { path = "../cpu" }
 # The log throttle (`LogThrottle`) for a connection task's panic line, and the clock it runs on.

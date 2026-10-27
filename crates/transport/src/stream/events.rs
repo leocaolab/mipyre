@@ -25,8 +25,8 @@ const LOG_PERIOD: Duration = Duration::from_secs(60);
 
 /// Holds a value alone on a 128-byte line, which covers x86's paired 64-byte lines and Apple's
 /// line size, so one kind's writes on one core do not stall another kind's on another. It is
-/// `mipyre_cpu::CacheLine` again, which this package may not depend on; where the one definition
-/// lives is b/633's question, and until then each events module pads its own.
+/// `mipyre_cpu::CacheLine` again, which this package may not depend on, so each events module pads
+/// its own.
 #[repr(align(128))]
 struct OwnLine<T>(T);
 

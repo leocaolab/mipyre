@@ -32,10 +32,10 @@ from tests import _pyo3_fixture
 from tests._helpers import bound_port, poll_until, read_file
 from tests._test_cost import TestCost
 
-# Hypothesis (docs/property-testing.md §5, b/749): the merge gate runs every property test on the same inputs
+# Hypothesis: every run takes every property test on the same inputs
 # (`ci`, derandomized, no example database to carry one run's finds into the next); the nightly run sets
 # MIPYRE_TEST_HYPOTHESIS_PROFILE=nightly for random inputs and many more of them. A counterexample found at night is
-# written into its test as an explicit `@example`, so the gate keeps running it.
+# written into its test as an explicit `@example`, so every run keeps running it.
 settings.register_profile("ci", derandomize=True, database=None)
 settings.register_profile("nightly", derandomize=False, database=None, max_examples=10_000)
 settings.load_profile(os.environ.get("MIPYRE_TEST_HYPOTHESIS_PROFILE", "ci"))
@@ -44,10 +44,10 @@ HOST = "127.0.0.1"
 
 
 # ---------------------------------------------------------------------------
-# Parallel runs (pytest-xdist, b/156): one Postgres database per worker
+# Parallel runs (pytest-xdist): one Postgres database per worker
 # ---------------------------------------------------------------------------
 
-# The db tests create and drop fixed table names (`mipyre_test_rows`, `w4_json`, ...) and
+# The db tests create and drop fixed table names (`mipyre_test_rows`, `pkgdata_json`, ...) and
 # one terminates a backend; under xdist the tests of one file can run on two workers at
 # once. So each worker gets a database of its own on the server the DSN names,
 # `<database>_<worker>` (`mipyre_gate_gw0`, ...), and the DSN in the environment is
@@ -95,21 +95,21 @@ def _pg_admin(dsn: str, verb: str, name: str) -> None:
         raise WorkerDatabaseError(f"could not {verb} the worker database {name}:\n{r.stderr[-2000:]}")
 
 
-# Test-only cargo features (b/186). A test that needs one carries `@pytest.mark.needs_feature("<name>")`, and this
-# hook is the only place that decides whether it runs: the probe below reads the built extension. The gate selects
-# the whole set with `-m needs_feature` in its feature build, so a feature test added later is not left out by its
-# file name. In a build without the feature the test is skipped with a reason that names `--features`, which the
-# default gate step defers to the feature build (dev/skip_gate.py). A name without a probe is an error.
+# Test-only cargo features. A test that needs one carries `@pytest.mark.needs_feature("<name>")`, and this
+# hook is the only place that decides whether it runs: the probe below reads the built extension. A feature build
+# selects the whole set with `-m needs_feature`, so a feature test added later is not left out by its file name. In
+# a build without the feature the test is skipped with a reason that names `--features`. A name without a probe is
+# an error.
 FEATURE_PROBES = {
     "fault_injection": lambda engine: hasattr(engine, "_fault_panic"),
     "bench": lambda engine: hasattr(engine.MipyreApp, "bench_inmem"),
 }
 
 
-# T1 (b/441): a TestServer's close waits for its threads for the app's `shutdown_timeout`, 5 s by default,
+# A TestServer's close waits for its threads for the app's `shutdown_timeout`, 5 s by default,
 # and raises AbandonedWorkersError past it. A test that does not set the grace itself is not testing it: its close waits
-# for the stop as an event, for longer than pytest-timeout's hang guard. How long idle TPC threads take to stop under
-# load is b/454; the grace's own judgement is `join_within`'s and test_b251_shutdown_timeout's. The product's
+# for the stop as an event, for longer than pytest-timeout's hang guard. The grace's own judgement is tested through
+# `join_within` and tests/test_shutdown_timeout.py. The product's
 # default is unchanged (the TestServer's own behaviour is public API).
 TEST_SHUTDOWN_GRACE_S = 3600.0
 
@@ -125,18 +125,44 @@ def _waiting_for_the_stop(init):
     return _start
 
 
+# A server pins its TPC threads in the order of its affinity mask, from the lowest CPU, so under xdist every
+# worker's servers landed on the same first CPUs while the rest sat idle. Each worker narrows its own
+# mask to a slice of the CPUs it was given; the servers and processes it starts inherit the slice. The server's
+# pin rule is not changed. Off Linux (macOS, where threads are not pinned) nothing is narrowed.
+def worker_cpus(worker: int, workers: int, allowed: list[int]) -> list[int]:
+    """Return the CPUs xdist worker `worker` of `workers` keeps out of `allowed` (ascending, not empty).
+
+    The workers get contiguous runs as even as the count allows; with more workers than CPUs,
+    neighbouring workers share one CPU, so none is left without a CPU.
+    """
+    start = worker * len(allowed) // workers
+    end = (worker + 1) * len(allowed) // workers
+    return allowed[start:max(end, start + 1)]
+
+
+def _narrow_to_worker_cpus(worker: str) -> None:
+    if sys.platform != "linux":
+        return
+    allowed = sorted(os.sched_getaffinity(0))
+    index = int(worker.removeprefix("gw"))
+    os.sched_setaffinity(0, worker_cpus(index, int(os.environ["PYTEST_XDIST_WORKER_COUNT"]), allowed))
+
+
 def pytest_configure(config):
     TestServer._start = _waiting_for_the_stop(TestServer._start)
     config.addinivalue_line(
         "markers", "needs_feature(name): needs a build with the named test-only cargo feature (--features <name>)"
     )
-    # Each test's requested sleep seconds and work, as JUnit properties for dev/test_time_gate.py (b/441, b/452).
+    # Each test's requested sleep seconds and work, as JUnit properties.
     cost = TestCost()
     cost.install()
     config.pluginmanager.register(cost, "mipyre-test-cost")
     worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker is None:
+        return
+    _narrow_to_worker_cpus(worker)
     dsn = os.environ.get(PG_DSN_ENV)
-    if worker is None or dsn is None:
+    if dsn is None:
         return
     own_dsn, name = worker_dsn(dsn, worker)
     _pg_admin(dsn, "create", name)
@@ -203,7 +229,7 @@ def _boot(script: str, mode: str) -> tuple[subprocess.Popen, int]:
     the process handle and the bound port (from the server's startup line).
     `mode` "gil" serves every handler on the main interpreter, "subinterp" leaves the default
     runtime: the script reads $MIPYRE_TEST_MODE (the runtime, "main" or "subinterp") and passes
-    it as `Mipyre(runtime=...)`, since an app's runtime is its code's (b/335 D9).
+    it as `Mipyre(runtime=...)`, since an app's runtime is its code's.
     """
     fd, path = tempfile.mkstemp(prefix="mipyre_test_", suffix=".py")
     with os.fdopen(fd, "w") as f:
@@ -213,7 +239,7 @@ def _boot(script: str, mode: str) -> tuple[subprocess.Popen, int]:
     env["MIPYRE_PORT"] = "0"
     # Output goes to a file, not a pipe: nobody drains a pipe while tests run, so a chatty
     # server could block on a full one, and `_teardown` scans the whole log, shutdown
-    # included (Layer 2, FR-12).
+    # included.
     log_path = path + ".log"
     with open(log_path, "w") as log:
         proc = subprocess.Popen(
@@ -229,7 +255,7 @@ def _boot(script: str, mode: str) -> tuple[subprocess.Popen, int]:
         proc.wait(timeout=5)
         raise RuntimeError(f"Mipyre server ({mode} mode) failed to start: {e}") from None
     # Then until it answers: waits for the answer or the process exiting, for no length of time (a loaded
-    # machine starts a server late, b/325); a hung start is pytest-timeout's.
+    # machine starts a server late); a hung start is pytest-timeout's.
     errors: list[Exception] = []
 
     def answered() -> bool:
@@ -298,12 +324,12 @@ def feature_server_factory(script: str):
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 (FR-12): fork panic-text scan for E2E server logs
+# Fork panic-text scan for E2E server logs
 # ---------------------------------------------------------------------------
 
 # The two refusals the PyO3 fork raises once more than one interpreter has executed the
 # engine and a thread with no thread state touches Python. A grep of src/ can't see
-# drops, so every Layer 2 E2E scans its server log for these instead.
+# drops, so every E2E scans its server log for these instead.
 FORK_PANIC_TEXTS = (
     "Python::attach was called on a thread that has no Python thread state",
     "was dropped on a thread that has no Python thread state",

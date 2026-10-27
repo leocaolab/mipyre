@@ -1,5 +1,5 @@
 """A C extension that can't load in a sub-interpreter (numpy) stops the start with
-CPython's own ImportError, the user's line that imported it, and the two fixes (design §8).
+CPython's own ImportError, the app's line that imported it, and the two fixes.
 mipyre does not copy or patch extensions to force them into sub-interpreters: routes
 that use them run in a process (runtime="process")."""
 
@@ -33,7 +33,7 @@ def test_numpy_at_the_top_of_a_sub_interpreter_app_is_a_start_error_saying_what_
     assert "Listening on" not in out
     # CPython's (or numpy's) own words, kept.
     assert "ImportError" in out, out[-3000:]
-    # Which library, where the user imported it, and the two fixes.
+    # Which library, where the app imported it, and the two fixes.
     assert "numpy can't load in a sub-interpreter" in out, out[-3000:]
     assert f"{app}:2  import numpy as np" in out, out[-3000:]
     assert "Router(runtime='process')" in out and "inside those routes' functions" in out

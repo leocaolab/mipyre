@@ -92,7 +92,7 @@ def test_delete_cookie_default_not_httponly():
 
 @pytest.mark.parametrize("max_age", ["0\r\nSet-Cookie: admin=1", "3600", True, 1.5])
 def test_set_cookie_rejects_a_max_age_that_is_not_an_int(max_age):
-    # b/390 (4d7346d5): Max-Age is interpolated verbatim, so a str carrying CR/LF would
+    # Max-Age is interpolated verbatim, so a str carrying CR/LF would
     # inject a header of its own; bool is an int subclass but never a Max-Age.
     with pytest.raises(ValueError, match="max_age must be an int"):
         Cookie("prefs", "dark", max_age=max_age)

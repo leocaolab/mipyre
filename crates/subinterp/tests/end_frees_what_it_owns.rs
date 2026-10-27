@@ -1,4 +1,4 @@
-//! Ending a worker frees everything it owns on the Rust heap (b/771).
+//! Ending a worker frees everything it owns on the Rust heap.
 //!
 //! An integration test because it needs its own global allocator, and this crate has none.
 

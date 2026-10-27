@@ -21,6 +21,7 @@ and `ISOLATION_FILE`: the file name that source is compiled under.
 
 # -- Python logging bridge to Rust tracing -----------------------------------
 
+import gc as _gc
 import logging as _logging
 
 # Set in this namespace before this file runs (see the docstring), read here by name: a missing one
@@ -52,19 +53,11 @@ _root.addHandler(_log_handler)
 # request rates, each a pause on the request path (p99 spikes). The engine runs
 # `gc.collect()` on its own schedule instead (`GcMode` in src/config.rs,
 # `MIPYRE_GC_MODE`); reference counting still frees non-cyclic garbage at once.
-try:
-    import gc as _gc
-    _gc.disable()
-except Exception:
-    _logging.getLogger("mipyre.bootstrap").error(
-        "gc.disable() failed — CPython auto-GC remains active; "
-        "expect P99 tail spikes at high RPS",
-        exc_info=True,
-    )
+_gc.disable()
 
 
 # -- runtime="isolated": the sub-interpreter loading adapter ------------------
-# Only when the app has runtime="isolated" routes (a compatibility option, design §14).
+# Only when the app has runtime="isolated" routes (a compatibility option).
 # Installed before the `mipyre` package is imported below, so the package's own imports
 # go through it as the user's do.
 if ISOLATION_SOURCE is not None:

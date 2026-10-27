@@ -1,0 +1,176 @@
+//! Serves sub-interpreter mode on the TPC threads: each thread owns a worker and runs its `def`
+//! handlers inline on it.
+
+use std::rc::Rc;
+
+use tokio_util::sync::CancellationToken;
+
+use mipyre_subinterp::gc::GcPolicy;
+use mipyre_tpc::{LocalStop, LocalTasks, ShutdownDeadline};
+use mipyre_transport::driver::{AcceptError, TransportDriver};
+
+use super::conn::{serve_accepted, ThreadWorker, TpcThread};
+use super::threads::{serve_on_workers, ThreadDrain};
+use super::{topology_label, AcceptMode, ServeError, TpcServer};
+use crate::request::handle_request;
+use crate::websocket::upgrade_target;
+use crate::ServerRunStop;
+
+/// Serves `server` with one `SO_REUSEPORT` listener per TPC thread.
+pub(super) fn run_per_thread_listener<D: TransportDriver>(
+    transport: D,
+    server: TpcServer,
+    announce: impl FnOnce(&'static str, &[String]),
+    run: &ServerRunStop,
+    deadline: &ShutdownDeadline,
+    spawner: &mut impl mipyre_tpc::Spawner,
+) -> Result<(), ServeError> {
+    let gc = server.gc;
+    let listening = transport.listening();
+    let label = topology_label(&server.threads, AcceptMode::PerThreadListener);
+    serve_on_workers(
+        server,
+        transport.into_loops(),
+        run,
+        deadline,
+        spawner,
+        move |tpc_thread, share, stop, deadline| tpc_accept_loop_inline(share, tpc_thread, stop, gc, deadline),
+        || announce(label, &listening),
+    )
+}
+
+/// Accepts on this thread's listeners and serves each connection inline on `tpc_thread`'s worker
+/// until `shutdown`, running the idle GC tick in idle mode.
+///
+/// Once the worker retires the thread stops accepting: its listeners close, so the kernel
+/// hands new connections to the other threads, and its open connections finish the request
+/// they are on and close. The thread itself runs until `shutdown`, for the process lanes it
+/// hosts.
+pub async fn tpc_accept_loop_inline<D: TransportDriver>(
+    share: D,
+    tpc_thread: Rc<TpcThread>,
+    shutdown: CancellationToken,
+    gc: GcPolicy,
+    deadline: ShutdownDeadline,
+) -> Result<(), ServeError> {
+    let mut source = Some(share.register()?);
+    // The worker fires its own count trigger (the threshold, or idle mode's OOM failsafe); this
+    // loop adds only the idle tick.
+    let mut ticker = gc.idle_tick().map(|tick| {
+        // Nothing needs collecting before any request ran, so the first tick is one period out.
+        tokio::time::interval_at(tokio::time::Instant::now() + tick, tick)
+    });
+    let ws = upgrade_target(
+        &tpc_thread.site,
+        tpc_thread.async_pool.as_deref(),
+        tpc_thread.main.as_deref(),
+    );
+    let stop = LocalStop::follow(&shutdown);
+    let stopped = stop.stopped();
+    tokio::pin!(stopped);
+    let (retiring, conn_stop) = connections_stop(&shutdown);
+    let worker = tpc_thread.worker.as_ref();
+    let thread = tpc_thread.index.get();
+    let lane_host = mipyre_process::host_tpc_thread(
+        tpc_thread.site.process.as_ref(),
+        tpc_thread.site.rules.routes.uses_lane(),
+        thread,
+    )
+    .map_err(ServeError::LaneHost)?;
+    let tracker = LocalTasks::new();
+    let ended = loop {
+        let event = tokio::select! {
+            biased;
+            () = &mut stopped => break Ok(()),
+            () = retired(worker), if source.is_some() => ThreadEvent::WorkerRetired,
+            accepted = accept::<D>(&mut source) => match accepted {
+                Ok(accepted) => ThreadEvent::Connection(accepted),
+                Err(stopped_accepting) => break Err(stopped_accepting.into()),
+            },
+            () = next_tick(&mut ticker) => ThreadEvent::IdleTick,
+        };
+        match event {
+            ThreadEvent::Connection(accepted) => {
+                tracker.spawn_local(serve_accepted::<D, _, _>(
+                    accepted,
+                    ws.clone(),
+                    {
+                        let tpc_thread = Rc::clone(&tpc_thread);
+                        move |req, peer| handle_request(req, Rc::clone(&tpc_thread), peer)
+                    },
+                    conn_stop.stopped(),
+                ));
+            }
+            ThreadEvent::IdleTick => {
+                if let Some(worker) = worker {
+                    worker.idle_tick();
+                }
+            }
+            ThreadEvent::WorkerRetired => {
+                source = None;
+                ticker = None;
+                retiring.cancel();
+                stopped_accepting(&tpc_thread);
+            }
+        }
+    };
+    ThreadDrain {
+        connections: tracker,
+        lane_host,
+    }
+    .finish(&deadline, &tpc_thread.site.counters.run)
+    .await;
+    ended
+}
+
+/// What woke this TPC thread's loop this round: a new connection, the idle GC tick, or its worker's
+/// retirement.
+enum ThreadEvent<C> {
+    Connection(C),
+    IdleTick,
+    WorkerRetired,
+}
+
+/// Returns a stop for a thread's connections that fires on shutdown or when the returned token is
+/// cancelled, which the thread does once its worker retires.
+pub(super) fn connections_stop(shutdown: &CancellationToken) -> (CancellationToken, LocalStop) {
+    let retiring = shutdown.child_token();
+    let stop = LocalStop::follow(&retiring);
+    (retiring, stop)
+}
+
+/// Waits for the next connection on `source`, forever once the thread has stopped accepting.
+async fn accept<D: TransportDriver>(source: &mut Option<D::AcceptSource>) -> Result<D::Connection, AcceptError> {
+    match source {
+        Some(source) => D::accept(source).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Completes once `worker` retires, and never for a thread without one.
+pub(super) async fn retired(worker: Option<&ThreadWorker>) {
+    match worker {
+        Some(worker) => worker.retired().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Logs that the thread takes no more connections; why its worker retired was logged then.
+pub(super) fn stopped_accepting(tpc_thread: &TpcThread) {
+    tracing::warn!(
+        target: "mipyre::server",
+        worker = tpc_thread.index.get(),
+        "this TPC thread's worker retired: the thread takes no more connections and closes \
+         the ones it has; the other threads serve"
+    );
+}
+
+/// Waits for the idle GC tick, forever in count and off modes.
+async fn next_tick(ticker: &mut Option<tokio::time::Interval>) {
+    match ticker {
+        Some(ticker) => {
+            ticker.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}

@@ -100,9 +100,8 @@ def test_the_clients_request_id_reaches_the_handler_and_a_ctx_snapshot_is_detach
         assert r.status_code == 200
         assert seen["rid"] == "trace-xyz"
         # Snapshot is a detached copy — mutating it doesn't affect the live ctx. Compared with
-        # what the live ctx held before, under a key no other test writes: until b/441 this
-        # asserted `ctx.get("foo") is None`, which a value another test left under "foo" in the
-        # same process turned red.
+        # what the live ctx held before, under a key no other test writes, so a value another
+        # test left in the same process cannot turn it red.
         before = ctx.get(_SNAPSHOT_PROBE)
         seen["snap"][_SNAPSHOT_PROBE] = "written to the snapshot"
         assert ctx.get(_SNAPSHOT_PROBE) == before

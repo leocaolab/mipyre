@@ -1,5 +1,5 @@
 """All routes on process lanes or main: no route runs on a sub-interpreter, so the server
-builds none (b/34), and this module is never imported by one."""
+builds none, and this module is never imported by one."""
 
 import os
 

@@ -95,12 +95,24 @@ def clone_tree(src: str, dst: str) -> None:
 
     try:
         if os.path.isdir(src) and not os.path.islink(src):
-            shutil.copytree(src, dst, symlinks=True)
+            shutil.copytree(
+                src, dst, symlinks=True, ignore=lambda directory, names: {n for n in names if _is_bytecode_temp(directory, n)}
+            )
         else:
             shutil.copy2(src, dst, follow_symlinks=False)
     except OSError as e:
         _remove_copy(dst)
         raise PrivateCopyError(f"copying {src} into {dst} failed: {e}; cloning it failed first ({clone_failure})") from e
+
+
+def _is_bytecode_temp(directory: str, name: str) -> bool:
+    """Return whether `name` is the temporary file importlib writes bytecode to before renaming it.
+
+    Another process importing from the source makes and renames these while the copy runs, so one
+    listed may be gone when it is opened; importlib never reads them, so the copy has no use for them.
+    """
+    stem, _, suffix = name.rpartition(".")
+    return os.path.basename(directory) == "__pycache__" and stem.endswith(".pyc") and suffix.isdecimal()
 
 
 def _remove_copy(path: str) -> None:

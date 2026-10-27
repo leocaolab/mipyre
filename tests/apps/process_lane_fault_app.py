@@ -19,7 +19,7 @@ def hello(req):
 
 @app.get("/lanes/template", runtime="main")
 def lanes_template(req):
-    return {"pid": app.process_lanes.template_pid}
+    return {"pid": app._runs.process_lanes.template_pid}
 
 
 @app.get("/lanes/worker-fds", runtime="process")

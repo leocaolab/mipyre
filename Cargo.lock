@@ -492,9 +492,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
 ]
@@ -1003,9 +1003,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.9.0"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca"
+checksum = "27b501faa50e7a26c3d3560ca625132f4078a17771f4810baf70475ae48cbe43"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1378,8 +1378,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mipyre_core"
+version = "3.0.0"
+dependencies = [
+ "mipyre_http",
+ "mipyre_microbench",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "mipyre_cpu"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "core_affinity",
  "libc",
@@ -1389,8 +1399,10 @@ dependencies = [
 
 [[package]]
 name = "mipyre_http"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
+ "atomic-waker",
+ "bolero",
  "brotli",
  "bytes",
  "dashmap",
@@ -1421,36 +1433,149 @@ dependencies = [
 
 [[package]]
 name = "mipyre_microbench"
-version = "2.0.0"
+version = "3.0.0"
+
+[[package]]
+name = "mipyre_pg"
+version = "3.0.0"
+dependencies = [
+ "futures-util",
+ "mipyre_util",
+ "parking_lot",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mipyre_process"
+version = "3.0.0"
+dependencies = [
+ "bolero",
+ "bytes",
+ "crossbeam-queue",
+ "futures-util",
+ "http",
+ "libc",
+ "loom",
+ "mipyre_core",
+ "mipyre_cpu",
+ "mipyre_http",
+ "mipyre_shm",
+ "mipyre_tpc",
+ "mipyre_transport",
+ "mipyre_util",
+ "parking_lot",
+ "proptest",
+ "rustix",
+ "serde_json",
+ "shuttle",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "mipyre_pyext"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "backtrace",
  "bolero",
  "bytes",
- "core_affinity",
  "crossbeam-channel",
- "crossbeam-utils",
+ "futures-util",
+ "httparse",
+ "hyper",
+ "libc",
+ "libmimalloc-sys",
+ "matchit",
+ "mimalloc",
+ "mipyre_core",
+ "mipyre_cpu",
+ "mipyre_http",
+ "mipyre_pg",
+ "mipyre_process",
+ "mipyre_runtime",
+ "mipyre_server",
+ "mipyre_shm",
+ "mipyre_subinterp",
+ "mipyre_tpc",
+ "mipyre_transport",
+ "mipyre_util",
+ "parking_lot",
+ "proptest",
+ "pyo3",
+ "pythonize",
+ "quanta",
+ "rustix",
+ "rustls",
+ "serde_json",
+ "socket2 0.5.10",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mipyre_runtime"
+version = "3.0.0"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
  "dashmap",
  "form_urlencoded",
+ "httpdate",
+ "hyper",
+ "itoa",
+ "libc",
+ "loom",
+ "metrics",
+ "metrics-util",
+ "mipyre_core",
+ "mipyre_http",
+ "mipyre_pg",
+ "mipyre_process",
+ "mipyre_shm",
+ "mipyre_subinterp",
+ "mipyre_tpc",
+ "mipyre_transport",
+ "mipyre_util",
+ "parking_lot",
+ "pyo3",
+ "rustix",
+ "serde_json",
+ "shuttle",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mipyre_server"
+version = "3.0.0"
+dependencies = [
+ "bytes",
+ "core_affinity",
+ "crossbeam-utils",
  "futures-util",
  "http-body-util",
- "httparse",
- "httpdate",
  "hyper",
  "hyper-util",
  "itoa",
  "libc",
- "libmimalloc-sys",
- "loom",
- "matchit",
- "metrics",
- "metrics-util",
- "mimalloc",
+ "mipyre_core",
  "mipyre_cpu",
  "mipyre_http",
+ "mipyre_pg",
+ "mipyre_process",
+ "mipyre_runtime",
  "mipyre_shm",
  "mipyre_subinterp",
  "mipyre_tpc",
@@ -1461,21 +1586,15 @@ dependencies = [
  "pin-project-lite",
  "proptest",
  "pyo3",
- "pythonize",
  "quanta",
- "rustix",
- "rustls",
  "serde_json",
- "shuttle",
- "socket2 0.5.10",
- "sqlx",
+ "signal-hook",
  "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
- "toml",
  "tracing",
  "tracing-subscriber",
  "tungstenite",
@@ -1483,7 +1602,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_shm"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "bolero",
  "bytes",
@@ -1499,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_subinterp"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "loom",
  "mipyre_cpu",
@@ -1513,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_tpc"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "futures-util",
  "loom",
@@ -1528,7 +1647,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_transport"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "libc",
  "mio",
@@ -1548,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_util"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "mipyre_microbench",
  "proptest",
@@ -2345,6 +2464,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2739,16 +2868,15 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
  "mio",
  "parking_lot",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2 0.6.3",
  "tokio-macros",
  "windows-sys 0.61.2",

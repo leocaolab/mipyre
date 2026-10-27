@@ -243,6 +243,9 @@ pub fn choose_precompressed(accept_encoding: Option<&str>, has: CodingSet) -> Op
 }
 
 #[cfg(test)]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -10,7 +10,7 @@
 #[cfg(not(shm_model))]
 pub mod adapter;
 pub mod channel;
-// The models and the kernel they sleep in exist only for the model tests: Loom's, and Shuttle's (b/744).
+// The models and the kernel they sleep in exist only for the model tests: Loom's, and Shuttle's.
 #[cfg(test)]
 #[cfg(all(shm_model, not(shm_shuttle)))]
 mod loom_model;

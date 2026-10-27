@@ -160,6 +160,9 @@ fn write_words(out: &mut Vec<u8>, words: &[u16]) {
 }
 
 #[cfg(test)]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -273,7 +276,7 @@ mod proptests {
 
     /// Strips leading integer zeros and the sign of a zero, as `decode` writes a wire in
     /// Postgres's own normal form.
-    fn normal_form(text: &str) -> String {
+    pub(super) fn normal_form(text: &str) -> String {
         let (negative, unsigned) = match text.strip_prefix('-') {
             Some(rest) => (true, rest),
             None => (false, text),

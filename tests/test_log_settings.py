@@ -9,7 +9,7 @@ from mipyre._log.settings import _AccessLog, _LogSettings
 
 def test_debug_and_production_defaults():
     assert _LogSettings.resolve(True, {}) == _LogSettings(LogLevel.Debug, True, "text")
-    assert _LogSettings.resolve(False, {}) == _LogSettings(LogLevel.Error, False, "json")
+    assert _LogSettings.resolve(False, {}) == _LogSettings(LogLevel.Warn, False, "json")
 
 
 def test_the_user_config_overrides_the_mode_defaults_and_its_level_is_parsed():
@@ -24,7 +24,7 @@ def test_asked_by_neither_the_user_nor_the_launch_the_settings_are_as_configured
     assert configured.with_access_log(None, False) == configured
 
 
-@pytest.mark.parametrize("hidden", [LogLevel.Error, LogLevel.Off])
+@pytest.mark.parametrize("hidden", [LogLevel.Warn, LogLevel.Error, LogLevel.Off])
 @pytest.mark.parametrize(
     "choice,launch_log", [(_AccessLog(None), False), (None, True)], ids=["user", "launch"]
 )
@@ -34,8 +34,8 @@ def test_the_access_log_raises_a_level_that_would_hide_it_to_info(hidden, choice
 
 
 def test_the_access_log_keeps_a_level_that_shows_it():
-    configured = _LogSettings(LogLevel.Warn, False, "json")
-    assert configured.with_access_log(_AccessLog(None), False).level == LogLevel.Warn
+    configured = _LogSettings(LogLevel.Info, False, "json")
+    assert configured.with_access_log(_AccessLog(None), False).level == LogLevel.Info
 
 
 @pytest.mark.parametrize("launch_log", [False, True])

@@ -1,4 +1,4 @@
-//! A mount's cache against reference models (b/739): one sequence of writes, deletes, watcher events and requests
+//! A mount's cache against reference models: one sequence of writes, deletes, watcher events and requests
 //! goes to a directory on disk served by a cached mount, and every request must be answered as the models answer it.
 //!
 //! The first model is a map of what the test wrote to disk: a file that is there is served with exactly its bytes, one
@@ -117,7 +117,7 @@ fn mount(root: &Path, copies: Copies, budget: &Arc<CacheBudget>, watch: MountWat
     StaticMount {
         rule: StaticMountRule::new("/static", copies).expect("the prefix starts with '/'"),
         cache: Arc::new(cache),
-        held: Box::leak(Box::new(HeldBytes::new())),
+        held: Arc::new(HeldBytes::new()),
     }
 }
 

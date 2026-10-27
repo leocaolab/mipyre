@@ -269,7 +269,7 @@ fn mount_on(root: &Path, copies: Copies, budget: &Arc<CacheBudget>) -> StaticMou
     StaticMount {
         rule: StaticMountRule::new("/static", copies).unwrap(),
         cache: Arc::new(cache),
-        held: Box::leak(Box::new(HeldBytes::new())),
+        held: Arc::new(HeldBytes::new()),
     }
 }
 
@@ -539,6 +539,37 @@ fn a_file_sent_from_disk_answers_as_the_kept_file_does() {
     .unwrap()
     .unwrap();
     assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+}
+
+/// A server's copy of a mount counts the bytes its answers hold apart from another server's copy
+/// of the same mount, while plain clones share the count.
+#[test]
+fn a_copy_counting_its_own_sends_holds_apart_from_the_other_copies() {
+    let tmp = tempdir();
+    std::fs::write(tmp.path().join("big.bin"), patterned(3 * send::CHUNK)).unwrap();
+    let rt = runtime();
+    let first = mount_on(tmp.path(), Copies::Original, &own_budget(0));
+    let shared = first.clone();
+    let mut second = first.clone();
+    second.count_own_sends();
+
+    let mut answer = serve_rel(&rt, &second, "big.bin", None).unwrap().unwrap().into_body();
+    let chunk = next_frame(&rt, &mut answer).unwrap().unwrap();
+    assert_eq!(second.bytes_in_flight(), chunk.len() as u64);
+    assert_eq!(
+        first.bytes_in_flight(),
+        0,
+        "the other server's copy counts this server's chunk"
+    );
+
+    let mut answer = serve_rel(&rt, &first, "big.bin", None).unwrap().unwrap().into_body();
+    let other = next_frame(&rt, &mut answer).unwrap().unwrap();
+    assert_eq!(
+        shared.bytes_in_flight(),
+        other.len() as u64,
+        "a clone does not see its mount's chunk"
+    );
+    assert_eq!(second.bytes_in_flight(), chunk.len() as u64);
 }
 
 /// The copy a client accepts is sent from disk with its own `Content-Encoding` and `ETag`.

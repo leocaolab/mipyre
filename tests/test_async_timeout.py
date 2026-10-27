@@ -1,14 +1,12 @@
 """Tests for async handler timeout in sub-interpreter mode.
 
-The async engine runs each request's task under a budget of TASK_TIMEOUT seconds, 2s before
-the request budget Rust answers 504 at, or half of it when that is less
-(`app.request_timeout`, 30s by default: 28s; the script sets 1s: 0.5s). The task is cancelled there and answered 504 by the engine itself.
-This prevents phantom load from zombie Python tasks after client disconnects.
+Rust answers 504 when a request outlives its budget (`app.request_timeout`; the script sets
+1s). The async engine keeps no timer of its own: the request's task is not cancelled then and
+runs to its end, its late answer dropped.
 
 Covers:
 - Fast async handlers complete normally
-- Slow async handlers (past TASK_TIMEOUT) are cancelled there (the handler sees
-  CancelledError) and get 504
+- Slow async handlers get 504, and their task is not cancelled
 - Server remains healthy after async timeout
 """
 
@@ -23,7 +21,7 @@ import urllib.error
 
 import pytest
 
-from tests._helpers import answers, bound_port, kill_session, poll_until, read_file
+from tests._helpers import answers, bound_port, kill_session, read_file
 
 
 def start_server(script_path):
@@ -42,7 +40,7 @@ def start_server(script_path):
             env=env,
         )
     port = bound_port(read_file(log_path), proc)
-    # Phase 1: wait for sync endpoint (confirms Rust accept loop is up), for no length of time (b/441 T2).
+    # Phase 1: wait for sync endpoint (confirms Rust accept loop is up), for no length of time.
     answers(f"http://127.0.0.1:{port}/", proc, read_file(log_path))
     # Phase 2: wait for async workers (_worker/async_engine.py init: asyncio event
     # loop + sub-interpreter bootstrap). Workers start lazily; on this hardware
@@ -71,7 +69,7 @@ def stop_server(proc, port):
 
 ASYNC_TIMEOUT_SCRIPT = r'''
 import os
-from mipyre import Mipyre
+from mipyre import Mipyre, ServerFlags
 
 CANCEL_MARK = "%s"
 
@@ -100,7 +98,7 @@ async def fast_async(req):
     return {"fast": True}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0)
+    app.run(ServerFlags(host="127.0.0.1", port=0))
 '''
 
 
@@ -138,7 +136,7 @@ def test_fast_async_succeeds(server):
 
 
 def test_slow_async_times_out(server, cancel_mark):
-    """Async handler exceeding the engine's task timeout returns 504, and its task is
+    """Async handler exceeding the request budget returns 504, and its task is not
     cancelled."""
     try:
         resp = urllib.request.urlopen(
@@ -150,9 +148,8 @@ def test_slow_async_times_out(server, cancel_mark):
         status = e.code
         body = e.read()
     assert status == 504, f"Expected 504, got {status}: {body}"
-    # The engine cancels the task at 0.5s, before the 504 at the 1s budget: the handler saw it.
-    # Its mark lands when the cancelled task runs its handler; waited for, for no length of time (b/441).
-    poll_until(lambda: os.path.exists(cancel_mark), timeout=None, what="the timed-out task's cancellation mark")
+    # A cancellation at the budget would have reached the handler before this 504 was sent.
+    assert not os.path.exists(cancel_mark)
 
 
 def test_server_healthy_after_async_timeout(server):

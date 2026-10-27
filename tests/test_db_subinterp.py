@@ -29,7 +29,7 @@ if not PG_DSN:
 SERVER = '''
 import json as _json
 import os
-from mipyre import Mipyre, Response
+from mipyre import Mipyre, Response, ServerFlags
 from mipyre.db import PgPool
 
 DSN = os.environ["MIPYRE_TEST_PG_DSN"]
@@ -70,7 +70,7 @@ def do_exec(req):
     return {"affected": n}
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ["MIPYRE_PORT"]), threads=2)
+    app.run(ServerFlags(host="127.0.0.1", port=int(os.environ["MIPYRE_PORT"]), threads=2))
 '''
 
 

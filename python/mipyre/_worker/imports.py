@@ -1,4 +1,4 @@
-"""Why a sub-interpreter worker could not import an extension, in words (design §8).
+"""Why a sub-interpreter worker could not import an extension, in words.
 
 A C extension that does not declare multi-interpreter support fails to import in a
 sub-interpreter with CPython's own ImportError (or the extension's own guard). mipyre
@@ -13,12 +13,14 @@ import os
 import re
 import sysconfig
 
+from mipyre._worker.extension_support import CPYTHON_REFUSAL
+
 # What CPython and the extension-building tools raise when an extension can't load in
 # a sub-interpreter, as their messages read.
 MARKERS = (
-    "does not support loading in subinterpreters",  # CPython's multi-interpreter check
+    CPYTHON_REFUSAL,
     "cannot load module more than once per process",  # numpy's guard
-    "do not yet support subinterpreters",  # PyO3 (#576)
+    "do not yet support subinterpreters",  # PyO3
     "this module can only be loaded into one interpreter per process",  # Cython
     "failed to import from subinterpreter due to exception",  # CPython ran PyInit in main
 )
@@ -42,7 +44,7 @@ def _offending(exc: BaseException) -> ImportError | None:
     return None
 
 
-_MODULE_IN_TEXT = re.compile(r"module '?([A-Za-z_][\w.]*)'? does not support loading in subinterpreters")
+_MODULE_IN_TEXT = re.compile(r"module '?([A-Za-z_][\w.]*)'? " + re.escape(CPYTHON_REFUSAL))
 
 
 def _module(exc: BaseException) -> str | None:
@@ -117,9 +119,9 @@ def explain(exc: BaseException) -> str | None:
     return (
         f"\n{library} can't load in a sub-interpreter{via}{at}Routes that use it need one of:\n"
         f"  1. runtime='process': they run in worker processes, where {library} loads as anywhere "
-        f"else. Put them in a module of their own with router = Router(runtime='process') (listed "
-        f"in Mipyre(routers=[...])) and import {library} there, or import {library} inside those "
-        f"routes' functions: a module with sub-interpreter routes is imported by every "
+        f"else. Put them in a module of their own with router = Router(runtime='process') (named "
+        f"in app.include_router('module:router')) and import {library} there, or import {library} "
+        f"inside those routes' functions: a module with sub-interpreter routes is imported by every "
         f"sub-interpreter, so it must not import {library} at its top.\n"
         f"  2. runtime='main': they run on the main interpreter (one GIL; for few routes).\n"
         f"  3. runtime='isolated': each sub-interpreter loads its own copy of {library} with "

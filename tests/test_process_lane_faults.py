@@ -101,7 +101,7 @@ def lane_memory_fds(pid: int) -> int:
 
 
 def test_the_template_holds_each_lanes_channel_and_maps_none(server):
-    # The template hands each lane's channel to the lane's workers and never maps one (b/761): it holds one shared
+    # The template hands each lane's channel to the lane's workers and never maps one: it holds one shared
     # memory object per lane (the current run's), and on Linux, where the mappings can be listed, none is mapped.
     status, body = server.get("/lanes/template")
     assert status == 200, (status, body)
@@ -113,10 +113,35 @@ def test_the_template_holds_each_lanes_channel_and_maps_none(server):
         assert mapped == [], mapped
 
 
+def tcp_sockets(pid: int) -> list[str]:
+    """The TCP sockets `pid` holds, each as the kernel names it: on Linux the inodes /proc lists in its TCP tables, on
+    macOS the addresses lsof lists."""
+    if sys.platform == "linux":
+        held = {os.readlink(f"/proc/{pid}/fd/{fd}")[len("socket:["):-1] for fd in os.listdir(f"/proc/{pid}/fd")}
+        tcp: set[str] = set()
+        for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+            with open(table) as rows:
+                next(rows)  # the header
+                tcp.update(row.split()[9] for row in rows)
+        return sorted(held & tcp)
+    # lsof exits 1 when it lists none.
+    listed = subprocess.run(["lsof", "-nP", "-a", "-p", str(pid), "-iTCP", "-Fn"], capture_output=True, text=True)
+    assert listed.returncode in (0, 1), listed.stdout + listed.stderr
+    return [line[1:] for line in listed.stdout.splitlines() if line.startswith("n")]
+
+
+def test_the_template_holds_no_tcp_socket(server):
+    # The template is forked before the server binds its ports, and a worker is forked from it without an exec, so
+    # close-on-exec could not keep the server's listening sockets out of either: only that order does.
+    status, body = server.get("/lanes/template")
+    assert status == 200, (status, body)
+    assert tcp_sockets(json.loads(body)["pid"]) == [], server.read()[-3000:]
+
+
 def test_a_worker_holds_only_its_own_lanes_bell_and_hands_no_channel_fd_to_a_program_it_runs(server):
     # A worker maps its lane and closes the shared memory; of the run's fds it keeps only its own lane's wake pipe
     # end, and neither another lane's channel nor the template's socket. Its pipes and sockets past the standard
-    # streams are close-on-exec, so a program its app runs gets none of them (b/761).
+    # streams are close-on-exec, so a program its app runs gets none of them.
     status, body = server.get("/lanes/worker-fds")
     assert status == 200, (status, body)
     worker = json.loads(body)

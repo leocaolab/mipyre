@@ -50,19 +50,19 @@ pub(crate) fn is_symlink_refusal(_: &io::Error) -> bool {
 }
 
 /// Plants a symlink for tests; `None` means making one needs privileges here, as on Windows.
-#[cfg(all(test, unix))]
+#[cfg(all(test, not(sync_model), unix))]
 pub(crate) fn plant_symlink(original: &std::path::Path, link: &std::path::Path) -> Option<io::Result<()>> {
     Some(std::os::unix::fs::symlink(original, link))
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, not(sync_model), not(unix)))]
 pub(crate) fn plant_symlink(_original: &std::path::Path, _link: &std::path::Path) -> Option<io::Result<()>> {
     None
 }
 
 /// Makes a FIFO for tests with the `mkfifo` tool, so the crate needs no `unsafe` call; `None`
 /// means the platform has no FIFOs, as on Windows.
-#[cfg(all(test, unix))]
+#[cfg(all(test, not(sync_model), unix))]
 pub(crate) fn plant_fifo(path: &std::path::Path) -> Option<io::Result<()>> {
     let made = std::process::Command::new("mkfifo").arg(path).status();
     Some(made.and_then(|status| {
@@ -74,7 +74,7 @@ pub(crate) fn plant_fifo(path: &std::path::Path) -> Option<io::Result<()>> {
     }))
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, not(sync_model), not(unix)))]
 pub(crate) fn plant_fifo(_path: &std::path::Path) -> Option<io::Result<()>> {
     None
 }

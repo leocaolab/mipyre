@@ -8,9 +8,7 @@ import functools
 import inspect
 from typing import Callable
 
-from mipyre.engine import Response, _is_async_handler, _route_params
-
-DETAIL_LIMIT = 20
+from mipyre.engine import VALIDATION_DETAIL_LIMIT, Response, _is_async_handler, _route_params
 
 
 def bind_handler(fn: Callable, path: str, model: type | None, query: type | None = None) -> Callable:
@@ -35,6 +33,7 @@ def _bind_path_params(fn: Callable, path: str, template: frozenset[str]) -> Call
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
         return fn  # a builtin/C callable: nothing to inject
+    _refuse_request_named_as_path_param(fn, sig, path, template)
     names = _path_param_names(fn, sig, path, template, leading=1)
     if not names:
         return fn  # hot path — the handler is registered as is
@@ -48,6 +47,23 @@ def _bind_path_params(fn: Callable, path: str, template: frozenset[str]) -> Call
             p = req.params
             return fn(req, **{n: p[n] for n in names})
     return _wrapping(bound, fn, _is_async_handler(fn))
+
+
+def _refuse_request_named_as_path_param(
+    fn: Callable, sig: inspect.Signature, path: str, template: frozenset[str]
+) -> None:
+    """Raise when the first parameter, which always receives the request, is named after one of
+    the path params: the handler would get the request where it expects the param, with no error
+    on any request."""
+    params = list(sig.parameters)
+    if not params or params[0] not in template:
+        return
+    meant = ", ".join(["req", *(p for p in params if p != "req")])
+    raise TypeError(
+        f"handler {fn.__name__!r}: its first parameter {params[0]!r} receives the request, but "
+        f"{path!r} has a path param of that name; the request comes first and path params "
+        f"follow by name: def {fn.__name__}({meant})"
+    )
 
 
 def _bind_validated(
@@ -173,7 +189,7 @@ def _errors(e, loc: tuple[str, ...] = ()) -> list[dict]:
 
 
 def _unprocessable(errors: list[dict]) -> Response:
-    """Return the 422 for a request that failed validation: the first ``DETAIL_LIMIT``
+    """Return the 422 for a request that failed validation: the first ``VALIDATION_DETAIL_LIMIT``
     errors and how many there were, so a body that fails in a million places costs a
     bounded answer. A validator's exception in an error's ``ctx`` goes out as its text, as in
     pydantic's own JSON.
@@ -183,7 +199,7 @@ def _unprocessable(errors: list[dict]) -> Response:
     for that run, saying how many were not logged since the last one."""
     from pydantic_core import to_json
 
-    body = to_json({"detail": errors[:DETAIL_LIMIT], "error_count": len(errors)}, fallback=str)
+    body = to_json({"detail": errors[:VALIDATION_DETAIL_LIMIT], "error_count": len(errors)}, fallback=str)
     return Response._validation_failure(body, len(errors))
 
 
@@ -197,11 +213,12 @@ def _path_param_names(
     fn: Callable, sig: inspect.Signature, path: str, template: frozenset[str], leading: int
 ) -> tuple[str, ...]:
     """The parameters after the ``leading`` ones the dispatcher fills (request,
-    body), each of which must name a param in the URL template."""
-    names = tuple(
-        p.name for p in list(sig.parameters.values())[leading:]
+    body), each of which must name a param in the URL template and take a str."""
+    params = [
+        p for p in list(sig.parameters.values())[leading:]
         if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-    )
+    ]
+    names = tuple(p.name for p in params)
     missing = [n for n in names if n not in template]
     if missing:
         raise ValueError(
@@ -210,7 +227,20 @@ def _path_param_names(
             f"injection only fills names that appear as `{{name}}` "
             f"or `{{*name}}` in the route path."
         )
+    for p in params:
+        if not _is_str_annotation(p.annotation):
+            raise TypeError(
+                f"handler {fn.__name__!r}: path param {p.name!r} is annotated "
+                f"{inspect.formatannotation(p.annotation)}, but a path param is passed as the str "
+                "the URL holds; annotate it str and convert it in the handler"
+            )
     return names
+
+
+def _is_str_annotation(annotation: object) -> bool:
+    """Return whether ``annotation`` admits the str a path param is: none, ``str``, or ``"str"``
+    under ``from __future__ import annotations``."""
+    return annotation is inspect.Parameter.empty or annotation is str or annotation == "str"
 
 
 def _takes_every_param(names: tuple[str, ...], template: frozenset[str]) -> bool:

@@ -1,4 +1,4 @@
-"""The OpenAPI 3.1 document `OpenApi(app)` serves (b/748): what it says about each route,
+"""The OpenAPI 3.1 document `OpenApi(app)` serves: what it says about each route,
 that it is valid against the official OpenAPI 3.1 schema, and that Schemathesis can test a served
 app from it."""
 
@@ -15,6 +15,7 @@ from openapi_spec_validator import validate
 
 from mipyre import FastRoute, Mipyre, OpenApi, Response, Route, Runtime
 from mipyre._openapi import document
+from mipyre.engine import VALIDATION_DETAIL_LIMIT
 from mipyre.testing import TestClient, TestServer
 from tests.apps.openapi_items import app as items_app, docs as items_docs
 
@@ -102,6 +103,16 @@ def test_a_model_route_takes_the_model_as_its_required_json_body_and_documents_t
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Point"}}},
     }
     assert set(op["responses"]) == {"200", "422"}
+
+
+def test_the_documented_422_lists_at_most_the_engines_detail_limit():
+    def create(p: Point) -> dict:
+        raise NotImplementedError
+
+    op = _doc(_route("POST", "/points", create, Point))["paths"]["/points"]["post"]
+
+    schema = op["responses"]["422"]["content"]["application/json"]["schema"]
+    assert schema["properties"]["detail"]["maxItems"] == VALIDATION_DETAIL_LIMIT
 
 
 def test_a_model_used_by_two_routes_is_one_component():
@@ -289,7 +300,7 @@ def items_url():
 
 
 @_items.parametrize()
-# Fixed: the merge gate runs the same cases every time (docs/property-testing.md §5).
+# Fixed: every run takes the same cases.
 @settings(derandomize=True, database=None, deadline=None)
 def test_schemathesis_finds_the_served_operation_answering_as_documented(case, items_url):
     # Left out: pydantic's default (lax) mode takes `false` and `"7"` for an int, which its own JSON

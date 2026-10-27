@@ -7,7 +7,7 @@ from tests.conftest import feature_server_factory
 
 SERVER = '''
 import os, json
-from mipyre import Mipyre, Response
+from mipyre import Mipyre, Response, ServerFlags
 from mipyre.cookies import Cookie, get_cookie
 
 app = Mipyre(runtime=os.environ["MIPYRE_TEST_MODE"])
@@ -25,10 +25,7 @@ def get_route(req):
     return {"sid": get_cookie(req, "sid", "none")}
 
 if __name__ == "__main__":
-    app.run(
-        host="127.0.0.1",
-        port=int(os.environ["MIPYRE_PORT"]),
-    )
+    app.run(ServerFlags(host="127.0.0.1", port=int(os.environ["MIPYRE_PORT"])))
 '''
 
 feature_server = feature_server_factory(SERVER)

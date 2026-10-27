@@ -2,34 +2,35 @@
 caller. ``app.run()``, ``mipyre run`` / ``mipyre dev`` and ``TestClient`` all serve through
 :class:`ServerRun`.
 
-A run ends in this order: the server stops; the workers that outlived the shutdown grace are
-taken and the process is kept from finalizing under them, and the way the run ended is logged
-(before any user code runs again); every shutdown hook runs; then the run raises its outcome
-(:func:`run_outcome`)."""
+A run ends in this order: the server stops, and the engine keeps the process from finalizing
+under any worker that outlived the shutdown grace; those workers are taken; every shutdown hook
+runs; then the run raises its outcome (:func:`run_outcome`), which is the one report of how it
+failed."""
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
 import enum
-import logging as _logging
-import os
+import errno
 import sys
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, Sequence
 
-from mipyre import _finalize, flags
+from mipyre import flags
 from mipyre._log import bridge
+from mipyre._log.settings import _LogSettings
 from mipyre._process_lane.settings import ProcessLanes
 from mipyre._routes import Runtime, RuntimeDeclarationError
 from mipyre.engine import (
     AbandonedWorker,
     Deployment,
-    MissingAppFileError,
     RunMetrics,
     ServerFlags,
     StartStrategy,
+    _exit_without_finalization,
+    _flags,
     _physical_cores,
     _python_log_level,
     emit_python_log,
@@ -40,12 +41,9 @@ from mipyre.engine import (
 if TYPE_CHECKING:
     import socket
 
-    from mipyre._log.settings import _LogSettings
     from mipyre._process_lane.server import Template
     from mipyre.app import Mipyre
-    from mipyre.engine import CommandLine, LaneRecipe, LaneSet, Server
-
-_logger = _logging.getLogger("mipyre.app")
+    from mipyre.engine import CommandLine, Flag, LaneRecipe, Server, _LaneSet
 
 
 class Transport(enum.Enum):
@@ -67,10 +65,11 @@ class AbandonedWorkersError(Exception):
 
     def __init__(self, workers: Sequence[AbandonedWorker]):
         self.workers: tuple[AbandonedWorker, ...] = tuple(workers)
-        super().__init__(
-            "worker(s) " + ", ".join(str(w) for w in self.workers) + " did not stop within the "
-            "shutdown grace period"
-        )
+        super().__init__(_not_stopped(self.workers))
+
+
+def _not_stopped(workers: Sequence[AbandonedWorker]) -> str:
+    return "worker(s) " + ", ".join(str(w) for w in workers) + " did not stop within the shutdown grace period"
 
 
 def run_outcome(failures: Sequence[BaseException], abandoned: Sequence[AbandonedWorker]) -> BaseException | None:
@@ -158,8 +157,8 @@ class ServerRun:
         if self._prepared:
             return
         app = self._app
-        if self._script is not None and app._app_file_path is None:
-            set_app_file(app, self._script)
+        if self._script is not None:
+            app._engine.set_script_path(self._script)
         command_line = self._held.enter_context(flags._lease(self._run_kind))
         try:
             self._runs.prepare(self._deployment, self._config, self._launch, command_line)
@@ -198,17 +197,10 @@ class ServerRun:
             self._note_function_defined_app(ended)
             failures.append(ended)
 
-        # Published before any shutdown hook runs: a hook may hang or exit the process, and
-        # by then the process must already refuse to finalize under a live worker.
         abandoned = tuple(app._engine._take_abandoned_workers())
-        if abandoned:
-            _finalize.refuse_finalization_while_owned([str(w) for w in abandoned])
-        hooks = app._shutdown_hooks
-        if failures or abandoned:
-            _logger.error("%s; running %d shutdown hook(s)", _how_it_ended(failures, abandoned), len(hooks))
 
         with _sigint_ignored() if graceful else contextlib.nullcontext():
-            for hook in hooks:
+            for hook in app._shutdown_hooks:
                 failed = _failure_of(hook)
                 if failed is None:
                     continue
@@ -264,19 +256,19 @@ class ServerRun:
         only the connections ``connect()`` makes, and the settings' address and TLS are not
         used."""
         app = self._app
-        for hook in app._startup_hooks:
-            hook()
-        server = app._engine.start(
-            deployment=self._deployment,
-            config=self._config,
-            transport=self._transport.value,
-            command_line=self._command_line,
-        )
-        with self._lock:
-            self._server = server
-            if self._stopping:
-                server.shutdown()
-        with self._runs.serving_while(self):
+        with self._runs.running_while(self):
+            for hook in app._startup_hooks:
+                hook()
+            server = app._engine.start(
+                deployment=self._deployment,
+                config=self._config,
+                transport=self._transport.value,
+                command_line=self._command_line,
+            )
+            with self._lock:
+                self._server = server
+                if self._stopping:
+                    server.shutdown()
             server.serve(on_serving)
 
     def _note_function_defined_app(self, error: BaseException) -> None:
@@ -299,22 +291,10 @@ def _failure_of(call: Callable[[], object]) -> BaseException | None:
     return None
 
 
-def _how_it_ended(failures: Sequence[BaseException], abandoned: Sequence[AbandonedWorker]) -> str:
-    """The run's end in one line, for the log: what failed (type and message) and the
-    workers left running."""
-    parts = [f"server run failed: {type(e).__name__}: {e}" for e in failures]
-    if abandoned:
-        parts.append(
-            "worker(s) " + ", ".join(str(w) for w in abandoned) + " did not stop within the "
-            "shutdown grace period"
-        )
-    return "; ".join(parts)
-
-
 class AppRuns:
     """What the runs of one app in this process share: the app's preparation (its
     registrations sealed and logging set up, once), its process lanes once started (one
-    template starts the workers of every run), and the runs serving now. The app's first run
+    template starts the workers of every run), and the runs running now. The app's first run
     makes it (:func:`runs_of`); it lasts as long as the app."""
 
     def __init__(self, app: Mipyre) -> None:
@@ -324,33 +304,29 @@ class AppRuns:
         self._prepare_lock = threading.Lock()
         self._prepared = False
         self._lanes: _StartedLanes | None = None
-        self._serving_lock = threading.Lock()
-        self._serving: set[ServerRun] = set()
+        self._running_lock = threading.Lock()
+        self._running: set[ServerRun] = set()
 
     @property
-    def process_lanes(self) -> LaneSet | None:
+    def process_lanes(self) -> _LaneSet | None:
         return None if self._lanes is None else self._lanes.lanes
 
-    def serving(self) -> list[ServerRun]:
-        """Return the runs whose server is up and serving now."""
-        with self._serving_lock:
-            return list(self._serving)
-
     def stop(self) -> None:
-        """Stop every run of the app that is serving, as SIGINT does: each drains and returns.
-        A no-op while none is. To stop one run of several, call that run's ``stop()``."""
-        for run in self.serving():
+        """Stop every run of the app that is running, as SIGTERM does (see ``Mipyre.stop``)."""
+        with self._running_lock:
+            running = list(self._running)
+        for run in running:
             run.stop()
 
     @contextlib.contextmanager
-    def serving_while(self, run: ServerRun) -> Iterator[None]:
-        with self._serving_lock:
-            self._serving.add(run)
+    def running_while(self, run: ServerRun) -> Iterator[None]:
+        with self._running_lock:
+            self._running.add(run)
         try:
             yield
         finally:
-            with self._serving_lock:
-                self._serving.discard(run)
+            with self._running_lock:
+                self._running.discard(run)
 
     def prepare(self, deployment: Deployment, config: ServerFlags, launch: Launch, command_line: CommandLine) -> None:
         """Get the app ready for a server. Once per app, by its first server: seal the script's
@@ -361,7 +337,8 @@ class AppRuns:
         with self._prepare_lock:
             if not self._prepared:
                 app._engine._seal_registrations()
-                log = app._configured_log.with_access_log(app._access_log, deployment.log(None, launch.log))
+                configured = _LogSettings.resolve(app.debug, app._log_config, dev=launch.log)
+                log = configured.with_access_log(app._access_log, deployment.log(None, launch.log))
                 self._start_lanes(deployment, config, launch.template, log)
 
                 app._engine.enable_request_logging(log.access_log)
@@ -418,7 +395,7 @@ class _StartedLanes:
     the first run it is told, and the module-level code of every worker it forks ran with that
     run's command line."""
 
-    def __init__(self, lanes: LaneSet, *, forks: bool) -> None:
+    def __init__(self, lanes: _LaneSet, *, forks: bool) -> None:
         self.lanes = lanes
         self._forks = forks
         self._imported_with: CommandLine | None = None
@@ -453,52 +430,12 @@ def lane_recipe(app: Mipyre, deployment: Deployment, config: ServerFlags) -> Lan
     return deployment.lanes(config._with_lanes(**dataclasses.asdict(declared)), _physical_cores())
 
 
-def set_app_file(app: Mipyre, path: str) -> None:
-    """The source file that defines ``app``: workers execute it, and the
-    reloader watches its directory. Defaults to ``__main__``'s file."""
-    app._app_file_path = path
-    app._engine.set_script_path(path)
-
-
-def app_file(app: Mipyre) -> str:
-    if app._app_file_path is not None:
-        return app._app_file_path
-    main = sys.modules["__main__"]
-    main_file = getattr(main, "__file__", None)
-    if main_file is None:
-        raise _no_reload_file(repr(main), _argv0())
-    return os.path.abspath(main_file)
-
-
-def _no_reload_file(main: str, argv0: str) -> MissingAppFileError:
-    """``run(reload=True)`` could not start: the reloader watches the directory of the
-    app's source file, and ``__main__`` has no ``__file__`` while no file was named."""
-    return MissingAppFileError(
-        "reload watches the directory of the app's source file and restarts the app "
-        f"when a file there changes, but there is no source file: __main__ is {main}, "
-        f"which has no __file__ (sys.argv[0] is {argv0}). Python sets __main__.__file__ "
-        "only when it runs a file (`python app.py`, `python -m pkg`); `python -c`, the "
-        "interactive interpreter and hosts that embed Python leave it unset. Start the "
-        "app from a file, or with `mipyre dev module:app`."
-    )
-
-
-def _argv0() -> str:
-    """``repr(sys.argv[0])``, or why there is none (an embedding host may set no argv)."""
-    argv = getattr(sys, "argv", None)
-    if argv is None:
-        return "absent: sys has no argv"
-    if not argv:
-        return "absent: sys.argv is empty"
-    return repr(argv[0])
-
-
 def _lane_target(app: Mipyre) -> str:
     """The target a process-lane worker imports to rebuild ``app`` (see `lane_target`); an app
     bound to no module-level name of its file is a declaration error."""
     from mipyre._process_lane.server import lane_target
 
-    file = app_file(app)
+    file = app._engine.app_file()
     target = lane_target(app, file, list(sys.modules.values()))
     if target is None:
         raise RuntimeDeclarationError(
@@ -519,7 +456,7 @@ def run(app: Mipyre, deployment: Deployment, config: ServerFlags, launch: Launch
 
     if reload and not _reload.is_reload_child():
         # This process only watches: it ends the way the server it ran last ended.
-        status = _reload.run_with_reload(_reload.ReloadTarget.of_this_process(app_file(app)))
+        status = _reload.run_with_reload(_reload.ReloadTarget.of_this_process(app._engine.app_file()))
         if status != 0:
             raise SystemExit(status)
         return
@@ -529,9 +466,21 @@ def run(app: Mipyre, deployment: Deployment, config: ServerFlags, launch: Launch
     try:
         ServerRun(app, deployment, config, launch).serve()
     except AbandonedWorkersError as e:
-        _finalize.exit_without_finalization(str(e), error=e)
+        _exit_without_finalization(str(e), e)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            e.add_note(_port_in_use(next(f for f in _flags() if f.name == "port")))
+        raise
     finally:
         flush_logs()
+
+
+def _port_in_use(port: Flag) -> str:
+    return (
+        f"Another program listens on that port: stop it, or serve on another port with "
+        f"{port.cli} (mipyre run / mipyre dev), {port.env}, {port.file} in pyproject.toml, or "
+        f"{' / '.join(port.code)} in code."
+    )
 
 
 @contextlib.contextmanager

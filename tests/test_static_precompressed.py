@@ -1,5 +1,5 @@
 """`app.static(..., precompressed=True)`: the `.br` / `.gz` twin the client accepts,
-the original's Content-Type, and a cache that follows the disk (b/15, b/16)."""
+the original's Content-Type, and a cache that follows the disk."""
 
 import gzip
 import http.client
@@ -100,7 +100,7 @@ def test_missing_is_404(client):
 def test_replaced_files_follow_the_disk(client, root):
     """Arena's staleness probe: original and twins replaced by same-length files (rename
     over), then put back; the replacement is served once the file watcher sees it. How soon is
-    the OS watcher's, not a promise (b/441 D8): the invalidation is `io/static_files/tests.rs`'s,
+    the OS watcher's, not a promise: the invalidation is `io/static_files/tests.rs`'s,
     and a watcher that never sees it is a hang pytest-timeout ends."""
     before = _get(client.port, "/static/site.css", ARENA_ACCEPT)[2]
     path = os.path.join(root, "site.css.br")
@@ -117,7 +117,7 @@ def test_replaced_files_follow_the_disk(client, root):
 
 @pytest.mark.parametrize("method", ["GET", "HEAD"])
 def test_a_client_revalidating_the_twin_it_has_gets_304_without_a_length(client, method):
-    """b/607: the twin's own ETag answers 304, with the validators and Vary and no body or
+    """The twin's own ETag answers 304, with the validators and Vary and no body or
     Content-Length (RFC 9110 §8.6: an empty body's 0 is not the representation's length)."""
     status, headers, twin = _get(client.port, "/static/site.css", ARENA_ACCEPT)
     assert status == 200

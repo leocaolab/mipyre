@@ -15,8 +15,8 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::io::static_files::{FileBody, FileSendError};
-use crate::plan::body_limit::{grown_capacity, BodySizeLimit, TooLarge};
-use crate::plan::limits::{BodyTimeAllowance, Limits};
+use crate::plan::body_limit::{BodySizeLimit, TooLarge};
+use crate::plan::limits::{BodyTimeAllowance, Limits, RequestBudget};
 
 /// A whole body is kept unboxed, so the common buffered response costs no allocation of its own.
 /// Only a file sent from disk can fail while it is sent; every other body is whole or infallible.
@@ -43,6 +43,7 @@ impl hyper::body::Body for ResponseBody {
     type Data = Bytes;
     type Error = FileSendError;
 
+    #[inline]
     fn poll_frame(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -58,6 +59,7 @@ impl hyper::body::Body for ResponseBody {
         }
     }
 
+    #[inline]
     fn is_end_stream(&self) -> bool {
         match self {
             ResponseBody::Full(body) => body.is_end_stream(),
@@ -66,6 +68,7 @@ impl hyper::body::Body for ResponseBody {
         }
     }
 
+    #[inline]
     fn size_hint(&self) -> hyper::body::SizeHint {
         match self {
             ResponseBody::Full(body) => body.size_hint(),
@@ -101,20 +104,19 @@ impl From<TooLarge> for BodyReadError {
 /// Decides, besides the size cap, whether a buffered body may grow.
 pub trait BodyGate {
     type Error: From<BodyReadError>;
-    /// Admits or refuses the next frame before it is copied. `committed` is the buffer's
-    /// allocation once the frame is in, which for a body that announced its size is that size
-    /// from the second frame on.
+    /// Admits or refuses the next frame before it is kept; `held` is the body's bytes once the
+    /// frame is in.
     ///
     /// # Errors
     ///
-    /// Returns the gate's refusal; the frame is then left uncopied.
-    fn admit(&mut self, committed: usize) -> Result<(), Self::Error>;
+    /// Returns the gate's refusal; the frame is then dropped.
+    fn admit(&mut self, held: usize) -> Result<(), Self::Error>;
 }
 
 impl<G: BodyGate> BodyGate for &mut G {
     type Error = G::Error;
-    fn admit(&mut self, committed: usize) -> Result<(), G::Error> {
-        (**self).admit(committed)
+    fn admit(&mut self, held: usize) -> Result<(), G::Error> {
+        (**self).admit(held)
     }
 }
 
@@ -122,7 +124,7 @@ struct OpenGate;
 
 impl BodyGate for OpenGate {
     type Error = BodyReadError;
-    fn admit(&mut self, _committed: usize) -> Result<(), BodyReadError> {
+    fn admit(&mut self, _held: usize) -> Result<(), BodyReadError> {
         Ok(())
     }
 }
@@ -138,7 +140,7 @@ impl BodyGate for OpenGate {
 /// # Errors
 ///
 /// Returns [`BodyReadError`] when the body is too large, too slow, or the connection is lost.
-pub fn read_body<'l, B>(body: B, limits: &'l Limits) -> impl Future<Output = Result<Bytes, BodyReadError>> + 'l
+pub fn read_body<'l, B>(body: B, limits: &'l Limits) -> impl Future<Output = Result<BodyFrames, BodyReadError>> + 'l
 where
     B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin + 'l,
 {
@@ -157,30 +159,29 @@ pub fn collect<'g, G: BodyGate>(
     body: Incoming,
     gate: &'g mut G,
     limits: &'g Limits,
-) -> impl std::future::Future<Output = Result<Bytes, G::Error>> + 'g {
+) -> impl std::future::Future<Output = Result<BodyFrames, G::Error>> + 'g {
     collect_within(body, gate, limits)
 }
 
 /// Arms the timer only when the body is not all there at the first poll, as most bodies are
 /// because hyper read them with the head, so they cost no clock read and no timer-wheel entry.
-/// The time a body earns by arriving is added when the timer fires, not per frame.
-async fn collect_within<B, G>(mut body: B, mut gate: G, limits: &Limits) -> Result<Bytes, G::Error>
+/// The time a body's bytes have paid for is counted when the timer fires, not per frame.
+async fn collect_within<B, G>(mut body: B, mut gate: G, limits: &Limits) -> Result<BodyFrames, G::Error>
 where
     B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin,
     G: BodyGate,
 {
     let hint = hyper::body::Body::size_hint(&body);
-    // The announced size only caps how far the buffer grows and never sizes it ahead of the bytes
-    // that came in, or a client could buy a large buffer with a two-byte header.
     let limit =
         BodySizeLimit::start(limits.max_body.as_usize(), hint.lower(), hint.exact()).map_err(BodyReadError::from)?;
     // It is atomic only because the future must be `Send` while holding a reference across an await.
     let received = crate::sync::AtomicU64::new(0);
     let read = async {
-        let mut buf = BodyBuf::Empty;
+        let mut frames = FrameChain::Empty;
+        let mut held = 0;
         while let Some(frame) = body.frame().await {
-            // HTTP/2 hands over the empty DATA frame a client may end the stream with; pushing it
-            // would copy a one-frame body.
+            // HTTP/2 hands over the empty DATA frame a client may end the stream with; keeping it
+            // would split a one-frame body.
             let Ok(data) = frame
                 .map_err(|e| BodyReadError::ConnectionLost(Arc::new(e)))?
                 .into_data()
@@ -190,16 +191,16 @@ where
             if data.is_empty() {
                 continue;
             }
-            limit.take(buf.len(), data.len()).map_err(BodyReadError::from)?;
-            gate.admit(buf.committed_with(data.len(), limit.expected()))?;
-            buf = buf.push(data, limit.expected());
-            received.store(buf.len() as u64, crate::sync::Ordering::Relaxed);
+            held = limit.take(held, data.len()).map_err(BodyReadError::from)?;
+            gate.admit(held)?;
+            frames = frames.push(data);
+            received.store(held as u64, crate::sync::Ordering::Relaxed);
         }
-        Ok::<_, G::Error>(buf.freeze())
+        Ok::<_, G::Error>(frames.finish())
     };
     let mut read = std::pin::pin!(read);
     // This is `tokio::time::timeout` with the `Sleep` made at the first wait instead of up front,
-    // and moved on when it fires to the deadline the body has earned since.
+    // and moved on when it fires to the deadline the body's bytes have paid for since.
     let mut timer = std::pin::pin!(None::<tokio::time::Sleep>);
     let mut started = None::<Instant>;
     std::future::poll_fn(|cx| {
@@ -230,67 +231,98 @@ where
     .await
 }
 
-/// A one-frame body, the common case, is kept as hyper handed it over, with no copy.
-enum BodyBuf {
-    Empty,
-    One(Bytes),
-    Many(BytesMut),
+/// A buffered body as hyper handed its frames over, none of them copied: a one-frame body, the
+/// common case, is that frame, and a body of several is copied once, into whatever needs it whole.
+#[derive(Debug)]
+pub enum BodyFrames {
+    Whole(Bytes),
+    /// It holds two frames or more.
+    Split(Arc<[Bytes]>),
 }
 
-impl BodyBuf {
-    fn len(&self) -> usize {
+impl Default for BodyFrames {
+    fn default() -> Self {
+        BodyFrames::Whole(Bytes::new())
+    }
+}
+
+impl BodyFrames {
+    pub fn len(&self) -> usize {
+        self.frames().iter().map(Bytes::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the frames in the order they arrived.
+    pub fn frames(&self) -> &[Bytes] {
         match self {
-            BodyBuf::Empty => 0,
-            BodyBuf::One(b) => b.len(),
-            BodyBuf::Many(b) => b.len(),
+            BodyFrames::Whole(whole) => std::slice::from_ref(whole),
+            BodyFrames::Split(frames) => frames,
         }
     }
 
-    /// Returns what [`BodyBuf::push`] will have allocated once a frame of `add` bytes is pushed.
-    fn committed_with(&self, add: usize, expected: Option<usize>) -> usize {
+    /// Returns the body as one buffer, copying a body of several frames once into a buffer of its size.
+    pub fn into_bytes(self) -> Bytes {
         match self {
-            BodyBuf::Empty => add,
-            BodyBuf::One(first) => grown_capacity(first.len().saturating_add(add), expected),
-            BodyBuf::Many(joined) => {
-                let needed = joined.len().saturating_add(add);
-                if needed <= joined.capacity() {
-                    joined.capacity()
-                } else {
-                    grown_capacity(needed, expected)
+            BodyFrames::Whole(whole) => whole,
+            BodyFrames::Split(frames) => {
+                let mut joined = BytesMut::with_capacity(frames.iter().map(Bytes::len).sum());
+                for frame in frames.iter() {
+                    joined.extend_from_slice(frame);
                 }
+                joined.freeze()
             }
         }
     }
 
-    fn push(self, data: Bytes, expected: Option<usize>) -> Self {
+    /// Copies the body into `dst`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `dst` is not [`BodyFrames::len`] bytes long, as `<[u8]>::copy_from_slice` does.
+    pub fn copy_to_slice(&self, dst: &mut [u8]) {
+        let mut rest = dst;
+        for frame in self.frames() {
+            let (head, tail) = rest.split_at_mut(frame.len());
+            head.copy_from_slice(frame);
+            rest = tail;
+        }
+        assert!(rest.is_empty(), "the destination is longer than the body");
+    }
+}
+
+impl From<Bytes> for BodyFrames {
+    fn from(whole: Bytes) -> Self {
+        BodyFrames::Whole(whole)
+    }
+}
+
+/// The frames read so far; it ends as [`BodyFrames`].
+enum FrameChain {
+    Empty,
+    One(Bytes),
+    Many(Vec<Bytes>),
+}
+
+impl FrameChain {
+    fn push(self, data: Bytes) -> Self {
         match self {
-            BodyBuf::Empty => BodyBuf::One(data),
-            BodyBuf::One(first) => {
-                let needed = first.len() + data.len();
-                let mut joined = BytesMut::with_capacity(grown_capacity(needed, expected));
-                joined.extend_from_slice(&first);
-                joined.extend_from_slice(&data);
-                BodyBuf::Many(joined)
-            }
-            BodyBuf::Many(mut joined) => {
-                let needed = joined.len() + data.len();
-                if needed > joined.capacity() {
-                    // `reserve` would grow past `expected`.
-                    let mut grown = BytesMut::with_capacity(grown_capacity(needed, expected));
-                    grown.extend_from_slice(&joined);
-                    joined = grown;
-                }
-                joined.extend_from_slice(&data);
-                BodyBuf::Many(joined)
+            FrameChain::Empty => FrameChain::One(data),
+            FrameChain::One(first) => FrameChain::Many(vec![first, data]),
+            FrameChain::Many(mut frames) => {
+                frames.push(data);
+                FrameChain::Many(frames)
             }
         }
     }
 
-    fn freeze(self) -> Bytes {
+    fn finish(self) -> BodyFrames {
         match self {
-            BodyBuf::Empty => Bytes::new(),
-            BodyBuf::One(b) => b,
-            BodyBuf::Many(b) => b.freeze(),
+            FrameChain::Empty => BodyFrames::default(),
+            FrameChain::One(whole) => BodyFrames::Whole(whole),
+            FrameChain::Many(frames) => BodyFrames::Split(frames.into()),
         }
     }
 }
@@ -333,19 +365,24 @@ enum HandoffError {
 /// Feeds a `body=BodyStream` route's body to its handler one frame at a time.
 ///
 /// The body is bounded like a buffered one, except that time spent waiting for the handler to
-/// take a chunk is not charged to the client. Each such wait lasts `time.budget` at most, so a
+/// take a chunk is not charged to the client. Each such wait lasts `handler_wait` at most, so a
 /// handler that stops reading cannot hold the feeder; it is then told [`BodyMessage::Unread`].
-pub async fn stream_body_feeder<B>(body: B, tx: BodySender, max_size: usize, time: BodyTimeAllowance)
-where
+pub async fn stream_body_feeder<B>(
+    body: B,
+    tx: BodySender,
+    max_size: usize,
+    time: BodyTimeAllowance,
+    handler_wait: RequestBudget,
+) where
     B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin,
 {
     let Ok(last_slot) = tx.clone().reserve_owned().await else {
         return;
     };
-    let last = match feed(body, &tx, max_size, time).await {
+    let last = match feed(body, &tx, max_size, time, handler_wait.get()).await {
         Ok(Ok(())) => BodyMessage::End,
         Ok(Err(reject)) => BodyMessage::Rejected(reject),
-        Err(HandoffError::Deadline) => BodyMessage::Unread(time.budget.get()),
+        Err(HandoffError::Deadline) => BodyMessage::Unread(handler_wait.get()),
         Err(HandoffError::ClosedReceiver) => return,
     };
     last_slot.send(last);
@@ -358,6 +395,7 @@ async fn feed<B>(
     tx: &BodySender,
     max_size: usize,
     time: BodyTimeAllowance,
+    handler_wait: Duration,
 ) -> Result<Result<(), BodyReadError>, HandoffError>
 where
     B: hyper::body::Body<Data = Bytes, Error = hyper::Error> + Unpin,
@@ -402,7 +440,7 @@ where
         total = taken;
         // A slow handler blocks this send and so the next poll_frame, which closes the client's
         // TCP window.
-        if let Some(waited) = hand(tx, BodyMessage::Chunk(chunk), timer.as_mut(), time.budget.get()).await? {
+        if let Some(waited) = hand(tx, BodyMessage::Chunk(chunk), timer.as_mut(), handler_wait).await? {
             handler_time += waited;
             timer.as_mut().reset(client_deadline(total, handler_time));
         }
@@ -433,19 +471,24 @@ async fn hand(
 }
 
 #[cfg(test)]
+#[cfg(not(sync_model))]
 mod tests {
     use super::*;
 
-    fn absolute(budget: Duration) -> BodyTimeAllowance {
-        let budget = crate::plan::limits::RequestBudget::from_secs(budget.as_secs_f64());
-        BodyTimeAllowance::absolute(budget.expect("a budget above zero"))
+    fn absolute(grace: Duration) -> BodyTimeAllowance {
+        let grace = crate::plan::limits::BodyGrace::from_secs(grace.as_secs_f64());
+        BodyTimeAllowance::absolute(grace.expect("a grace above zero"))
+    }
+
+    fn handler_wait(wait: Duration) -> RequestBudget {
+        RequestBudget::from_secs(wait.as_secs_f64()).expect("a wait above zero")
     }
 
     /// The app's limits with `max` bytes and `time` for a body, the rest at their defaults.
     fn limits(max: usize, time: BodyTimeAllowance) -> Limits {
         Limits {
             max_body: crate::plan::limits::ByteLimit(max as u64),
-            request_budget: time.budget,
+            body_grace: time.grace,
             body_min_rate: time.min_rate,
             body_time_limit: time.cap,
             ..Limits::DEFAULT
@@ -502,34 +545,34 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_stalled_body_is_refused_within_100_ms_of_the_budget() {
-        let budget = Duration::from_secs(30);
+    async fn a_stalled_body_is_refused_within_100_ms_of_the_grace() {
+        let grace = Duration::from_secs(30);
         let started = Instant::now();
-        let read = collect_within(stalled(), &mut OpenGate, &limits(1024, absolute(budget))).await;
+        let read = collect_within(stalled(), &mut OpenGate, &limits(1024, absolute(grace))).await;
         let took = started.elapsed();
         assert!(
-            matches!(read, Err(BodyReadError::TimedOut(b)) if b == budget),
+            matches!(read, Err(BodyReadError::TimedOut(b)) if b == grace),
             "{read:?}"
         );
-        assert!(took >= budget, "{took:?}");
-        assert!(took <= budget + Duration::from_millis(100), "{took:?}");
+        assert!(took >= grace, "{took:?}");
+        assert!(took <= grace + Duration::from_millis(100), "{took:?}");
     }
 
     /// The deadline counts from the call, not from the last frame.
     #[tokio::test(start_paused = true)]
-    async fn a_body_that_stalls_after_its_first_frame_is_refused_within_100_ms_of_the_budget() {
-        let budget = Duration::from_secs(30);
+    async fn a_body_that_stalls_after_its_first_frame_is_refused_within_100_ms_of_the_grace() {
+        let grace = Duration::from_secs(30);
         let first = tokio_stream::iter([Ok(hyper::body::Frame::data(Bytes::from_static(b"12")))]);
         let body = http_body_util::StreamBody::new(tokio_stream::StreamExt::chain(first, tokio_stream::pending()));
         let started = Instant::now();
-        let read = collect_within(body, &mut OpenGate, &limits(1024, absolute(budget))).await;
+        let read = collect_within(body, &mut OpenGate, &limits(1024, absolute(grace))).await;
         let took = started.elapsed();
         assert!(
-            matches!(read, Err(BodyReadError::TimedOut(b)) if b == budget),
+            matches!(read, Err(BodyReadError::TimedOut(b)) if b == grace),
             "{read:?}"
         );
-        assert!(took >= budget, "{took:?}");
-        assert!(took <= budget + Duration::from_millis(100), "{took:?}");
+        assert!(took >= grace, "{took:?}");
+        assert!(took <= grace + Duration::from_millis(100), "{took:?}");
     }
 
     /// A body that is all there arms no timer: it is read outside any runtime, where arming one
@@ -544,7 +587,7 @@ mod tests {
         let Poll::Ready(read) = read.poll(&mut cx) else {
             panic!("a body that is all there is read in one poll");
         };
-        assert_eq!(read.unwrap(), Bytes::from_static(b"hello"));
+        assert_eq!(read.unwrap().into_bytes(), Bytes::from_static(b"hello"));
     }
 
     /// Yields its frames, then ends, or waits forever when `stall` is set; `hint` stands for a
@@ -638,7 +681,7 @@ mod tests {
         assert_eq!(read.unwrap().len(), 20, "exactly the cap is allowed");
     }
 
-    /// The gate is asked about each buffer before it is made.
+    /// The gate is asked about each frame before it is kept, with the bytes received, not the size announced.
     #[tokio::test]
     async fn an_announced_size_does_not_buy_a_buffer_of_that_size() {
         const ANNOUNCED: u64 = 10 << 20;
@@ -648,8 +691,8 @@ mod tests {
             limit: usize::MAX,
         };
         let read = collect_within(body, &mut gate, &limits(16 << 20, absolute(Duration::from_secs(30)))).await;
-        assert_eq!(read.unwrap(), Bytes::from_static(b"ab"));
-        assert_eq!(gate.asked, vec![1, 4]);
+        assert_eq!(read.unwrap().into_bytes(), Bytes::from_static(b"ab"));
+        assert_eq!(gate.asked, vec![1, 2]);
     }
 
     #[tokio::test]
@@ -661,8 +704,7 @@ mod tests {
         };
         let read = collect_within(body, &mut gate, &limits(1024, absolute(Duration::from_secs(30)))).await;
         assert!(matches!(read, Err(BodyReadError::TooLarge)), "{read:?}");
-        // The second ask is 16, twice the 8 bytes it must hold, so the third frame is never asked about.
-        assert_eq!(gate.asked, vec![4, 16]);
+        assert_eq!(gate.asked, vec![4, 8, 10]);
     }
 
     #[tokio::test]
@@ -673,15 +715,47 @@ mod tests {
             limit: usize::MAX,
         };
         let read = collect_within(body, &mut gate, &limits(1024, absolute(Duration::from_secs(30)))).await;
-        assert_eq!(read.unwrap(), Bytes::from_static(b"hello"));
-        assert_eq!(gate.asked, vec![2, 5, 5]);
+        let frames = read.unwrap();
+        assert_eq!(frames.frames().len(), 3, "the frames are kept apart");
+        assert_eq!(frames.into_bytes(), Bytes::from_static(b"hello"));
+        assert_eq!(gate.asked, vec![2, 4, 5]);
+    }
+
+    #[test]
+    fn a_one_frame_body_is_its_frame_uncopied() {
+        let frame = Bytes::from_static(b"hello");
+        let BodyFrames::Whole(whole) = FrameChain::Empty.push(frame.clone()).finish() else {
+            panic!("one frame is the body whole");
+        };
+        assert_eq!(whole.as_ptr(), frame.as_ptr());
+    }
+
+    #[test]
+    fn a_body_of_several_frames_copies_into_a_slice_of_its_length_in_order() {
+        let frames = [&b"he"[..], b"ll", b"o"]
+            .into_iter()
+            .fold(FrameChain::Empty, |frames, frame| {
+                frames.push(Bytes::from_static(frame))
+            })
+            .finish();
+        let mut dst = [0u8; 5];
+        frames.copy_to_slice(&mut dst);
+        assert_eq!(&dst, b"hello");
+        assert!(matches!(frames, BodyFrames::Split(_)));
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_streamed_body_announced_over_the_cap_is_refused_before_a_chunk() {
         let (tx, mut rx) = body_channel();
         let body = Scripted::new(&[b"0123"], Some(2048));
-        stream_body_feeder(body, tx, 1024, absolute(Duration::from_secs(30))).await;
+        stream_body_feeder(
+            body,
+            tx,
+            1024,
+            absolute(Duration::from_secs(30)),
+            handler_wait(Duration::from_secs(30)),
+        )
+        .await;
         assert!(
             matches!(rx.recv().await, Some(BodyMessage::Rejected(BodyReadError::TooLarge))),
             "the rejection comes first"
@@ -720,6 +794,7 @@ mod tests {
             tx,
             1024,
             absolute(Duration::from_secs(30)),
+            handler_wait(Duration::from_secs(30)),
         ));
         let (chunks, last) = read_all(&mut rx).await;
         feeder.await.unwrap();
@@ -735,6 +810,7 @@ mod tests {
             tx,
             3,
             absolute(Duration::from_secs(30)),
+            handler_wait(Duration::from_secs(30)),
         ));
         let (chunks, last) = read_all(&mut rx).await;
         feeder.await.unwrap();
@@ -752,7 +828,14 @@ mod tests {
         let budget = Duration::from_secs(30);
         let (tx, mut rx) = body_channel();
         let started = Instant::now();
-        stream_body_feeder(chunks_then(CHUNKS_IN_FLIGHT, None, true), tx, 1024, absolute(budget)).await;
+        stream_body_feeder(
+            chunks_then(CHUNKS_IN_FLIGHT, None, true),
+            tx,
+            1024,
+            absolute(budget),
+            handler_wait(budget),
+        )
+        .await;
         assert_eq!(started.elapsed(), budget, "it gave up at the deadline, no later");
         let (chunks, last) = read_all(&mut rx).await;
         assert_eq!(chunks, CHUNKS_IN_FLIGHT);
@@ -768,7 +851,14 @@ mod tests {
         let budget = Duration::from_secs(30);
         let (tx, mut rx) = body_channel();
         let started = Instant::now();
-        stream_body_feeder(chunks_then(100, None, false), tx, 1024, absolute(budget)).await;
+        stream_body_feeder(
+            chunks_then(100, None, false),
+            tx,
+            1024,
+            absolute(budget),
+            handler_wait(budget),
+        )
+        .await;
         assert_eq!(started.elapsed(), budget);
         let (chunks, last) = read_all(&mut rx).await;
         assert_eq!(chunks, CHUNKS_IN_FLIGHT);
@@ -812,7 +902,7 @@ mod tests {
                         first: (0..CHUNKS_IN_FLIGHT).map(|_| Bytes::from_static(b"x")).collect(),
                         rest: req.into_body(),
                     };
-                    stream_body_feeder(body, tx, 1 << 20, absolute(budget)).await;
+                    stream_body_feeder(body, tx, 1 << 20, absolute(budget), handler_wait(budget)).await;
                     fed.send(()).expect("the test waits for the feeder");
                 }
                 Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Empty::<Bytes>::new()))
@@ -842,6 +932,86 @@ mod tests {
         conn.abort();
     }
 
+    /// How the client end of [`read_sent_body`]'s pipe behaves once the request is written.
+    #[derive(Clone, Copy)]
+    enum ClientEnd {
+        StaysOpen,
+        ShutsWriting,
+    }
+
+    /// Returns what a buffered read makes of the body of `sent`, which hyper serves over an
+    /// in-memory pipe.
+    async fn read_sent_body(sent: &'static [u8], end: ClientEnd) -> Result<Bytes, BodyReadError> {
+        use tokio::io::AsyncWriteExt;
+
+        let (done, done_rx) = tokio::sync::oneshot::channel();
+        let handed = std::sync::Mutex::new(Some(done));
+        let service = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+            let done = handed.lock().unwrap().take();
+            async move {
+                if let Some(done) = done {
+                    let read = read_body(req.into_body(), &limits(1024, absolute(Duration::from_secs(30))))
+                        .await
+                        .map(BodyFrames::into_bytes);
+                    done.send(read)
+                        .unwrap_or_else(|_| panic!("the test waits for the read"));
+                }
+                Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Empty::<Bytes>::new()))
+            }
+        });
+        let (mut client, server) = tokio::io::duplex(4096);
+        let conn = tokio::spawn(
+            hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(server), service),
+        );
+        client.write_all(sent).await.unwrap();
+        if let ClientEnd::ShutsWriting = end {
+            client.shutdown().await.unwrap();
+        }
+        let read = done_rx.await.expect("hyper served the request");
+        conn.abort();
+        read
+    }
+
+    #[tokio::test]
+    async fn a_body_cut_short_of_its_content_length_is_a_lost_connection_not_a_body() {
+        let read = read_sent_body(
+            b"POST / HTTP/1.1\r\nhost: t\r\ncontent-length: 8\r\n\r\nabc",
+            ClientEnd::ShutsWriting,
+        )
+        .await;
+        assert!(matches!(read, Err(BodyReadError::ConnectionLost(_))), "{read:?}");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_cut_mid_chunk_is_a_lost_connection_not_a_body() {
+        let read = read_sent_body(
+            b"POST / HTTP/1.1\r\nhost: t\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n8\r\nde",
+            ClientEnd::ShutsWriting,
+        )
+        .await;
+        assert!(matches!(read, Err(BodyReadError::ConnectionLost(_))), "{read:?}");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_cut_before_its_last_chunk_is_a_lost_connection_not_a_body() {
+        let read = read_sent_body(
+            b"POST / HTTP/1.1\r\nhost: t\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n",
+            ClientEnd::ShutsWriting,
+        )
+        .await;
+        assert!(matches!(read, Err(BodyReadError::ConnectionLost(_))), "{read:?}");
+    }
+
+    #[tokio::test]
+    async fn a_whole_chunked_body_is_read() {
+        let read = read_sent_body(
+            b"POST / HTTP/1.1\r\nhost: t\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+            ClientEnd::StaysOpen,
+        )
+        .await;
+        assert_eq!(read.expect("the body was whole"), Bytes::from_static(b"abc"));
+    }
+
     fn trickle(
         frames: usize,
         size: usize,
@@ -855,21 +1025,22 @@ mod tests {
         )))
     }
 
-    /// Allows `budget_s` seconds plus one for every `min_rate` bytes, at most `cap_s` in all.
-    fn allowance(budget_s: u64, min_rate: u64, cap_s: u64) -> BodyTimeAllowance {
-        use crate::plan::limits::{BodyMinRate, BodyTimeLimit, RequestBudget};
+    /// Allows `grace_s` seconds, or one for every `min_rate` bytes if that is longer, at most `cap_s`
+    /// in all.
+    fn allowance(grace_s: u64, min_rate: u64, cap_s: u64) -> BodyTimeAllowance {
+        use crate::plan::limits::{BodyGrace, BodyMinRate, BodyTimeLimit};
         BodyTimeAllowance {
-            budget: RequestBudget::from_secs(budget_s as f64).expect("a budget above zero"),
+            grace: BodyGrace::from_secs(grace_s as f64).expect("a grace above zero"),
             min_rate: BodyMinRate::new(min_rate as i64).expect("a rate above zero"),
             cap: BodyTimeLimit::from_secs(cap_s as f64).expect("a cap above zero"),
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_body_arriving_at_the_minimum_rate_is_read_past_the_budget() {
+    async fn a_body_arriving_at_the_minimum_rate_is_read_past_the_grace() {
         let time = allowance(30, 1024, 600);
         // Frames come at 0 s to 89 s and the stream ends a second after the last, so the read
-        // takes exactly 90 s, three times the budget.
+        // takes exactly 90 s, three times the grace.
         let started = Instant::now();
         let read = collect_within(
             trickle(90, 2048, Duration::from_secs(1)),
@@ -884,8 +1055,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_body_slower_than_the_minimum_rate_runs_out_of_time() {
         let time = allowance(30, 1024, 600);
-        // At 30 s, 3100 bytes have come and earn 3 s; at 33 s, 3400 bytes still earn only 3 s, so
-        // the body runs out of time at 33 s.
+        // At 30 s, 3100 bytes have come and pay for 3 s, under the grace, so the body runs out of
+        // time at 30 s.
         let started = Instant::now();
         let read = collect_within(
             trickle(1000, 100, Duration::from_secs(1)),
@@ -896,8 +1067,8 @@ mod tests {
         let Err(BodyReadError::TimedOut(allowed)) = read else {
             panic!("{read:?}");
         };
-        assert_eq!(allowed, Duration::from_secs(33));
-        assert_eq!(allowed, time.allowed(34 * 100));
+        assert_eq!(allowed, Duration::from_secs(30));
+        assert_eq!(allowed, time.allowed(31 * 100));
         assert_eq!(started.elapsed(), allowed);
     }
 
@@ -931,7 +1102,9 @@ mod tests {
     }
 
     /// Returns when a [`trickle`] body is done with and what it comes to, computed independently of
-    /// the reader. A frame due before the timer is read before it.
+    /// the reader. A frame due before the timer is read before it; one due at the very instant the
+    /// timer fires is counted as arrived, which the reader does not promise, so a schedule meant to
+    /// match the reader keeps its frames off the timer's instants.
     fn trickle_outcome(frames: u64, size: u64, every: Duration, time: BodyTimeAllowance) -> (Duration, TrickleOutcome) {
         let ended = every * u32::try_from(frames).unwrap();
         let mut fires = time.allowed(0);
@@ -975,7 +1148,7 @@ mod tests {
                 &limits(1 << 30, time),
             )
             .await;
-            (started.elapsed(), read)
+            (started.elapsed(), read.map(BodyFrames::into_bytes))
         })
     }
 
@@ -997,12 +1170,16 @@ mod tests {
         fn a_body_is_read_or_refused_exactly_when_its_time_says(
             frames in 1u64..120,
             size in 1u64..4096,
-            every_ms in 100u64..3000,
-            budget_s in 1u64..40,
+            every_ms in proptest::strategy::Strategy::prop_filter(
+                100u64..3000,
+                "a frame on a whole second ties with the timer",
+                |ms| ms % 2 != 0 && ms % 5 != 0,
+            ),
+            grace_s in 1u64..40,
             min_rate in 1u64..8192,
             over_cap_s in 0u64..200,
         ) {
-            let time = allowance(budget_s, min_rate, budget_s + over_cap_s);
+            let time = allowance(grace_s, min_rate, grace_s + over_cap_s);
             let every = Duration::from_millis(every_ms);
             let (at, outcome) = trickle_outcome(frames, size, every, time);
             let (took, read) = read_trickle(frames, size, every, time);
@@ -1013,11 +1190,46 @@ mod tests {
         }
     }
 
+    /// By the 34 s grace 15 frames have come, which pay for 20 s, so the body is refused there.
+    #[test]
+    fn a_body_paying_for_less_than_its_grace_is_refused_at_the_grace() {
+        let time = allowance(34, 2723, 77);
+        let every = Duration::from_millis(2375);
+        let (at, outcome) = trickle_outcome(33, 3658, every, time);
+        assert_eq!(
+            (at, outcome),
+            (
+                Duration::from_secs(34),
+                TrickleOutcome::Refused(Duration::from_secs(34))
+            )
+        );
+        let (took, read) = read_trickle(33, 3658, every, time);
+        assert_eq!(took, at);
+        assert_eq!(broken_rule(&read, outcome, 33 * 3658), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_a_byte_per_second_under_the_minimum_rate_is_refused_at_the_grace() {
+        let time = allowance(30, 1024, 600);
+        let started = Instant::now();
+        let read = collect_within(
+            trickle(1000, 1023, Duration::from_secs(1)),
+            &mut OpenGate,
+            &limits(1 << 20, time),
+        )
+        .await;
+        assert!(
+            matches!(read, Err(BodyReadError::TimedOut(a)) if a == Duration::from_secs(30)),
+            "{read:?}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+    }
+
     /// The case that found the tie: 32 frames of 1822 bytes every 1.625 s end at 52 s, the instant
     /// the timer reaches the 52 s cap, and tokio showed the timer first.
     #[test]
     fn a_stream_ending_as_the_timer_fires_may_be_read_or_refused() {
-        let time = allowance(37, 3645, 52);
+        let time = allowance(37, 1000, 52);
         let every = Duration::from_millis(1625);
         let (at, outcome) = trickle_outcome(32, 1822, every, time);
         assert_eq!(
@@ -1036,7 +1248,7 @@ mod tests {
     /// 52 s deadline: before it the body is read, after it refused; only the instant itself is a tie.
     #[test]
     fn a_millisecond_either_side_of_the_tie_is_exact() {
-        let time = allowance(37, 3645, 52);
+        let time = allowance(37, 1000, 52);
         let size = 32 * 1822;
         for (every_ms, want) in [
             (51_999, (Duration::from_millis(51_999), TrickleOutcome::Read)),
@@ -1066,6 +1278,7 @@ mod tests {
             tx,
             1024,
             absolute(budget),
+            handler_wait(budget),
         ));
         tokio::time::sleep(Duration::from_secs(25)).await;
         let (chunks, last) = read_all(&mut rx).await;
@@ -1075,7 +1288,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_streamed_body_at_the_minimum_rate_goes_past_the_budget() {
+    async fn a_streamed_body_at_the_minimum_rate_goes_past_the_grace() {
         let time = allowance(30, 1024, 600);
         let (tx, mut rx) = body_channel();
         let feeder = tokio::spawn(stream_body_feeder(
@@ -1083,6 +1296,7 @@ mod tests {
             tx,
             1 << 20,
             time,
+            handler_wait(Duration::from_secs(30)),
         ));
         let (chunks, last) = read_all(&mut rx).await;
         feeder.await.unwrap();
@@ -1090,26 +1304,27 @@ mod tests {
         assert!(matches!(last, Some(BodyMessage::End)), "{last:?}");
     }
 
-    /// A per-frame deadline would let this body through, though it would take ten budgets in all.
+    /// A per-frame deadline would let this body through, though it would take ten times its grace in all.
     #[tokio::test(start_paused = true)]
-    async fn a_streamed_body_dripping_under_the_per_frame_time_is_refused_at_the_whole_budget() {
-        let budget = Duration::from_secs(4);
+    async fn a_streamed_body_dripping_under_the_per_frame_time_is_refused_at_the_whole_grace() {
+        let grace = Duration::from_secs(4);
         let (tx, mut rx) = body_channel();
         let started = Instant::now();
         let feeder = tokio::spawn(stream_body_feeder(
-            trickle(40, 1, budget / 4),
+            trickle(40, 1, grace / 4),
             tx,
             1024,
-            absolute(budget),
+            absolute(grace),
+            handler_wait(grace),
         ));
         let (chunks, last) = read_all(&mut rx).await;
         feeder.await.unwrap();
         assert!(chunks < 40, "{chunks}");
         assert!(
-            matches!(last, Some(BodyMessage::Rejected(BodyReadError::TimedOut(b))) if b == budget),
+            matches!(last, Some(BodyMessage::Rejected(BodyReadError::TimedOut(b))) if b == grace),
             "{last:?}"
         );
-        assert_eq!(started.elapsed(), budget);
+        assert_eq!(started.elapsed(), grace);
     }
 
     #[tokio::test]
@@ -1123,6 +1338,7 @@ mod tests {
                 &limits(1024, absolute(Duration::from_secs(30))),
             )
             .await
+            .map(BodyFrames::into_bytes)
         }
         for frames in [&[BODY][..], &[BODY, NONE], &[NONE, BODY], &[NONE, BODY, NONE]] {
             let body = read(frames).await.expect("the body was read");
@@ -1141,7 +1357,7 @@ mod tests {
         };
         let body = Scripted::new(&[b"abc", b""], None);
         let read = collect_within(body, &mut gate, &limits(1024, absolute(Duration::from_secs(30)))).await;
-        assert_eq!(read.expect("the body was read"), b"abc"[..]);
+        assert_eq!(read.expect("the body was read").into_bytes(), b"abc"[..]);
         assert_eq!(gate.asked, [3]);
     }
 
@@ -1149,7 +1365,14 @@ mod tests {
     async fn a_streamed_body_hands_on_no_empty_chunk() {
         let (tx, mut rx) = body_channel();
         let body = Scripted::new(&[b"", b"x", b"", b"x", b""], None);
-        stream_body_feeder(body, tx, 1024, absolute(Duration::from_secs(30))).await;
+        stream_body_feeder(
+            body,
+            tx,
+            1024,
+            absolute(Duration::from_secs(30)),
+            handler_wait(Duration::from_secs(30)),
+        )
+        .await;
         let (chunks, last) = read_all(&mut rx).await;
         assert_eq!(chunks, 2);
         assert!(matches!(last, Some(BodyMessage::End)), "{last:?}");
@@ -1257,7 +1480,9 @@ mod tests {
         .await;
         let lens: Vec<usize> = frames.iter().map(Bytes::len).collect();
         assert_eq!(lens, [3, 0], "the frames hyper handed over");
-        let read = read.expect("the body was read");
+        let BodyFrames::Whole(read) = read.expect("the body was read") else {
+            panic!("one frame is the body whole");
+        };
         assert_eq!(read, Bytes::from_static(b"abc"));
         assert_eq!(read.as_ptr(), frames[0].as_ptr(), "the body was copied");
     }
@@ -1265,7 +1490,16 @@ mod tests {
     #[tokio::test]
     async fn an_h2_body_ended_by_an_empty_frame_streams_one_chunk() {
         let (tx, mut rx) = body_channel();
-        read_h2_body(move |body| stream_body_feeder(body, tx, 1024, absolute(Duration::from_secs(30)))).await;
+        read_h2_body(move |body| {
+            stream_body_feeder(
+                body,
+                tx,
+                1024,
+                absolute(Duration::from_secs(30)),
+                handler_wait(Duration::from_secs(30)),
+            )
+        })
+        .await;
         let mut chunks = Vec::new();
         let last = loop {
             match rx.recv().await {

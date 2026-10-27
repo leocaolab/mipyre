@@ -2,11 +2,11 @@
 //! Loom's under `--cfg shm_model`, where the models run the same protocol over every interleaving. Only the names
 //! switch; nothing wraps the real ones, so a build pays nothing for them.
 //!
-//! This is the one module that names an atomic type itself (dev/archcheck.toml E-L1; the package's clippy.toml
+//! This is the one module that names an atomic type itself (the package's clippy.toml
 //! disallows std's and Loom's alike, so the expectation below holds under both builds): the atomics are type
 //! aliases here, and every other module names the alias, never the type behind it.
 //!
-//! Under `--cfg shm_model --cfg shm_shuttle` the names are Shuttle's instead (b/744): the same models' memory and
+//! Under `--cfg shm_model --cfg shm_shuttle` the names are Shuttle's instead: the same models' memory and
 //! kernel, run under seeded random schedules at a scale Loom cannot enumerate. Shuttle checks no cell (it explores
 //! schedules, not data races, and runs every atomic as `SeqCst`), so the slot cell there is `channel/memory.rs`'s.
 //!

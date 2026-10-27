@@ -12,8 +12,7 @@
 //! A `Pending` read does not write by itself: hyper probes for EOF right after parsing the last
 //! request of a batch, before its response exists, and a write there would split the batch.
 //! Unlike hyper's `pipeline_flush`, nothing here depends on what the client sends next, so half a
-//! request cannot hold a response until the header-read timeout. `docs/write-coalescing.md`
-//! analyses hyper's call order.
+//! request cannot hold a response until the header-read timeout.
 //!
 //! An HTTP/2 connection, recognised by its preface, passes straight through, because h2 buffers
 //! its frames itself.
@@ -604,4 +603,5 @@ impl<F: std::future::Future + ?Sized, T: AsyncWrite + Unpin, S: Sharing> std::fu
 }
 
 #[cfg(test)]
+#[cfg(not(sync_model))]
 mod tests;

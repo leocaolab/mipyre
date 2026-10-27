@@ -43,15 +43,15 @@ def index(req):
 
 
 @app.websocket("/ws")
-def echo(ws):
+async def echo(ws):
     try:
-        while (msg := ws.recv_message()) is not None:
+        async for msg in ws:
             if isinstance(msg, bytes):
-                ws.send_bytes(msg)
+                await ws.send_bytes(msg)
             else:
-                ws.send(f"echo: {msg}")
-    except (ConnectionError, BlockingIOError):
-        ws.close()  # the client left, or stopped reading what we send
+                await ws.send(f"echo: {msg}")
+    except ConnectionError:
+        pass  # the client left
 
 
 if __name__ == "__main__":

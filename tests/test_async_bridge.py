@@ -1,5 +1,5 @@
 """Test: Phase 7.2 async bridge — sleep(1ms) should break the 8k ceiling."""
-from mipyre.engine import MipyreApp, RuntimeChoice
+from mipyre.engine import MipyreApp, RuntimeChoice, ServerFlags
 
 app = MipyreApp()
 
@@ -25,4 +25,4 @@ app.route("GET", "/async-sleep", async_sleep, RuntimeChoice.Worker)
 app.route("GET", "/sync-sleep", sync_sleep, RuntimeChoice.Worker)
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=0)
+    app.run(ServerFlags(host="127.0.0.1", port=0))

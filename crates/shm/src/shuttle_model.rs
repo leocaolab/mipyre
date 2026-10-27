@@ -1,4 +1,4 @@
-//! The channel's Shuttle model (b/744, design §4.3): one host thread runs four channels, each with a peer thread of
+//! The channel's Shuttle model: one host thread runs four channels, each with a peer thread of
 //! its own, through the shipping ends ([`HostEnd`], [`PeerEnd`], `sleep_all`, `wake_all`) over a [`ModelMemory`] and
 //! the same kernel as the Loom models (`model.rs`: the peer sleeps on a futex, the host on its one wake pipe, neither
 //! with a timeout). Loom enumerates two threads and a few steps; this runs five threads and 800 requests under
@@ -6,7 +6,7 @@
 //! never lost (a lost one leaves every thread asleep, which Shuttle reports as a deadlock). Shuttle runs every
 //! atomic as `SeqCst` and checks no cell, so memory ordering and slot races stay the Loom models' (`loom_model.rs`).
 //!
-//! The merge gate runs [`SCHEDULES`] schedules of [`SEED`] (dev/proofs.toml):
+//! Every run takes [`SCHEDULES`] schedules of [`SEED`]:
 //! `RUSTFLAGS="--cfg shm_model --cfg shm_shuttle" cargo test -p mipyre_shm --lib --profile model --target-dir target/shuttle shuttle_model`.
 //! The nightly run adds `--cfg shm_shuttle_random` for random schedules; a schedule that fails prints itself, and goes
 //! into [`REGRESSIONS`], replayed on every run.
@@ -33,7 +33,7 @@ const DEPTH: u32 = 2;
 /// probability per run.
 const PCT_DEPTH: usize = 3;
 
-/// The merge gate's schedules: [`SCHEDULES`] PCT schedules drawn from this seed, the same on every run. One seed and
+/// The fixed schedules: [`SCHEDULES`] PCT schedules drawn from this seed, the same on every run. One seed and
 /// many schedules, not many seeds of one schedule each: PCT picks where to change priorities from the run lengths it
 /// has seen, so the first schedule of a seed changes them nowhere useful, and 32 one-schedule seeds missed the lost
 /// wake that [`a_host_that_says_it_sleeps_after_its_last_look_loses_a_wake`] plants (8 schedules of one seed miss it
@@ -150,7 +150,7 @@ fn config() -> Config {
     config
 }
 
-/// The merge gate's schedules ([`SEED`], [`SCHEDULES`]), the same on every run; each runs the model to its end.
+/// Runs the fixed schedules ([`SEED`], [`SCHEDULES`]), the same on every run; each runs the model to its end.
 #[test]
 fn every_request_is_taken_and_answered_once_in_order_under_the_fixed_schedules() {
     // Counts the runs that got to the model's end, outside Shuttle's view: the schedules ran the model whole.
@@ -164,7 +164,7 @@ fn every_request_is_taken_and_answered_once_in_order_under_the_fixed_schedules()
 }
 
 /// The check itself: a host that says it sleeps only after its last look, as a host with no `sleep_all` would, loses
-/// a wake in some schedule the merge gate runs (the peer publishes between the look and the flag, sees no flag and
+/// a wake in one of the fixed schedules (the peer publishes between the look and the flag, sees no flag and
 /// rings nothing), and Shuttle reports the deadlock. It runs that shape on bare words, not the shipping code.
 #[test]
 #[should_panic(expected = "deadlock")]
@@ -202,8 +202,8 @@ fn the_schedules_found_failing_pass() {
     }
 }
 
-/// The nightly run (b/744): random PCT schedules, many of them, built only under `--cfg shm_shuttle_random` so the
-/// merge gate's run stays the fixed [`SCHEDULES`]; a failing one prints its schedule for [`REGRESSIONS`].
+/// The nightly run: random PCT schedules, many of them, built only under `--cfg shm_shuttle_random` so the
+/// default run stays the fixed [`SCHEDULES`]; a failing one prints its schedule for [`REGRESSIONS`].
 #[cfg(shm_shuttle_random)]
 #[test]
 fn every_request_is_taken_and_answered_once_in_order_under_random_schedules() {

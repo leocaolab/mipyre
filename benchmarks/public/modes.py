@@ -84,6 +84,13 @@ CELLS: tuple[tuple[Mode, tuple[Scenario, ...]], ...] = (
 )
 
 
+def cell_name(mode: Mode, scenario: Scenario) -> str:
+    return f"{mode.slug}/{scenario.name}"
+
+
+CELL_NAMES = frozenset(cell_name(mode, scenario) for mode, scenarios in CELLS for scenario in scenarios)
+
+
 @dataclasses.dataclass(frozen=True)
 class WrkParams:
     threads: int

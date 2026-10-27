@@ -38,6 +38,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable
 
 from mipyre.engine import HTTPException, Response, encode_json
+from mipyre._json_schema import NoJsonForm, SchemaViolation, check_object, hint_schema, json_type_name
 from mipyre._rpc import media_type, unsupported_media_type
 
 if TYPE_CHECKING:
@@ -82,9 +83,6 @@ def _extract_schema(fn: Callable) -> dict:
     """The JSON Schema of ``fn``'s arguments, from its type hints (see ``hint_schema``).
     A parameter without a hint accepts any JSON value; one whose hint has no JSON form
     is a registration error naming it."""
-    # Imported here: every worker imports this module, and only an app with MCP tools needs it.
-    from mipyre._json_schema import NoJsonForm, hint_schema
-
     sig = inspect.signature(fn)
     # Not `fn.__annotations__`: under `from __future__ import annotations` those are
     # strings (`'int'`).
@@ -126,97 +124,12 @@ def _extract_schema(fn: Callable) -> dict:
     return schema
 
 
-# JSON Schema's primitive types, as checks on the Python value json.loads produced.
-_JSON_TYPE_CHECKS: dict[str, Callable[[object], bool]] = {
-    "null": lambda v: v is None,
-    "boolean": lambda v: isinstance(v, bool),
-    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
-    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
-    "string": lambda v: isinstance(v, str),
-    "array": lambda v: isinstance(v, list),
-    "object": lambda v: isinstance(v, dict),
-}
-
-
-def _json_equal(a: object, b: object) -> bool:
-    """Whether two decoded JSON values are the same JSON value: ``true`` is not ``1`` and
-    ``1`` is ``1.0``, as JSON Schema compares ``enum`` and ``const``."""
-    if isinstance(a, bool) or isinstance(b, bool):
-        return type(a) is type(b) and a == b
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        return a == b
-    if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(map(_json_equal, a, b))
-    if isinstance(a, dict) and isinstance(b, dict):
-        return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
-    return type(a) is type(b) and a == b
-
-
-def _json_type_name(value: object) -> str:
-    return next(
-        (name for name, check in _JSON_TYPE_CHECKS.items() if check(value)),
-        type(value).__name__,
-    )
-
-
-class _Invalid(Exception):
-    """An argument value its schema does not accept, with where and why."""
-
-
-def _check_value(schema: dict, value: object, where: str) -> None:
-    """Checks ``value`` against ``schema``: ``type``, ``enum``, ``const``, ``anyOf``,
-    ``items``, ``properties``, ``required`` and ``additionalProperties``. Other keywords
-    (``format``, ``minimum``…) are annotations here and are not checked."""
-    expected = schema.get("type")
-    if expected is not None:
-        names = expected if isinstance(expected, list) else [expected]
-        if not any(_JSON_TYPE_CHECKS[n](value) for n in names):
-            raise _Invalid(f"{where}: expected {' or '.join(names)}, got {_json_type_name(value)}")
-    if "enum" in schema and not any(_json_equal(value, option) for option in schema["enum"]):
-        raise _Invalid(f"{where}: {value!r} is not one of {schema['enum']!r}")
-    if "const" in schema and not _json_equal(value, schema["const"]):
-        raise _Invalid(f"{where}: must be {schema['const']!r}, got {value!r}")
-    if "anyOf" in schema:
-        reasons = []
-        for option in schema["anyOf"]:
-            try:
-                _check_value(option, value, where)
-                break
-            except _Invalid as e:
-                reasons.append(str(e))
-        else:
-            raise _Invalid(" / ".join(reasons))
-    if isinstance(value, list) and "items" in schema:
-        for i, item in enumerate(value):
-            _check_value(schema["items"], item, f"{where}[{i}]")
-    if isinstance(value, dict):
-        _check_object(schema, value, where)
-
-
-def _check_object(schema: dict, value: dict, where: str) -> None:
-    missing = [k for k in schema.get("required", ()) if k not in value]
-    if missing:
-        raise _Invalid(f"{where}: missing required key(s) {missing}")
-    properties = schema.get("properties", {})
-    extra = schema.get("additionalProperties", True)
-    for key, item in value.items():
-        if key in properties:
-            _check_value(properties[key], item, f"{where}.{key}")
-        elif extra is False:
-            raise _Invalid(f"{where}: unexpected key {key!r}")
-        elif isinstance(extra, dict):
-            _check_value(extra, item, f"{where}.{key}")
-
-
 def _check_arguments(schema: dict, arguments: dict) -> None:
-    """Every argument value against its property in the tool's input schema; -32602 with
-    the reason for one it does not accept."""
-    properties = schema.get("properties", {})
+    """Check the arguments object against the tool's input schema; -32602 with the reason
+    when it does not accept them."""
     try:
-        for name, value in arguments.items():
-            if name in properties:
-                _check_value(properties[name], value, f"argument {name!r}")
-    except _Invalid as e:
+        check_object(schema, arguments, "arguments")
+    except SchemaViolation as e:
         raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"invalid params: {e}") from None
 
 
@@ -267,9 +180,6 @@ class _Params:
         unexpected = [] if self.accepts_any else sorted(a for a in arguments if a not in self.names)
         if unexpected:
             raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"unexpected argument(s): {unexpected}")
-        missing = [n for n in self.required if n not in arguments]
-        if missing:
-            raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"missing required argument(s): {missing}")
 
 
 _NAMED = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
@@ -389,17 +299,21 @@ class MCPServer:
         input_schema: dict | None = None,
     ):
         """Register a tool that AI models can invoke. ``ValueError`` when a tool of that
-        name is already registered. The tool reports a failure to the model by raising
+        name is already registered, or when ``input_schema`` does not list as required an
+        argument the handler requires. The tool reports a failure to the model by raising
         ``ToolError``."""
 
         def register(f: Callable) -> Callable:
             tool_name = name or f.__name__
             _refuse_repeat("tool", tool_name, self._tools)
+            params = _Params.of(f)
+            schema = input_schema or _extract_schema(f)
+            _refuse_unrequired(tool_name, schema, params)
             self._tools[tool_name] = _Tool(
                 name=tool_name,
                 description=description or f.__doc__ or "",
-                input_schema=input_schema or _extract_schema(f),
-                params=_Params.of(f),
+                input_schema=schema,
+                params=params,
                 handler=f,
             )
             return f
@@ -511,14 +425,14 @@ class MCPServer:
         if not _is_json_rpc_id(req_id):
             return _error_response(
                 None, JsonRpcCode.INVALID_REQUEST,
-                f"Invalid Request: id must be a string, number or null, got {_json_type_name(req_id)}",
+                f"Invalid Request: id must be a string, number or null, got {json_type_name(req_id)}",
             )
         method = message.get("method")
         if not isinstance(method, str):
             return _error_response(
                 req_id, JsonRpcCode.INVALID_REQUEST,
                 "Invalid Request: method must be a string, got "
-                + ("nothing" if "method" not in message else _json_type_name(method)),
+                + ("nothing" if "method" not in message else json_type_name(method)),
             )
         # JSON-RPC 2.0 §5.1: when present, `params` MUST be a Structured
         # value (Object or Array). Treat absent as empty dict.
@@ -581,11 +495,8 @@ class MCPServer:
         if tool is None:
             raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"Unknown tool: {tool_name}")
         arguments = _arguments_object(params)
-        missing = [r for r in tool.input_schema.get("required", []) if r not in arguments]
-        if missing:
-            raise JsonRpcError(JsonRpcCode.INVALID_PARAMS, f"missing required argument(s): {missing}")
-        tool.params.check(arguments)
         _check_arguments(tool.input_schema, arguments)
+        tool.params.check(arguments)
 
         try:
             value = tool.handler(**arguments)
@@ -705,6 +616,17 @@ async def _tool_result_later(pending: Any) -> dict:
     return _tool_result(_as_text(value), is_error=False)
 
 
+def _refuse_unrequired(tool: str, schema: dict, params: _Params) -> None:
+    """Raise ``ValueError`` when the handler requires an argument ``schema`` does not: the
+    schema's ``required`` is the one check of a missing argument at call time."""
+    unrequired = [n for n in params.required if n not in schema.get("required", ())]
+    if unrequired:
+        raise ValueError(
+            f"MCP tool {tool!r}: its handler requires {unrequired}, which input_schema= does not list "
+            "as required"
+        )
+
+
 def _refuse_repeat(kind: str, key: str, registered: dict) -> None:
     if key in registered:
         raise ValueError(f"MCP {kind} {key!r} is already registered")
@@ -740,7 +662,7 @@ def _str_param(params: dict, key: str) -> str:
     """``params[key]``, which must be a string: -32602 with the reason otherwise."""
     value = params.get(key)
     if not isinstance(value, str):
-        got = "nothing" if key not in params else _json_type_name(value)
+        got = "nothing" if key not in params else json_type_name(value)
         raise JsonRpcError(
             JsonRpcCode.INVALID_PARAMS, f"Invalid params: {key!r} must be a string, got {got}"
         )

@@ -14,12 +14,14 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// sends nothing more, so the close waits this long after its last bytes.
 pub const LINGER_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
-const DEFAULT_MAX_BODY_BYTES: u64 = 10 * 1024 * 1024;
+/// The default matches Django's `DATA_UPLOAD_MAX_MEMORY_SIZE`.
+const DEFAULT_MAX_BODY_BYTES: u64 = 2_621_440;
 /// The default matches the `websockets` library's 1 MiB rather than tungstenite's 64 MiB.
 const DEFAULT_MAX_MESSAGE_BYTES: MessageByteLimit = MessageByteLimit(1024 * 1024);
 const DEFAULT_REQUEST_BUDGET: RequestBudget = RequestBudget(Duration::from_secs(30));
+const DEFAULT_BODY_GRACE: BodyGrace = BodyGrace(Duration::from_secs(5));
 const DEFAULT_BODY_MIN_RATE: BodyMinRate = BodyMinRate(NonZeroU64::new(1024).unwrap());
-const DEFAULT_BODY_TIME_LIMIT: BodyTimeLimit = BodyTimeLimit(Duration::from_secs(600));
+const DEFAULT_BODY_TIME_LIMIT: BodyTimeLimit = BodyTimeLimit(Duration::from_secs(30));
 const DEFAULT_INTERRUPT_GRACE: InterruptGrace = InterruptGrace(Duration::from_secs(2));
 const DEFAULT_SHUTDOWN_TIMEOUT: ShutdownTimeout = ShutdownTimeout(Duration::from_secs(5));
 /// Each WebSocket connection holds one OS thread for its Python handler.
@@ -82,6 +84,17 @@ impl std::fmt::Display for MessageByteLimit {
 pub struct ByteLimit(pub u64);
 
 impl ByteLimit {
+    /// Parses a byte limit from Python's `int`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ByteLimitError`] when `bytes` is negative.
+    pub fn new(setting: &'static str, bytes: i64) -> Result<Self, ByteLimitError> {
+        u64::try_from(bytes)
+            .map(Self)
+            .map_err(|_| ByteLimitError { setting, got: bytes })
+    }
+
     /// Returns the limit as a buffer length, saturating at the address space.
     pub fn as_usize(self) -> usize {
         usize::try_from(self.0).unwrap_or(usize::MAX)
@@ -93,8 +106,15 @@ impl ByteLimit {
     }
 }
 
-/// How long the server waits for one step of a request, its whole body arriving (else 408) or
-/// its handler responding (else 504). It is always above zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{setting} must be a number of bytes, 0 or more, got {got}")]
+pub struct ByteLimitError {
+    pub setting: &'static str,
+    pub got: i64,
+}
+
+/// How long the server waits for a request's handler to respond (else 504), and for a streamed
+/// body's handler to take each chunk. It is always above zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RequestBudget(Duration);
 
@@ -132,7 +152,27 @@ fn positive_secs(setting: &'static str, seconds: f64) -> Result<Duration, Second
         .ok_or(SecondsError { setting, got: seconds })
 }
 
-/// The slowest a request body may arrive and still earn time past the request budget, in bytes
+/// How long a request body may take to arrive however slowly it comes; it is always above zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BodyGrace(Duration);
+
+impl BodyGrace {
+    /// Parses the setting from Python's seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecondsError`] unless `seconds` is finite, above zero and at most
+    /// [`MAX_SETTING_SECS`].
+    pub fn from_secs(seconds: f64) -> Result<Self, SecondsError> {
+        positive_secs("body_grace", seconds).map(Self)
+    }
+
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
+/// The slowest average rate at which a request body may go on arriving past its grace, in bytes
 /// per second; it is always above zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BodyMinRate(NonZeroU64);
@@ -160,7 +200,7 @@ impl BodyMinRate {
 #[error("body_min_rate must be a number of bytes per second above 0, got {0}")]
 pub struct BodyMinRateError(pub i64);
 
-/// The most time a request body may take, whatever it earns by arriving; it is always above zero.
+/// The most time a request body may take, however fast it arrives; it is always above zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BodyTimeLimit(Duration);
 
@@ -221,32 +261,40 @@ impl ShutdownTimeout {
     }
 }
 
-/// How long a request body may take to arrive: `budget`, plus one second for every `min_rate`
-/// bytes received, and never more than `cap`.
+/// How long a request body may take to arrive: `grace`, or one second for every `min_rate`
+/// bytes received if that is longer, and never more than `cap`.
 ///
-/// A client sending at `min_rate` or faster is never cut off for being slow, while holding a
-/// connection for `cap` costs a client at least `cap × min_rate` bytes.
+/// Past the grace a body goes on only while its bytes have paid for the time it has taken, so a
+/// client averaging under `min_rate` is cut off at the grace instead of trickling to the cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BodyTimeAllowance {
-    pub budget: RequestBudget,
+    pub grace: BodyGrace,
     pub min_rate: BodyMinRate,
     pub cap: BodyTimeLimit,
 }
 
 impl BodyTimeAllowance {
-    /// Allows `budget` and no more, whatever arrives.
-    pub const fn absolute(budget: RequestBudget) -> Self {
+    /// Allows `grace` and no more, whatever arrives.
+    pub const fn absolute(grace: BodyGrace) -> Self {
         BodyTimeAllowance {
-            budget,
+            grace,
             min_rate: BodyMinRate(NonZeroU64::MAX),
-            cap: BodyTimeLimit(budget.get()),
+            cap: BodyTimeLimit(grace.get()),
         }
     }
 
     /// Returns the time a body has in total once `received` bytes of it have come in.
     pub fn allowed(&self, received: u64) -> Duration {
-        let earned = Duration::from_secs(received / self.min_rate.get().get());
-        self.budget.get().saturating_add(earned).min(self.cap.get())
+        let paid = received / self.min_rate.get().get();
+        let grace = self.grace.get();
+        // `paid` is whole seconds, so comparing seconds alone is exact, at one comparison where
+        // `Duration::max` takes two.
+        let longer = if paid > grace.as_secs() {
+            Duration::from_secs(paid)
+        } else {
+            grace
+        };
+        longer.min(self.cap.get())
     }
 }
 
@@ -254,6 +302,7 @@ impl BodyTimeAllowance {
 pub struct Limits {
     pub max_body: ByteLimit,
     pub request_budget: RequestBudget,
+    pub body_grace: BodyGrace,
     pub body_min_rate: BodyMinRate,
     pub body_time_limit: BodyTimeLimit,
     pub interrupt_grace: InterruptGrace,
@@ -265,6 +314,7 @@ impl Limits {
     pub const DEFAULT: Self = Self {
         max_body: ByteLimit(DEFAULT_MAX_BODY_BYTES),
         request_budget: DEFAULT_REQUEST_BUDGET,
+        body_grace: DEFAULT_BODY_GRACE,
         body_min_rate: DEFAULT_BODY_MIN_RATE,
         body_time_limit: DEFAULT_BODY_TIME_LIMIT,
         interrupt_grace: DEFAULT_INTERRUPT_GRACE,
@@ -274,7 +324,7 @@ impl Limits {
 
     pub fn body_time(&self) -> BodyTimeAllowance {
         BodyTimeAllowance {
-            budget: self.request_budget,
+            grace: self.body_grace,
             min_rate: self.body_min_rate,
             cap: self.body_time_limit,
         }
@@ -317,6 +367,14 @@ impl Limits {
                 self.request_budget.get(),
             ));
         }
+        if in_worker.body_grace != self.body_grace {
+            ignored.push(format!(
+                "set_body_grace({:?}) in a worker is ignored: limits are per app, and the app \
+                 served is the main interpreter's, which has {:?}",
+                in_worker.body_grace.get(),
+                self.body_grace.get(),
+            ));
+        }
         if in_worker.body_time_limit != self.body_time_limit {
             ignored.push(format!(
                 "set_body_time_limit({:?}) in a worker is ignored: limits are per app, and the \
@@ -331,6 +389,22 @@ impl Limits {
                  app served is the main interpreter's, which has {:?}",
                 in_worker.shutdown_timeout.get(),
                 self.shutdown_timeout.get(),
+            ));
+        }
+        if in_worker.ws.keepalive.ping_after != self.ws.keepalive.ping_after {
+            ignored.push(format!(
+                "set_websocket_ping_interval({:?}) in a worker is ignored: limits are per app, and \
+                 the app served is the main interpreter's, which has {:?}",
+                in_worker.ws.keepalive.ping_after.get(),
+                self.ws.keepalive.ping_after.get(),
+            ));
+        }
+        if in_worker.ws.keepalive.pong_within != self.ws.keepalive.pong_within {
+            ignored.push(format!(
+                "set_websocket_ping_timeout({:?}) in a worker is ignored: limits are per app, and \
+                 the app served is the main interpreter's, which has {:?}",
+                in_worker.ws.keepalive.pong_within.get(),
+                self.ws.keepalive.pong_within.get(),
             ));
         }
         if in_worker.interrupt_grace != self.interrupt_grace {
@@ -349,13 +423,75 @@ impl Limits {
 pub struct WsLimits {
     pub max_message_bytes: MessageByteLimit,
     pub max_connections: NonZeroUsize,
+    pub keepalive: WsKeepalive,
 }
 
 impl WsLimits {
     pub const DEFAULT: Self = Self {
         max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
         max_connections: DEFAULT_MAX_CONNECTIONS,
+        keepalive: WsKeepalive::DEFAULT,
     };
+}
+
+/// Bounds how long a WebSocket client may go unheard: after `ping_after` without a frame from it
+/// the server pings, and it closes the connection when no frame comes within `pong_within` of
+/// the ping. A message trickled inside one frame holds back the Pong too, so it is cut off the
+/// same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WsKeepalive {
+    pub ping_after: PingAfter,
+    pub pong_within: PongWithin,
+}
+
+impl WsKeepalive {
+    /// The defaults are the `websockets` library's `ping_interval` and `ping_timeout`.
+    pub const DEFAULT: Self = Self {
+        ping_after: PingAfter(Duration::from_secs(20)),
+        pong_within: PongWithin(Duration::from_secs(20)),
+    };
+}
+
+/// How long a WebSocket client may go unheard before the server pings it; it is always above
+/// zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PingAfter(Duration);
+
+impl PingAfter {
+    /// Parses the setting from Python's seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecondsError`] unless `seconds` is finite, above zero and at most
+    /// [`MAX_SETTING_SECS`].
+    pub fn from_secs(seconds: f64) -> Result<Self, SecondsError> {
+        positive_secs("websocket_ping_interval", seconds).map(Self)
+    }
+
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
+/// How long a pinged WebSocket client has to send a frame before the server closes it; it is
+/// always above zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PongWithin(Duration);
+
+impl PongWithin {
+    /// Parses the setting from Python's seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecondsError`] unless `seconds` is finite, above zero and at most
+    /// [`MAX_SETTING_SECS`].
+    pub fn from_secs(seconds: f64) -> Result<Self, SecondsError> {
+        positive_secs("websocket_ping_timeout", seconds).map(Self)
+    }
+
+    pub const fn get(self) -> Duration {
+        self.0
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -384,7 +520,7 @@ mod tests {
 
     fn thirty_seconds_a_kib_up_to_100() -> BodyTimeAllowance {
         BodyTimeAllowance {
-            budget: RequestBudget::from_secs(30.0).unwrap(),
+            grace: BodyGrace::from_secs(30.0).unwrap(),
             min_rate: BodyMinRate::new(1024).unwrap(),
             cap: BodyTimeLimit::from_secs(100.0).unwrap(),
         }
@@ -395,58 +531,64 @@ mod tests {
     }
 
     #[test]
-    fn a_body_earns_a_second_per_min_rate_bytes() {
+    fn a_body_has_its_grace_until_its_bytes_pay_for_longer() {
         let time = thirty_seconds_a_kib_up_to_100();
         assert_eq!(time.allowed(0), secs(30));
         assert_eq!(time.allowed(1023), secs(30), "one byte short of a second");
-        assert_eq!(time.allowed(1024), secs(31), "exactly a second's worth");
-        assert_eq!(time.allowed(10 * 1024), secs(40));
+        assert_eq!(time.allowed(1024), secs(30), "exactly a second's worth");
+        assert_eq!(time.allowed(10 * 1024), secs(30));
+        assert_eq!(
+            time.allowed(31 * 1024 - 1),
+            secs(30),
+            "a byte short of paying past the grace"
+        );
+        assert_eq!(time.allowed(31 * 1024), secs(31), "a second past the grace paid for");
     }
 
     #[test]
-    fn a_body_earns_no_more_than_the_cap() {
+    fn a_body_gets_no_more_than_the_cap() {
         let time = thirty_seconds_a_kib_up_to_100();
-        assert_eq!(time.allowed(69 * 1024 + 1023), secs(99), "a byte short of the cap");
-        assert_eq!(time.allowed(70 * 1024), secs(100), "at the cap");
-        assert_eq!(time.allowed(71 * 1024), secs(100), "past what the cap allows");
+        assert_eq!(time.allowed(99 * 1024 + 1023), secs(99), "a byte short of the cap");
+        assert_eq!(time.allowed(100 * 1024), secs(100), "at the cap");
+        assert_eq!(time.allowed(101 * 1024), secs(100), "past what the cap allows");
         assert_eq!(time.allowed(u64::MAX), secs(100));
     }
 
     #[test]
-    fn an_apps_body_time_is_its_budget_rate_and_limit() {
+    fn an_apps_body_time_is_its_grace_rate_and_limit() {
         let limits = Limits {
-            request_budget: RequestBudget::from_secs(1.5).unwrap(),
+            body_grace: BodyGrace::from_secs(1.5).unwrap(),
             body_min_rate: BodyMinRate::new(4096).unwrap(),
             body_time_limit: BodyTimeLimit::from_secs(2.0).unwrap(),
             ..Limits::DEFAULT
         };
         let time = limits.body_time();
         assert_eq!(
-            (time.budget.get(), time.min_rate.get().get(), time.cap.get()),
+            (time.grace.get(), time.min_rate.get().get(), time.cap.get()),
             (Duration::from_millis(1500), 4096, secs(2))
         );
         assert_eq!(time.allowed(0), Duration::from_millis(1500));
-        assert_eq!(time.allowed(4096), secs(2));
+        assert_eq!(time.allowed(4096), Duration::from_millis(1500));
         assert_eq!(time.allowed(15 * 4096), secs(2));
     }
 
     proptest::proptest! {
         #[test]
-        fn the_allowance_is_the_budget_plus_whole_seconds_earned_up_to_the_cap(
-            budget_ms in 1u64..100_000,
+        fn the_allowance_is_the_grace_or_the_whole_seconds_paid_for_up_to_the_cap(
+            grace_ms in 1u64..100_000,
             min_rate in 1u64..1 << 20,
             over_cap_ms in 0u64..1_000_000,
             received in 0u64..1 << 40,
         ) {
-            let budget = Duration::from_millis(budget_ms);
-            let cap = budget + Duration::from_millis(over_cap_ms);
+            let grace = Duration::from_millis(grace_ms);
+            let cap = grace + Duration::from_millis(over_cap_ms);
             let time = BodyTimeAllowance {
-                budget: RequestBudget::from_secs(budget.as_secs_f64()).unwrap(),
+                grace: BodyGrace::from_secs(grace.as_secs_f64()).unwrap(),
                 min_rate: BodyMinRate::new(min_rate as i64).unwrap(),
                 cap: BodyTimeLimit::from_secs(cap.as_secs_f64()).unwrap(),
             };
             let allowed = time.allowed(received);
-            proptest::prop_assert_eq!(allowed, (budget + secs(received / min_rate)).min(cap));
+            proptest::prop_assert_eq!(allowed, grace.max(secs(received / min_rate)).min(cap));
             proptest::prop_assert!(time.allowed(received + 1) >= allowed);
             let next = time.allowed(received + min_rate);
             proptest::prop_assert!(next - allowed <= secs(1), "{:?} → {:?}", allowed, next);
@@ -455,9 +597,47 @@ mod tests {
     }
 
     #[test]
-    fn an_absolute_budget_earns_nothing() {
-        let budget = RequestBudget::from_secs(30.0).unwrap();
-        assert_eq!(BodyTimeAllowance::absolute(budget).allowed(u64::MAX), secs(30));
+    fn a_body_averaging_the_minimum_rate_has_the_time_its_bytes_paid_for() {
+        let time = thirty_seconds_a_kib_up_to_100();
+        for t in 31..=100 {
+            assert_eq!(time.allowed(1024 * t), secs(t), "{t} s of bytes");
+        }
+    }
+
+    #[test]
+    fn a_body_a_byte_per_second_under_the_minimum_rate_has_only_the_grace_at_the_grace() {
+        let time = thirty_seconds_a_kib_up_to_100();
+        assert_eq!(time.allowed(1024 * 30), secs(30));
+        assert_eq!(time.allowed(1023 * 30), secs(30));
+        for t in 31..=100 {
+            assert!(time.allowed(1023 * t) < secs(t), "{t} s at 1023 B/s");
+        }
+    }
+
+    #[test]
+    fn an_absolute_grace_earns_nothing() {
+        let grace = BodyGrace::from_secs(30.0).unwrap();
+        assert_eq!(BodyTimeAllowance::absolute(grace).allowed(u64::MAX), secs(30));
+    }
+
+    #[test]
+    fn a_byte_limit_takes_zero_and_refuses_one_below() {
+        assert_eq!(ByteLimit::new("max_body_size", 0), Ok(ByteLimit(0)));
+        assert_eq!(
+            ByteLimit::new("max_body_size", -1),
+            Err(ByteLimitError {
+                setting: "max_body_size",
+                got: -1
+            })
+        );
+        assert_eq!(
+            ByteLimitError {
+                setting: "max_body_size",
+                got: -1
+            }
+            .to_string(),
+            "max_body_size must be a number of bytes, 0 or more, got -1"
+        );
     }
 
     #[test]
@@ -512,10 +692,11 @@ mod tests {
     fn every_time_setting_takes_a_year_and_refuses_anything_longer() {
         let year = MAX_SETTING_SECS as f64;
         type FromSecs = fn(f64) -> Result<Duration, SecondsError>;
-        let settings: [(&str, FromSecs); 4] = [
+        let settings: [(&str, FromSecs); 7] = [
             ("request_timeout", |s| {
                 RequestBudget::from_secs(s).map(RequestBudget::get)
             }),
+            ("body_grace", |s| BodyGrace::from_secs(s).map(BodyGrace::get)),
             ("body_time_limit", |s| {
                 BodyTimeLimit::from_secs(s).map(BodyTimeLimit::get)
             }),
@@ -524,6 +705,12 @@ mod tests {
             }),
             ("shutdown_timeout", |s| {
                 ShutdownTimeout::from_secs(s).map(ShutdownTimeout::get)
+            }),
+            ("websocket_ping_interval", |s| {
+                PingAfter::from_secs(s).map(PingAfter::get)
+            }),
+            ("websocket_ping_timeout", |s| {
+                PongWithin::from_secs(s).map(PongWithin::get)
             }),
         ];
         for (setting, from_secs) in settings {
@@ -546,19 +733,51 @@ mod tests {
     }
 
     #[test]
+    fn the_websocket_keepalive_defaults_to_20_s_each_and_refuses_out_of_range_values() {
+        assert_eq!(WsKeepalive::DEFAULT.ping_after.get(), Duration::from_secs(20));
+        assert_eq!(WsKeepalive::DEFAULT.pong_within.get(), Duration::from_secs(20));
+        for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e30] {
+            assert!(PingAfter::from_secs(seconds).is_err());
+            assert!(PongWithin::from_secs(seconds).is_err());
+        }
+        assert_eq!(PingAfter::from_secs(0.5).unwrap().get(), Duration::from_millis(500));
+        assert_eq!(PongWithin::from_secs(1.5).unwrap().get(), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn a_keepalive_set_in_a_worker_is_said_to_be_ignored() {
+        let mut in_worker = Limits::DEFAULT;
+        in_worker.ws.keepalive.ping_after = PingAfter::from_secs(5.0).unwrap();
+        in_worker.ws.keepalive.pong_within = PongWithin::from_secs(7.0).unwrap();
+        let ignored = Limits::DEFAULT.ignored_in_worker(&in_worker);
+        assert_eq!(ignored.len(), 2, "{ignored:?}");
+        assert!(
+            ignored[0].starts_with("set_websocket_ping_interval(5s) in a worker is ignored"),
+            "{ignored:?}"
+        );
+        assert!(
+            ignored[1].starts_with("set_websocket_ping_timeout(7s) in a worker is ignored"),
+            "{ignored:?}"
+        );
+        assert!(Limits::DEFAULT.ignored_in_worker(&Limits::DEFAULT).is_empty());
+    }
+
+    #[test]
     fn the_default_request_budget_is_30_s() {
         assert_eq!(Limits::DEFAULT.request_budget.get(), Duration::from_secs(30));
     }
 
     #[test]
     fn the_body_time_settings_have_defaults_and_refuse_out_of_range_values() {
+        assert_eq!(Limits::DEFAULT.body_grace.get(), Duration::from_secs(5));
         assert_eq!(Limits::DEFAULT.body_min_rate.get().get(), 1024);
-        assert_eq!(Limits::DEFAULT.body_time_limit.get(), Duration::from_secs(600));
+        assert_eq!(Limits::DEFAULT.body_time_limit.get(), Duration::from_secs(30));
         for rate in [0, -1] {
             assert_eq!(BodyMinRate::new(rate), Err(BodyMinRateError(rate)));
         }
         assert_eq!(BodyMinRate::new(100).unwrap().get().get(), 100);
         for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e30] {
+            assert!(BodyGrace::from_secs(seconds).is_err());
             assert!(BodyTimeLimit::from_secs(seconds).is_err());
         }
         assert_eq!(
@@ -580,14 +799,14 @@ mod proofs {
     }
 
     #[kani::proof]
-    fn a_body_is_allowed_its_budget_and_never_past_its_cap() {
+    fn a_body_is_allowed_its_grace_and_never_past_its_cap() {
         let time = BodyTimeAllowance {
-            budget: RequestBudget(any_duration()),
+            grace: BodyGrace(any_duration()),
             min_rate: BodyMinRate(kani::any()),
             cap: BodyTimeLimit(any_duration()),
         };
         let allowed = time.allowed(kani::any());
         assert!(allowed <= time.cap.get());
-        assert!(allowed >= time.budget.get().min(time.cap.get()));
+        assert!(allowed >= time.grace.get().min(time.cap.get()));
     }
 }

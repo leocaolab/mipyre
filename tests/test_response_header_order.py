@@ -1,6 +1,5 @@
 """A `Response`'s header lines go out, and read back, in the order the handler gave them,
-wherever its `Content-Type` is among them (b/437: taking the type out of the map used to
-move the last line into its place)."""
+wherever its `Content-Type` is among them."""
 
 from mipyre import Mipyre, Response
 from mipyre.testing import TestClient

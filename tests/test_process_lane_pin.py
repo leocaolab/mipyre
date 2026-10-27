@@ -17,7 +17,7 @@ import pytest
 import mipyre
 from mipyre import engine
 from tests._helpers import bound_port, poll_until, read_file
-from mipyre._clone import PrivateCopyError, claim_name, clone_tree, ensure_private_dir
+from mipyre._clone import PrivateCopyError, _is_bytecode_temp, claim_name, clone_tree, ensure_private_dir
 from mipyre._process_lane.server import (
     START_REFUSED,
     _remove_stale_run_dirs,
@@ -202,7 +202,7 @@ def test_a_clone_keeps_its_sources_mtime_so_their_cached_bytecode_stays_valid(tm
 
 
 def test_a_copy_that_cannot_be_made_either_way_warns_raises_and_leaves_nothing(tmp_path, caplog):
-    # An in-process server started by an earlier test leaves the root logger at its level (ERROR).
+    # An in-process server started by an earlier test leaves the root logger at its level (WARN).
     caplog.set_level(logging.WARNING, logger="mipyre.clone")
     src = tmp_path / "pkg"
     src.mkdir()
@@ -218,6 +218,45 @@ def test_a_copy_that_cannot_be_made_either_way_warns_raises_and_leaves_nothing(t
         assert not (parent / "clone").exists()
     finally:
         parent.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    ("directory", "name", "temp"),
+    [
+        ("pkg/__pycache__", "m.cpython-314.pyc.4242", True),
+        ("pkg/__pycache__", "m.cpython-314.pyc", False),
+        ("pkg/__pycache__", "m.cpython-314.pyc.tmp", False),
+        ("pkg", "m.cpython-314.pyc.4242", False),
+    ],
+)
+def test_only_importlibs_bytecode_temp_files_in_pycache_are_bytecode_temps(directory, name, temp):
+    assert _is_bytecode_temp(directory, name) is temp
+
+
+def _source_with_unreadable(tmp_path, unreadable):
+    src = tmp_path / "pkg"
+    cache = src / "__pycache__"
+    cache.mkdir(parents=True)
+    (src / "m.py").write_text("")
+    (cache / "m.cpython-314.pyc").write_bytes(b"pyc")
+    (cache / unreadable).write_bytes(b"pyc")
+    (cache / unreadable).chmod(0)
+    return src
+
+
+def test_a_bytecode_temp_file_the_clone_cannot_read_is_left_out_of_the_copy(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="mipyre.clone")
+    src = _source_with_unreadable(tmp_path, "m.cpython-314.pyc.4242")
+    clone_tree(str(src), str(tmp_path / "clone"))
+    assert "making a plain copy instead" in caplog.text
+    assert sorted(os.listdir(tmp_path / "clone" / "__pycache__")) == ["m.cpython-314.pyc"]
+
+
+def test_bytecode_the_clone_cannot_read_still_fails_the_copy(tmp_path):
+    src = _source_with_unreadable(tmp_path, "n.cpython-314.pyc")
+    with pytest.raises(PrivateCopyError, match="Permission denied"):
+        clone_tree(str(src), str(tmp_path / "clone"))
+    assert not (tmp_path / "clone").exists()
 
 
 def test_only_run_dirs_whose_lock_is_free_are_removed(tmp_path):

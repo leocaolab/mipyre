@@ -2,7 +2,7 @@
 //! threads still running, [`RunStop`]): std's in a normal build, Loom's under `--cfg sync_model`,
 //! where the models (`threads/loom_model.rs`) run the same code over every interleaving. Only the
 //! names switch; nothing wraps the real ones, so a build pays nothing for them. Shipping code names
-//! an atomic or a lock only through this module (dev/archcheck.toml E-L1).
+//! an atomic or a lock only through this module.
 //!
 //! [`RunStop`]: crate::RunStop
 

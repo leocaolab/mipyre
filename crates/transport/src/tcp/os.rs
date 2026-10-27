@@ -5,6 +5,8 @@
 
 use std::io;
 
+use crate::tcp::listener::PortLayout;
+
 /// Turns off delayed ACKs on a connection; off Linux there is nothing to set and it succeeds.
 #[cfg(target_os = "linux")]
 pub(crate) fn quickack(stream: &std::net::TcpStream) -> io::Result<()> {
@@ -28,7 +30,11 @@ pub(crate) struct AcceptingSocket(tokio::io::unix::AsyncFd<mio::net::TcpListener
 impl AcceptingSocket {
     /// Registers `socket`, which must be nonblocking, with the current runtime.
     pub(crate) fn register(socket: std::net::TcpListener) -> io::Result<Self> {
-        tokio::io::unix::AsyncFd::new(mio::net::TcpListener::from_std(socket)).map(AcceptingSocket)
+        let listener = mio::net::TcpListener::from_std(socket);
+        // SAFETY: the listener owns the socket's descriptor, moved into it here, for as long as it
+        // lives; nothing replaces it, and `as_raw_fd` returns that one descriptor.
+        let registered = unsafe { tokio::io::unix::AsyncFd::register(listener) };
+        Ok(AcceptingSocket(registered?))
     }
 
     pub(crate) fn poll_accept(
@@ -68,6 +74,14 @@ impl AcceptingSocket {
             .map(|accepted| accepted.and_then(|(stream, remote)| Ok((stream.into_std()?, remote))))
     }
 }
+
+/// Linux hashes connections over the `SO_REUSEPORT` sockets of a port; Darwin and the BSDs hand
+/// every connection to one of them, so there the accept loops share one socket.
+pub(crate) const PORT_LAYOUT: PortLayout = if cfg!(any(target_os = "linux", target_os = "android")) {
+    PortLayout::SocketPerLoop
+} else {
+    PortLayout::SharedSocket
+};
 
 /// Sets SO_REUSEPORT; Windows has no such option, so there it succeeds without setting one.
 #[cfg(not(windows))]

@@ -7,7 +7,7 @@ use pyo3::types::{PyDict, PyList};
 use sqlx::postgres::PgRow;
 
 use super::cell;
-use crate::runtime::{DbRuntime, OpenPool, TaskError};
+use mipyre_pg::{DbRuntime, OpenPool, TaskError};
 
 use super::error::DbError;
 use super::query::{bind, QueryMethod, SqlQuery};

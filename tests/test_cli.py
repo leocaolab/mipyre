@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from mipyre import Mipyre, flags
+from mipyre._target import parse_target
 from mipyre.cli import _load_app, main
 
 
@@ -64,42 +65,42 @@ def _cleanup_sys_path(monkeypatch):
 
 def test_load_app_default_attr(tmp_path):
     modname = _write_app_module(tmp_path)
-    app = _load_app(modname)
+    app = _load_app(parse_target(modname))
     assert isinstance(app, Mipyre)
 
 
 def test_load_app_explicit_attr(tmp_path):
     modname = _write_app_module(tmp_path)
-    app = _load_app(f"{modname}:app")
+    app = _load_app(parse_target(f"{modname}:app"))
     assert isinstance(app, Mipyre)
 
 
 def test_load_app_missing_module_exits(tmp_path):
     with pytest.raises(SystemExit) as ei:
-        _load_app("definitely_not_a_module_abc123")
+        _load_app(parse_target("definitely_not_a_module_abc123"))
     assert "cannot import" in str(ei.value)
 
 
 def test_load_app_missing_attr(tmp_path):
     modname = _write_app_module(tmp_path)
     with pytest.raises(SystemExit) as ei:
-        _load_app(f"{modname}:not_there")
+        _load_app(parse_target(f"{modname}:not_there"))
     assert "no attribute" in str(ei.value)
 
 
 def test_an_import_error_inside_the_app_module_is_the_modules_own_error(tmp_path):
-    # b/845: the module exists; a dependency of it does not. That is the module's failure,
+    # The module exists; a dependency of it does not. That is the module's failure,
     # with its traceback, not "cannot import the target".
     (tmp_path / "cli_broken_dep.py").write_text("import definitely_missing_dep_abc123\n")
     sys.path.insert(0, str(tmp_path))
     with pytest.raises(ModuleNotFoundError) as raised:
-        _load_app("cli_broken_dep:app")
+        _load_app(parse_target("cli_broken_dep:app"))
     assert raised.value.name == "definitely_missing_dep_abc123"
 
 
 def test_a_missing_py_file_target_exits_with_one_line(tmp_path):
     with pytest.raises(SystemExit) as ei:
-        _load_app(str(tmp_path / "nowhere.py") + ":app")
+        _load_app(parse_target(str(tmp_path / "nowhere.py") + ":app"))
     assert "nowhere.py" in str(ei.value)
 
 
@@ -107,8 +108,14 @@ def test_a_module_getattr_is_not_taken_for_the_target(tmp_path):
     (tmp_path / "cli_lazy_attr.py").write_text("def __getattr__(name):\n    raise RuntimeError('computed')\n")
     sys.path.insert(0, str(tmp_path))
     with pytest.raises(SystemExit) as ei:
-        _load_app("cli_lazy_attr:app")
+        _load_app(parse_target("cli_lazy_attr:app"))
     assert "no attribute 'app'" in str(ei.value)
+
+
+def test_a_target_with_two_colons_exits_with_one_line():
+    with pytest.raises(SystemExit) as ei:
+        main(["routes", "a:b:c"])
+    assert str(ei.value) == "mipyre: invalid target 'a:b:c': expected module:attr (exactly one ':')"
 
 
 @pytest.mark.parametrize(
@@ -151,7 +158,7 @@ def test_load_app_wrong_type(tmp_path):
     mod.write_text("app = 42\n")
     sys.path.insert(0, str(tmp_path))
     with pytest.raises(SystemExit) as ei:
-        _load_app("cli_not_pyron:app")
+        _load_app(parse_target("cli_not_pyron:app"))
     assert "expected mipyre.Mipyre" in str(ei.value)
 
 

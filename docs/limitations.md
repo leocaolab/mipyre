@@ -19,8 +19,8 @@ An extension module loads in a sub-interpreter only if it declares support for i
   - `async def` handlers (refused when the route is registered);
   - `body=BodyStream` streaming request bodies (refused when the route is registered);
   - returning a `Stream` (the request is answered `500`, and the log says to use `runtime='main'`);
-  - `app.state` and `PgPool` (using either raises `RuntimeError`, answered `500`).
-- WebSocket handlers always run on the main interpreter, whatever the app's runtime.
+  - `app.state` and `PgPool` (using either raises `RuntimeError`, answered `500`);
+  - WebSocket routes (`app.websocket` raises `ValueError` when the route's runtime is `process`; give it `runtime="main"` or a sub-interpreter one).
 - A request body and a response are each limited to `slot_bytes`, 256 KiB by default: a larger request is answered `413`, a larger response `500`, naming the sizes. Raise it with `ProcessLanes(slot_bytes=...)` or `--process-slot-bytes`.
 - Every request to a process route crosses to another process, so it costs the server more CPU than the same route on `subinterp`.
 
@@ -55,6 +55,3 @@ Declare them with `mipyre.flags` (`mipyre run app:app --db-dsn x`, listed by `--
 
 FastAPI, Starlette, Flask, Django and other ASGI or WSGI apps can't be mounted in mipyre yet. This is planned.
 
-## Known issues
-
-- **A handler parameter named like a path parameter, in the request's place.** A handler's first parameter always receives the request, whatever it is called. With `@app.get("/hello/{name}")` and `def hello(name):`, registration succeeds, but `name` receives the `Request` object. Write `def hello(req, name):`.

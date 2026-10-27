@@ -5,7 +5,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyString};
 
-use crate::runtime::{map_for_new, AppStore, StateValue};
+use mipyre_runtime::{map_for_new, AppStore, StateValue};
 
 /// Copies a stored value into a Python `str`; a value set with `set_bytes` that is not UTF-8
 /// is a `TypeError` naming the key.
@@ -19,7 +19,7 @@ fn text<'py>(py: Python<'py>, key: &str, value: &StateValue) -> PyResult<Bound<'
 
 /// Refuses access from a process-lane worker, a process apart from the server's state.
 fn guard() -> PyResult<()> {
-    crate::runtime::process::refuse_in_lane_worker("app.state (SharedState)")
+    mipyre_process::refuse_in_lane_worker("app.state (SharedState)")
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
 

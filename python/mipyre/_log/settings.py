@@ -34,6 +34,12 @@ def _parse_level(level: LogLevel | LogLevelName) -> LogLevel:
     return level if isinstance(level, LogLevel) else LogLevel.parse(level)
 
 
+def _parsed_level(user: LogConfig) -> LogConfig:
+    """Return ``user`` with its level, if it gives one, as a ``LogLevel``; an unknown name
+    raises ``ValueError``."""
+    return {**user, "level": _parse_level(user["level"])} if "level" in user else user
+
+
 @dataclass(frozen=True)
 class _AccessLog:
     """The access log the user turned on with ``enable_access_log()``, at the level they
@@ -51,9 +57,10 @@ class _LogSettings:
     format: Literal["text", "json"]
 
     @classmethod
-    def resolve(cls, debug: bool, user: LogConfig) -> _LogSettings:
+    def resolve(cls, debug: bool, user: LogConfig, *, dev: bool = False) -> _LogSettings:
         """Return the user's settings over the defaults of the mode: debug logs text with
-        the access log at DEBUG, production logs JSON at ERROR without it."""
+        the access log at DEBUG, production logs JSON at WARN without it, and ``mipyre dev``
+        (``dev``) logs text, for a person reading a terminal."""
         if debug:
             return cls(
                 level=_parse_level(user.get("level", LogLevel.Debug)),
@@ -61,21 +68,21 @@ class _LogSettings:
                 format=user.get("format", "text"),
             )
         return cls(
-            level=_parse_level(user.get("level", LogLevel.Error)),
+            level=_parse_level(user.get("level", LogLevel.Warn)),
             access_log=user.get("access_log", False),
-            format=user.get("format", "json"),
+            format=user.get("format", "text" if dev else "json"),
         )
 
     def with_access_log(self, choice: _AccessLog | None, launch_log: bool) -> _LogSettings:
         """Return the settings a server applies: these, with the access log on when the
         user's ``choice`` or the launch (``MIPYRE_LOG=1``, ``mipyre dev``) asks for it, at
         the level the choice gave, else at the configured one raised to INFO when that
-        would hide the access lines (ERROR, OFF). Asked by neither, these as they are."""
+        would hide the access lines (WARN, ERROR, OFF). Asked by neither, these as they are."""
         if choice is None and not launch_log:
             return self
         if choice is not None and choice.level is not None:
             level = choice.level
-        elif self.level in (LogLevel.Error, LogLevel.Off):
+        elif self.level in (LogLevel.Warn, LogLevel.Error, LogLevel.Off):
             level = LogLevel.Info
         else:
             level = self.level

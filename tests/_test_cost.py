@@ -1,12 +1,11 @@
-"""What each test costs, counted (b/441, b/452): the seconds of sleep it asked for and the work it did.
+"""What each test costs, counted: the seconds of sleep it asked for and the work it did.
 
-The merge gate used to judge a test by its wall clock (b/253). Wall clock is work + waiting + queueing, and the
-queueing moves with whatever else the merge host runs, so the gate went red under load on tests that had not
-changed. These counts do not move with the machine: they are what the test asked for, not how long it took.
+A test is not judged by its wall clock. Wall clock is work + waiting + queueing, and the queueing moves with
+whatever else the machine runs, so a wall-clock limit goes red under load on tests that have not changed. These
+counts do not move with the machine: they are what the test asked for, not how long it took.
 
 Per test, for its call phase (fixtures excluded: a module-scoped fixture runs once per xdist worker, so whichever
-test comes first on a worker would carry it), written as JUnit properties that `dev/test_time_gate.py` holds to
-`dev/test_cost_budget.toml`:
+test comes first on a worker would carry it), written as JUnit properties:
 
 - `sleep_s`: the seconds `time.sleep` / `asyncio.sleep` were asked for by code under `tests/`, one call of at least
   `FIXED_SLEEP_S` at a time. The requested value, not the time slept: a loaded machine sleeps longer, the request
@@ -40,8 +39,7 @@ import pytest
 
 TESTS_DIR = str(Path(__file__).resolve().parent)
 HELPERS = str(Path(__file__).resolve().with_name("_helpers.py"))
-# A sleep this long or longer is a fixed sleep; a shorter one is a poll interval. The same line as
-# dev/sleep_gate.py draws.
+# A sleep this long or longer is a fixed sleep; a shorter one is a poll interval.
 FIXED_SLEEP_S = 0.05
 
 COUNTS = ("sleep_s", "subprocesses", "servers", "requests", "connections")

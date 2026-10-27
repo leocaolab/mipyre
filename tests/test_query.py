@@ -1,4 +1,4 @@
-"""b/764: `query=` validates the query string against a pydantic model and hands the handler the
+"""`query=` validates the query string against a pydantic model and hands the handler the
 instance; it fails like `body=` does, with a 422 whose `detail` lists the errors."""
 
 from __future__ import annotations

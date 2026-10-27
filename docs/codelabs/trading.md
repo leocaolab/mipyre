@@ -47,7 +47,7 @@ mipyre --version
 **Checkpoint:**
 
 ```text
-mipyre 2.0.0
+mipyre 3.0.0
 ```
 
 The server needs `pydantic`, `numpy`, `pandas` and `msgpack`. `httpx` is what `RPCClient` uses to call the server (step 5), and `websockets` is the test client for step 6.
@@ -230,7 +230,8 @@ With `body=OrderRequest`, the handler receives the validated order instead of th
 In `trading/main.py`, list the router. Change `app = Mipyre()` to:
 
 ```python
-app = Mipyre(routers=["trading.orders:router"])
+app = Mipyre()
+app.include_router("trading.orders:router")
 ```
 
 The app names its routers by import string, not by object, so each runtime imports only the routers it serves: the main interpreter imports `trading.orders`, and the sub-interpreters never do.
@@ -264,10 +265,10 @@ curl -s localhost:8000/orders/1; echo
 {"order_id": 1, "status": "filled", "ticker": "AAPL", "side": "buy", "quantity": 100, "requested_price": 230.5, "fill_price": 230.7, "market_price": 230.23, "slippage_bps": 8.7, "timestamp": 1792586097.550865}
 ```
 
-The banner counts the order route on the main interpreter as `GIL`:
+The banner counts the order route on the main interpreter as `main`:
 
 ```text
-  Routes: 4 sub-interp + 1 GIL + 0 process + 0 async
+  Routes: 4 sub-interp + 1 main + 0 process + 0 async
 ```
 
 Stop the server.
@@ -336,7 +337,9 @@ The portfolio is a constant in the module, which each worker builds once when it
 List the router in `trading/main.py`:
 
 ```python
-app = Mipyre(routers=["trading.orders:router", "trading.analytics:router"])
+app = Mipyre()
+app.include_router("trading.orders:router")
+app.include_router("trading.analytics:router")
 ```
 
 The worker processes start from a template process. `python trading_api.py` starts it after it imports the app, as a new interpreter, so the thread pool numpy starts when it is imported doesn't reach it. Restart the server:
@@ -459,21 +462,20 @@ Add `import json` at the top of `trading/main.py`, and this handler at the end:
 
 ```python
 @app.websocket("/ws/prices")
-def price_stream(ws):
+async def price_stream(ws):
     """Answer each text message, a comma-separated list of tickers or "all", with their
     quotes."""
-    while (msg := ws.recv_message()) is not None:
+    async for msg in ws:
         if isinstance(msg, bytes):
             continue
         wanted = TICKERS if msg.strip().lower() == "all" else [t.strip().upper() for t in msg.split(",")]
         try:
-            ws.send(json.dumps({t: get_live_price(t) for t in wanted if t in TICKERS}))
-        except (ConnectionError, BlockingIOError):
-            ws.close()  # the client left, or stopped reading what we send
-            return
+            await ws.send(json.dumps({t: get_live_price(t) for t in wanted if t in TICKERS}))
+        except ConnectionError:
+            return  # the client left
 ```
 
-WebSocket handlers always run on the main interpreter, each connection on a thread of its own. `recv_message()` returns `None` when the connection ends; `send()` raises `ConnectionError` when it has closed and `BlockingIOError` when the client stops reading. Like a `POST`, an upgrade from another site's page is refused with `403` unless that site is in `enable_cors(allow_origins=...)`; this app's `"*"` lets every site's pages open the feed. The [realtime codelab](realtime.md) covers WebSockets in depth.
+A WebSocket handler is an `async def` and runs on the app's runtime, here `subinterp`: each connection is a task on a sub-interpreter worker's event loop, and holds no thread while it waits. `async for` ends when the connection does; `await ws.send(...)` waits while a slow client has let the buffer fill, and raises `ConnectionError` once the connection has closed. Like a `POST`, an upgrade from another site's page is refused with `403` unless that site is in `enable_cors(allow_origins=...)`; this app's `"*"` lets every site's pages open the feed. The [realtime codelab](realtime.md) covers WebSockets in depth.
 
 Start `mipyre run trading_api:app`, then:
 
@@ -523,7 +525,7 @@ POST    /rpc/get_signals        get_signals   runtime=main
   | `POST /order` | `main` | pydantic can't load in a sub-interpreter, and the route writes `app.state`, which a worker process can't reach; one GIL is enough for a low-traffic write |
   | `GET /analytics/portfolio`, `GET /analytics/correlation` | `process` | numpy and pandas can't load in a sub-interpreter, and the routes need only the request, so they run in parallel in worker processes |
   | `POST /rpc/get_signals` | `main` | always: RPC methods run on the main interpreter |
-  | `/ws/prices` | main interpreter | always: WebSocket handlers run there, one thread per connection |
+  | `/ws/prices` | `subinterp` | pure Python and `app.state`: each connection is a task on a worker's event loop |
 
 - An app split into routers, so the sub-interpreters import neither pydantic nor numpy nor pandas, and the worker processes import only the analytics.
 - A MsgPack RPC method that other services call with `RPCClient`.

@@ -8,7 +8,7 @@ use pyo3::sync::InterpreterHandle;
 
 use mipyre_subinterp::attach::{with_interpreter, with_main};
 
-use crate::runtime::{DbRuntime, TaskError};
+use mipyre_pg::{DbRuntime, TaskError};
 
 use super::error::DbError;
 
@@ -48,9 +48,7 @@ where
 
     let query = rt.spawn(fut);
     let abort = query.abort_handle();
-    let runs_on = Arc::clone(rt);
     rt.spawn(async move {
-        let _runs_on = runs_on;
         let result = match query.await {
             Ok(done) => done,
             Err(join_error) => Err(DbError::from(TaskError::from(join_error))),
@@ -109,7 +107,7 @@ impl LoopFuture {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| outcome(py))).unwrap_or_else(|payload| {
                     Err(PyRuntimeError::new_err(format!(
                         "converting the database result to Python panicked: {}",
-                        mipyre_tpc::panic_message(&*payload)
+                        mipyre_util::panic_message(&*payload)
                     )))
                 });
             let (ok, value) = match outcome {
@@ -197,5 +195,29 @@ impl QueryAbortHook {
             self.0.abort();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use mipyre_pg::DbRuntime;
+    use mipyre_subinterp::PYTHON_THREAD_STACK;
+
+    #[test]
+    fn the_db_runtime_starts_its_threads_with_python_stacks() {
+        mipyre_runtime::testkit::thread_stack::with_exact_stacks(
+            concat!(module_path!(), "::the_db_runtime_starts_its_threads_with_python_stacks"),
+            || {
+                let python = mipyre_runtime::testkit::thread_stack::of_a_thread_with(PYTHON_THREAD_STACK);
+                let rt = DbRuntime::build(Some(NonZeroUsize::MIN), PYTHON_THREAD_STACK).expect("the DB runtime builds");
+                let blocking = rt
+                    .run(async { tokio::task::spawn_blocking(mipyre_runtime::testkit::thread_stack::current).await })
+                    .expect("the DB runtime runs the task")
+                    .expect("on the blocking pool");
+                assert_eq!(blocking, python);
+            },
+        );
     }
 }

@@ -196,7 +196,7 @@ def test_mcp_answers_any_id_a_client_sends_with_valid_json(raw_id):
 
 @pytest.mark.parametrize("req_id", [2**64, -(2**63) - 1, 2**200])
 def test_mcp_echoes_an_id_wider_than_64_bits_in_full(req_id):
-    """The reply is encoded by the engine (b/841): an id wider than 64 bits comes back as
+    """The reply is encoded by the engine: an id wider than 64 bits comes back as
     the same integer, not a 500."""
     body = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": "tools/call", "params": {"name": "ping"}})
     r = _post_mcp(_main_app_with_ping(), body)
@@ -291,6 +291,32 @@ def test_mcp_prompt_arguments_declared_are_announced_and_called_with():
     assert reply["result"]["messages"][0]["content"]["text"] == "warm hello Ann"
 
 
+# -- a tool's input_schema is checked whole --------------------------------------
+
+
+@pytest.mark.parametrize("arguments,accepted", [({"x": 1}, True), ({"x": 1, "y": 2}, False)])
+def test_mcp_tool_schema_without_additional_properties_refuses_an_argument_it_does_not_list(arguments, accepted):
+    server = MCPServer(Mipyre())
+    schema = {"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"], "additionalProperties": False}
+    server.tool(lambda x, y=None: "ok", name="t", input_schema=schema)
+    reply = _rpc(server, "tools/call", {"name": "t", "arguments": arguments})
+    assert ("result" in reply) == accepted, reply
+    if not accepted:
+        assert reply["error"] == {"code": -32602, "message": "invalid params: arguments: unexpected key 'y'"}
+
+
+@pytest.mark.parametrize("required,refused", [(["x"], False), ([], True)])
+def test_mcp_tool_schema_must_require_what_its_handler_requires(required, refused):
+    server = MCPServer(Mipyre())
+    schema = {"type": "object", "properties": {"x": {}}, "required": required}
+    register = server.tool(name="t", input_schema=schema)
+    if refused:
+        with pytest.raises(ValueError, match=r"MCP tool 't': its handler requires \['x'\]"):
+            register(lambda x: "ok")
+    else:
+        register(lambda x: "ok")
+
+
 # -- enum / const compare JSON values, not Python ones -------------------------
 
 
@@ -305,7 +331,7 @@ def test_mcp_prompt_arguments_declared_are_announced_and_called_with():
 ])
 def test_mcp_enum_and_const_tell_true_from_1(schema, value, accepted):
     server = MCPServer(Mipyre())
-    server.tool(lambda x: "ok", name="t", input_schema={"type": "object", "properties": {"x": schema}})
+    server.tool(lambda x: "ok", name="t", input_schema={"type": "object", "properties": {"x": schema}, "required": ["x"]})
     reply = _rpc(server, "tools/call", {"name": "t", "arguments": {"x": value}})
     assert ("result" in reply) == accepted, reply
 

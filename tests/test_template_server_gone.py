@@ -1,16 +1,21 @@
-"""b/900: the process-lane template takes the server's end closing as "the server is gone" however
+"""The process-lane template takes the server's end closing as "the server is gone" however
 the kernel reports it — EOF, ECONNRESET on Linux when the server left frames unread, EPIPE on a
 report — and ends quietly, never with a traceback."""
 
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import subprocess
 import sys
 import textwrap
+import urllib.request
+from typing import IO
 
 from mipyre._process_lane.template import recv_commands, send_report
+
+from tests._helpers import kill_session, listening_ports
 
 
 def test_the_server_closing_with_template_frames_unread_reads_as_gone():
@@ -73,3 +78,43 @@ def test_a_test_process_that_used_a_process_route_exits_without_a_template_trace
     )
     assert done.returncode == 0, done.stderr
     assert "Traceback" not in done.stderr, done.stderr
+
+
+def _banner_and_port(output: IO[str]) -> tuple[str, int]:
+    """The lines `output` gave up to and with the first "Listening on", and its port."""
+    banner = ""
+    for line in output:
+        banner += line
+        ports = listening_ports(line)
+        if ports:
+            return banner, ports[0]
+    raise RuntimeError(f"mipyre run ended before it listened:\n{banner[-4000:]}")
+
+
+def test_ctrl_c_on_mipyre_run_with_a_process_lane_in_use_exits_0_without_a_traceback(tmp_path):
+    """Ctrl-C sends SIGINT to the whole foreground group: the server, the template and its workers.
+    The output is read to its end, which comes once every one of them has exited, so the
+    template's last words are in it."""
+    (tmp_path / "server_gone_app.py").write_text(textwrap.dedent(APP))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MIPYRE_")}
+    env["PYTHONUNBUFFERED"] = "1"
+    run = subprocess.Popen(
+        [sys.executable, "-m", "mipyre", "run", "server_gone_app:app", "--host", "127.0.0.1", "--port", "0",
+         "--process-workers", "2"],
+        cwd=tmp_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        start_new_session=True,
+    )
+    try:
+        banner, port = _banner_and_port(run.stdout)
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/hello") as answer:
+            assert answer.status == 200
+        os.killpg(run.pid, signal.SIGINT)
+        output = banner + run.stdout.read()
+        code = run.wait()
+    finally:
+        kill_session(run)
+        run.stdout.close()
+
+    assert code == 0, output
+    for last_words in ("Traceback", "ConnectionResetError", "BrokenPipeError"):
+        assert last_words not in output, output

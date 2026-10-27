@@ -1,4 +1,4 @@
-"""A pooled connection the server closed while it sat idle (b/18).
+"""A pooled connection the server closed while it sat idle.
 
 The pool does not ping a connection before handing it out (`ping_on_acquire=False`,
 the default), so the first query on a connection the server has ended fails, and it

@@ -114,12 +114,12 @@ _FAT = b"\xca\xfe\xba\xbe"
         st.binary(max_size=256),
     )
 )
-@example(_FAT + b"\xff\xff\xff\xff" + bytes(56))  # b/892: 2**32 - 1 slices claimed, none there
+@example(_FAT + b"\xff\xff\xff\xff" + bytes(56))  # 2**32 - 1 slices claimed, none there
 def test_any_file_is_read_as_facts_and_never_runs_past_its_end(content):
     """Whatever the bytes, the string-table reader returns a table or refuses the file with the one error its caller
-    turns into a fact (#1298's promise for the reader it replaced), and the facts come back as one of their kinds,
+    turns into a fact, and the facts come back as one of their kinds,
     bounded by what the file holds: a header that claims more than the file has is an unknown format, not a loop over
-    what it claims (b/892)."""
+    what it claims."""
     import tempfile
 
     with tempfile.TemporaryDirectory() as d:

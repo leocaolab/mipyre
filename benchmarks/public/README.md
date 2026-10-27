@@ -69,11 +69,12 @@ lscpu -e        # pick server and client CPUs; keep SMT siblings on the same sid
 nice -n 10 taskset -c 4-7,12-15 python benchmarks/public/run.py measure \
     --out results.jsonl --reps 3 \
     --server-cpus 0-3,8-11 --client-cpus 4-7,12-15 \
-    --wrk-threads 8 --connections 128 --duration 10
+    --wrk-threads 8 --connections 64 --duration 10
 python benchmarks/public/run.py table results.jsonl
 ```
 
-`measure` appends one JSON line per run (with the raw `wrk` output and the start of the
+`--cell <mode>/<route>` (repeatable, e.g. `--cell subinterp-tpc/plaintext`) measures only
+those cells. `measure` appends one JSON line per run (with the raw `wrk` output and the start of the
 server's log); `table` prints the median and min–max of every cell, and every run that was
 not measured with the reason.
 

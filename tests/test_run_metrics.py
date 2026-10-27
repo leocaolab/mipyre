@@ -1,4 +1,4 @@
-"""A server's counts are its own (b/335 D15): two servers of one process each read what they
+"""A server's counts are its own: two servers of one process each read what they
 served from ``metrics()``, not a sum over every server the process ran."""
 
 from mipyre import Mipyre
@@ -41,7 +41,7 @@ def test_a_server_says_why_its_last_worker_retired(tmp_path, monkeypatch):
     monkeypatch.setenv("RUN_METRICS_GC_MARKER", str(tmp_path / "gc-failed"))
     from tests.apps.run_metrics_gc_failure import app as failing
 
-    # A TestClient reads no environment (b/335 M5.6): the collection settings are its config.
+    # A TestClient reads no environment: the collection settings are its config.
     with TestClient(failing, config=ServerFlags(gc_mode="count", gc_threshold=1, threads=2)) as c:
         for _ in range(4):
             c.get("/work")

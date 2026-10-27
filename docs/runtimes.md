@@ -28,9 +28,9 @@ from mipyre import Mipyre, ProcessLanes
 
 app = Mipyre(
     runtime="subinterp",                  # the app's default
-    routers=["analytics:router"],         # routers by import string
     process=ProcessLanes(workers=2, timeout=10.0),
 )
+app.include_router("analytics:router")   # a router by import string; prefix="/x" puts its paths under /x
 
 
 @app.get("/health", runtime="main")       # one route
@@ -144,7 +144,7 @@ Requests and responses are limited to `slot_bytes`, 256 KiB by default.
 
 The server's main interpreter: one GIL for every `main` route. Use it for the few routes that need one place: `Stream` responses, `body=BodyStream` bodies, objects that must not be copied per worker, libraries that can't load in a sub-interpreter when `process` doesn't fit.
 
-On the default, thread-per-core server, the `def` handlers of `main` routes run on 4 bridge threads that share the one GIL (an I/O-bound handler releases it for the others), with a queue of 64 requests in front of them; past that the server answers `503` at once. `MIPYRE_GIL_BRIDGE_WORKERS` and `MIPYRE_GIL_BRIDGE_CAPACITY` change both ([configuration.md](configuration.md#engine-tuning)). `async def` handlers of `main` routes run on one event loop of the main interpreter: one that awaits holds no thread, so any number of them can wait at once.
+On the default, thread-per-core server, the `def` handlers of `main` routes run on 4 bridge threads that share the one GIL (an I/O-bound handler releases it for the others), with a queue of 64 requests in front of them; past that the server answers `503` at once. On the multi-thread server (`MIPYRE_TPC=0`) they run on threads of the same kind, up to 512, started as requests find none free and retired after 10 s idle, with 16 queued requests per thread. `MIPYRE_BRIDGE_WORKERS` and `MIPYRE_BRIDGE_CAPACITY` change both ([configuration.md](configuration.md#engine-tuning)). `async def` handlers of `main` routes run on one event loop of the main interpreter: one that awaits holds no thread, so any number of them can wait at once.
 
 `Mipyre(runtime="main")` serves every route on the main interpreter and starts no sub-interpreter; so does any app none of whose routes runs on a sub-interpreter. CPU-bound Python on `main` doesn't scale past one core.
 

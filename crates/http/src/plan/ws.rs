@@ -102,6 +102,9 @@ impl UpgradeError {
 }
 
 #[cfg(test)]
+mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -1,4 +1,4 @@
-//! The `slot_take` fuzz target (design `shm-channel.md` §4.4, b/718's lane part): whatever bytes the peer left in an
+//! The `slot_take` fuzz target: whatever bytes the peer left in an
 //! answer slot, the host takes the answer whole or refuses it with the length the slot claimed, and reads nothing
 //! past the slot.
 //!

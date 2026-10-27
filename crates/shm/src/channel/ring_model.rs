@@ -1,4 +1,4 @@
-//! The channel against a reference model (b/739's ring, design `shm-channel.md` §4.2): one sequence of operations,
+//! The channel against a reference model: one sequence of operations,
 //! the peer's corrupting writes among them, goes to both ends of a channel on heap memory and to a model a reader can
 //! check by eye, and every step's outcome must agree.
 //!
@@ -19,7 +19,7 @@ use super::{
     SleepVerdict, Wait,
 };
 use crate::plan::geometry::{Geometry, SlotBytes};
-use crate::plan::ring::{PeerCounterError, RingDepth, Seq, Window};
+use crate::plan::ring::{slot_state, PeerCounterError, RingDepth, Seq, SlotState, Window};
 use crate::plan::slot_len::SlotLengthError;
 use crate::plan::spin_window::SpinWindow;
 use crate::protocol::doorbell::{AtomicU32, Doorbell, Parker};
@@ -166,6 +166,8 @@ struct RingModel {
     running: bool,
     taken: u32,
     resp_head: u32,
+    /// Whether the peer wrote a counter no correct peer would since the counters were last set.
+    scribbled: bool,
     requests: Vec<SlotCopy>,
     answers: Vec<SlotCopy>,
 }
@@ -186,6 +188,7 @@ impl RingModel {
             running: false,
             taken: 0,
             resp_head: 0,
+            scribbled: false,
             requests: vec![empty.clone(); depth as usize],
             answers: vec![empty; depth as usize],
         }
@@ -267,6 +270,37 @@ impl RingModel {
         Ok((self.taken != published).then_some(published))
     }
 
+    /// Names the state of the requests around the lap from its own lists, when it believes the counters: the `depth`
+    /// read last and the one a lap past `read` are consumed, the ones in flight fall before `published`, before
+    /// `taken` or after both, and the ones that still fit after `sent` are empty.
+    fn named_states(&self) -> Option<Vec<(u32, SlotState)>> {
+        if self.fault.is_some() {
+            return None;
+        }
+        let published = self.check_published().ok()?;
+        self.check_taken(published).ok()?;
+        let believable = self.believable();
+        let answered = believable.iter().position(|&s| s == published)?;
+        let took = believable.iter().position(|&s| s == self.taken)?;
+        let read = self.read();
+        let consumed = (1..=self.depth)
+            .map(|back| read.wrapping_sub(back))
+            .chain([read.wrapping_add(self.depth)])
+            .map(|seq| (seq, SlotState::Consumed));
+        let in_flight = self.flight.iter().enumerate().map(|(i, &seq)| {
+            let state = if i < answered {
+                SlotState::AnswerCommitted
+            } else if i < took {
+                SlotState::TakenByPeer
+            } else {
+                SlotState::Committed
+            };
+            (seq, state)
+        });
+        let empty = (0..self.depth - self.flight.len() as u32).map(|j| (self.sent.wrapping_add(j), SlotState::Empty));
+        Some(consumed.chain(in_flight).chain(empty).collect())
+    }
+
     /// Moves `read` and both counters to `next`, as a take-over or an abandon leaves them, for a new peer.
     fn restart_at(&mut self, next: u32) {
         while self.flight.front().is_some_and(|&s| s != next) {
@@ -274,6 +308,7 @@ impl RingModel {
         }
         self.taken = next;
         self.resp_head = next;
+        self.scribbled = false;
         self.fault = None;
         self.cursor = next;
         self.running = false;
@@ -304,8 +339,8 @@ impl RingModel {
             .take_while(|&&s| s != published)
             .map(|&s| (s, self.answers[self.slot(s)].message()))
             .collect();
-        // b/925 (the user's ruling C): the requests the dead peer never took are given up with the one it ran; the
-        // next peer starts after every request sent.
+        // The dead peer could have written the slots of the requests it never took, so they are given up with the
+        // one it ran; the next peer starts after every request sent.
         self.restart_at(self.sent);
         Ok(TakeOver { answered, running })
     }
@@ -388,6 +423,7 @@ impl Harness {
     fn send(&mut self, len: u32) -> Result<bool, TestCaseError> {
         let m = &mut self.model;
         let has_room = m.fault.is_none() && (m.flight.len() as u32) < m.depth;
+        let channel = Arc::clone(self.hosts[0].channel());
         let Some(mut slot) = self.hosts[0].request_slot() else {
             prop_assert!(!has_room, "no request slot, though the model has room");
             return Ok(false);
@@ -397,6 +433,10 @@ impl Harness {
         let bytes = message(m.sent, len, false);
         let put = slot.write(|w| w.put(&bytes));
         prop_assert_eq!(put.is_ok(), len <= ROOM);
+        if !m.scribbled {
+            let writing = state_as_read(&channel, Window::new(Seq::new(m.read()), Seq::new(m.sent)), slot.seq());
+            prop_assert_eq!(writing, Ok(SlotState::Empty), "Writing is an Empty slot the host holds");
+        }
         prop_assert_eq!(slot.publish(), Ok(None), "the peer never sleeps here, so nothing rings");
         let at = m.slot(m.sent);
         m.requests[at].write(&bytes);
@@ -448,6 +488,14 @@ impl Harness {
         };
         prop_assert!(available, "a request handed out, though none was sent");
         Self::handed(model, request.seq(), request.bytes())?;
+        if !model.scribbled {
+            let processing = state_as_read(self.hosts[0].channel(), self.hosts[0].window(), request.seq());
+            prop_assert_eq!(
+                processing,
+                Ok(SlotState::TakenByPeer),
+                "Processing is a TakenByPeer request the peer holds"
+            );
+        }
         let bytes = message(model.cursor, len, true);
         let mut put = None;
         let rung = request.answer(|w| put = Some(w.put(&bytes)));
@@ -499,8 +547,14 @@ impl Harness {
         let m = &mut self.model;
         let at = m.slot(m.read());
         let word = match field {
-            Field::Taken => &mut m.taken,
-            Field::RespHead => &mut m.resp_head,
+            Field::Taken => {
+                m.scribbled = true;
+                &mut m.taken
+            }
+            Field::RespHead => {
+                m.scribbled = true;
+                &mut m.resp_head
+            }
             Field::Len => &mut m.answers[at].len,
         };
         *word = match scribble {
@@ -535,8 +589,24 @@ impl Harness {
             (h.taken.load(Relaxed), h.resp_head.load(Relaxed)),
             (m.taken, m.resp_head)
         );
+        for (seq, named) in m.named_states().unwrap_or_default() {
+            let read = state_as_read(self.channel(), host.window(), Seq::new(seq));
+            prop_assert_eq!(read, Ok(named), "request {}", seq);
+        }
         Ok(())
     }
+}
+
+/// Returns the state of request `seq`'s slot from the counters the peer wrote in `channel`, against `window`.
+fn state_as_read(channel: &Channel<HeapMemory>, window: Window, seq: Seq) -> Result<SlotState, PeerCounterError> {
+    let h = channel.memory.header();
+    slot_state(
+        &window,
+        channel.memory.geometry().depth(),
+        Seq::new(h.resp_head.load(Relaxed)),
+        Seq::new(h.taken.load(Relaxed)),
+        seq,
+    )
 }
 
 fn take_all(host: &mut Host) -> Result<Vec<(u32, Vec<u8>)>, PeerFault> {

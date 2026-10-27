@@ -24,7 +24,10 @@ Behaviour:
   entering Python or running a ``before_request`` hook: a pod whose interpreter is busy, or
   whose hooks ask for credentials, is still alive. k8s uses it to decide whether to restart
   the pod.
-- ``GET /readyz`` runs every registered check. Success → ``200
+- ``GET /readyz`` runs every registered check, and on ``runtime="main"`` one of its own,
+  ``abandoned_workers``: it fails while a sub-interpreter pool is at its limit of abandoned
+  workers (as many as its sync workers, each stuck in a request an interruption did not end).
+  Those threads can't be taken back, so the pod is to be restarted. Success → ``200
   {"status":"ready","checks":{"db":{"ok":true},...}}``. Any failure
   (an exception, a timeout, or a ``False`` return) → ``503 {"status":"not_ready",
   "checks":{"db":{"ok":false},...},"request_id":"..."}``. The probe is
@@ -46,15 +49,18 @@ starting another: a stuck check costs one thread, not one per probe.
 
 from __future__ import annotations
 
+import _thread
+import contextvars
+import inspect
 import json
 import logging
 import threading
 import time
+from concurrent.futures import Future, wait
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, Sequence, TypeVar, Union
 
-from mipyre import Runtime, RuntimeDeclarationError
-from mipyre._bounded import BoundedCall
+from mipyre import Runtime, RuntimeDeclarationError, engine
 from mipyre.engine import Response
 
 if TYPE_CHECKING:
@@ -81,10 +87,11 @@ _LIVEZ_BODY = json.dumps({"status": "alive"}).encode("utf-8")
 
 @dataclass(frozen=True)
 class ReadinessCheck:
-    """A registered check: its name and the bounded call that runs it."""
+    """A check: its name and the call that runs it. A registered check runs bounded by the probe
+    timeout (``of``); one that only reads the engine's counters cannot hang and runs as it is."""
 
     name: str
-    call: BoundedCall
+    call: Callable[[], Any]
 
     @classmethod
     def of(cls, name: str, fn: CheckFn) -> ReadinessCheck:
@@ -262,6 +269,13 @@ def _build_readyz_handler(checks: Sequence[ReadinessCheck]):
 _Check = TypeVar("_Check", bound=CheckFn)
 
 
+def _no_pool_at_abandon_limit() -> bool:
+    """Return whether no sub-interpreter pool of this process is at its limit of abandoned
+    workers. It reads the counters of the process it runs in, so it is registered only where
+    /readyz runs in the server's own process."""
+    return engine.get_gil_metrics().pools_at_abandon_limit == 0
+
+
 class HealthProbes:
     """Kubernetes-style ``/livez`` and ``/readyz`` routes on ``app``.
 
@@ -272,6 +286,9 @@ class HealthProbes:
 
     ``runtime`` is where ``/readyz`` and its checks run: ``"main"`` (the default; most checks touch
     globals, DB pools and cache clients, that live on the main interpreter) or ``"process"``.
+    On ``"main"`` it also checks ``abandoned_workers``: not ready while a sub-interpreter pool is at
+    its limit of abandoned workers. A ``"process"`` probe runs in a worker process, which cannot see
+    the server's pool, so it does not have that check.
 
     :raises RuntimeDeclarationError: ``runtime`` is ``"subinterp"`` or ``"isolated"``. A check that
         hangs is left on a thread of its own, and a sub-interpreter can only start threads it waits
@@ -288,7 +305,8 @@ class HealthProbes:
         runtime: Runtime | str = Runtime.MAIN,
     ) -> None:
         where = f"HealthProbes(runtime={runtime!r})"
-        if Runtime.parse(runtime, where).on_subinterpreters:
+        parsed = Runtime.parse(runtime, where)
+        if parsed.on_subinterpreters:
             raise RuntimeDeclarationError(
                 f"{where}: readiness checks can't run in a sub-interpreter. A hung check is left "
                 "running on its own thread, and a sub-interpreter only has threads it waits for "
@@ -296,6 +314,8 @@ class HealthProbes:
                 "\"process\"."
             )
         self._checks: list[ReadinessCheck] = []
+        if parsed is Runtime.MAIN:
+            self._checks.append(ReadinessCheck("abandoned_workers", _no_pool_at_abandon_limit))
         app.add_fast_response("GET", livez_path, _LIVEZ_BODY, content_type="application/json")
         app.get(readyz_path, runtime=runtime)(_build_readyz_handler(self._checks))
 
@@ -316,6 +336,69 @@ class HealthProbes:
             return fn
 
         return decorator
+
+
+# An awaitable a check returns is driven on its thread's own event loop, so the caller may itself
+# be inside a running loop. The thread is a daemon wherever the interpreter allows one (main; a
+# sub-interpreter worker does not), so a hung check never holds up exit there. ``asyncio`` is
+# imported only when a check returns an awaitable: it pulls in ``ssl``, ``subprocess`` and the
+# rest, about 3 MiB in every interpreter that imports mipyre.
+
+
+def _start(fn: Callable[[], Any], timeout: float) -> Future:
+    """Start ``fn`` on a new thread, in a copy of the caller's context, and return the
+    future of its value."""
+    future: Future = Future()
+    deadline = time.monotonic() + timeout
+
+    def run() -> None:
+        try:
+            result = fn()
+            if inspect.isawaitable(result):
+                import asyncio
+
+                result = asyncio.run(_await_by(result, deadline))
+        except BaseException as e:  # noqa: BLE001 — handed to the waiting caller
+            future.set_exception(e)
+        else:
+            future.set_result(result)
+
+    threading.Thread(
+        target=contextvars.copy_context().run,
+        args=(run,),
+        name=f"mipyre-bounded:{getattr(fn, '__qualname__', repr(fn))}",
+        daemon=_thread.daemon_threads_allowed(),
+    ).start()
+    return future
+
+
+async def _await_by(awaitable: Any, deadline: float) -> Any:
+    """``awaitable``'s value, cancelled at ``deadline`` (so its thread ends too)."""
+    import asyncio
+
+    return await asyncio.wait_for(awaitable, max(0.0, deadline - time.monotonic()))
+
+
+class BoundedCall:
+    """``fn`` called with a timeout, at most one run at a time: while a run is still going
+    (a hung check), a new call waits on that run instead of starting another thread."""
+
+    def __init__(self, fn: Callable[[], Any], timeout: float) -> None:
+        self.fn = fn
+        self.timeout = timeout
+        self._lock = threading.Lock()
+        self._run: Future | None = None
+
+    def __call__(self) -> Any:
+        """Return ``fn``'s value or raise its exception; raise ``TimeoutError`` when it has not
+        finished within the timeout."""
+        with self._lock:
+            if self._run is None or self._run.done():
+                self._run = _start(self.fn, self.timeout)
+            run = self._run
+        if not wait((run,), self.timeout).done:
+            raise TimeoutError(f"did not finish within {self.timeout:g}s")
+        return run.result()
 
 
 __all__ = ["CheckFn", "HealthProbes", "ReadinessCheck"]

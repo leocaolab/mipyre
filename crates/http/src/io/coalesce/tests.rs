@@ -625,7 +625,20 @@ fn a_keep_alive_connection_reuses_its_buffer_for_batches_up_to_the_limit() {
     }
 }
 
+/// Returns what `f` logs on this thread.
+///
+/// A callsite caches its interest the first time any thread reaches it. While this capture is the
+/// only subscriber alive, tracing-core asks only the reaching thread's default, so a parallel test
+/// dropping a connection with bytes owed reaches `say_dropped_write_out` first, with no subscriber
+/// of its own, caches `never`, and this capture loses the warning. A global subscriber
+/// that wants every event keeps a second one alive, so the interest is asked of every live
+/// subscriber, this one too.
 fn captured_log(f: impl FnOnce()) -> String {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        tracing::subscriber::set_global_default(tracing_subscriber::registry())
+            .expect("no other test in this binary sets the global subscriber");
+    });
     #[derive(Clone, Default)]
     struct Buf(Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for Buf {

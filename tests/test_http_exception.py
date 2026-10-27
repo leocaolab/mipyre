@@ -1,7 +1,6 @@
 """`HTTPException`: a handler, a hook, `req.json()` / `req.text()` or `parse_multipart` that
 raises it answers its status, its headers and `{"detail": …}` on every runtime, logged once at
-debug with no traceback; the engine's own refusals answer `{"detail": …}` too (b/845, design
-docs/design/client-errors-and-server-run.md §9.1 E2E-1…6)."""
+debug with no traceback; the engine's own refusals answer `{"detail": …}` too."""
 
 from __future__ import annotations
 
@@ -128,6 +127,15 @@ def test_a_client_sending_bad_json_to_req_json_gets_a_4xx(srv, runtime):
     assert json.loads(body)["detail"].startswith("the body is not valid JSON: "), body
     if runtime != "process":
         answered_once_at_debug(srv, f"/{runtime}/json")
+
+
+@pytest.mark.parametrize("runtime", RUNTIMES)
+def test_req_json_decodes_a_json_body(srv, runtime):
+    doc = {"a": [1, 2.5, "x"], "b": None}
+    status, _, body = srv.request(
+        "POST", f"/{runtime}/json", json.dumps(doc).encode(), {"Content-Type": "application/json"}
+    )
+    assert (status, json.loads(body)) == (200, {"got": doc}), body
 
 
 def test_a_body_that_is_not_utf8_is_a_400_from_req_text(srv):
