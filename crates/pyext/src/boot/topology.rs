@@ -179,7 +179,7 @@ impl ServerLayout {
             FlagUse::MacosTpc => cfg!(target_os = "macos") && matches!(self.topology, Topology::Tpc { .. }),
             FlagUse::SubinterpreterWorkers => self.workers() > 0,
             FlagUse::MainRoutes => self.main_routes,
-            FlagUse::PoolAsyncRoutes => matches!(self.topology, Topology::Pool { .. }) && self.async_worker_routes,
+            FlagUse::AsyncWorkerRoutes => self.async_worker_routes && self.workers() > 0,
             FlagUse::ProcessRoutes => self.process_routes,
             FlagUse::TcpTransport => self.tcp,
             // A server flag is never used by entry point; the entry checks those.
@@ -425,11 +425,12 @@ mod tests {
         lanes.process_routes = true;
         let mut memory = layout(TPC);
         memory.tcp = false;
-        let pairs: [(&str, &str, ServerLayout, ServerLayout); 7] = [
+        let pairs: [(&str, &str, ServerLayout, ServerLayout); 8] = [
             ("MIPYRE_GC_MODE", "idle", layout(TPC), tpc_without_workers()),
             ("MIPYRE_ISOLATE_DIR", "/srv/iso", layout(POOL), layout(MULTI_GIL)),
             ("MIPYRE_BRIDGE_WORKERS", "2", main, layout(MULTI_GIL)),
-            ("MIPYRE_ASYNC_QUEUE_CAPACITY", "100", pool_async, tpc_async),
+            ("MIPYRE_ASYNC_QUEUE_CAPACITY", "100", pool_async, layout(POOL)),
+            ("MIPYRE_ASYNC_QUEUE_CAPACITY", "100", tpc_async, layout(TPC)),
             ("MIPYRE_PROCESS_WORKERS", "2", lanes, layout(TPC)),
             ("MIPYRE_PORT", "8001", layout(TPC), memory),
             ("MIPYRE_THREADS", "2", layout(MULTI_GIL), layout(MULTI_GIL)),

@@ -74,8 +74,9 @@ pub(crate) enum FlagUse {
     SubinterpreterWorkers,
     /// A server with main-interpreter routes (or a fallback).
     MainRoutes,
-    /// A sub-interpreter pool with `async def` routes, whose queue the capacity sizes.
-    PoolAsyncRoutes,
+    /// A server with `async def` routes on sub-interpreter workers, whose async pool the capacity
+    /// sizes: the pool, and the thread-per-core server, which hands them to an async pool too.
+    AsyncWorkerRoutes,
     /// A server with `runtime="process"` routes.
     ProcessRoutes,
     /// A server taking TCP connections.
@@ -97,7 +98,7 @@ impl FlagUse {
             FlagUse::MacosTpc => "the thread-per-core server on macOS",
             FlagUse::SubinterpreterWorkers => "a server with sub-interpreter workers",
             FlagUse::MainRoutes => "a server with main-interpreter routes",
-            FlagUse::PoolAsyncRoutes => "the sub-interpreter pool (tpc off) with async def routes",
+            FlagUse::AsyncWorkerRoutes => "a server with async def routes on sub-interpreter workers",
             FlagUse::ProcessRoutes => "a server with runtime=\"process\" routes",
             FlagUse::TcpTransport => "a server taking TCP connections",
             FlagUse::ReloadingEntry => "a script's app.run() and mipyre run (mipyre dev reloads by itself)",
@@ -809,8 +810,8 @@ flags! {
         file: PyprojectKey::Top("async_queue_capacity"),
         code: [server_flags("async_queue_capacity")],
         shape: FlagShape::Positive,
-        used: PoolAsyncRoutes,
-        default: "the async pool's own",
+        used: AsyncWorkerRoutes,
+        default: "128 per pool worker",
         doc: "async def requests queued or running before 503",
     },
     metrics: bool = {

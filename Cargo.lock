@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_core"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "mipyre_http",
  "mipyre_microbench",
@@ -1389,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_cpu"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "core_affinity",
  "libc",
@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_http"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "atomic-waker",
  "bolero",
@@ -1433,11 +1433,11 @@ dependencies = [
 
 [[package]]
 name = "mipyre_microbench"
-version = "3.0.0"
+version = "3.0.1"
 
 [[package]]
 name = "mipyre_pg"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "futures-util",
  "mipyre_util",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_process"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bolero",
  "bytes",
@@ -1479,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_pyext"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "backtrace",
  "bolero",
@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_runtime"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -1559,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_server"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bytes",
  "core_affinity",
@@ -1602,7 +1602,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_shm"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bolero",
  "bytes",
@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_subinterp"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "loom",
  "mipyre_cpu",
@@ -1632,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_tpc"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "futures-util",
  "loom",
@@ -1647,7 +1647,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_transport"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "libc",
  "mio",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_util"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "mipyre_microbench",
  "proptest",

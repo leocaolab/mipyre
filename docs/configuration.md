@@ -341,7 +341,7 @@ Each server setting, by its three names. A `[tool.mipyre]` key is written in `py
 | `gc_oom_failsafe` | `--gc-oom-failsafe` | `MIPYRE_GC_OOM_FAILSAFE` | `[tool.mipyre] gc_oom_failsafe` | 50000 | requests after which idle mode collects even without a lull; 0 collects only in lulls |
 | `bridge_workers` | `--bridge-workers` | `MIPYRE_BRIDGE_WORKERS` | `[tool.mipyre] bridge_workers` | 4 (thread-per-core) / 512 (tpc off) | most threads that run main-interpreter def routes |
 | `bridge_capacity` | `--bridge-capacity` | `MIPYRE_BRIDGE_CAPACITY` | `[tool.mipyre] bridge_capacity` | 16 per main-interpreter thread | main-interpreter requests queued (async def: queued or running) before 503 |
-| `async_queue_capacity` | `--async-queue-capacity` | `MIPYRE_ASYNC_QUEUE_CAPACITY` | `[tool.mipyre] async_queue_capacity` | the async pool's own | async def requests queued before 503 |
+| `async_queue_capacity` | `--async-queue-capacity` | `MIPYRE_ASYNC_QUEUE_CAPACITY` | `[tool.mipyre] async_queue_capacity` | 128 per pool worker | async def requests queued before 503 |
 | `metrics` | `--metrics` | `MIPYRE_METRICS` | `[tool.mipyre] metrics` | off | count every answer and sample RSS |
 | `host` | `--host` | `MIPYRE_HOST` | `[tool.mipyre] host` | 127.0.0.1 | the address to bind |
 | `port` | `--port` | `MIPYRE_PORT` | `[tool.mipyre] port` | 8000 | the port to bind |

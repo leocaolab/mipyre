@@ -2,6 +2,12 @@
 
 All notable changes to mipyre are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/): within 1.x, the public API does not break.
 
+## [3.0.1] — 2026-10-27
+
+### Fixed
+
+- The thread-per-core server takes `async_queue_capacity` (`MIPYRE_ASYNC_QUEUE_CAPACITY`, `--async-queue-capacity`, `[tool.mipyre] async_queue_capacity`). It hands `async def` routes to an async pool that this setting sizes, but setting it refused the start as a setting the server does not use, so the pool stayed at 128 per worker: with a `def` route beside them, 2048 `async def` requests on a 32-thread server, and each one past that answered `503`.
+
 ## [3.0.0] — 2026-10-27
 
 WebSocket handlers are `async def` and run on the sub-interpreters by default, the server is given its settings as one `ServerFlags`, every setting has one spelling, and the request-body defaults are tighter. It breaks the 2.0 API in the places listed under Breaking; an old spelling fails where it is written, never silently.
