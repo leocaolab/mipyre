@@ -2,7 +2,7 @@
 
 All notable changes to mipyre are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/): within 1.x, the public API does not break.
 
-## [4.0.0] — unreleased
+## [4.0.0] — 2026-11-08
 
 A WebSocket handler is a `def` called once per message, and an app serves gRPC unary methods with a Python handler. The WebSocket change breaks the 3.0 API; it is listed under Breaking.
 
