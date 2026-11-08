@@ -1,188 +1,279 @@
-//! Gives a Python handler its side of a WebSocket connection and the two queues to the connection.
+//! Carries WebSocket messages between a connection and the Python that serves it: the connection's
+//! outgoing queue ([`Outbox`]), the process's topics, and the `ws` object a handler is given.
 //!
-//! Every queued message holds its bytes from the direction's [`ByteBudget`], so each direction
-//! is bounded in memory although the channels are unbounded in count. A handler that finds the
-//! budget spent waits for the connection to send what is queued; nothing here waits on a clock.
+//! The outbox holds what a handler or a publish queued until the connection takes it; it bounds
+//! the bytes queued to one maximum-size message, and a send that does not fit closes the
+//! connection (1008) instead of waiting, because a handler runs on the connection's own thread
+//! and must not block it. It does not know the socket, when bytes reach it, or which handler ran.
 
-use std::future::Future;
-use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, LazyLock};
+use std::task::{Context, Poll, Waker};
 
-use crate::sync::Mutex;
-use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyStopAsyncIteration, PyTypeError, PyValueError};
+use bytes::Bytes;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use pyo3::{PyTraverseError, PyVisit};
+use tungstenite::Utf8Bytes;
 
 use mipyre_http::plan::limits::{MessageByteLimit, MESSAGE_OVERHEAD_BYTES};
 
-use crate::exchange::loop_wait::LoopWaits;
 use crate::exchange::request::Request;
+use crate::sync::Mutex;
 
-/// The budget bounds the bytes queued in one direction of one connection; a message holds its
-/// share until it leaves the queue.
-///
-/// The budget fits one maximum-size message, so every allowed message can be queued once the
-/// queue drains. Nothing closes the private semaphore, so acquiring only waits or finds the
-/// budget spent.
-#[derive(Clone)]
-pub struct ByteBudget(Arc<Semaphore>);
-
-impl ByteBudget {
-    fn new(max_message_bytes: MessageByteLimit) -> Self {
-        let permits = max_message_bytes.budget_permits();
-        Self(Arc::new(Semaphore::new(permits as usize)))
-    }
-
-    /// Cannot overflow, because tungstenite enforces `max_message_bytes` on input and `send`
-    /// checks it on output.
-    fn cost(len: usize) -> u32 {
-        len as u32 + MESSAGE_OVERHEAD_BYTES
-    }
-
-    /// Waits until the queue has drained enough to hold `len`.
-    #[expect(
-        clippy::expect_used,
-        reason = "closing is acquire's only error, and nothing closes a ByteBudget's private semaphore (SEMAPHORE_NEVER_CLOSED)"
-    )]
-    pub async fn reserve(&self, len: usize) -> OwnedSemaphorePermit {
-        self.0
-            .clone()
-            .acquire_many_owned(Self::cost(len))
-            .await
-            .expect(SEMAPHORE_NEVER_CLOSED)
-    }
-
-    /// Returns `None` while the budget is spent.
-    fn try_reserve(&self, len: usize) -> Option<OwnedSemaphorePermit> {
-        match self.0.clone().try_acquire_many_owned(Self::cost(len)) {
-            Ok(permit) => Some(permit),
-            Err(TryAcquireError::NoPermits) => None,
-            Err(TryAcquireError::Closed) => unreachable!("{SEMAPHORE_NEVER_CLOSED}"),
-        }
-    }
+/// One WebSocket message as a handler sends or receives it: a text one is `str` in Python, a
+/// binary one `bytes`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsMessage {
+    Text(Utf8Bytes),
+    Binary(Bytes),
 }
 
-/// Acquiring cannot fail because no code in this module, the only one that can reach the
-/// semaphore, closes it.
-const SEMAPHORE_NEVER_CLOSED: &str =
-    "a ByteBudget's semaphore is private to it and never closed: closing is acquire's only error";
-
-pub enum WebSocketMessage {
-    Text(String),
-    Binary(Vec<u8>),
-}
-
-impl WebSocketMessage {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Text(_) => "text",
-            Self::Binary(_) => "binary",
-        }
-    }
-
+impl WsMessage {
     #[expect(
         clippy::len_without_is_empty,
-        reason = "a message's length is what it costs the connection's byte budget; no caller asks whether it is empty"
+        reason = "a message's length is what it costs the outbox's budget; no caller asks whether it is empty"
     )]
     pub fn len(&self) -> usize {
         match self {
-            Self::Text(s) => s.len(),
-            Self::Binary(b) => b.len(),
+            WsMessage::Text(text) => text.len(),
+            WsMessage::Binary(data) => data.len(),
         }
     }
 
-    fn into_text(self) -> Result<String, Self> {
+    fn kind(&self) -> &'static str {
         match self {
-            Self::Text(s) => Ok(s),
-            other => Err(other),
+            WsMessage::Text(_) => "text",
+            WsMessage::Binary(_) => "binary",
         }
     }
 
-    fn into_binary(self) -> Result<Vec<u8>, Self> {
+    /// Copies a `str` or `bytes` out of Python.
+    ///
+    /// # Errors
+    ///
+    /// Raises `TypeError` for any other value.
+    pub(crate) fn from_py(value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(text) = value.cast::<PyString>() {
+            return Ok(WsMessage::Text(Utf8Bytes::from(text.to_str()?)));
+        }
+        if let Ok(data) = value.cast::<PyBytes>() {
+            return Ok(WsMessage::Binary(Bytes::copy_from_slice(data.as_bytes())));
+        }
+        Err(PyTypeError::new_err(format!(
+            "a WebSocket message is str or bytes, not {}",
+            value.get_type().name()?
+        )))
+    }
+
+    /// Copies the message into Python as `str` or `bytes`.
+    pub(crate) fn to_py<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
         match self {
-            Self::Binary(b) => Ok(b),
-            other => Err(other),
+            WsMessage::Text(text) => PyString::new(py, text.as_str()).into_any(),
+            WsMessage::Binary(data) => PyBytes::new(py, data).into_any(),
         }
     }
 }
 
-pub struct QueueEntry {
-    pub msg: WebSocketMessage,
-    pub _budget: OwnedSemaphorePermit,
+/// The status and reason of a WebSocket close (RFC 6455 §7.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WsClose {
+    pub code: u16,
+    pub reason: String,
 }
 
-/// The message of the other kind stays queued, and the error tells the handler how to read it.
-struct KindMismatch {
-    method: &'static str,
-    got: &'static str,
-    len: usize,
-}
+impl WsClose {
+    pub const GOING_AWAY: u16 = 1001;
+    pub const NO_STATUS: u16 = 1005;
+    pub const ABNORMAL: u16 = 1006;
+    pub const POLICY: u16 = 1008;
+    pub const TOO_BIG: u16 = 1009;
+    pub const INTERNAL_ERROR: u16 = 1011;
 
-impl From<KindMismatch> for PyErr {
-    fn from(m: KindMismatch) -> Self {
-        PyTypeError::new_err(format!(
-            "{}() found a {} message ({} bytes) next; it is still queued: read it with \
-             recv_message(), which returns str or bytes",
-            m.method, m.got, m.len
-        ))
+    pub fn new(code: u16, reason: impl Into<String>) -> Self {
+        WsClose {
+            code,
+            reason: reason.into(),
+        }
     }
 }
 
-struct Inbox {
-    rx: UnboundedReceiver<QueueEntry>,
-    /// A message a typed receive refused, returned first by the next receive.
-    held: Option<WebSocketMessage>,
+/// A close frame's reason must leave its 125-byte payload room for the 2-byte code.
+const MAX_CLOSE_REASON_BYTES: usize = 123;
+
+/// Returns whether an endpoint may send `code` in a close frame: 1005, 1006 and 1015 only report
+/// what happened and never go on the wire, and below 1000 or from 1016 to 2999 nothing is defined.
+fn closable(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
-impl Inbox {
-    /// Returns `None` once the peer has closed, and leaves a message that `extract` hands back at
-    /// the head of the queue.
-    fn poll_matching<T>(
-        &mut self,
-        cx: &mut Context<'_>,
-        method: &'static str,
-        extract: fn(WebSocketMessage) -> Result<T, WebSocketMessage>,
-    ) -> Poll<Result<Option<T>, KindMismatch>> {
-        let next = match self.held.take() {
-            Some(msg) => Some(msg),
-            None => ready!(self.rx.poll_recv(cx)).map(|q| q.msg),
+/// Returns whether a message of `len` bytes fits a budget of `budget` with `used` taken.
+fn fits(used: u32, budget: u32, len: usize) -> bool {
+    u64::from(used) + len as u64 + u64::from(MESSAGE_OVERHEAD_BYTES) <= u64::from(budget)
+}
+
+/// What the connection writes next, besides the messages taken.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Taken {
+    Messages,
+    /// The messages go first, then the close frame; the outbox takes nothing more.
+    MessagesThenClose(WsClose),
+}
+
+#[derive(Debug)]
+enum OutboxState {
+    Open {
+        queued: VecDeque<WsMessage>,
+        used: u32,
+    },
+    Closing {
+        queued: VecDeque<WsMessage>,
+        close: WsClose,
+    },
+    Done,
+}
+
+impl OutboxState {
+    /// Queues `msg` when it fits, and otherwise drops it and everything queued, owing a 1008;
+    /// returns whether it was queued.
+    fn send(&mut self, budget: u32, msg: WsMessage) -> bool {
+        let OutboxState::Open { queued, used } = self else {
+            return false;
         };
-        let Some(msg) = next else {
-            return Poll::Ready(Ok(None));
-        };
-        Poll::Ready(extract(msg).map(Some).map_err(|msg| {
-            let mismatch = KindMismatch {
-                method,
-                got: msg.kind(),
-                len: msg.len(),
+        if fits(*used, budget, msg.len()) {
+            *used += msg.len() as u32 + MESSAGE_OVERHEAD_BYTES;
+            queued.push_back(msg);
+            true
+        } else {
+            *self = OutboxState::Closing {
+                queued: VecDeque::new(),
+                close: WsClose::new(WsClose::POLICY, "the client reads too slowly"),
             };
-            self.held = Some(msg);
-            mismatch
-        }))
+            false
+        }
+    }
+
+    /// Owes `close` after what is queued; a close already owed is kept.
+    fn close(&mut self, close: WsClose) {
+        if let OutboxState::Open { queued, .. } = self {
+            *self = OutboxState::Closing {
+                queued: std::mem::take(queued),
+                close,
+            };
+        }
+    }
+
+    /// Swaps what is queued into the empty `into`, so both queues keep their capacity.
+    fn take(&mut self, into: &mut VecDeque<WsMessage>) -> Option<Taken> {
+        if let OutboxState::Open { queued, used } = self {
+            if queued.is_empty() {
+                return None;
+            }
+            *used = 0;
+            std::mem::swap(queued, into);
+            return Some(Taken::Messages);
+        }
+        match std::mem::replace(self, OutboxState::Done) {
+            OutboxState::Closing { mut queued, close } => {
+                std::mem::swap(&mut queued, into);
+                Some(Taken::MessagesThenClose(close))
+            }
+            OutboxState::Open { .. } | OutboxState::Done => None,
+        }
     }
 }
 
-pub struct QueueSender {
-    pub tx: UnboundedSender<QueueEntry>,
-    pub budget: ByteBudget,
+/// What the outbox holds behind its lock: the messages and close not yet taken, and the
+/// connection to wake when there are some.
+#[derive(Debug)]
+struct Backlog {
+    state: OutboxState,
+    /// Is the connection's waker while it waits for something to write.
+    waiting: Option<Waker>,
 }
 
-struct Outbox {
-    queue: QueueSender,
+/// One connection's outgoing queue, shared by its `ws` object, every publish that reaches it, and
+/// the connection, which alone takes from it.
+#[derive(Debug)]
+pub struct Outbox {
+    backlog: Mutex<Backlog>,
     max_message_bytes: MessageByteLimit,
 }
 
-/// What queuing a message without waiting did.
-enum PushOutcome {
-    Sent,
-    /// The budget is spent; the message waits for room.
-    Full(WebSocketMessage, ByteBudget),
-}
-
 impl Outbox {
-    fn try_push(&self, msg: WebSocketMessage) -> PyResult<PushOutcome> {
+    pub fn new(max_message_bytes: MessageByteLimit) -> Arc<Self> {
+        Arc::new(Outbox {
+            backlog: Mutex::new(Backlog {
+                state: OutboxState::Open {
+                    queued: VecDeque::new(),
+                    used: 0,
+                },
+                waiting: None,
+            }),
+            max_message_bytes,
+        })
+    }
+
+    /// Queues `msg` and returns true, or returns false when it does not fit, which closes the
+    /// connection with 1008, or when the connection is closing.
+    pub fn send(&self, msg: WsMessage) -> bool {
+        let budget = self.max_message_bytes.budget_permits();
+        let (sent, woken) = {
+            let mut backlog = self.backlog.lock();
+            let sent = backlog.state.send(budget, msg);
+            (sent, backlog.waiting.take())
+        };
+        if let Some(waker) = woken {
+            waker.wake();
+        }
+        sent
+    }
+
+    /// Closes the connection with `close` once what is queued is written.
+    pub fn close(&self, close: WsClose) {
+        let woken = {
+            let mut backlog = self.backlog.lock();
+            backlog.state.close(close);
+            backlog.waiting.take()
+        };
+        if let Some(waker) = woken {
+            waker.wake();
+        }
+    }
+
+    /// Moves what is queued into the empty `into`, or returns `None` when there is nothing to
+    /// write.
+    pub fn take(&self, into: &mut VecDeque<WsMessage>) -> Option<Taken> {
+        self.backlog.lock().state.take(into)
+    }
+
+    /// Takes as [`Self::take`] does, or registers `cx` to be woken once there is something.
+    pub fn poll_take(&self, cx: &mut Context<'_>, into: &mut VecDeque<WsMessage>) -> Poll<Taken> {
+        let mut backlog = self.backlog.lock();
+        match backlog.state.take(into) {
+            Some(take) => Poll::Ready(take),
+            None => {
+                backlog.waiting = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Ends the outbox with its connection: what is queued is dropped, every later send returns
+    /// false, and the connection leaves every topic.
+    pub fn end(self: &Arc<Self>) {
+        {
+            let mut backlog = self.backlog.lock();
+            backlog.state = OutboxState::Done;
+            backlog.waiting = None;
+        }
+        TOPICS.forget(self);
+    }
+
+    /// Checks a message a handler hands over against `max_websocket_message_size`.
+    fn admit(&self, value: &Bound<'_, PyAny>) -> PyResult<WsMessage> {
+        let msg = WsMessage::from_py(value)?;
         if self.max_message_bytes.is_exceeded_by(msg.len()) {
             return Err(PyValueError::new_err(format!(
                 "{} message of {} bytes exceeds max_websocket_message_size ({} bytes)",
@@ -191,82 +282,65 @@ impl Outbox {
                 self.max_message_bytes
             )));
         }
-        let Some(budget) = self.queue.budget.try_reserve(msg.len()) else {
-            return Ok(PushOutcome::Full(msg, self.queue.budget.clone()));
-        };
-        self.queue
-            .tx
-            .send(QueueEntry { msg, _budget: budget })
-            .map_err(|_| closed())?;
-        Ok(PushOutcome::Sent)
+        Ok(msg)
     }
 }
 
-/// Waits until `msg` fits the budget, then queues it. It holds the budget and not the queue, so it
-/// keeps no connection open; a connection that ends drops what was queued, which ends the wait,
-/// and the message is then refused as closed.
-async fn push_when_room(outbox: Arc<Mutex<Option<Outbox>>>, budget: ByteBudget, msg: WebSocketMessage) -> PyResult<()> {
-    let permit = budget.reserve(msg.len()).await;
-    let outbox = outbox.lock();
-    let outbox = outbox.as_ref().ok_or_else(closed)?;
-    outbox
-        .queue
-        .tx
-        .send(QueueEntry { msg, _budget: permit })
-        .map_err(|_| closed())
+/// Which connections are subscribed to each topic, for the whole process.
+struct Topics(Mutex<HashMap<Box<str>, Vec<Arc<Outbox>>>>);
+
+static TOPICS: LazyLock<Topics> = LazyLock::new(|| Topics(Mutex::new(HashMap::new())));
+
+impl Topics {
+    fn subscribe(&self, topic: &str, outbox: &Arc<Outbox>) {
+        let mut topics = self.0.lock();
+        let subscribers = topics.entry(topic.into()).or_default();
+        if !subscribers.iter().any(|s| Arc::ptr_eq(s, outbox)) {
+            subscribers.push(Arc::clone(outbox));
+        }
+    }
+
+    fn unsubscribe(&self, topic: &str, outbox: &Arc<Outbox>) {
+        let mut topics = self.0.lock();
+        if let Some(subscribers) = topics.get_mut(topic) {
+            subscribers.retain(|s| !Arc::ptr_eq(s, outbox));
+            if subscribers.is_empty() {
+                topics.remove(topic);
+            }
+        }
+    }
+
+    fn forget(&self, outbox: &Arc<Outbox>) {
+        self.0.lock().retain(|_, subscribers| {
+            subscribers.retain(|s| !Arc::ptr_eq(s, outbox));
+            !subscribers.is_empty()
+        });
+    }
+
+    /// Sends `msg` to every subscriber of `topic` but `except`; a subscriber it does not fit is
+    /// closed with 1008, as a send of its own would be.
+    fn publish(&self, topic: &str, msg: &WsMessage, except: Option<&Arc<Outbox>>) {
+        let topics = self.0.lock();
+        let Some(subscribers) = topics.get(topic) else {
+            return;
+        };
+        for subscriber in subscribers {
+            if except.is_some_and(|me| Arc::ptr_eq(me, subscriber)) {
+                continue;
+            }
+            subscriber.send(msg.clone());
+        }
+    }
 }
 
-fn closed() -> PyErr {
-    PyConnectionError::new_err("WebSocket closed")
-}
-
-pub struct ConnectionEnds {
-    pub incoming: QueueSender,
-    pub outgoing: UnboundedReceiver<QueueEntry>,
-}
-
-pub struct HandlerEnds {
-    inbox: Inbox,
-    outbox: Outbox,
-}
-
-pub fn connection_channels(max_message_bytes: MessageByteLimit) -> (ConnectionEnds, HandlerEnds) {
-    let (incoming_tx, incoming_rx) = unbounded_channel::<QueueEntry>();
-    let (outgoing_tx, outgoing_rx) = unbounded_channel::<QueueEntry>();
-    (
-        ConnectionEnds {
-            incoming: QueueSender {
-                tx: incoming_tx,
-                budget: ByteBudget::new(max_message_bytes),
-            },
-            outgoing: outgoing_rx,
-        },
-        HandlerEnds {
-            inbox: Inbox {
-                rx: incoming_rx,
-                held: None,
-            },
-            outbox: Outbox {
-                queue: QueueSender {
-                    tx: outgoing_tx,
-                    budget: ByteBudget::new(max_message_bytes),
-                },
-                max_message_bytes,
-            },
-        },
-    )
-}
-
-/// One connection as its handler sees it. Every receive and send is awaited on the loop of the
-/// engine the connection was handed to; one task receives at a time.
-#[pyclass(name = "WebSocket", module = "mipyre.engine", frozen)]
+/// One WebSocket connection as its handlers see it.
+#[pyclass(name = "WebSocket", module = "mipyre.engine")]
 pub struct WebSocket {
-    inbox: Arc<Mutex<Inbox>>,
-    /// Is the receive being awaited, if any, so a second task's receive is refused meanwhile.
-    receiving: Mutex<Option<u64>>,
-    outbox: Arc<Mutex<Option<Outbox>>>,
     request: Py<Request>,
-    waits: Py<LoopWaits>,
+    /// Is whatever the handlers keep for this connection, `None` until they set it.
+    #[pyo3(get, set)]
+    data: Py<PyAny>,
+    outbox: Arc<Outbox>,
 }
 
 #[pymethods]
@@ -277,128 +351,177 @@ impl WebSocket {
         self.request.clone_ref(py)
     }
 
-    /// Returns an awaitable of the next message as `str` or `bytes`, or `None` once the
-    /// connection is closed.
-    fn recv_message<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.receive(py, "recv_message", Ok, message_or_none)
+    /// Queues `msg` (`str` or `bytes`) and returns True; returns False when the client reads too
+    /// slowly for it to fit, which closes the connection with 1008, or once the connection is
+    /// closing. A message longer than `max_websocket_message_size` raises `ValueError` and
+    /// leaves the connection open: only one within the limit that does not fit the outgoing
+    /// budget closes it. Raises `TypeError` for another type.
+    fn send(&self, msg: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(self.outbox.send(self.outbox.admit(msg)?))
     }
 
-    /// Returns an awaitable of the next text message, or `None` once the connection is closed; it
-    /// raises `TypeError` if the next message is binary, leaving it queued.
-    fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.receive(py, "recv", WebSocketMessage::into_text, |py, text: Option<String>| {
-            Ok(text.into_pyobject(py)?.unbind())
-        })
+    /// Closes the connection with `code` and `reason` once what was sent before is written;
+    /// later sends return False. Raises `ValueError` for a code an endpoint may not send or a
+    /// reason over 123 bytes.
+    #[pyo3(signature = (code = 1000, reason = ""))]
+    fn close(&self, code: u16, reason: &str) -> PyResult<()> {
+        if !closable(code) {
+            return Err(PyValueError::new_err(format!(
+                "{code} is not a close code an endpoint may send (1000-1003, 1007-1014, 3000-4999)"
+            )));
+        }
+        if reason.len() > MAX_CLOSE_REASON_BYTES {
+            return Err(PyValueError::new_err(format!(
+                "a close reason is at most {MAX_CLOSE_REASON_BYTES} bytes, got {}",
+                reason.len()
+            )));
+        }
+        self.outbox.close(WsClose::new(code, reason));
+        Ok(())
     }
 
-    /// Returns an awaitable of the next binary message, or `None` once the connection is closed;
-    /// it raises `TypeError` if the next message is text, leaving it queued.
-    fn recv_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.receive(py, "recv_bytes", WebSocketMessage::into_binary, |py, data: Option<Vec<u8>>| {
-            Ok(data.map_or_else(|| py.None(), |b| PyBytes::new(py, &b).into_any().unbind()))
-        })
+    fn subscribe(&self, topic: &str) {
+        TOPICS.subscribe(topic, &self.outbox);
     }
 
-    fn __aiter__(slf: Py<Self>) -> Py<Self> {
-        slf
+    fn unsubscribe(&self, topic: &str) {
+        TOPICS.unsubscribe(topic, &self.outbox);
     }
 
-    /// Returns an awaitable of the next message, which raises `StopAsyncIteration` once the
-    /// connection is closed.
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.receive(py, "__anext__", Ok, |py, msg| match msg {
-            Some(msg) => message_or_none(py, Some(msg)),
-            None => Err(PyStopAsyncIteration::new_err(())),
-        })
+    /// Sends `msg` to every connection subscribed to `topic` but this one.
+    fn publish(&self, topic: &str, msg: &Bound<'_, PyAny>) -> PyResult<()> {
+        TOPICS.publish(topic, &self.outbox.admit(msg)?, Some(&self.outbox));
+        Ok(())
     }
 
-    /// Returns an awaitable that queues a text message once a slow client has left room for it;
-    /// raises `ValueError` past `max_websocket_message_size`, and `ConnectionError` once the
-    /// connection is closed.
-    fn send<'py>(&self, py: Python<'py>, msg: &str) -> PyResult<Bound<'py, PyAny>> {
-        self.push(py, WebSocketMessage::Text(msg.to_string()))
-    }
-
-    /// Returns an awaitable that queues a binary message, raising as `send` does.
-    fn send_bytes<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
-        self.push(py, WebSocketMessage::Binary(data))
-    }
-
-    /// Closes the connection once what is queued has been sent; a send still waiting for room
-    /// raises `ConnectionError` when it wakes, and any later send at once.
-    fn close(&self) {
-        drop(self.outbox.lock().take());
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.data)?;
+        visit.call(&self.request)
     }
 }
 
 impl WebSocket {
-    pub(crate) fn new(ends: HandlerEnds, request: Py<Request>, waits: Py<LoopWaits>) -> Self {
+    /// Queues what a handler returned as its reply: nothing for `None`, else the `str` or
+    /// `bytes`, after what the handler sent. A reply that does not fit closes the connection
+    /// with 1008, as a send would, so nothing is left to report.
+    pub(crate) fn reply(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        if !value.is_none() {
+            self.outbox.send(self.outbox.admit(value)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn new(py: Python<'_>, request: Py<Request>, outbox: Arc<Outbox>) -> Self {
         WebSocket {
-            inbox: Arc::new(Mutex::new(ends.inbox)),
-            receiving: Mutex::new(None),
-            outbox: Arc::new(Mutex::new(Some(ends.outbox))),
             request,
-            waits,
+            data: py.None(),
+            outbox,
         }
-    }
-
-    fn receive<'py, T: 'static>(
-        &self,
-        py: Python<'py>,
-        method: &'static str,
-        extract: fn(WebSocketMessage) -> Result<T, WebSocketMessage>,
-        into_py: fn(Python<'_>, Option<T>) -> PyResult<Py<PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let waits = self.waits.get();
-        let receiving = *self.receiving.lock();
-        if let Some(wait) = receiving {
-            if waits.is_awaited(py, wait)? {
-                return Err(PyRuntimeError::new_err(format!(
-                    "{method}() while another task awaits a receive on this WebSocket; receive from one task"
-                )));
-            }
-        }
-        let inbox = Arc::clone(&self.inbox);
-        let (done, wait) = waits.start(
-            py,
-            Box::new(move |py, cx| {
-                let got = ready!(inbox.lock().poll_matching(cx, method, extract));
-                Poll::Ready(got.map_err(PyErr::from).and_then(|msg| into_py(py, msg)))
-            }),
-        )?;
-        *self.receiving.lock() = wait;
-        Ok(done)
-    }
-
-    fn push<'py>(&self, py: Python<'py>, msg: WebSocketMessage) -> PyResult<Bound<'py, PyAny>> {
-        let queued = self.outbox.lock().as_ref().ok_or_else(closed)?.try_push(msg)?;
-        let waits = self.waits.get();
-        let PushOutcome::Full(msg, budget) = queued else {
-            return Ok(waits.sent(py));
-        };
-        let mut wait = Box::pin(push_when_room(Arc::clone(&self.outbox), budget, msg));
-        let (done, _) = waits.start(
-            py,
-            Box::new(move |py, cx| wait.as_mut().poll(cx).map(|pushed| pushed.map(|()| py.None()))),
-        )?;
-        Ok(done)
     }
 }
 
-fn message_or_none(py: Python<'_>, msg: Option<WebSocketMessage>) -> PyResult<Py<PyAny>> {
-    Ok(match msg {
-        Some(WebSocketMessage::Text(s)) => PyString::new(py, &s).into_any().unbind(),
-        Some(WebSocketMessage::Binary(b)) => PyBytes::new(py, &b).into_any().unbind(),
-        None => py.None(),
-    })
+/// Sends `msg` (`str` or `bytes`) to every WebSocket connection subscribed to `topic`, from any
+/// handler on any runtime; `mipyre.publish` is this. Raises `TypeError` for another type.
+pub fn publish(topic: &str, msg: &Bound<'_, PyAny>) -> PyResult<()> {
+    TOPICS.publish(topic, &WsMessage::from_py(msg)?, None);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::pin::pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::Wake;
+
+    const LIMIT: u32 = 1000;
+    const BUDGET: u32 = LIMIT + MESSAGE_OVERHEAD_BYTES;
+
+    fn text(len: usize) -> WsMessage {
+        WsMessage::Text(Utf8Bytes::from("x".repeat(len)))
+    }
+
+    /// Takes from `o` into a queue of the test's own, with what follows the messages.
+    fn take(o: &Outbox) -> Option<(VecDeque<WsMessage>, Taken)> {
+        let mut into = VecDeque::new();
+        o.take(&mut into).map(|taken| (into, taken))
+    }
+
+    fn outbox() -> Arc<Outbox> {
+        Outbox::new(MessageByteLimit::new(i64::from(LIMIT)).unwrap())
+    }
+
+    #[test]
+    fn a_message_fits_up_to_the_last_byte_of_the_budget() {
+        let len = (BUDGET - MESSAGE_OVERHEAD_BYTES) as usize;
+        assert!(fits(0, BUDGET, len));
+        assert!(!fits(0, BUDGET, len + 1));
+        assert!(fits(10, BUDGET, len - 10));
+        assert!(!fits(10, BUDGET, len - 9));
+    }
+
+    #[test]
+    fn a_max_size_message_fits_an_empty_budget_and_not_one_beside_it() {
+        let o = outbox();
+        assert!(o.send(text(LIMIT as usize)));
+        assert!(!o.send(text(0)));
+    }
+
+    #[test]
+    fn a_send_that_does_not_fit_drops_what_was_queued_and_owes_a_1008() {
+        let o = outbox();
+        assert!(o.send(text(600)));
+        assert!(!o.send(text(600)));
+        let Some((queued, Taken::MessagesThenClose(close))) = take(&o) else {
+            panic!("a close is owed");
+        };
+        assert!(queued.is_empty());
+        assert_eq!(close.code, WsClose::POLICY);
+        assert_eq!(take(&o), None, "nothing after the close");
+        assert!(!o.send(text(1)), "a send after the close");
+    }
+
+    #[test]
+    fn taking_frees_the_budget() {
+        let o = outbox();
+        assert!(o.send(text(600)));
+        assert_eq!(take(&o), Some((VecDeque::from([text(600)]), Taken::Messages)));
+        assert!(o.send(text(600)));
+    }
+
+    #[test]
+    fn a_close_goes_after_what_was_queued_and_later_sends_are_refused() {
+        let o = outbox();
+        assert!(o.send(text(1)));
+        o.close(WsClose::new(4000, "bye"));
+        assert!(!o.send(text(2)));
+        o.close(WsClose::new(1000, "second"));
+        assert_eq!(
+            take(&o),
+            Some((
+                VecDeque::from([text(1)]),
+                Taken::MessagesThenClose(WsClose::new(4000, "bye"))
+            ))
+        );
+    }
+
+    #[test]
+    fn an_ended_outbox_refuses_and_leaves_its_topics() {
+        let o = outbox();
+        TOPICS.subscribe("ended", &o);
+        o.end();
+        assert!(!o.send(text(1)));
+        assert!(!TOPICS.0.lock().contains_key("ended"));
+    }
+
+    #[test]
+    fn the_codes_an_endpoint_may_send_stop_at_the_reserved_ones() {
+        for code in [1000, 1003, 1007, 1014, 3000, 4999] {
+            assert!(closable(code), "{code}");
+        }
+        for code in [999, 1004, 1005, 1006, 1015, 2999, 5000] {
+            assert!(!closable(code), "{code}");
+        }
+    }
 
     #[derive(Default)]
     struct WakeCount(AtomicUsize);
@@ -409,158 +532,33 @@ mod tests {
         }
     }
 
-    impl WakeCount {
-        fn wakes(&self) -> usize {
-            self.0.load(Ordering::SeqCst)
-        }
-    }
-
-    /// Polls a send, with whether it queued its message or found the connection closed.
-    fn poll(wait: std::pin::Pin<&mut impl Future<Output = PyResult<()>>>, count: &Arc<WakeCount>) -> Poll<bool> {
-        let waker = Waker::from(Arc::clone(count));
-        wait.poll(&mut Context::from_waker(&waker)).map(|sent| sent.is_ok())
-    }
-
-    const LIMIT: u32 = 1000;
-
-    fn channels() -> (ConnectionEnds, Arc<Mutex<Option<Outbox>>>) {
-        let (connection, handler) = connection_channels(MessageByteLimit::new(i64::from(LIMIT)).unwrap());
-        (connection, Arc::new(Mutex::new(Some(handler.outbox))))
-    }
-
-    fn text(len: usize) -> WebSocketMessage {
-        WebSocketMessage::Text("x".repeat(len))
-    }
-
-    fn try_push(outbox: &Arc<Mutex<Option<Outbox>>>, msg: WebSocketMessage) -> PushOutcome {
-        outbox.lock().as_ref().unwrap().try_push(msg).unwrap()
-    }
-
-    fn queue(outbox: &Arc<Mutex<Option<Outbox>>>, msg: WebSocketMessage) {
-        assert!(
-            matches!(try_push(outbox, msg), PushOutcome::Sent),
-            "the message waits for room"
-        );
-    }
-
-    fn send_waiting(outbox: &Arc<Mutex<Option<Outbox>>>, msg: WebSocketMessage) -> impl Future<Output = PyResult<()>> {
-        match try_push(outbox, msg) {
-            PushOutcome::Full(msg, budget) => push_when_room(Arc::clone(outbox), budget, msg),
-            PushOutcome::Sent => panic!("the message fit at once"),
-        }
-    }
-
     #[test]
-    fn a_send_with_room_queues_at_once() {
-        let (mut connection, outbox) = channels();
-        queue(&outbox, text(LIMIT as usize));
-        assert_eq!(connection.outgoing.try_recv().unwrap().msg.len(), LIMIT as usize);
-    }
-
-    /// Pins that a handler facing a slow client is woken once, when the last queued message
-    /// leaves, and not while one is still queued: no spin and no clock.
-    #[test]
-    fn a_send_waiting_for_room_is_woken_once_when_the_last_queued_message_leaves_and_not_before() {
-        let (mut connection, outbox) = channels();
-        queue(&outbox, text(10));
-        queue(&outbox, text(10));
+    fn a_waiting_connection_is_woken_by_a_send_and_not_by_a_send_while_it_does_not_wait() {
+        let o = outbox();
         let count = Arc::new(WakeCount::default());
-        let mut wait = pin!(send_waiting(&outbox, text(LIMIT as usize)));
-        assert_eq!(poll(wait.as_mut(), &count), Poll::Pending);
-
-        drop(connection.outgoing.try_recv().unwrap());
-        assert_eq!(count.wakes(), 0);
-        assert_eq!(poll(wait.as_mut(), &count), Poll::Pending);
-
-        drop(connection.outgoing.try_recv().unwrap());
-        assert_eq!(count.wakes(), 1);
-        assert_eq!(poll(wait.as_mut(), &count), Poll::Ready(true));
-        assert_eq!(connection.outgoing.try_recv().unwrap().msg.len(), LIMIT as usize);
+        let waker = Waker::from(Arc::clone(&count));
+        assert!(o
+            .poll_take(&mut Context::from_waker(&waker), &mut VecDeque::new())
+            .is_pending());
+        assert!(o.send(text(1)));
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        assert!(o.send(text(1)));
+        assert_eq!(count.0.load(Ordering::SeqCst), 1, "the connection was not waiting");
     }
 
     #[test]
-    fn a_send_waiting_for_room_fails_once_the_connection_drops_the_queue() {
-        let (connection, outbox) = channels();
-        queue(&outbox, text(LIMIT as usize));
-        let count = Arc::new(WakeCount::default());
-        let mut wait = pin!(send_waiting(&outbox, text(LIMIT as usize)));
-        assert_eq!(poll(wait.as_mut(), &count), Poll::Pending);
-
-        drop(connection);
-        assert_eq!(count.wakes(), 1);
-        assert_eq!(poll(wait.as_mut(), &count), Poll::Ready(false));
-    }
-
-    #[test]
-    fn a_send_waiting_for_room_fails_once_the_handler_closed() {
-        let (mut connection, outbox) = channels();
-        queue(&outbox, text(LIMIT as usize));
-        let count = Arc::new(WakeCount::default());
-        let mut wait = pin!(send_waiting(&outbox, text(LIMIT as usize)));
-        assert_eq!(poll(wait.as_mut(), &count), Poll::Pending);
-
-        drop(outbox.lock().take());
-        drop(connection.outgoing.try_recv().unwrap());
-        assert_eq!(poll(wait.as_mut(), &count), Poll::Ready(false));
-    }
-
-    #[tokio::test]
-    async fn byte_budget_counts_bytes_not_messages() {
-        let budget = ByteBudget::new(MessageByteLimit::new(1000).unwrap());
-        let big = budget.try_reserve(900).expect("fits");
-        // With 964 of 1064 used, a 100-byte message costs 164 and no longer fits, but an empty one does.
-        assert!(budget.try_reserve(100).is_none());
-        let small = budget.try_reserve(0).expect("fits");
-        drop(big);
-        assert!(budget.try_reserve(900).is_some());
-        drop(small);
-    }
-
-    #[test]
-    fn a_max_size_message_always_fits_an_empty_budget() {
-        let budget = ByteBudget::new(MessageByteLimit::new(1000).unwrap());
-        assert!(budget.try_reserve(1000).is_some());
-    }
-
-    fn next<T>(
-        inbox: &mut Inbox,
-        method: &'static str,
-        extract: fn(WebSocketMessage) -> Result<T, WebSocketMessage>,
-    ) -> Result<Option<T>, KindMismatch> {
-        match inbox.poll_matching(&mut Context::from_waker(Waker::noop()), method, extract) {
-            Poll::Ready(got) => got,
-            Poll::Pending => panic!("{method}() found nothing queued"),
-        }
-    }
-
-    #[test]
-    fn typed_receive_keeps_the_other_kind_queued() {
-        let (tx, rx) = unbounded_channel();
-        let budget = ByteBudget::new(MessageByteLimit::new(1000).unwrap());
-        for msg in [
-            WebSocketMessage::Binary(vec![1, 2, 3]),
-            WebSocketMessage::Text("hi".into()),
-        ] {
-            let permit = budget.try_reserve(msg.len()).unwrap();
-            tx.send(QueueEntry { msg, _budget: permit }).unwrap();
-        }
-        let mut inbox = Inbox { rx, held: None };
-        let mismatch = next(&mut inbox, "recv", WebSocketMessage::into_text).err().unwrap();
-        assert_eq!((mismatch.got, mismatch.len), ("binary", 3));
-        assert_eq!(
-            next(&mut inbox, "recv_bytes", WebSocketMessage::into_binary)
-                .ok()
-                .flatten(),
-            Some(vec![1, 2, 3])
-        );
-        assert_eq!(
-            next(&mut inbox, "recv", WebSocketMessage::into_text).ok().flatten(),
-            Some("hi".to_string())
-        );
-        drop(tx);
-        assert!(next(&mut inbox, "recv", WebSocketMessage::into_text)
-            .ok()
-            .unwrap()
-            .is_none());
+    fn a_publish_reaches_every_subscriber_but_the_one_excluded() {
+        let (me, other) = (outbox(), outbox());
+        TOPICS.subscribe("room", &me);
+        TOPICS.subscribe("room", &other);
+        TOPICS.subscribe("room", &other);
+        TOPICS.publish("room", &text(3), Some(&me));
+        assert_eq!(take(&me), None);
+        assert_eq!(take(&other), Some((VecDeque::from([text(3)]), Taken::Messages)));
+        TOPICS.unsubscribe("room", &other);
+        TOPICS.publish("room", &text(4), None);
+        assert_eq!(take(&other), None);
+        assert_eq!(take(&me), Some((VecDeque::from([text(4)]), Taken::Messages)));
+        me.end();
     }
 }

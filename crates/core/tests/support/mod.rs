@@ -4,6 +4,7 @@
 
 use std::future::{ready, Future, Ready};
 use std::hint::black_box;
+use std::marker::PhantomData;
 use std::pin::{pin, Pin};
 use std::task::{Context, Poll, Waker};
 
@@ -15,11 +16,11 @@ pub type Body = [u64; 8];
 
 pub struct Full;
 
-/// A backend whose run has replied by its first poll, as a pool run whose reply is in its oneshot
-/// by the time the request's task is polled.
-pub struct ReadyBackend;
+/// A backend whose runs are all an `R`: a `Ready` run has replied by its first poll, as a pool run
+/// whose reply is in its oneshot by the time the request's task is polled.
+pub struct StubBackend<R>(pub PhantomData<R>);
 
-impl HandoffBackend for ReadyBackend {
+impl HandoffBackend for StubBackend<Ready<Body>> {
     type Ask = Body;
     type Reply = Body;
     type Refusal = Full;
@@ -30,10 +31,8 @@ impl HandoffBackend for ReadyBackend {
     }
 }
 
-/// A backend whose run replies at its second poll: the request waits once, so its deadline is set
-/// and registered with the timer.
-pub struct SecondPollBackend;
-
+/// A run that replies at its second poll: the request waits once, so its deadline is set and
+/// registered with the timer.
 pub struct SecondPollRun {
     body: Body,
     polled: bool,
@@ -51,7 +50,7 @@ impl Future for SecondPollRun {
     }
 }
 
-impl HandoffBackend for SecondPollBackend {
+impl HandoffBackend for StubBackend<SecondPollRun> {
     type Ask = Body;
     type Reply = Body;
     type Refusal = Full;

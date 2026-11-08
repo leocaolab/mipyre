@@ -308,12 +308,16 @@ def plain(req):
 def only_post(req):
     return "posted"
 
-@app.websocket("/ws")
-async def ws(ws):
+def describe(ws):
     r = ws.request
-    await ws.send(json.dumps({"method": r.method, "path": r.path, "query": r.query,
+    ws.send(json.dumps({"method": r.method, "path": r.path, "query": r.query,
                         "body": r.body.decode(), "ip": r.client_ip}))
     ws.close()
+
+# The pool (MIPYRE_TPC=0) has no TPC thread for a worker route's connection to run on.
+@app.websocket("/ws", on_connect=describe, runtime="main" if os.environ.get("MIPYRE_TPC") == "0" else None)
+def ws(ws, msg):
+    return None
 """ + RUN
 
 REQUEST_CASES = [
@@ -644,9 +648,12 @@ import os
 from mipyre import Mipyre
 app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 
-@app.websocket("/ws-raise")
-async def ws_raise(ws):
+def ws_raise(ws):
     raise ValueError("ws-handler-boom")
+
+@app.websocket("/ws-raise", on_connect=ws_raise)
+def ws_raise_message(ws, msg):
+    return None
 """ + RUN
 
 
@@ -694,10 +701,10 @@ def guard(req):
     if req.query_params.get("deny"):
         return Response("denied", status_code=403)
 
-@app.websocket("/ws")
-async def hold(ws):
-    while await ws.recv() is not None:
-        pass
+# The pool (MIPYRE_TPC=0) has no TPC thread for a worker route's connection to run on.
+@app.websocket("/ws", runtime="main" if os.environ.get("MIPYRE_TPC") == "0" else None)
+def hold(ws, msg):
+    return None
 
 @app.get("/plain")
 def plain(req):
@@ -791,8 +798,10 @@ def _slot_held_through_a_timed_out_hook(port: int, gate: pathlib.Path) -> tuple[
 
 def test_the_connection_slot_lives_as_long_as_the_hook_thread(tmp_path):
     # R2: the slot used to drop with the 504 while the hook thread kept running, so the
-    # next connection got a second thread past the cap.
-    gates = {path: tmp_path / f"gate-{path}" for path in ("tpc", "gil")}
+    # next connection got a second thread past the cap. Only main's hooks run on a thread of
+    # their own: on TPC a worker route's upgrade hooks run inline on the connection's thread, as
+    # its def routes do, so there is no 504 to answer there either.
+    gates = {path: tmp_path / f"gate-{path}" for path in ("gil",)}
     for gate in gates.values():
         os.mkfifo(gate)
     servers = {path: Server(WS_SCRIPT, path, env={"HOLD_GATE": str(gates[path])}) for path in gates}

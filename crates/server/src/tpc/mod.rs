@@ -29,8 +29,8 @@ use mipyre_runtime::{InterpreterPool, MainThreads, WorkerIndex, WorkerLife, Work
 
 #[cfg(feature = "bench")]
 pub use self::conn::drive_conn;
-pub(crate) use self::conn::ThreadWorker;
 pub use self::conn::TpcThread;
+pub(crate) use self::conn::{ThreadWorker, WorkerLease};
 pub use self::error::ServeError;
 #[cfg(feature = "bench")]
 pub use self::inline::tpc_accept_loop_inline;

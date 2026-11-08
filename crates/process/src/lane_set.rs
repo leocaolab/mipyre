@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use super::driver::StartStrategy;
 use super::health::FailurePolicy;
-use super::host_config::{HostConfig, HostConfigError};
+use super::lane_config::{LaneConfig, LaneConfigError};
 use super::lane_failure::LaneIndex;
 use super::run::ServerLanes;
 use super::wire;
@@ -53,7 +53,7 @@ pub fn create_server_lanes(
 ) -> Result<ServerLanes, LaneSettingsError> {
     let lanes = NonZeroUsize::new(workers).ok_or(LaneSettingsError::NoLanes)?;
     let geometry = lane_geometry(depth, slot_bytes)?;
-    let host = HostConfig::new(&geometry, timeout, queue_per_worker, server_spin, on_failure)?;
+    let host = LaneConfig::new(&geometry, timeout, queue_per_worker, server_spin, on_failure)?;
     Ok(ServerLanes::create(lanes, geometry, host))
 }
 
@@ -164,7 +164,7 @@ pub enum LaneSettingsError {
     #[error("process lanes: {0}")]
     Layout(#[from] GeometryError),
     #[error(transparent)]
-    Host(#[from] HostConfigError),
+    Host(#[from] LaneConfigError),
 }
 
 /// Returns the layout of one lane's channel.
@@ -261,11 +261,11 @@ mod tests {
         let max = super::super::template::MAX_FRAME_BYTES as usize;
         assert!(matches!(
             lanes.tell_template_run(&"x".repeat(max - 1)),
-            Err(crate::template_host::TemplateRunError::NoTemplate)
+            Err(crate::fork_server::TemplateRunError::NoForkServer)
         ));
         assert!(matches!(
             lanes.tell_template_run(&"x".repeat(max)),
-            Err(crate::template_host::TemplateRunError::CommandLineTooLong { bytes }) if bytes == max
+            Err(crate::fork_server::TemplateRunError::CommandLineTooLong { bytes }) if bytes == max
         ));
     }
 
@@ -275,11 +275,11 @@ mod tests {
         let max = super::super::template::MAX_FRAME_BYTES as usize;
         assert!(matches!(
             lanes.setup_template(&vec![b'x'; max - 1]),
-            Err(crate::template_host::TemplateSetupError::NoTemplate)
+            Err(crate::fork_server::TemplateSetupError::NoForkServer)
         ));
         assert!(matches!(
             lanes.setup_template(&vec![b'x'; max]),
-            Err(crate::template_host::TemplateSetupError::TooLong { bytes }) if bytes == max
+            Err(crate::fork_server::TemplateSetupError::TooLong { bytes }) if bytes == max
         ));
     }
 

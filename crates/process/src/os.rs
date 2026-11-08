@@ -9,7 +9,7 @@
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
-use mipyre_shm::adapter::doorbell::HostBell;
+use mipyre_shm::adapter::doorbell::RequesterBell;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
@@ -21,7 +21,7 @@ pub enum StartedProcess {
 
 impl StartedProcess {
     /// Returns what `os.fork()` would, because the Python launcher reads it that way.
-    pub fn fork_answer(self) -> libc::pid_t {
+    pub fn into_fork_return(self) -> libc::pid_t {
         match self {
             StartedProcess::Parent { pid } => pid,
             StartedProcess::Child => 0,
@@ -55,11 +55,11 @@ pub struct ProcessHandle {
 
 /// What registering a process with [`ExitWatch::add`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Registration {
+pub enum ExitWatchStatus {
     /// The exit is reported once it happens.
     Watching,
     /// The process was gone already: no exit of it will be reported.
-    Gone,
+    AlreadyExited,
 }
 
 /// Watches processes' exits through one descriptor a reactor can wait on: an epoll of pidfds on
@@ -122,13 +122,13 @@ impl ExitWatch {
     /// # Errors
     ///
     /// The registration the OS refused.
-    pub fn add(&self, handle: &ProcessHandle, _pid: rustix::process::Pid, token: u64) -> io::Result<Registration> {
+    pub fn add(&self, handle: &ProcessHandle, _pid: rustix::process::Pid, token: u64) -> io::Result<ExitWatchStatus> {
         use rustix::event::epoll;
         let Some(pidfd) = &handle.pidfd else {
-            return Ok(Registration::Gone);
+            return Ok(ExitWatchStatus::AlreadyExited);
         };
         epoll::add(&self.0, pidfd, epoll::EventData::new_u64(token), epoll::EventFlags::IN)?;
-        Ok(Registration::Watching)
+        Ok(ExitWatchStatus::Watching)
     }
 
     /// Stops watching the process `handle` holds, whose exit was reported: its pidfd stays
@@ -224,13 +224,13 @@ impl ExitWatch {
     /// # Errors
     ///
     /// The registration the OS refused.
-    pub fn add(&self, handle: &ProcessHandle, pid: rustix::process::Pid, token: u64) -> io::Result<Registration> {
+    pub fn add(&self, handle: &ProcessHandle, pid: rustix::process::Pid, token: u64) -> io::Result<ExitWatchStatus> {
         if handle.known_gone() {
-            return Ok(Registration::Gone);
+            return Ok(ExitWatchStatus::AlreadyExited);
         }
         match self.0.add(pid, token as usize) {
-            Ok(()) => Ok(Registration::Watching),
-            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(Registration::Gone),
+            Ok(()) => Ok(ExitWatchStatus::Watching),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(ExitWatchStatus::AlreadyExited),
             Err(e) => Err(e),
         }
     }
@@ -364,7 +364,7 @@ impl AsFd for ExitQueue {
 /// lanes. It owns the pipes, so none closes while the queue names it.
 pub(super) struct BellQueue {
     queue: OwnedFd,
-    bells: Vec<HostBell>,
+    bells: Vec<RequesterBell>,
 }
 
 impl BellQueue {
@@ -373,7 +373,7 @@ impl BellQueue {
     /// # Errors
     ///
     /// The OS's refusal to make the queue or register a pipe.
-    pub(super) fn new(bells: Vec<HostBell>) -> io::Result<Self> {
+    pub(super) fn new(bells: Vec<RequesterBell>) -> io::Result<Self> {
         let queue = BellQueue {
             queue: Self::create()?,
             bells,
@@ -385,7 +385,7 @@ impl BellQueue {
     }
 
     /// Returns the pipe of the lane at place `k`.
-    pub(super) fn bell(&self, k: usize) -> &HostBell {
+    pub(super) fn bell(&self, k: usize) -> &RequesterBell {
         &self.bells[k]
     }
 
@@ -892,7 +892,7 @@ mod tests {
         let (mut child, pid) = sleeper();
         let handle = ProcessHandle::open(pid).unwrap();
         let watch = ExitWatch::new().unwrap();
-        assert_eq!(watch.add(&handle, pid, 7).unwrap(), Registration::Watching);
+        assert_eq!(watch.add(&handle, pid, 7).unwrap(), ExitWatchStatus::Watching);
         let none = |_| -> io::Result<()> { panic!("an exit was reported") };
         assert_eq!(watch.exited::<4>(Some(std::time::Duration::ZERO), none).unwrap(), 0);
         child.kill().unwrap();
@@ -919,7 +919,7 @@ mod tests {
         let handle = ProcessHandle::open(pid).unwrap();
         assert_eq!(
             ExitWatch::new().unwrap().add(&handle, pid, 1).unwrap(),
-            Registration::Gone
+            ExitWatchStatus::AlreadyExited
         );
     }
 

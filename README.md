@@ -10,20 +10,20 @@ Python 3.14 (the regular build with the GIL). Wheels for Linux x86_64 and macOS 
 
 ## Why mipyre
 
-**It is fast.** The server is Rust; Python runs only your handler. On 4 physical cores, a handler that returns a short string or a small `dict` is served at about 470,000 requests per second, with sub-millisecond latency:
+**It is fast.** The server is Rust; Python runs only your handler. On 4 physical cores, a handler that returns a short string or a small `dict` is served at about 460,000 requests per second, with sub-millisecond latency:
 
 | Route | Requests/s | p50 | p99 |
 |---|---:|---:|---:|
-| `/plaintext` (returns `"Hello, World!"`) | 473,909 | 0.14 ms | 0.21 ms |
-| `/json` (returns `{"message": "Hello, World!"}`) | 457,791 | 0.14 ms | 0.21 ms |
+| `/plaintext` (returns `"Hello, World!"`) | 465,932 | 0.13 ms | 0.22 ms |
+| `/json` (returns `{"message": "Hello, World!"}`) | 458,079 | 0.13 ms | 0.24 ms |
 
 **It runs Python in parallel.** Each core runs its own sub-interpreter with its own GIL, so CPU-bound Python handlers don't wait for each other. The same 4 cores, serving a pure-Python handler that computes for a few milliseconds per request:
 
 | Where the handler runs | Requests/s | Server cores used |
 |---|---:|---:|
-| sub-interpreters, one per core (the default) | 1,660 | 4.0 |
-| a pool of 8 sub-interpreters on the multi-thread server (`MIPYRE_TPC=0`), which also uses the cores' SMT siblings | 1,919 | 8.0 |
-| the main interpreter, one GIL (`runtime="main"`) | 414 | 1.1 |
+| sub-interpreters, one per core (the default) | 1,689 | 4.0 |
+| a pool of 8 sub-interpreters on the multi-thread server (`MIPYRE_TPC=0`), which also uses the cores' SMT siblings | 1,992 | 8.0 |
+| the main interpreter, one GIL (`runtime="main"`) | 427 | 1.0 |
 
 With one GIL the server tops out at one core's worth of Python; with a GIL per core it uses all four, about 4 times as many requests.
 
@@ -31,12 +31,12 @@ With one GIL the server tops out at one core's worth of Python; with a GIL per c
 
 | Where the handler runs | Requests/s |
 |---|---:|
-| worker processes (`runtime="process"`) | 325,601 |
-| the main interpreter, one GIL (`runtime="main"`) | 77,185 |
+| worker processes (`runtime="process"`) | 318,369 |
+| the main interpreter, one GIL (`runtime="main"`) | 107,473 |
 
 **One process.** By default there is no `fork` and no copy of your app per core: every core's sub-interpreter lives in the same server process, and they share state through `app.state`. Only `runtime="process"` routes use extra processes.
 
-How these numbers were measured: Linux on an AMD Ryzen 7 7840HS (8 cores, 16 threads); the server pinned to 4 physical cores and their SMT siblings, `wrk` on the other 4 cores and their siblings; `wrk -t8 -c64 -d10s --latency` without pipelining, after a 2 s warm-up, against a fresh server per run; default settings otherwise; Python 3.14.7, numpy 2.5.4; each number the median of 3 runs. The `/plaintext`, `/json` and sub-interpreter `/cpu` rows were measured on mipyre 3.0.0; the main-interpreter and `runtime="process"` rows on 2.0.0 with `-c128`. This measures mipyre only; it is not a comparison with other frameworks. Every mode, the raw table with min–max ranges, and the script to rerun it are in [`benchmarks/public/`](benchmarks/public/).
+How these numbers were measured: Linux on an AMD Ryzen 7 7840HS (8 cores, 16 threads); the server pinned to 4 physical cores and their SMT siblings, `wrk` on the other 4 cores and their siblings; `wrk -t8 -c64 -d10s --latency` without pipelining, after a 2 s warm-up, against a fresh server per run; default settings otherwise; Python 3.14.7, numpy 2.5.4; each number the median of 3 runs. Measured on mipyre 4.0.0. This measures mipyre only; it is not a comparison with other frameworks. Every mode, the raw table with min–max ranges, and the script to rerun it are in [`benchmarks/public/`](benchmarks/public/).
 
 ## How it works
 
@@ -180,8 +180,8 @@ Every setting, where it is set and its default: [docs/configuration.md](docs/con
 - **Middleware**: `before_request` / `after_request` hooks, `on_startup` / `on_shutdown`.
 - **Security**: cross-site requests that act refused on every route unless the site is in `enable_cors(allow_origins=...)`; a `Host` allowlist (`allowed_hosts`) against DNS rebinding; `Cookie` values checked when made; redirects that refuse CR/LF; `trusted_proxies` for the client's address behind a reverse proxy.
 - **Responses**: gzip and brotli compression, static files with ETag / `304` and precompressed `.br` / `.gz`.
-- **Bodies and streams**: multipart uploads, streaming request bodies (`body=BodyStream`), Server-Sent Events from a generator (`EventSourceResponse`) or written by hand (`Stream`), WebSocket with `async def` handlers on the sub-interpreters.
-- **Services**: RPC with JSON, MsgPack or Protobuf (`@rpc(app)`, `RPCClient`); an MCP endpoint for AI agents (`mcp = MCPServer(app)`, then `@mcp.tool`, `@mcp.resource`, `@mcp.prompt`).
+- **Bodies and streams**: multipart uploads, streaming request bodies (`body=BodyStream`), Server-Sent Events from a generator (`EventSourceResponse`) or written by hand (`Stream`), WebSocket with a `def` handler called once per message on the sub-interpreters.
+- **Services**: gRPC unary methods with a Python handler (`@app.unary_unary`); RPC with JSON, MsgPack or Protobuf (`@rpc(app)`, `RPCClient`); an MCP endpoint for AI agents (`mcp = MCPServer(app)`, then `@mcp.tool`, `@mcp.resource`, `@mcp.prompt`).
 - **Data**: a PostgreSQL pool (`mipyre.db.PgPool`), a per-worker JSON cache (`@cached_json`), shared state (`app.state`).
 - **Operations**: `/livez` and `/readyz` probes, Prometheus metrics, JSON or text logs, an access log with sampling (`app.enable_access_log()`), graceful shutdown (also from code, `app.stop()`), systemd socket activation, TLS, HTTP/2.
 - **Development**: hot reload, `mipyre routes`; command-line flags declared where they are used (`mipyre.flags`); `TestClient` and `TestServer` for integration tests of every runtime, with WebSocket support and `flags.override` ([docs/testing.md](docs/testing.md)).

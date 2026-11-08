@@ -9,12 +9,11 @@ use http::header::{HeaderMap, CONTENT_TYPE};
 use http::Method;
 
 use crate::plan::reject::RouteMiss;
-use crate::plan::route::{FastResponse, GrpcMethod, HandlerCall, Params, RouteTable};
+use crate::plan::route::{FastResponse, HandlerCall, Params, RouteTable};
 use crate::plan::static_plan::{self, StaticLookups, StaticMountRule};
 
 /// What answers a request, as far as its line and headers tell.
 pub enum RequestDecision<'r, 'q, H, D> {
-    Grpc(GrpcMethod),
     Fast(&'r FastResponse),
     Route { call: HandlerCall, params: Params },
     NoRoute(NoRoute<'r, 'q, H, D>),
@@ -36,7 +35,9 @@ pub enum StaticMissAnswer {
     Miss(RouteMiss),
 }
 
-/// Tries a registered gRPC method, a pre-built response and a route, in that order.
+/// Tries a gRPC method's call, a pre-built response and a route, in that order. A gRPC call is a
+/// `POST` to a method's path with an `application/grpc*` content type; any other request to that
+/// path goes on to the routes.
 ///
 /// A `HEAD` with no `HEAD` registration takes the `GET` one, whose body the engine drops.
 #[inline]
@@ -47,9 +48,12 @@ pub fn decide<'r, 'q, H, D>(
     routes: &'r RouteTable<H, D>,
 ) -> RequestDecision<'r, 'q, H, D> {
     if *method == Method::POST {
-        if let Some(grpc) = routes.grpc_method(path) {
+        if let Some(method) = routes.grpc_method(path) {
             if is_grpc(headers) {
-                return RequestDecision::Grpc(grpc);
+                return RequestDecision::Route {
+                    call: HandlerCall::Grpc(method),
+                    params: Params::new(),
+                };
             }
         }
     }
@@ -100,24 +104,21 @@ impl<H, D> NoRoute<'_, '_, H, D> {
 }
 
 #[cfg(test)]
-mod fuzz;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::plan::route::{BodyMode, HandlerPlace, MainHandler};
     use crate::plan::static_plan::Copies;
     use http::header::{HeaderValue, ACCEPT_ENCODING};
 
-    struct Mount(StaticMountRule);
+    struct StubMount(StaticMountRule);
 
-    impl AsRef<StaticMountRule> for Mount {
+    impl AsRef<StaticMountRule> for StubMount {
         fn as_ref(&self) -> &StaticMountRule {
             &self.0
         }
     }
 
-    type Table = RouteTable<u32, Mount>;
+    type Table = RouteTable<u32, StubMount>;
 
     fn table() -> Table {
         let mut t = Table::new();
@@ -140,11 +141,13 @@ mod tests {
         let fast =
             FastResponse::parse(bytes::Bytes::from_static(b"ok"), "text/plain", 200, &Default::default()).unwrap();
         t.add_fast_response("GET", "/health", fast).unwrap();
-        t.add_static_mount(Mount(StaticMountRule::new("/static", Copies::Precompressed).unwrap()));
+        t.add_static_mount(StubMount(
+            StaticMountRule::new("/static", Copies::Precompressed).unwrap(),
+        ));
         t
     }
 
-    const GRPC_GET_SUM_PATH: &str = GrpcMethod::BenchmarkGetSum.path();
+    const GRPC_GET_SUM_PATH: &str = "/benchmark.BenchmarkService/GetSum";
 
     fn grpc_headers() -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -153,14 +156,14 @@ mod tests {
     }
 
     #[test]
-    fn the_grpc_method_is_decided_first_and_only_when_on() {
+    fn a_grpc_call_is_a_grpc_post_to_a_registered_method() {
         let off = table();
         let mut t = table();
-        t.add_grpc_method(GrpcMethod::BenchmarkGetSum);
+        let method = t.add_grpc_method(GRPC_GET_SUM_PATH, 9, "get_sum".into()).unwrap();
         let h = grpc_headers();
         assert!(matches!(
             decide(&Method::POST, GRPC_GET_SUM_PATH, &h, &t),
-            RequestDecision::Grpc(GrpcMethod::BenchmarkGetSum)
+            RequestDecision::Route { call: HandlerCall::Grpc(id), params } if id == method && params.is_empty()
         ));
         assert!(matches!(
             decide(&Method::POST, GRPC_GET_SUM_PATH, &h, &off),
@@ -244,7 +247,7 @@ mod tests {
         method: &'q Method,
         path: &'q str,
         h: &'q HeaderMap,
-    ) -> NoRoute<'r, 'q, u32, Mount> {
+    ) -> NoRoute<'r, 'q, u32, StubMount> {
         match decide(method, path, h, t) {
             RequestDecision::NoRoute(no_route) => no_route,
             _ => panic!("expected no route for {method} {path}"),

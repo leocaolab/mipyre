@@ -107,6 +107,7 @@ fn poll_deadline(deadline: Pin<&mut Sleep>, cx: &mut Context<'_>) -> Poll<()> {
 mod tests {
     use std::cell::Cell;
     use std::future::{ready, Ready};
+    use std::marker::PhantomData;
     use std::rc::Rc;
     use std::task::Waker;
     use std::time::Duration;
@@ -122,13 +123,13 @@ mod tests {
 
     /// A backend whose run replies `after` the ask was taken; `full` refuses every ask.
     /// `dropped_unready` counts the runs dropped before they replied: the runs nobody waited for.
-    struct TimerBackend {
+    struct FakeBackend {
         after: Duration,
         full: bool,
         dropped_unready: Rc<Cell<u32>>,
     }
 
-    impl TimerBackend {
+    impl FakeBackend {
         fn replying_after(after: Duration) -> Self {
             Self {
                 after,
@@ -138,13 +139,13 @@ mod tests {
         }
     }
 
-    struct TimerRun {
+    struct FakeRun {
         sleep: Pin<Box<Sleep>>,
         reply: Option<&'static str>,
         dropped_unready: Rc<Cell<u32>>,
     }
 
-    impl Future for TimerRun {
+    impl Future for FakeRun {
         type Output = &'static str;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<&'static str> {
@@ -153,7 +154,7 @@ mod tests {
         }
     }
 
-    impl Drop for TimerRun {
+    impl Drop for FakeRun {
         fn drop(&mut self) {
             if self.reply.is_some() {
                 self.dropped_unready.set(self.dropped_unready.get() + 1);
@@ -161,17 +162,17 @@ mod tests {
         }
     }
 
-    impl HandoffBackend for TimerBackend {
+    impl HandoffBackend for FakeBackend {
         type Ask = &'static str;
         type Reply = &'static str;
         type Refusal = Full;
-        type Run = TimerRun;
+        type Run = FakeRun;
 
-        fn submit(&self, ask: &'static str) -> Result<TimerRun, Full> {
+        fn submit(&self, ask: &'static str) -> Result<FakeRun, Full> {
             if self.full {
                 return Err(Full);
             }
-            Ok(TimerRun {
+            Ok(FakeRun {
                 sleep: Box::pin(tokio::time::sleep(self.after)),
                 reply: Some(ask),
                 dropped_unready: Rc::clone(&self.dropped_unready),
@@ -179,10 +180,10 @@ mod tests {
         }
     }
 
-    /// A backend whose run has replied by its first poll.
-    struct ReadyBackend;
+    /// A backend whose runs are all an `R`: a `Ready` run has replied by its first poll.
+    struct StubBackend<R>(PhantomData<R>);
 
-    impl HandoffBackend for ReadyBackend {
+    impl HandoffBackend for StubBackend<Ready<&'static str>> {
         type Ask = &'static str;
         type Reply = &'static str;
         type Refusal = Full;
@@ -202,23 +203,23 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_reply_within_the_budget_is_the_answer_and_its_run_was_waited_for() {
-        let backend = TimerBackend::replying_after(Duration::from_secs(1));
+        let backend = FakeBackend::replying_after(Duration::from_secs(1));
         assert_eq!(reply(&backend, "ok", budget(1.0)).await, Some("ok"));
         assert_eq!(backend.dropped_unready.get(), 0);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_reply_past_the_budget_times_out_and_its_run_is_dropped_unready() {
-        let backend = TimerBackend::replying_after(Duration::from_millis(1001));
+        let backend = FakeBackend::replying_after(Duration::from_millis(1001));
         assert_eq!(reply(&backend, "late", budget(1.0)).await, None);
         assert_eq!(backend.dropped_unready.get(), 1);
     }
 
     #[test]
     fn a_full_backend_refuses_without_a_run() {
-        let backend = TimerBackend {
+        let backend = FakeBackend {
             full: true,
-            ..TimerBackend::replying_after(Duration::ZERO)
+            ..FakeBackend::replying_after(Duration::ZERO)
         };
         assert!(matches!(dispatch(&backend, "ask", budget(1.0), ready(())), Err(Full)));
         assert_eq!(backend.dropped_unready.get(), 0);
@@ -226,7 +227,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_caller_that_leaves_mid_run_drops_the_run_unready() {
-        let backend = TimerBackend::replying_after(Duration::from_secs(10));
+        let backend = FakeBackend::replying_after(Duration::from_secs(10));
         let left = tokio::time::timeout(Duration::from_secs(1), reply(&backend, "ask", budget(30.0))).await;
         assert!(left.is_err());
         assert_eq!(backend.dropped_unready.get(), 1);
@@ -234,7 +235,12 @@ mod tests {
 
     #[test]
     fn a_run_ready_at_the_first_poll_answers_without_a_runtime() {
-        let Ok(wait) = dispatch(&ReadyBackend, "ok", budget(1.0), ready(())) else {
+        let Ok(wait) = dispatch(
+            &StubBackend::<Ready<&'static str>>(PhantomData),
+            "ok",
+            budget(1.0),
+            ready(()),
+        ) else {
             panic!("the backend takes the ask");
         };
         let mut cx = Context::from_waker(Waker::noop());
@@ -244,14 +250,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_budget_starts_once_the_start_is_ready() {
         let body_read = tokio::time::sleep(Duration::from_secs(5));
-        let backend = TimerBackend::replying_after(Duration::from_secs(6));
+        let backend = FakeBackend::replying_after(Duration::from_secs(6));
         let Ok(wait) = dispatch(&backend, "ok", budget(1.0), body_read) else {
             panic!("the backend takes the ask");
         };
         assert_eq!(wait.await, Some("ok"));
 
         let body_read = tokio::time::sleep(Duration::from_secs(5));
-        let backend = TimerBackend::replying_after(Duration::from_millis(6001));
+        let backend = FakeBackend::replying_after(Duration::from_millis(6001));
         let Ok(wait) = dispatch(&backend, "late", budget(1.0), body_read) else {
             panic!("the backend takes the ask");
         };
@@ -260,7 +266,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_reply_before_the_start_is_ready_is_the_answer() {
-        let backend = TimerBackend::replying_after(Duration::from_secs(2));
+        let backend = FakeBackend::replying_after(Duration::from_secs(2));
         let never = std::future::pending::<()>();
         let Ok(wait) = dispatch(&backend, "early", budget(1.0), never) else {
             panic!("the backend takes the ask");
@@ -283,9 +289,7 @@ mod tests {
         }
     }
 
-    struct GreedyBackend;
-
-    impl HandoffBackend for GreedyBackend {
+    impl HandoffBackend for StubBackend<GreedyRun> {
         type Ask = ();
         type Reply = &'static str;
         type Refusal = Full;
@@ -298,7 +302,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_run_that_spends_the_coop_budget_still_times_out() {
-        let waiting = tokio::spawn(reply(&GreedyBackend, (), budget(1.0)));
+        let waiting = tokio::spawn(reply(&StubBackend::<GreedyRun>(PhantomData), (), budget(1.0)));
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(2)).await;
         for _ in 0..256 {

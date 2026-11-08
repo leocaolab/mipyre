@@ -71,7 +71,7 @@ pub enum TaggedField {
     PeerKind,
     RequestIdKind,
     TracebackFlag,
-    AnswerKind,
+    ResponseKind,
 }
 
 impl std::fmt::Display for TaggedField {
@@ -80,7 +80,7 @@ impl std::fmt::Display for TaggedField {
             TaggedField::PeerKind => "peer kind",
             TaggedField::RequestIdKind => "request id kind",
             TaggedField::TracebackFlag => "traceback flag",
-            TaggedField::AnswerKind => "answer kind",
+            TaggedField::ResponseKind => "answer kind",
         })
     }
 }
@@ -172,7 +172,7 @@ pub enum LaneUnansweredError {
     /// have written honestly, so whether it ran the request is unknown. The worker is killed.
     #[error(
         "the worker of process lane {lane} (pid {pid}) corrupted the lane: {}",
-        fault_said(fault)
+        fault_source(fault)
     )]
     PeerCorrupted {
         pid: i32,
@@ -197,7 +197,7 @@ pub enum LaneUnansweredError {
 }
 
 /// Says what a worker wrote that no correct worker writes: the error the lane's end measured it with.
-pub(super) fn fault_said(fault: &PeerFault) -> &dyn std::fmt::Display {
+pub(super) fn fault_source(fault: &PeerFault) -> &dyn std::fmt::Display {
     match fault {
         PeerFault::Counter(e) => e,
         PeerFault::Length(e) => e,

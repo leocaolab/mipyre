@@ -25,7 +25,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::conn::{drive_connection, drive_local_connection, ConnectionTimeouts, LocalExec};
-use crate::test_clock::{paused_runtime, ticking_clock, NO_FIRST_REQUEST};
+use crate::test_clock::{paused_runtime, ticking_clock, NO_FIRST_REQUEST_LOCK};
 use mipyre_http::io::body::ResponseBody;
 use mipyre_http::plan::limits::HEADER_READ_TIMEOUT;
 use mipyre_transport::stream::stall::WRITE_TIMEOUT;
@@ -41,14 +41,14 @@ const PIPE_BYTES: usize = 64 * 1024;
 /// Counts the writes that reach the server's end of the pipe and those that found it full. With
 /// `vectored` it takes several slices in one write, as a socket's `writev` does; the pipe itself
 /// takes one slice per write.
-struct CountingIo {
+struct SpySocket {
     inner: DuplexStream,
     writes: Arc<AtomicUsize>,
     blocked: Arc<AtomicUsize>,
     vectored: bool,
 }
 
-impl CountingIo {
+impl SpySocket {
     fn count(&self, r: &Poll<io::Result<usize>>) {
         match r {
             Poll::Ready(Ok(n)) if *n > 0 => {
@@ -62,13 +62,13 @@ impl CountingIo {
     }
 }
 
-impl AsyncRead for CountingIo {
+impl AsyncRead for SpySocket {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
-impl AsyncWrite for CountingIo {
+impl AsyncWrite for SpySocket {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let r = Pin::new(&mut self.inner).poll_write(cx, buf);
         self.count(&r);
@@ -175,7 +175,7 @@ async fn answer(mut req: hyper::Request<Incoming>) -> Result<hyper::Response<Res
     Ok(full(path))
 }
 
-struct Server {
+struct ServedConnection {
     client: DuplexStream,
     writes: Arc<AtomicUsize>,
     blocked: Arc<AtomicUsize>,
@@ -193,16 +193,16 @@ enum Writes {
 }
 
 /// Serves one connection on the current `LocalSet`, over a pipe that takes one slice per write.
-async fn serve_one(writes_mode: Writes) -> Server {
+async fn serve_one(writes_mode: Writes) -> ServedConnection {
     serve_over(writes_mode, false).await
 }
 
 /// Works like [`serve_one`], over a pipe that takes several slices in one write when `vectored`.
-async fn serve_over(writes_mode: Writes, vectored: bool) -> Server {
+async fn serve_over(writes_mode: Writes, vectored: bool) -> ServedConnection {
     let (client, stream) = tokio::io::duplex(PIPE_BYTES);
     let writes = Arc::new(AtomicUsize::new(0));
     let blocked = Arc::new(AtomicUsize::new(0));
-    let io = CountingIo {
+    let io = SpySocket {
         inner: stream,
         writes: Arc::clone(&writes),
         blocked: Arc::clone(&blocked),
@@ -236,7 +236,7 @@ async fn serve_over(writes_mode: Writes, vectored: bool) -> Server {
                 .await;
         }),
     };
-    Server {
+    ServedConnection {
         client,
         writes,
         blocked,
@@ -251,12 +251,12 @@ fn get(path: &str) -> String {
 
 /// Holds a response's body as the client read it, de-chunked.
 #[derive(Debug)]
-struct Got {
+struct ParsedResponse {
     body: Vec<u8>,
 }
 
 /// Parses complete responses off the front of `buf`.
-fn parse_responses(buf: &mut Vec<u8>, out: &mut Vec<Got>) {
+fn parse_responses(buf: &mut Vec<u8>, out: &mut Vec<ParsedResponse>) {
     loop {
         let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
             return;
@@ -271,7 +271,7 @@ fn parse_responses(buf: &mut Vec<u8>, out: &mut Vec<Got>) {
             if buf.len() < rest + len {
                 return;
             }
-            out.push(Got {
+            out.push(ParsedResponse {
                 body: buf[rest..rest + len].to_vec(),
             });
             buf.drain(..rest + len);
@@ -294,14 +294,14 @@ fn parse_responses(buf: &mut Vec<u8>, out: &mut Vec<Got>) {
                     break;
                 }
             }
-            out.push(Got { body });
+            out.push(ParsedResponse { body });
             buf.drain(..at);
         }
     }
 }
 
 /// Reads until `n` complete responses have arrived, panicking once `within` passes.
-async fn read_responses(client: &mut DuplexStream, n: usize, within: Duration) -> Vec<Got> {
+async fn read_responses(client: &mut DuplexStream, n: usize, within: Duration) -> Vec<ParsedResponse> {
     let mut buf = Vec::new();
     let mut got = Vec::new();
     let deadline = tokio::time::Instant::now() + within;
@@ -627,7 +627,7 @@ fn a_client_gone_mid_response_ends_the_connection() {
     for (mode, vectored) in COALESCED_OVER_BOTH {
         run(async move {
             let s = serve_over(mode, vectored).await;
-            let Server { mut client, done, .. } = s;
+            let ServedConnection { mut client, done, .. } = s;
             client
                 .write_all(get(&format!("/big/{}", 4 * PIPE_BYTES)).as_bytes())
                 .await
@@ -698,7 +698,7 @@ const TICK: Duration = Duration::from_millis(1);
 
 /// Asserts that the connection is still served just before `deadline` and has ended, with the
 /// client reading EOF, just after it.
-async fn closed_at(s: &mut Server, deadline: Instant) {
+async fn closed_at(s: &mut ServedConnection, deadline: Instant) {
     assert!(
         tokio::time::timeout_at(deadline - TICK, &mut s.done).await.is_err(),
         "the connection ended before {:?}",
@@ -716,7 +716,7 @@ async fn closed_at(s: &mut Server, deadline: Instant) {
 /// connection for `HEADER_READ_TIMEOUT` and no longer.
 #[test]
 fn a_request_head_never_finished_is_closed_at_the_header_read_timeout() {
-    let _alone = NO_FIRST_REQUEST
+    let _alone = NO_FIRST_REQUEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     run(async {

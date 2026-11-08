@@ -1,13 +1,14 @@
-//! Hands out the channel's slots as the protocol's states: a request the host writes and then publishes, the
-//! answers the peer published, taken one by one into the host's own bytes, and a request the peer reads and answers
+//! Hands out the channel's slots as the protocol's states: a request the caller writes and then publishes, the
+//! answers the peer published, taken one by one into the caller's own bytes, and a request the peer reads and answers
 //! in one call. Each handle borrows its end, so no slot outlives its turn and no two are held at once.
 
 use bytes::BytesMut;
 
 use super::ends::PeerFault;
+use super::header::add_sole_writer;
 use super::memory::{MessageView, SlotRef};
 use super::{Channel, Memory};
-use crate::plan::ring::{Seq, Window};
+use crate::plan::ring::{RingWindow, Seq};
 use crate::plan::slot_len::SlotLengthError;
 use crate::protocol::doorbell::{publish, Doorbell};
 use crate::sync::Ordering::Relaxed;
@@ -53,12 +54,12 @@ impl SlotWriter<'_> {
 
     /// Drops what was written, so a writer that ran out of room can write a shorter message instead.
     #[inline]
-    pub fn restart(&mut self) {
+    pub fn clear(&mut self) {
         self.len = 0;
     }
 }
 
-/// The free slot of the host's next request. Dropping it sends nothing; [`RequestSlot::publish`] sends what was
+/// The free slot of the caller's next request. Dropping it sends nothing; [`RequestSlot::publish`] sends what was
 /// written.
 ///
 /// It borrows its end, so two are never held at once:
@@ -66,10 +67,10 @@ impl SlotWriter<'_> {
 /// ```compile_fail,E0499
 /// # use std::sync::Arc;
 /// # use mipyre_shm::adapter::doorbell::FutexDoorbell;
-/// # use mipyre_shm::channel::{Channel, HeapMemory, HostEnd};
+/// # use mipyre_shm::channel::{Channel, HeapMemory, RequesterEnd};
 /// # use mipyre_shm::plan::{geometry::{Geometry, SlotBytes}, ring::RingDepth};
 /// # let g = Geometry::new(RingDepth::new(2).unwrap(), SlotBytes::new(64).unwrap()).unwrap();
-/// let mut end = HostEnd::new(Arc::new(Channel::new(HeapMemory::new(&g))), FutexDoorbell);
+/// let mut end = RequesterEnd::new(Arc::new(Channel::new(HeapMemory::new(&g))), FutexDoorbell);
 /// let first = end.request_slot();
 /// let second = end.request_slot();
 /// drop(first);
@@ -80,10 +81,10 @@ impl SlotWriter<'_> {
 /// ```compile_fail,E0505
 /// # use std::sync::Arc;
 /// # use mipyre_shm::adapter::doorbell::FutexDoorbell;
-/// # use mipyre_shm::channel::{Channel, HeapMemory, HostEnd};
+/// # use mipyre_shm::channel::{Channel, HeapMemory, RequesterEnd};
 /// # use mipyre_shm::plan::{geometry::{Geometry, SlotBytes}, ring::RingDepth};
 /// # let g = Geometry::new(RingDepth::new(2).unwrap(), SlotBytes::new(64).unwrap()).unwrap();
-/// let mut end = HostEnd::new(Arc::new(Channel::new(HeapMemory::new(&g))), FutexDoorbell);
+/// let mut end = RequesterEnd::new(Arc::new(Channel::new(HeapMemory::new(&g))), FutexDoorbell);
 /// let slot = end.request_slot();
 /// drop(end);
 /// drop(slot);
@@ -92,13 +93,13 @@ impl SlotWriter<'_> {
 pub struct RequestSlot<'e, M: Memory, B: Doorbell> {
     channel: &'e Channel<M>,
     bell: &'e B,
-    window: &'e mut Window,
+    window: &'e mut RingWindow,
     len: u32,
 }
 
 impl<'e, M: Memory, B: Doorbell> RequestSlot<'e, M, B> {
     #[inline]
-    pub(super) fn new(channel: &'e Channel<M>, bell: &'e B, window: &'e mut Window) -> Self {
+    pub(super) fn new(channel: &'e Channel<M>, bell: &'e B, window: &'e mut RingWindow) -> Self {
         RequestSlot {
             channel,
             bell,
@@ -124,7 +125,7 @@ impl<'e, M: Memory, B: Doorbell> RequestSlot<'e, M, B> {
         let slot = self
             .channel
             .memory
-            .slot(self.channel.memory.geometry().request_slot(self.seq()));
+            .slot(self.channel.memory.geometry().request_offset(self.seq()));
         let mut writer = SlotWriter { slot, len: self.len };
         let out = fill(&mut writer);
         self.len = writer.len;
@@ -142,33 +143,33 @@ impl<'e, M: Memory, B: Doorbell> RequestSlot<'e, M, B> {
         let seq = self.seq();
         let memory = &self.channel.memory;
         memory
-            .slot(memory.geometry().request_slot(seq))
+            .slot(memory.geometry().request_offset(seq))
             .len_word()
             .store(self.len, Relaxed);
-        *self.window = Window::new(self.window.read(), seq.after(1));
+        *self.window = RingWindow::new(self.window.read(), seq.after(1));
         let h = memory.header();
         publish(&h.req_head, &h.peer_sleeping, seq.after(1).get(), self.bell)
     }
 }
 
-/// The answers the peer published and the host has not taken, oldest first. Dropping it leaves the rest for the
-/// next [`HostEnd::answers`](super::HostEnd::answers).
-pub struct ReadyAnswers<'e, M: Memory> {
+/// The answers the peer published and the caller has not taken, oldest first. Dropping it leaves the rest for the
+/// next [`RequesterEnd::answers`](super::RequesterEnd::answers).
+pub struct ReadyResponses<'e, M: Memory> {
     channel: &'e Channel<M>,
-    window: &'e mut Window,
+    window: &'e mut RingWindow,
     published: Seq,
     fault: &'e mut Option<PeerFault>,
 }
 
-impl<'e, M: Memory> ReadyAnswers<'e, M> {
+impl<'e, M: Memory> ReadyResponses<'e, M> {
     #[inline]
     pub(super) fn new(
         channel: &'e Channel<M>,
-        window: &'e mut Window,
+        window: &'e mut RingWindow,
         published: Seq,
         fault: &'e mut Option<PeerFault>,
     ) -> Self {
-        ReadyAnswers {
+        ReadyResponses {
             channel,
             window,
             published,
@@ -193,10 +194,10 @@ impl<'e, M: Memory> ReadyAnswers<'e, M> {
             return Ok(None);
         }
         let memory = &self.channel.memory;
-        if let Err(e) = memory.slot(memory.geometry().answer_slot(seq)).take_message(dst) {
+        if let Err(e) = memory.slot(memory.geometry().response_offset(seq)).take_message(dst) {
             return Err(*self.fault.insert(PeerFault::Length(e)));
         }
-        *self.window = Window::new(seq.after(1), self.window.sent());
+        *self.window = RingWindow::new(seq.after(1), self.window.sent());
         Ok(Some(seq))
     }
 }
@@ -221,7 +222,7 @@ impl<'p, M: Memory, B: Doorbell> PeerRequest<'p, M, B> {
         *self.cursor
     }
 
-    /// Borrows the request's bytes. The host wrote them and does not touch the slot until it reads the answer, so
+    /// Borrows the request's bytes. The caller wrote them and does not touch the slot until it reads the answer, so
     /// they are borrowed, not copied; the borrow ends before the request is answered.
     ///
     /// # Errors
@@ -230,29 +231,31 @@ impl<'p, M: Memory, B: Doorbell> PeerRequest<'p, M, B> {
     #[inline]
     pub fn bytes(&self) -> Result<MessageView<'_>, SlotLengthError> {
         let memory = &self.channel.memory;
-        memory.slot(memory.geometry().request_slot(*self.cursor)).view_message()
+        memory
+            .slot(memory.geometry().request_offset(*self.cursor))
+            .view_message()
     }
 
-    /// Lets `fill` write the answer and publishes it, ringing the host when it said it sleeps (`Ok(None)` rang
+    /// Lets `fill` write the answer and publishes it, ringing the caller when it said it sleeps (`Ok(None)` rang
     /// nothing). An answer that does not fit is for `fill` to replace with a shorter one.
     ///
     /// # Errors
     ///
     /// The doorbell's error, after the answer is published.
     #[inline]
-    pub fn answer(self, fill: impl FnOnce(&mut SlotWriter<'_>)) -> Result<Option<B::Outcome>, B::Error> {
+    pub fn respond(self, fill: impl FnOnce(&mut SlotWriter<'_>)) -> Result<Option<B::Outcome>, B::Error> {
         let seq = *self.cursor;
         let memory = &self.channel.memory;
-        let slot = memory.slot(memory.geometry().answer_slot(seq));
+        let slot = memory.slot(memory.geometry().response_offset(seq));
         let len_word = slot.len_word();
         let mut writer = SlotWriter { slot, len: 0 };
         fill(&mut writer);
         len_word.store(writer.len, Relaxed);
         *self.cursor = seq.after(1);
         let h = memory.header();
-        let rung = publish(&h.resp_head, &h.host_sleeping, seq.after(1).get(), self.bell)?;
+        let rung = publish(&h.resp_head, &h.requester_sleeping, seq.after(1).get(), self.bell)?;
         if rung.is_some() {
-            h.peer_waits.wakes.add(1);
+            add_sole_writer(&h.peer_waits.wakes, 1);
         }
         Ok(rung)
     }

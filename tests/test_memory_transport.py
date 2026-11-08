@@ -39,8 +39,8 @@ def stream(req):
 
 
 @app.websocket("/ws")
-async def ws(conn):
-    await conn.send(await conn.recv())
+def ws(conn, msg):
+    return msg
 
 
 @pytest.fixture(scope="module")

@@ -1,8 +1,8 @@
-//! A shared-memory channel between two processes: a host that sends requests and a peer that answers them, over
+//! A shared-memory channel between two processes: a caller that sends requests and a peer that answers them, over
 //! two rings that share one slot index.
 //!
 //! [`plan`] holds the channel's decisions as pure functions of the values its counters and slot headers held. The
-//! peer runs user code and C extensions, so every value it wrote is believed only once it fits what the host itself
+//! peer runs user code and C extensions, so every value it wrote is believed only once it fits what the caller itself
 //! sent and read. [`protocol`] keeps the two words' wake-up protocol and defines the ports for waking and sleeping;
 //! [`channel`] is the channel over a [`channel::Memory`], knowing no OS; [`adapter`] implements the ports over
 //! the OS, whose calls are all in one private module.

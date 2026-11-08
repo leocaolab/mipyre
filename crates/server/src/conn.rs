@@ -13,15 +13,15 @@ use hyper_util::server::conn::auto::{Builder as AutoBuilder, HttpServerConnExec}
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use mipyre_http::io::body::ResponseBody;
-use mipyre_http::io::clock::{Clock, ConnectionTimer, Deadline};
+use mipyre_http::io::clock::{Clock, ConnectionTimer, Sleep};
 use mipyre_http::io::coalesce::{coalesce, coalesce_local, CoalescedPoll, Flusher, Sharing};
 use mipyre_http::io::events::{self, HttpEvent};
 use mipyre_http::io::static_files::FileSendError;
 
 use mipyre_http::plan::limits::{HEADER_READ_TIMEOUT, LINGER_IDLE_TIMEOUT};
 use mipyre_transport::stream::events::{self as stream_events, StreamEvent};
-use mipyre_transport::stream::linger::{Close, LingerBounds};
-use mipyre_transport::stream::stall::WriteStall;
+use mipyre_transport::stream::linger::{CloseStyle, LingerBounds};
+use mipyre_transport::stream::stall::TimeoutStream;
 use mipyre_transport::stream::stall::WRITE_TIMEOUT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,7 +92,7 @@ pub(crate) async fn drive_connection<IO, S, E, F>(
     E: HttpServerConnExec<S::Future, ResponseBody>,
     F: std::future::Future<Output = ()>,
 {
-    let (io, flusher) = coalesce(WriteStall::new(io, WRITE_TIMEOUT));
+    let (io, flusher) = coalesce(TimeoutStream::new(io, WRITE_TIMEOUT));
     let requested = AtomicBool::new(false);
     let svc = RequestNoter {
         inner: svc,
@@ -117,7 +117,7 @@ pub(crate) async fn drive_local_connection<IO, S, F>(
     S::Future: 'static,
     F: std::future::Future<Output = ()>,
 {
-    let (io, flusher) = coalesce_local(WriteStall::new(io, WRITE_TIMEOUT));
+    let (io, flusher) = coalesce_local(TimeoutStream::new(io, WRITE_TIMEOUT));
     let requested = AtomicBool::new(false);
     let svc = RequestNoter {
         inner: svc,
@@ -185,7 +185,7 @@ async fn serve<C, T, K, F>(
     // hyper times an HTTP/1 head only once it has told HTTP/1 from HTTP/2 by the first bytes,
     // and never an HTTP/2 connection's wait for a stream: until the first request, the deadline
     // below is the connection's only bound.
-    let first_request_by = clock.deadline(clock.alarm(), clock.now() + timeouts.request_head);
+    let first_request_by = clock.sleep_until(clock.alarm(), clock.now() + timeouts.request_head);
     tokio::pin!(stop);
     // The connection (and the IO it holds) ends with this block, so `finish` below sees
     // whether anyone else (an upgrade) still holds the IO.
@@ -229,7 +229,7 @@ async fn serve<C, T, K, F>(
         }
         End::NoFirstRequest => {
             report_no_first_request(timeouts.request_head);
-            Close::Now
+            CloseStyle::Now
         }
     };
     // A stop that comes while the connection lingers ends the wait: the answer is out by then,
@@ -245,7 +245,7 @@ pin_project_lite::pin_project! {
     struct NewConnection<'a, C> {
         #[pin]
         conn: C,
-        deadline: Option<Deadline>,
+        deadline: Option<Sleep>,
         requested: &'a AtomicBool,
     }
 }
@@ -340,14 +340,14 @@ enum ConnectionEnd {
     NoNextRequest,
     /// A static file's answer was cut off while it was sent, because the file changed or failed;
     /// the body reports it.
-    AnswerCut,
+    ResponseTruncated,
     Failed,
 }
 
 /// Returns what ended a connection that failed with `e` at `stage`.
 fn connection_end(e: &(dyn std::error::Error + 'static), stage: Stage) -> ConnectionEnd {
-    if answer_cut(e).is_some() {
-        ConnectionEnd::AnswerCut
+    if file_send_error(e).is_some() {
+        ConnectionEnd::ResponseTruncated
     } else if events::peer_went_away(e) {
         ConnectionEnd::PeerGone
     } else if let Some(stalled) = write_stalled(e) {
@@ -372,18 +372,18 @@ fn connection_end(e: &(dyn std::error::Error + 'static), stage: Stage) -> Connec
 /// and it answers a bad request before it errs: in those cases the client may still be sending.
 /// Once the server is stopping nothing is waited for, so a stop is not held up by clients that
 /// keep their connections open.
-fn close_after(end: Option<ConnectionEnd>, stopping: bool) -> Close {
+fn close_after(end: Option<ConnectionEnd>, stopping: bool) -> CloseStyle {
     match end {
-        _ if stopping => Close::Now,
-        None | Some(ConnectionEnd::BadRequest(_)) => Close::Lingering,
+        _ if stopping => CloseStyle::Now,
+        None | Some(ConnectionEnd::BadRequest(_)) => CloseStyle::Lingering,
         Some(
             ConnectionEnd::PeerGone
             | ConnectionEnd::WriteStalled { .. }
             | ConnectionEnd::NoFirstRequest
             | ConnectionEnd::NoNextRequest
-            | ConnectionEnd::AnswerCut
+            | ConnectionEnd::ResponseTruncated
             | ConnectionEnd::Failed,
-        ) => Close::Now,
+        ) => CloseStyle::Now,
     }
 }
 
@@ -416,8 +416,8 @@ fn report_connection_error(e: &(dyn std::error::Error + 'static), stage: Stage, 
         }
         // It is counted and logged per file, throttled, since every client of a file being
         // rewritten meets it.
-        ConnectionEnd::AnswerCut => {
-            if let Some(cut) = answer_cut(e) {
+        ConnectionEnd::ResponseTruncated => {
+            if let Some(cut) = file_send_error(e) {
                 cut.report();
             }
         }
@@ -425,7 +425,7 @@ fn report_connection_error(e: &(dyn std::error::Error + 'static), stage: Stage, 
     }
 }
 
-/// Logs a write stall that `WriteStall` already counted. It comes in floods when one client stops
+/// Logs a write stall that `TimeoutStream` already counted. It comes in floods when one client stops
 /// reading on many connections, so the line is throttled.
 pub(crate) fn report_write_stall(limit: std::time::Duration) {
     if let Some(held) = stream_events::admit(StreamEvent::WriteStalled) {
@@ -440,7 +440,7 @@ pub(crate) fn report_write_stall(limit: std::time::Duration) {
 
 /// Finds the static file answer that was cut off along `e`'s source chain, if that is why the
 /// connection failed.
-fn answer_cut<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a FileSendError> {
+fn file_send_error<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a FileSendError> {
     std::iter::successors(Some(e), |e| e.source()).find_map(|e| e.downcast_ref::<FileSendError>())
 }
 
@@ -476,13 +476,13 @@ mod tests {
     /// Mimics a `hyper::Error` from a failed write, which has its own text and the io error as
     /// its cause.
     #[derive(Debug)]
-    struct Wrapper(std::io::Error);
-    impl std::fmt::Display for Wrapper {
+    struct FakeHyperError(std::io::Error);
+    impl std::fmt::Display for FakeHyperError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("error writing a body to connection")
         }
     }
-    impl std::error::Error for Wrapper {
+    impl std::error::Error for FakeHyperError {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.0)
         }
@@ -495,9 +495,9 @@ mod tests {
             std::io::ErrorKind::TimedOut,
             mipyre_transport::stream::stall::WriteStallError { limit },
         );
-        let wrapped = Wrapper(stalled);
+        let wrapped = FakeHyperError(stalled);
         assert_eq!(write_stalled(&wrapped).map(|s| s.limit), Some(limit));
-        let other = Wrapper(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let other = FakeHyperError(std::io::Error::from(std::io::ErrorKind::TimedOut));
         assert!(write_stalled(&other).is_none());
     }
 
@@ -513,9 +513,9 @@ mod tests {
     #[test]
     fn a_connection_end_is_classed_by_what_ended_it() {
         let limit = std::time::Duration::from_secs(10);
-        let reset = Wrapper(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        let reset = FakeHyperError(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         assert_eq!(reported(&reset), "", "the client going away is not logged");
-        let stalled = Wrapper(std::io::Error::new(
+        let stalled = FakeHyperError(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             mipyre_transport::stream::stall::WriteStallError { limit },
         ));
@@ -524,7 +524,7 @@ mod tests {
             log.lines().all(|l| l.contains("write stalled") && l.contains("10s")),
             "{log}"
         );
-        let timed_out = Wrapper(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let timed_out = FakeHyperError(std::io::Error::from(std::io::ErrorKind::TimedOut));
         let log = reported(&timed_out);
         let line = log.lines().find(|l| l.contains("Connection error")).expect(&log);
         assert!(line.contains("\"level\":\"WARN\""), "{line}");
@@ -733,7 +733,7 @@ mod tests {
         let cases: [(&str, Box<dyn std::error::Error>, ConnectionEnd); 7] = [
             (
                 "a reset",
-                Box::new(Wrapper(io(std::io::ErrorKind::ConnectionReset))),
+                Box::new(FakeHyperError(io(std::io::ErrorKind::ConnectionReset))),
                 ConnectionEnd::PeerGone,
             ),
             (
@@ -743,13 +743,13 @@ mod tests {
             ),
             (
                 "a stall hyper wraps",
-                Box::new(Wrapper(stall())),
+                Box::new(FakeHyperError(stall())),
                 ConnectionEnd::WriteStalled { limit },
             ),
             ("a bare stall", Box::new(stall()), ConnectionEnd::WriteStalled { limit }),
             (
                 "a timeout that is no stall",
-                Box::new(Wrapper(io(std::io::ErrorKind::TimedOut))),
+                Box::new(FakeHyperError(io(std::io::ErrorKind::TimedOut))),
                 ConnectionEnd::Failed,
             ),
             (
@@ -772,25 +772,25 @@ mod tests {
     #[test]
     fn a_connection_lingers_only_where_the_client_may_still_be_sending_and_not_once_stopping() {
         let cases = [
-            (None, Close::Lingering),
+            (None, CloseStyle::Lingering),
             (
                 Some(ConnectionEnd::BadRequest(HttpEvent::MalformedRequest)),
-                Close::Lingering,
+                CloseStyle::Lingering,
             ),
-            (Some(ConnectionEnd::PeerGone), Close::Now),
+            (Some(ConnectionEnd::PeerGone), CloseStyle::Now),
             (
                 Some(ConnectionEnd::WriteStalled {
                     limit: std::time::Duration::from_secs(10),
                 }),
-                Close::Now,
+                CloseStyle::Now,
             ),
-            (Some(ConnectionEnd::NoFirstRequest), Close::Now),
-            (Some(ConnectionEnd::NoNextRequest), Close::Now),
-            (Some(ConnectionEnd::Failed), Close::Now),
+            (Some(ConnectionEnd::NoFirstRequest), CloseStyle::Now),
+            (Some(ConnectionEnd::NoNextRequest), CloseStyle::Now),
+            (Some(ConnectionEnd::Failed), CloseStyle::Now),
         ];
         for (end, close) in cases {
             assert_eq!(close_after(end, false), close, "{end:?}");
-            assert_eq!(close_after(end, true), Close::Now, "{end:?} while stopping");
+            assert_eq!(close_after(end, true), CloseStyle::Now, "{end:?} while stopping");
         }
     }
 

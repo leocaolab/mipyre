@@ -32,7 +32,7 @@ pub struct WriteStallError {
 /// After a timeout every later write, flush and shutdown fails the same way without touching the
 /// inner stream, because the connection is to be closed. Each stall is counted once as
 /// [`StreamEvent::WriteStalled`].
-pub struct WriteStall<IO> {
+pub struct TimeoutStream<IO> {
     inner: IO,
     limit: Duration,
     stall: Stall,
@@ -55,9 +55,9 @@ enum Call {
     Flush,
 }
 
-impl<IO> WriteStall<IO> {
+impl<IO> TimeoutStream<IO> {
     pub fn new(inner: IO, limit: Duration) -> Self {
-        WriteStall {
+        TimeoutStream {
             inner,
             limit,
             stall: Stall::Clear,
@@ -127,13 +127,13 @@ fn done(_: &io::Result<()>) -> bool {
     true
 }
 
-impl<IO: AsyncRead + Unpin> AsyncRead for WriteStall<IO> {
+impl<IO: AsyncRead + Unpin> AsyncRead for TimeoutStream<IO> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
-impl<IO: AsyncWrite + Unpin> AsyncWrite for WriteStall<IO> {
+impl<IO: AsyncWrite + Unpin> AsyncWrite for TimeoutStream<IO> {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         if let Some(spent) = self.spent() {
             return spent;

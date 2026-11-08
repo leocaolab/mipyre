@@ -462,20 +462,16 @@ Add `import json` at the top of `trading/main.py`, and this handler at the end:
 
 ```python
 @app.websocket("/ws/prices")
-async def price_stream(ws):
+def price_stream(ws, msg):
     """Answer each text message, a comma-separated list of tickers or "all", with their
     quotes."""
-    async for msg in ws:
-        if isinstance(msg, bytes):
-            continue
-        wanted = TICKERS if msg.strip().lower() == "all" else [t.strip().upper() for t in msg.split(",")]
-        try:
-            await ws.send(json.dumps({t: get_live_price(t) for t in wanted if t in TICKERS}))
-        except ConnectionError:
-            return  # the client left
+    if isinstance(msg, bytes):
+        return None
+    wanted = TICKERS if msg.strip().lower() == "all" else [t.strip().upper() for t in msg.split(",")]
+    return json.dumps({t: get_live_price(t) for t in wanted if t in TICKERS})
 ```
 
-A WebSocket handler is an `async def` and runs on the app's runtime, here `subinterp`: each connection is a task on a sub-interpreter worker's event loop, and holds no thread while it waits. `async for` ends when the connection does; `await ws.send(...)` waits while a slow client has let the buffer fill, and raises `ConnectionError` once the connection has closed. Like a `POST`, an upgrade from another site's page is refused with `403` unless that site is in `enable_cors(allow_origins=...)`; this app's `"*"` lets every site's pages open the feed. The [realtime codelab](realtime.md) covers WebSockets in depth.
+A WebSocket handler is a `def` called once per message, and runs on the app's runtime, here `subinterp`: inline on the worker of the thread that holds the connection, which holds no thread while it waits for the next message. What it returns is the reply; `None` sends nothing. Like a `POST`, an upgrade from another site's page is refused with `403` unless that site is in `enable_cors(allow_origins=...)`; this app's `"*"` lets every site's pages open the feed. The [realtime codelab](realtime.md) covers WebSockets in depth.
 
 Start `mipyre run trading_api:app`, then:
 

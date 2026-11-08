@@ -182,7 +182,7 @@ impl<'r> SlotRef<'r> {
     }
 
     /// Reads the length word once and borrows that many message bytes. Only the side whose message the other side
-    /// does not write while it reads may borrow: the peer reading the host's request.
+    /// does not write while it reads may borrow: the peer reading the caller's request.
     pub fn view_message(&self) -> Result<MessageView<'r>, SlotLengthError> {
         let len = decode_len(self.len.load(Relaxed), self.room)?;
         // SAFETY: `len` bytes inside the room, alive as long as the region (`'r`); by the protocol the writer does not
@@ -484,17 +484,23 @@ mod tests {
     fn a_fresh_heap_memory_holds_a_header_of_zeroes() {
         let m = HeapMemory::new(&geometry(4, 4096));
         let h = m.header();
-        let words = [&h.req_head, &h.taken, &h.resp_head, &h.peer_sleeping, &h.host_sleeping];
+        let words = [
+            &h.req_head,
+            &h.taken,
+            &h.resp_head,
+            &h.peer_sleeping,
+            &h.requester_sleeping,
+        ];
         let start = [&h.start.attempt, &h.start.state, &h.start.note_len];
         assert!(words.iter().chain(start.iter()).all(|w| w.load(Relaxed) == 0));
-        assert_eq!(h.peer_waits.read(), crate::channel::header::WaitTotals::default());
+        assert_eq!(h.peer_waits.read(), crate::channel::header::Waits::default());
     }
 
     #[test]
     fn a_message_copied_in_is_the_message_taken_out_and_viewed() {
         let g = geometry(2, 64);
         let m = HeapMemory::new(&g);
-        let slot = m.slot(g.answer_slot(Seq::new(1)));
+        let slot = m.slot(g.response_offset(Seq::new(1)));
         assert_eq!(slot.copy_in(0, &[1, 2, 3]), Ok(3));
         assert_eq!(slot.copy_in(3, &[4; 53]), Ok(56));
         slot.len_word().store(56, Relaxed);
@@ -502,14 +508,14 @@ mod tests {
         assert_eq!(slot.take_message(&mut out), Ok(56));
         assert_eq!(out[..8], *b"kept\x01\x02\x03\x04");
         assert_eq!(slot.view_message().map(|v| v.to_vec()), Ok(out[4..].to_vec()));
-        assert_eq!(m.slot(g.answer_slot(Seq::new(1))).len_word().load(Relaxed), 56);
+        assert_eq!(m.slot(g.response_offset(Seq::new(1))).len_word().load(Relaxed), 56);
     }
 
     #[test]
     fn bytes_up_to_the_slots_end_are_reached_and_one_past_it_is_refused() {
         let g = geometry(1, 64);
         let m = HeapMemory::new(&g);
-        let slot = m.slot(g.request_slot(Seq::new(0)));
+        let slot = m.slot(g.request_offset(Seq::new(0)));
         let room = g.max_message();
         assert_eq!(slot.room(), room);
         assert_eq!(slot.copy_in(0, &vec![9; room as usize]), Ok(room));
@@ -545,10 +551,10 @@ mod tests {
         let g = geometry(2, 64);
         let m = HeapMemory::new(&g);
         let slots = [
-            g.request_slot(Seq::new(0)),
-            g.request_slot(Seq::new(1)),
-            g.answer_slot(Seq::new(0)),
-            g.answer_slot(Seq::new(1)),
+            g.request_offset(Seq::new(0)),
+            g.request_offset(Seq::new(1)),
+            g.response_offset(Seq::new(0)),
+            g.response_offset(Seq::new(1)),
         ];
         let refs = || slots.iter().map(|at| m.slot(*at)).chain([m.note()]);
         for (i, slot) in refs().enumerate() {

@@ -1,4 +1,4 @@
-//! The kernel under the Loom models: the futex a peer sleeps on and the pipe a host's reactor waits on, as the
+//! The kernel under the Loom models: the futex a peer sleeps on and the pipe a caller's reactor waits on, as the
 //! ports' implementations. Neither sleeps with a timeout, so a wake the protocol loses leaves a side asleep for
 //! good, which Loom reports as a deadlock.
 
@@ -12,7 +12,7 @@ use crate::sync::{AtomicU32, Condvar, Mutex, Ordering::Relaxed};
 /// takes the lock and wakes every sleeper, as the kernel compares and wakes under its hash bucket's lock. A clone is
 /// the same futex.
 #[derive(Clone, Default)]
-pub(crate) struct FutexModel(Arc<Bucket>);
+pub(crate) struct FakeFutex(Arc<Bucket>);
 
 /// What the kernel keeps for one futex: a lock and the sleepers under it.
 #[derive(Default)]
@@ -21,7 +21,7 @@ struct Bucket {
     woken: Condvar,
 }
 
-impl Parker for FutexModel {
+impl Parker for FakeFutex {
     type Error = Infallible;
 
     /// Sleeps until one ring, or not at all when `word` moved; the slice is ignored.
@@ -34,7 +34,7 @@ impl Parker for FutexModel {
     }
 }
 
-impl Doorbell for FutexModel {
+impl Doorbell for FakeFutex {
     type Outcome = ();
     type Error = Infallible;
 
@@ -45,10 +45,10 @@ impl Doorbell for FutexModel {
     }
 }
 
-/// A host's wake pipe: a ring writes a byte, and the host's reactor sleeps until there is one to read, then reads
+/// A caller's wake pipe: a ring writes a byte, and the caller's reactor sleeps until there is one to read, then reads
 /// them all. A clone is the same pipe.
 #[derive(Clone, Default)]
-pub(crate) struct PipeModel(Arc<Pipe>);
+pub(crate) struct FakeWakePipe(Arc<Pipe>);
 
 #[derive(Default)]
 struct Pipe {
@@ -63,7 +63,7 @@ struct PipeBytes {
     written: u32,
 }
 
-impl PipeModel {
+impl FakeWakePipe {
     /// Sleeps until a byte is in the pipe, then reads every byte there.
     pub(crate) fn wait_and_drain(&self) {
         let mut bytes = self.0.bytes.lock().unwrap_or_else(PoisonError::into_inner);
@@ -79,7 +79,7 @@ impl PipeModel {
     }
 }
 
-impl Doorbell for PipeModel {
+impl Doorbell for FakeWakePipe {
     type Outcome = ();
     type Error = Infallible;
 

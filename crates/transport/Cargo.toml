@@ -30,8 +30,6 @@ tracing = "0.1"
 rustix = { version = "1.1.5", default-features = false, features = ["std", "net", "time"] }
 
 [dev-dependencies]
-# The microbenches' harness and counting allocator.
-mipyre_microbench = { path = "../microbench" }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "test-util"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 # A fresh self-signed certificate per TLS test: no key or expiry date checked in.
@@ -39,25 +37,3 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 
 [lints]
 workspace = true
-
-[[bench]]
-name = "passed_accept"
-harness = false
-
-# The per-call benches, one per module they measure (`mipyre_microbench::run`).
-[[bench]]
-name = "events"
-harness = false
-
-[[bench]]
-name = "listener"
-harness = false
-
-[[bench]]
-name = "write_stall"
-harness = false
-
-# What a new TLS connection costs and how often it resumes, by where resumption state lives.
-[[bench]]
-name = "tls_handshake"
-harness = false

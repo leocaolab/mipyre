@@ -11,6 +11,7 @@ use std::num::NonZeroUsize;
 use pyo3::prelude::*;
 
 use mipyre_cpu::Cpus;
+use mipyre_http::plan::route::{WsPlace, WsRoute};
 
 use super::config::{FlagError, ServerKind, ServerRecipe};
 use super::settings::{FlagUse, ServerFlagValues};
@@ -48,6 +49,38 @@ pub(crate) struct UnsupportedGcMode {
 impl From<UnsupportedGcMode> for PyErr {
     fn from(e: UnsupportedGcMode) -> Self {
         pyo3::exceptions::PyValueError::new_err(e.to_string())
+    }
+}
+
+/// A worker WebSocket route's calls run on the worker of the TPC thread that holds the
+/// connection, so a topology without TPC threads cannot serve one.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "websocket {path} runs on a sub-interpreter worker, which needs the thread-per-core server, and \
+     {topology} has none: register it with runtime='main', or unset MIPYRE_TPC=0"
+)]
+pub(crate) struct WebSocketTopologyError {
+    path: String,
+    topology: Topology,
+}
+
+impl From<WebSocketTopologyError> for PyErr {
+    fn from(e: WebSocketTopologyError) -> Self {
+        pyo3::exceptions::PyValueError::new_err(e.to_string())
+    }
+}
+
+/// Refuses a topology without TPC threads when a WebSocket route runs on a worker.
+pub(crate) fn check_websockets(topology: Topology, routes: &[WsRoute]) -> Result<(), WebSocketTopologyError> {
+    if matches!(topology, Topology::Tpc { .. }) {
+        return Ok(());
+    }
+    match routes.iter().find(|r| r.place == WsPlace::Worker) {
+        Some(route) => Err(WebSocketTopologyError {
+            path: route.path.clone(),
+            topology,
+        }),
+        None => Ok(()),
     }
 }
 
@@ -590,5 +623,18 @@ mod tests {
         assert_eq!(tpc_async_workers(n(3), RouteKinds::Both), n(1));
         assert_eq!(tpc_async_workers(n(1), RouteKinds::Both), n(1));
         assert_eq!(tpc_async_workers(n(1), RouteKinds::Async), n(1));
+    }
+
+    #[test]
+    fn a_worker_websocket_route_needs_the_tpc_server_and_a_main_one_does_not() {
+        let route = |place| WsRoute {
+            path: "/ws".to_string(),
+            place,
+        };
+        assert_eq!(check_websockets(TPC, &[route(WsPlace::Worker)]), Ok(()));
+        assert_eq!(check_websockets(POOL, &[route(WsPlace::Main)]), Ok(()));
+        assert_eq!(check_websockets(MULTI_GIL, &[]), Ok(()));
+        let refused = check_websockets(POOL, &[route(WsPlace::Main), route(WsPlace::Worker)]).unwrap_err();
+        assert!(refused.to_string().contains("runtime='main'"), "{refused}");
     }
 }

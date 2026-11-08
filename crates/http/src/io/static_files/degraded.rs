@@ -11,7 +11,7 @@ pub enum StaticDegradation {
     UnwatchedMount,
     /// An answer sent from disk was cut off: its file changed, ended early or could not be read
     /// while it was sent.
-    AnswerCut,
+    ResponseTruncated,
 }
 
 static PRECOMPRESSED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -22,7 +22,7 @@ fn counter(kind: StaticDegradation) -> &'static AtomicU64 {
     match kind {
         StaticDegradation::PrecompressedFallback => &PRECOMPRESSED_FALLBACKS,
         StaticDegradation::UnwatchedMount => &UNWATCHED_MOUNTS,
-        StaticDegradation::AnswerCut => &ANSWERS_CUT,
+        StaticDegradation::ResponseTruncated => &ANSWERS_CUT,
     }
 }
 

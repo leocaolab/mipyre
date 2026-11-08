@@ -8,7 +8,7 @@ use super::lane_failure::LaneIndex;
 use super::os::BellQueue;
 use super::run::RunBell;
 use futures_util::FutureExt as _;
-use mipyre_shm::adapter::doorbell::{drain_once, Drain, DrainOutcome, HostBell};
+use mipyre_shm::adapter::doorbell::{drain_once, DrainOutcome, RequesterBell, WakeRead};
 use mipyre_shm::SyscallError;
 use tokio::io::unix::AsyncFd;
 
@@ -57,7 +57,7 @@ impl HostBellWatch {
     /// Registers each of `bells` in one queue, under its lane's place among the host's lanes, and
     /// the queue in this thread's reactor.
     pub(crate) fn new(bells: Vec<RunBell>) -> std::io::Result<Self> {
-        let (reads, writes): (Vec<HostBell>, Vec<OwnedFd>) =
+        let (reads, writes): (Vec<RequesterBell>, Vec<OwnedFd>) =
             bells.into_iter().map(|RunBell { bell, write }| (bell, write)).unzip();
         let queue =
             BellQueue::new(reads).map_err(|e| std::io::Error::new(e.kind(), format!("the wake pipes' queue: {e}")))?;
@@ -78,7 +78,7 @@ const LEFTOVER_READS: usize = 4096;
 /// Reads what lane `lane`'s pipe holds, up to [`LEFTOVER_READS`] reads, so its next worker is not
 /// held to bytes its predecessor (or anything else holding the write end) wrote. What is written
 /// past that counts against the next worker.
-pub(crate) fn drain_leftover(lane: LaneIndex, bell: &HostBell) -> Result<(), PollerError> {
+pub(crate) fn drain_leftover(lane: LaneIndex, bell: &RequesterBell) -> Result<(), PollerError> {
     for _ in 0..LEFTOVER_READS {
         if bell_drained(lane, drain_once(bell))?.outcome == DrainOutcome::Empty {
             break;
@@ -112,6 +112,6 @@ pub(crate) fn woken_pipe<G>(waited: std::io::Result<G>) -> Result<G, PollerError
 /// Turns one read of lane `lane`'s wake pipe into what it took, or the host's failure: a pipe
 /// that cannot be read would fail the same way at once, with nobody reading the lanes.
 #[inline]
-pub(crate) fn bell_drained(lane: LaneIndex, drained: Result<Drain, SyscallError>) -> Result<Drain, PollerError> {
+pub(crate) fn bell_drained(lane: LaneIndex, drained: Result<WakeRead, SyscallError>) -> Result<WakeRead, PollerError> {
     drained.map_err(|source| PollerError::BellUnreadable { lane, source })
 }

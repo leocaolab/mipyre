@@ -30,7 +30,7 @@ pub fn bind_options() -> BindOptions {
 pub fn handed_by_systemd(
     tls: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
     copies: std::num::NonZeroUsize,
-) -> Result<Option<Endpoints>, mipyre_transport::tcp::passed::PassedError> {
+) -> Result<Option<Endpoints>, mipyre_transport::tcp::passed::SocketActivationError> {
     let handed = mipyre_transport::tcp::passed::take_from_systemd()?;
     if handed.is_empty() {
         return Ok(None);

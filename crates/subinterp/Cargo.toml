@@ -21,7 +21,6 @@ mipyre_cpu = { path = "../cpu" }
 pyo3 = "0.29"
 parking_lot = "0.12"
 thiserror = "2"
-tracing = "0.1"
 
 # The Loom model of a slot's state word (`src/interp/unit/loom_model.rs`), built only under `--cfg sync_model`, which swaps
 # `src/sync.rs`'s names for Loom's in every package built with it, so Loom is a dependency under that cfg only:
@@ -34,18 +33,5 @@ loom = "0.7"
 [target.'cfg(all(sync_model, sync_shuttle))'.dependencies]
 shuttle = "0.9.8"
 
-[dev-dependencies]
-# The microbenches' harness and counting allocator.
-mipyre_microbench = { path = "../microbench" }
-
 [lints]
 workspace = true
-
-# The per-call benches, one per module they measure (`mipyre_microbench::run`).
-[[bench]]
-name = "interp"
-harness = false
-
-[[bench]]
-name = "gc"
-harness = false

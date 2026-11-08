@@ -34,10 +34,14 @@ def run_main(req):
     app.state.incr("runs", 1)
     return {"ran": True}
 
-@app.websocket("/ws")
-async def ws(ws):
-    await ws.send("hello")
+def hello(ws):
+    ws.send("hello")
     ws.close()
+
+# The pool (MIPYRE_TPC=0) has no TPC thread for a worker route's connection to run on.
+@app.websocket("/ws", on_connect=hello, runtime="main" if os.environ.get("MIPYRE_TPC") == "0" else None)
+def ws(ws, msg):
+    return None
 
 @app.get("/runs")
 def runs(req):
@@ -194,10 +198,13 @@ def _trusting_app() -> Mipyre:
     app = Mipyre(runtime="main")
     app.enable_cors(allow_origins=["https://app.test"], allow_credentials=True)
 
-    @app.websocket("/ws")
-    async def ws(ws):
-        await ws.send("hello")
+    def hello(ws):
+        ws.send("hello")
         ws.close()
+
+    @app.websocket("/ws", on_connect=hello)
+    def ws(ws, msg):
+        return None
 
     return app
 

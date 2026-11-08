@@ -10,21 +10,21 @@ mod ring_model;
 mod slot;
 #[cfg(test)]
 #[cfg(not(shm_model))]
-mod slot_fuzz;
+mod slot_take;
 
 pub use self::ends::{
-    sleep_all, wake_all, Attempt, DeadPeerAnswer, DeadPeerError, HostEnd, PeerEnd, PeerFault, SleepVerdict,
-    StartOutcome, Wait,
+    finish_wait, prepare_to_wait, Attempt, DeadPeerResponse, PeerEnd, PeerFault, RequesterEnd, SleepDecision,
+    StartOutcome, TakeOverError, WaitOutcome,
 };
-pub use self::header::{WaitTotals, NOTE_BYTES};
+pub use self::header::{Waits, NOTE_BYTES};
 #[cfg(not(shm_model))]
 pub use self::memory::HeapMemory;
 pub use self::memory::{Memory, MessageView};
 #[cfg(shm_model)]
 pub use self::memory::{ModelMemory, MODEL_SLOT};
-pub use self::slot::{PeerRequest, ReadyAnswers, RequestSlot, SlotRoomError, SlotWriter};
+pub use self::slot::{PeerRequest, ReadyResponses, RequestSlot, SlotRoomError, SlotWriter};
 
-/// One channel between a host and a peer, for one run: every run makes a new one, so its memory starts zeroed and
+/// One channel between a caller and a peer, for one run: every run makes a new one, so its memory starts zeroed and
 /// no peer of an earlier run can write into it.
 pub struct Channel<M: Memory> {
     memory: M,
@@ -37,7 +37,7 @@ impl<M: Memory> Channel<M> {
     }
 
     /// Returns how the peer waited, as it counted; it counts over this channel's run only.
-    pub fn peer_waits(&self) -> WaitTotals {
+    pub fn peer_waits(&self) -> Waits {
         self.memory.header().peer_waits.read()
     }
 }

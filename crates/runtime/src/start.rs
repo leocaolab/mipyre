@@ -196,8 +196,9 @@ pub trait ThreadResident: Sized {
 }
 
 impl<R: RequestRunner> ThreadResident for SubInterpreterWorker<R> {
+    /// Ends the interpreter, which its drop does.
     fn end_here(self) {
-        self.end_on_own_thread()
+        drop(self);
     }
 }
 
@@ -316,10 +317,10 @@ mod tests {
         let worker = WorkerIndex::new(1);
         let refused = WorkerStartError::CreationFailed {
             worker,
-            source: mipyre_subinterp::NewInterpreterError::new(
-                Some("Py_NewInterpreterFromConfig".into()),
-                Some("refused".into()),
-            ),
+            source: mipyre_subinterp::NewInterpreterError::Refused(mipyre_subinterp::PyStatusError {
+                func: Some("Py_NewInterpreterFromConfig".into()),
+                message: Some("refused".into()),
+            }),
         };
         assert!(refused.to_string().starts_with("worker 1: "), "{refused}");
         assert_eq!(refused.kind(), "creation_failed");
@@ -329,12 +330,12 @@ mod tests {
     }
 
     /// Counts its ends, checking each happens on the thread that created it.
-    struct Counted {
+    struct FakeWorker {
         ends: Arc<AtomicUsize>,
         created_on: std::thread::ThreadId,
     }
 
-    impl ThreadResident for Counted {
+    impl ThreadResident for FakeWorker {
         fn end_here(self) {
             assert_eq!(
                 std::thread::current().id(),
@@ -383,16 +384,16 @@ mod tests {
                     most.fetch_max(now, Ordering::SeqCst);
                     turns.lock().unwrap().push(i);
                     let created = match fate {
-                        Fate::Created => Ok(Counted {
+                        Fate::Created => Ok(FakeWorker {
                             ends: Arc::clone(&ends),
                             created_on: std::thread::current().id(),
                         }),
                         Fate::CreationRefused => Err(WorkerStartError::CreationFailed {
                             worker: index,
-                            source: NewInterpreterError::new(
-                                Some("Py_NewInterpreterFromConfig".into()),
-                                Some("out of memory".into()),
-                            ),
+                            source: NewInterpreterError::Refused(mipyre_subinterp::PyStatusError {
+                                func: Some("Py_NewInterpreterFromConfig".into()),
+                                message: Some("out of memory".into()),
+                            }),
                         }),
                         Fate::PrepareRaised => Err(WorkerStartError::NoRoutes {
                             worker: index,
@@ -495,7 +496,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let started = start_here(start_handle, WorkerIndex::new(i), || {
                     created.fetch_add(1, Ordering::SeqCst);
-                    Ok(None::<Counted>)
+                    Ok(None::<FakeWorker>)
                 });
                 assert!(started.is_none(), "an aborted start serves nothing");
             }));
@@ -516,7 +517,7 @@ mod tests {
         let gone = gate.enlist();
         let kept = gate.enlist();
         let waiter =
-            std::thread::spawn(move || start_here(kept, WorkerIndex::new(1), || Ok(None::<Counted>)).is_none());
+            std::thread::spawn(move || start_here(kept, WorkerIndex::new(1), || Ok(None::<FakeWorker>)).is_none());
         drop(gone);
         let aborted = gate.serve_or_abort(vec![(), ()]).expect_err("the start fails");
         assert_eq!(kinds(&aborted), vec!["report_lost"]);

@@ -1,10 +1,9 @@
 """A Python call that blocks does not take the server's IO with it.
 
-- A blocking main-interpreter handler (and a WebSocket handler's join) runs on the blocking
-  pool, not a Tokio IO thread: with as many blocked as there are IO threads, every other route
-  would starve.
-- A WebSocket handler's `recv()` waits for the client detached from the GIL, not freezing every
-  other Python thread.
+- A blocking main-interpreter handler runs on the blocking pool, not a Tokio IO thread: with as
+  many blocked as there are IO threads, every other route would starve.
+- A WebSocket connection waiting for its client's next message holds no Python thread and not
+  the GIL, so every other Python thread runs.
 """
 
 from __future__ import annotations
@@ -58,11 +57,12 @@ from mipyre import Mipyre, ServerFlags
 
 app = Mipyre(runtime="main")
 
-@app.websocket("/wait")
-async def wait(ws):
-    await ws.send("ready")
-    msg = await ws.recv()
-    await ws.send(f"got {msg}")
+def ready(ws):
+    return "ready"
+
+@app.websocket("/wait", on_connect=ready)
+def wait(ws, msg):
+    return f"got {msg}"
 
 @app.get("/python")
 def python(req):
@@ -108,13 +108,13 @@ def _answers(port: int) -> bool:
         return False
 
 
-def test_a_websocket_handler_waiting_in_recv_leaves_other_python_threads_running(ws_server):
+def test_a_websocket_connection_waiting_for_a_message_leaves_other_python_threads_running(ws_server):
     from websockets.sync.client import connect
 
     with connect(f"ws://127.0.0.1:{ws_server}/wait", open_timeout=10) as ws:
         assert ws.recv(timeout=10) == "ready"
-        # The handler is now waiting in recv() for this client. Another Python thread (a
-        # handler on the blocking pool) still runs: recv() waits without the GIL.
+        # The connection now waits for this client's next message. Another Python thread (a
+        # handler on the blocking pool) still runs: the wait is the server's, outside Python.
         with urllib.request.urlopen(f"http://127.0.0.1:{ws_server}/python", timeout=10) as resp:
             assert resp.read() == b"ran"
         ws.send("done")

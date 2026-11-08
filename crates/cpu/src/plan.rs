@@ -39,7 +39,7 @@ impl Cpus {
     }
 }
 
-/// The allowed CPUs of one physical core. It is never empty, because only [`decide`] makes one,
+/// The allowed CPUs of one physical core. It is never empty, because only [`group_cores`] makes one,
 /// and it puts the core's own CPU first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CoreCpus {
@@ -65,13 +65,13 @@ struct Core {
 }
 
 /// This process's physical cores in order of their first CPU. It is never empty, because only
-/// [`decide`] makes one, from [`Facts`] that hold at least one CPU.
+/// [`group_cores`] makes one, from [`Topology`] that hold at least one CPU.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CoreGroups {
+pub(crate) struct Cores {
     cores: Vec<Core>,
 }
 
-impl CoreGroups {
+impl Cores {
     fn fastest(&self) -> u32 {
         self.cores.iter().map(|c| c.perf).fold(u32::MIN, u32::max)
     }
@@ -106,7 +106,7 @@ impl CoreGroups {
 
 /// One allowed CPU's readings; a reading that was not made is `None`.
 #[derive(Clone, Debug)]
-pub(crate) struct CpuFacts {
+pub(crate) struct CpuTopology {
     /// The CPU's SMT siblings; the list may name the CPU itself and CPUs outside the mask.
     pub(crate) siblings: Vec<CoreId>,
     pub(crate) cache: Option<Vec<CoreId>>,
@@ -116,7 +116,7 @@ pub(crate) struct CpuFacts {
 
 /// The readings of the allowed CPUs, each reading whole or not at all.
 #[derive(Clone, Debug)]
-pub(crate) struct Facts {
+pub(crate) struct Topology {
     /// Each allowed CPU's SMT siblings; a list may name the CPU itself and CPUs outside the mask.
     siblings: BTreeMap<CoreId, Vec<CoreId>>,
     /// Each allowed CPU's L3 list, in the order of `siblings`.
@@ -125,9 +125,9 @@ pub(crate) struct Facts {
     perf: Option<Vec<u32>>,
 }
 
-impl Facts {
+impl Topology {
     /// Uses a reading only when every CPU has it. Returns `None` when there is no CPU.
-    pub(crate) fn new(cpus: BTreeMap<CoreId, CpuFacts>) -> Option<Self> {
+    pub(crate) fn new(cpus: BTreeMap<CoreId, CpuTopology>) -> Option<Self> {
         if cpus.is_empty() {
             return None;
         }
@@ -145,7 +145,7 @@ impl Facts {
                 values
             });
         }
-        Some(Facts { siblings, cache, perf })
+        Some(Topology { siblings, cache, perf })
     }
 
     fn allows(&self, cpu: CoreId) -> bool {
@@ -186,7 +186,7 @@ impl CpuOrder {
 /// A CPU already grouped stays put even when a later CPU's siblings list it (the lists disagree).
 /// Cores come in CPU order, so numbering cache keys by first appearance numbers the domains by
 /// their lowest CPU.
-pub(crate) fn decide(facts: &Facts) -> CoreGroups {
+pub(crate) fn group_cores(facts: &Topology) -> Cores {
     let mut placed: BTreeSet<CoreId> = BTreeSet::new();
     let mut domains: BTreeMap<CoreId, usize> = BTreeMap::new();
     let mut cores = Vec::new();
@@ -216,12 +216,12 @@ pub(crate) fn decide(facts: &Facts) -> CoreGroups {
             perf: facts.perf.as_ref().map_or(0, |values| values[row]),
         });
     }
-    CoreGroups { cores }
+    Cores { cores }
 }
 
 /// Names an L3 domain by its lowest allowed CPU. The core's own CPU counts, so a list that names
 /// no allowed CPU still gives the core a domain of its own.
-fn cache_key(facts: &Facts, list: &[CoreId], cpu: CoreId) -> CoreId {
+fn cache_key(facts: &Topology, list: &[CoreId], cpu: CoreId) -> CoreId {
     list.iter()
         .copied()
         .filter(|&c| facts.allows(c))
@@ -230,7 +230,7 @@ fn cache_key(facts: &Facts, list: &[CoreId], cpu: CoreId) -> CoreId {
 
 const P_CORE: u32 = 2;
 const E_CORE: u32 = 1;
-// `CoreGroups` takes the highest value as the fastest tier, so a P-core must be above an E-core.
+// `Cores` takes the highest value as the fastest tier, so a P-core must be above an E-core.
 const _: () = assert!(P_CORE > E_CORE);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,7 +251,7 @@ impl std::fmt::Display for PerfValueError {
 
 impl std::error::Error for PerfValueError {}
 
-/// Returns a CPU's performance value: on a hybrid host, which lists its P-cores, whether the CPU
+/// Returns a CPU's performance value: on a hybrid machine, which lists its P-cores, whether the CPU
 /// is one; elsewhere its `cpu_capacity`.
 pub(crate) fn perf_value(p_cores: Option<&CpuSet>, cpu: CoreId, capacity: Option<u32>) -> Option<u32> {
     match p_cores {
@@ -261,8 +261,8 @@ pub(crate) fn perf_value(p_cores: Option<&CpuSet>, cpu: CoreId, capacity: Option
 }
 
 /// Returns the first CPU without a performance value when another CPU has one, which leaves
-/// the values unused. A host where no CPU has one has one tier, which is not a gap.
-pub(crate) fn perf_gap(cpus: &BTreeMap<CoreId, CpuFacts>) -> Option<PerfValueError> {
+/// the values unused. A machine where no CPU has one has one tier, which is not a gap.
+pub(crate) fn perf_gap(cpus: &BTreeMap<CoreId, CpuTopology>) -> Option<PerfValueError> {
     if cpus.values().all(|facts| facts.perf.is_none()) {
         return None;
     }
@@ -271,8 +271,8 @@ pub(crate) fn perf_gap(cpus: &BTreeMap<CoreId, CpuFacts>) -> Option<PerfValueErr
         .map(|(&cpu, _)| PerfValueError::CapacityMissing { cpu })
 }
 
-/// A CPU set in the layout of the kernel's `cpu_set_t`, sized at run time like glibc's
-/// `CPU_ALLOC`: on a host with more than 1024 possible CPUs, `sched_getaffinity` refuses the fixed
+/// An affinity mask in the layout of the kernel's `cpu_set_t`, sized at run time like glibc's
+/// `CPU_ALLOC`: on a machine with more than 1024 possible CPUs, `sched_getaffinity` refuses the fixed
 /// `cpu_set_t` with `EINVAL`. A CPU it has no room for is refused rather than a panic, because the
 /// numbers come from the OS.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -361,7 +361,7 @@ pub const MAX_CPUS: usize = 8192;
 pub(crate) struct CpuSet {
     /// Boxed, so passing a set along moves a pointer and not a kilobyte.
     words: Box<[u64; MAX_CPUS / 64]>,
-    /// One past the last word with a CPU in it, so listing a small host's set reads one word.
+    /// One past the last word with a CPU in it, so listing a small machine's set reads one word.
     end: usize,
 }
 
@@ -409,28 +409,28 @@ impl std::fmt::Debug for CpuSet {
     }
 }
 
-pub(crate) fn parse_cpu_list(text: &str) -> Result<CpuSet, CpuListError> {
-    let fault = |fault| CpuListError {
+pub(crate) fn parse_cpu_list(text: &str) -> Result<CpuSet, ParseCpuListError> {
+    let fault = |fault| ParseCpuListError {
         text: text.to_owned(),
         fault,
     };
     let number = |part: &str| {
         let cpu: usize = part
             .parse()
-            .map_err(|_| fault(CpuListFault::NotACpu { part: part.to_owned() }))?;
+            .map_err(|_| fault(CpuListErrorKind::NotACpu { part: part.to_owned() }))?;
         if cpu >= MAX_CPUS {
-            return Err(fault(CpuListFault::PastMaxCpus { cpu }));
+            return Err(fault(CpuListErrorKind::PastMaxCpus { cpu }));
         }
         Ok(cpu)
     };
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err(fault(CpuListFault::Empty));
+        return Err(fault(CpuListErrorKind::Empty));
     }
     let mut cpus = CpuSet::empty();
     for part in trimmed.split(',') {
         if part.is_empty() {
-            return Err(fault(CpuListFault::EmptyPart));
+            return Err(fault(CpuListErrorKind::EmptyPart));
         }
         let (lo, hi) = match part.split_once('-') {
             Some((lo, hi)) => (number(lo)?, number(hi)?),
@@ -440,7 +440,7 @@ pub(crate) fn parse_cpu_list(text: &str) -> Result<CpuSet, CpuListError> {
             }
         };
         if lo > hi {
-            return Err(fault(CpuListFault::Reversed { lo, hi }));
+            return Err(fault(CpuListErrorKind::Reversed { lo, hi }));
         }
         cpus.insert_range(lo, hi);
     }
@@ -448,13 +448,13 @@ pub(crate) fn parse_cpu_list(text: &str) -> Result<CpuSet, CpuListError> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CpuListError {
+pub struct ParseCpuListError {
     text: String,
-    fault: CpuListFault,
+    fault: CpuListErrorKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum CpuListFault {
+enum CpuListErrorKind {
     Empty,
     EmptyPart,
     NotACpu { part: String },
@@ -462,21 +462,21 @@ enum CpuListFault {
     PastMaxCpus { cpu: usize },
 }
 
-impl std::fmt::Display for CpuListError {
+impl std::fmt::Display for ParseCpuListError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = &self.text;
         match &self.fault {
-            CpuListFault::Empty => write!(f, "{text:?} is not a CPU list: it is empty"),
-            CpuListFault::EmptyPart => {
+            CpuListErrorKind::Empty => write!(f, "{text:?} is not a CPU list: it is empty"),
+            CpuListErrorKind::EmptyPart => {
                 write!(f, "{text:?} is not a CPU list: it has an empty part")
             }
-            CpuListFault::NotACpu { part } => {
+            CpuListErrorKind::NotACpu { part } => {
                 write!(f, "{text:?} is not a CPU list: {part:?} is not a CPU number")
             }
-            CpuListFault::Reversed { lo, hi } => {
+            CpuListErrorKind::Reversed { lo, hi } => {
                 write!(f, "{text:?} is not a CPU list: the range {lo}-{hi} runs backwards")
             }
-            CpuListFault::PastMaxCpus { cpu } => write!(
+            CpuListErrorKind::PastMaxCpus { cpu } => write!(
                 f,
                 "{text:?} is not a CPU list: CPU {cpu} is past the {MAX_CPUS} CPUs Linux can have"
             ),
@@ -484,7 +484,7 @@ impl std::fmt::Display for CpuListError {
     }
 }
 
-impl std::error::Error for CpuListError {}
+impl std::error::Error for ParseCpuListError {}
 
 pub(crate) fn tightest(a: Quota, b: Quota) -> Quota {
     match (a, b) {
@@ -495,38 +495,38 @@ pub(crate) fn tightest(a: Quota, b: Quota) -> Quota {
 
 /// Rounds down but never below one: a 2.5-CPU quota gives 2, because a third pinned thread
 /// would stall on the quota.
-pub(crate) fn parse_cpu_max(text: &str) -> Result<Quota, CpuMaxError> {
-    let fault = |fault| CpuMaxError {
+pub(crate) fn parse_cpu_max(text: &str) -> Result<Quota, ParseCpuMaxError> {
+    let fault = |fault| ParseCpuMaxError {
         text: text.to_owned(),
         fault,
     };
     let mut parts = text.split_whitespace();
     let (Some(quota), Some(period), None) = (parts.next(), parts.next(), parts.next()) else {
-        return Err(fault(CpuMaxFault::NotTwoFields));
+        return Err(fault(CpuMaxErrorKind::NotTwoFields));
     };
-    let period: u64 = period.parse().map_err(|_| fault(CpuMaxFault::PeriodNotANumber))?;
+    let period: u64 = period.parse().map_err(|_| fault(CpuMaxErrorKind::PeriodNotANumber))?;
     if period == 0 {
-        return Err(fault(CpuMaxFault::PeriodZero));
+        return Err(fault(CpuMaxErrorKind::PeriodZero));
     }
     if quota == "max" {
         return Ok(Quota::Unlimited);
     }
-    let quota: u64 = quota.parse().map_err(|_| fault(CpuMaxFault::QuotaNotANumber))?;
+    let quota: u64 = quota.parse().map_err(|_| fault(CpuMaxErrorKind::QuotaNotANumber))?;
     if quota == 0 {
-        return Err(fault(CpuMaxFault::QuotaZero));
+        return Err(fault(CpuMaxErrorKind::QuotaZero));
     }
-    let cores = usize::try_from(quota / period).map_err(|_| fault(CpuMaxFault::PastUsize))?;
+    let cores = usize::try_from(quota / period).map_err(|_| fault(CpuMaxErrorKind::PastUsize))?;
     Ok(Quota::Cores(NonZeroUsize::new(cores).unwrap_or(NonZeroUsize::MIN)))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CpuMaxError {
+pub struct ParseCpuMaxError {
     pub text: String,
-    pub fault: CpuMaxFault,
+    pub fault: CpuMaxErrorKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CpuMaxFault {
+pub enum CpuMaxErrorKind {
     NotTwoFields,
     PeriodNotANumber,
     PeriodZero,
@@ -535,33 +535,33 @@ pub enum CpuMaxFault {
     PastUsize,
 }
 
-impl std::fmt::Display for CpuMaxError {
+impl std::fmt::Display for ParseCpuMaxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let why = match self.fault {
-            CpuMaxFault::NotTwoFields => "expected two fields: quota and period",
-            CpuMaxFault::PeriodNotANumber => "the period is not a number",
-            CpuMaxFault::PeriodZero => "the period is zero",
-            CpuMaxFault::QuotaNotANumber => "the quota is neither `max` nor a number",
-            CpuMaxFault::QuotaZero => "the quota is zero",
-            CpuMaxFault::PastUsize => "the quota is more CPUs than this platform counts",
+            CpuMaxErrorKind::NotTwoFields => "expected two fields: quota and period",
+            CpuMaxErrorKind::PeriodNotANumber => "the period is not a number",
+            CpuMaxErrorKind::PeriodZero => "the period is zero",
+            CpuMaxErrorKind::QuotaNotANumber => "the quota is neither `max` nor a number",
+            CpuMaxErrorKind::QuotaZero => "the quota is zero",
+            CpuMaxErrorKind::PastUsize => "the quota is more CPUs than this platform counts",
         };
         write!(f, "{:?} is not a cpu.max line: {why}", self.text)
     }
 }
 
-impl std::error::Error for CpuMaxError {}
+impl std::error::Error for ParseCpuMaxError {}
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
-    /// Returns each core's first CPU, for the host test in `os.rs`.
-    pub(crate) fn first_cpus(cores: &CoreGroups) -> Vec<CoreId> {
+    /// Returns each core's first CPU, for the machine test in `os.rs`.
+    pub(crate) fn first_cpus(cores: &Cores) -> Vec<CoreId> {
         cores.cores.iter().map(|c| c.cpus.first()).collect()
     }
 
-    /// Returns how many cores there are, for the host test in `os.rs`.
-    pub(crate) fn core_count(cores: &CoreGroups) -> usize {
+    /// Returns how many cores there are, for the machine test in `os.rs`.
+    pub(crate) fn core_count(cores: &Cores) -> usize {
         cores.cores.len()
     }
 
@@ -576,54 +576,54 @@ pub(crate) mod tests {
         }
     }
 
-    fn host(
+    fn machine(
         allowed: &[usize],
         siblings: impl Fn(usize) -> Vec<usize>,
         cache: impl Fn(usize) -> Vec<usize>,
         perf: impl Fn(usize) -> u32,
-    ) -> Facts {
-        rows(allowed, |c| CpuFacts {
+    ) -> Topology {
+        rows(allowed, |c| CpuTopology {
             siblings: ids(&siblings(c)),
             cache: Some(ids(&cache(c))),
             perf: Some(perf(c)),
         })
     }
 
-    fn rows(allowed: &[usize], facts: impl Fn(usize) -> CpuFacts) -> Facts {
-        Facts::new(allowed.iter().map(|&c| (CoreId { id: c }, facts(c))).collect()).unwrap()
+    fn rows(allowed: &[usize], facts: impl Fn(usize) -> CpuTopology) -> Topology {
+        Topology::new(allowed.iter().map(|&c| (CoreId { id: c }, facts(c))).collect()).unwrap()
     }
 
-    fn order(facts: &Facts, k: Option<usize>) -> Vec<usize> {
-        let cpus: Vec<usize> = decide(facts).pin_order().cpus().iter().map(|c| c.id).collect();
+    fn order(facts: &Topology, k: Option<usize>) -> Vec<usize> {
+        let cpus: Vec<usize> = group_cores(facts).pin_order().cpus().iter().map(|c| c.id).collect();
         match k {
             Some(k) => cpus[..k.min(cpus.len())].to_vec(),
             None => cpus,
         }
     }
 
-    fn threads(facts: &Facts, quota: Quota) -> usize {
-        threads_for(decide(facts).top_count(), quota).get()
+    fn threads(facts: &Topology, quota: Quota) -> usize {
+        threads_for(group_cores(facts).top_count(), quota).get()
     }
 
-    fn cores_of(facts: &Facts) -> CoreGroups {
-        decide(facts)
+    fn cores_of(facts: &Topology) -> Cores {
+        group_cores(facts)
     }
 
     /// Returns how many cache domains the cores are in.
-    pub(crate) fn domain_count(cores: &CoreGroups) -> usize {
+    pub(crate) fn domain_count(cores: &Cores) -> usize {
         cores.cores.iter().map(|c| c.domain).collect::<BTreeSet<_>>().len()
     }
 
-    /// Builds a host where CPU n and CPU n+8 are one core, with one L3 and one tier.
-    fn smt_pairs_one_l3(allowed: &[usize]) -> Facts {
-        host(allowed, |c| vec![c % 8, c % 8 + 8], |_| (0..16).collect(), |_| 1024)
+    /// Builds a machine where CPU n and CPU n+8 are one core, with one L3 and one tier.
+    fn smt_pairs_one_l3(allowed: &[usize]) -> Topology {
+        machine(allowed, |c| vec![c % 8, c % 8 + 8], |_| (0..16).collect(), |_| 1024)
     }
 
     /// Builds a cpuset of CPUs 0-31 and 64-95, where CPU n and CPU n+64 are one core, over 16
     /// four-core L3 domains.
-    fn four_core_l3_domains_under_a_cpuset() -> Facts {
+    fn four_core_l3_domains_under_a_cpuset() -> Topology {
         let allowed: Vec<usize> = (0..32).chain(64..96).collect();
-        host(
+        machine(
             &allowed,
             |c| vec![c % 64, c % 64 + 64],
             |c| {
@@ -635,8 +635,8 @@ pub(crate) mod tests {
     }
 
     /// Builds six fast cores (0-5) and twelve slow ones (6-17), one CPU each, in one L3.
-    fn two_tiers_no_smt() -> Facts {
-        host(
+    fn two_tiers_no_smt() -> Topology {
+        machine(
             &(0..18).collect::<Vec<_>>(),
             |c| vec![c],
             |_| (0..18).collect(),
@@ -645,8 +645,8 @@ pub(crate) mod tests {
     }
 
     /// Builds fast cores 0-15 as SMT pairs (2n, 2n+1) and slow cores 16-31, in one L3.
-    fn hybrid_fast_and_slow_cores() -> Facts {
-        host(
+    fn hybrid_fast_and_slow_cores() -> Topology {
+        machine(
             &(0..32).collect::<Vec<_>>(),
             |c| {
                 if c < 16 {
@@ -753,7 +753,7 @@ pub(crate) mod tests {
         assert_eq!(parse_cpu_max("250000 100000").unwrap(), Quota::Cores(n(2)));
         assert_eq!(parse_cpu_max("50000 100000").unwrap(), Quota::Cores(n(1)));
         for bad in ["", "max", "0 100000", "400000 0", "x 100000", "1 2 3", "max x"] {
-            assert!(matches!(parse_cpu_max(bad), Err(CpuMaxError { .. })), "{bad:?}");
+            assert!(matches!(parse_cpu_max(bad), Err(ParseCpuMaxError { .. })), "{bad:?}");
         }
     }
 
@@ -768,7 +768,7 @@ pub(crate) mod tests {
     #[test]
     fn an_unread_cache_is_one_domain() {
         // CPU n and CPU n+4 are one core, and each pair would have its own L3 if it were read.
-        let f = rows(&(0..8).collect::<Vec<_>>(), |c| CpuFacts {
+        let f = rows(&(0..8).collect::<Vec<_>>(), |c| CpuTopology {
             siblings: ids(&[c % 4, c % 4 + 4]),
             cache: None,
             perf: Some(1),
@@ -779,13 +779,13 @@ pub(crate) mod tests {
     #[test]
     fn a_cache_read_for_some_cores_only_is_not_used() {
         // There would be two L3s, but core 1's is not read, so there is one domain.
-        let f = rows(&[0, 1], |c| CpuFacts {
+        let f = rows(&[0, 1], |c| CpuTopology {
             siblings: ids(&[c]),
             cache: (c == 0).then(|| ids(&[0])),
             perf: Some(1),
         });
         assert_eq!(domain_count(&cores_of(&f)), 1);
-        let read = rows(&[0, 1], |c| CpuFacts {
+        let read = rows(&[0, 1], |c| CpuTopology {
             siblings: ids(&[c]),
             cache: Some(ids(&[c])),
             perf: Some(1),
@@ -796,7 +796,7 @@ pub(crate) mod tests {
     #[test]
     fn an_l3_list_without_an_allowed_cpu_is_the_cores_own_domain() {
         // CPU 1's L3 list names only CPUs outside the mask; the key falls back to CPU 1 itself.
-        let f = rows(&[0, 1], |c| CpuFacts {
+        let f = rows(&[0, 1], |c| CpuTopology {
             siblings: ids(&[c]),
             cache: Some(if c == 0 { ids(&[0]) } else { ids(&[9]) }),
             perf: Some(1),
@@ -806,7 +806,7 @@ pub(crate) mod tests {
 
     #[test]
     fn an_unread_perf_is_one_tier_so_every_core_counts() {
-        let f = rows(&[0, 1, 2, 3], |c| CpuFacts {
+        let f = rows(&[0, 1, 2, 3], |c| CpuTopology {
             siblings: ids(&[c]),
             cache: Some(ids(&[0, 1, 2, 3])),
             perf: None,
@@ -817,7 +817,7 @@ pub(crate) mod tests {
     #[test]
     fn a_perf_read_for_some_cores_only_is_not_used() {
         // Core 0 would be the one fast core, but core 3's value is not read: one tier.
-        let f = rows(&[0, 1, 2, 3], |c| CpuFacts {
+        let f = rows(&[0, 1, 2, 3], |c| CpuTopology {
             siblings: ids(&[c]),
             cache: Some(ids(&[0, 1, 2, 3])),
             perf: (c != 3).then_some(if c == 0 { 2 } else { 1 }),
@@ -827,14 +827,14 @@ pub(crate) mod tests {
 
     #[test]
     fn facts_with_no_cpu_are_refused() {
-        assert!(Facts::new(BTreeMap::new()).is_none());
+        assert!(Topology::new(BTreeMap::new()).is_none());
     }
 
     /// Both edges of "every CPU has the reading": the first CPU or the last one without it.
     #[test]
     fn a_reading_missing_for_the_first_or_the_last_cpu_is_used_for_none() {
         for missing in [0, 2] {
-            let f = rows(&[0, 1, 2], |c| CpuFacts {
+            let f = rows(&[0, 1, 2], |c| CpuTopology {
                 siblings: ids(&[c]),
                 cache: (c != missing).then(|| ids(&[0, 1, 2])),
                 perf: (c != missing).then_some(1),
@@ -842,7 +842,7 @@ pub(crate) mod tests {
             assert_eq!(f.cache, None, "missing for CPU {missing}");
             assert_eq!(f.perf, None, "missing for CPU {missing}");
         }
-        let whole = rows(&[0, 1, 2], |c| CpuFacts {
+        let whole = rows(&[0, 1, 2], |c| CpuTopology {
             siblings: ids(&[c]),
             cache: Some(ids(&[0, 1, 2])),
             perf: Some(1),
@@ -875,11 +875,11 @@ pub(crate) mod tests {
         assert_eq!(perf_value(None, CoreId { id: 0 }, None), None);
     }
 
-    fn perfs(values: &[(usize, Option<u32>)]) -> BTreeMap<CoreId, CpuFacts> {
+    fn perfs(values: &[(usize, Option<u32>)]) -> BTreeMap<CoreId, CpuTopology> {
         values
             .iter()
             .map(|&(c, perf)| {
-                let facts = CpuFacts {
+                let facts = CpuTopology {
                     siblings: ids(&[c]),
                     cache: None,
                     perf,
@@ -914,11 +914,11 @@ pub(crate) mod tests {
 
     #[test]
     fn readings_become_one_row_per_allowed_cpu_and_an_unmade_one_is_unused() {
-        let facts = Facts::new(
+        let facts = Topology::new(
             [
                 (
                     CoreId { id: 0 },
-                    CpuFacts {
+                    CpuTopology {
                         siblings: ids(&[0]),
                         cache: Some(ids(&[0, 1])),
                         perf: None,
@@ -926,7 +926,7 @@ pub(crate) mod tests {
                 ),
                 (
                     CoreId { id: 1 },
-                    CpuFacts {
+                    CpuTopology {
                         siblings: ids(&[1]),
                         cache: Some(ids(&[0, 1])),
                         perf: None,
@@ -1028,7 +1028,7 @@ pub(crate) mod tests {
     }
 
     fn grouped(allowed: &[usize], siblings: impl Fn(usize) -> Vec<CoreId>) -> Vec<Vec<CoreId>> {
-        let f = rows(allowed, |c| CpuFacts {
+        let f = rows(allowed, |c| CpuTopology {
             siblings: siblings(c),
             cache: None,
             perf: None,
@@ -1038,7 +1038,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_core_lists_its_first_cpu_then_its_siblings() {
-        let alone = cores_of(&rows(&[5], |_| CpuFacts {
+        let alone = cores_of(&rows(&[5], |_| CpuTopology {
             siblings: Vec::new(),
             cache: None,
             perf: None,
@@ -1048,7 +1048,7 @@ pub(crate) mod tests {
         assert_eq!(cpus, &ids(&[5])[..]);
         assert_eq!(alone.first(), CoreId { id: 5 });
         assert!(alone.rest().is_empty());
-        let smt = cores_of(&rows(&[0, 8], |c| CpuFacts {
+        let smt = cores_of(&rows(&[0, 8], |c| CpuTopology {
             siblings: ids(&[c % 8, c % 8 + 8]),
             cache: None,
             perf: None,
@@ -1069,19 +1069,19 @@ pub(crate) mod tests {
 
     #[test]
     fn a_core_group_order_counts_its_physical_cores() {
-        let one = host(&[5], |c| vec![c], |c| vec![c], |_| 1);
-        let d = decide(&one);
+        let one = machine(&[5], |c| vec![c], |c| vec![c], |_| 1);
+        let d = group_cores(&one);
         assert_eq!(d.pin_order().cpus(), &ids(&[5])[..]);
         assert_eq!(core_count(&d), 1);
         let eight = smt_pairs_one_l3(&(0..16).collect::<Vec<_>>());
-        let d = decide(&eight);
+        let d = group_cores(&eight);
         assert_eq!(core_count(&d), 8);
         assert_eq!(d.pin_order().cpus().len(), 16);
     }
 
     /// Builds slow cores 0-11 and fast cores 12-17, one CPU each, in one L3.
-    fn slow_cores_numbered_first() -> Facts {
-        host(
+    fn slow_cores_numbered_first() -> Topology {
+        machine(
             &(0..18).collect::<Vec<_>>(),
             |c| vec![c],
             |_| (0..18).collect(),
@@ -1091,8 +1091,8 @@ pub(crate) mod tests {
 
     /// Builds two sockets with interleaved CPUs: even CPUs share socket 0's L3 and odd ones socket
     /// 1's; eight cores, no SMT.
-    fn two_sockets_interleaved_even_odd() -> Facts {
-        host(
+    fn two_sockets_interleaved_even_odd() -> Topology {
+        machine(
             &(0..8).collect::<Vec<_>>(),
             |c| vec![c],
             |c| (0..8).filter(|x| x % 2 == c % 2).collect(),
@@ -1117,7 +1117,7 @@ pub(crate) mod tests {
         assert_eq!(order(&f, None), vec![0, 2, 4, 6, 1, 3, 5, 7]);
     }
 
-    fn fault(text: &str) -> CpuListFault {
+    fn fault(text: &str) -> CpuListErrorKind {
         let e = parse_cpu_list(text).unwrap_err();
         assert_eq!(e.text, text, "the error carries the text as given");
         e.fault
@@ -1125,10 +1125,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_cpu_list_that_is_not_one_says_what_is_wrong_with_the_text() {
-        assert_eq!(fault(" "), CpuListFault::Empty);
-        assert_eq!(fault("3-1"), CpuListFault::Reversed { lo: 3, hi: 1 });
-        assert_eq!(fault(",0,,1,"), CpuListFault::EmptyPart);
-        assert_eq!(fault("8192"), CpuListFault::PastMaxCpus { cpu: 8192 });
+        assert_eq!(fault(" "), CpuListErrorKind::Empty);
+        assert_eq!(fault("3-1"), CpuListErrorKind::Reversed { lo: 3, hi: 1 });
+        assert_eq!(fault(",0,,1,"), CpuListErrorKind::EmptyPart);
+        assert_eq!(fault("8192"), CpuListErrorKind::PastMaxCpus { cpu: 8192 });
         assert_eq!(parse_cpu_list("8191"), Ok(set(&[8191])));
     }
 
@@ -1189,18 +1189,18 @@ pub(crate) mod tests {
             period in cpu_max_field(),
         ) {
             let want = if period == 0 {
-                Err(CpuMaxFault::PeriodZero)
+                Err(CpuMaxErrorKind::PeriodZero)
             } else if quota == 0 {
-                Err(CpuMaxFault::QuotaZero)
+                Err(CpuMaxErrorKind::QuotaZero)
             } else {
                 usize::try_from(quota / period)
                     .map(|cores| Quota::Cores(n(cores.max(1))))
-                    .map_err(|_| CpuMaxFault::PastUsize)
+                    .map_err(|_| CpuMaxErrorKind::PastUsize)
             };
             let got = parse_cpu_max(&format!("{quota} {period}\n")).map_err(|e| e.fault);
             proptest::prop_assert_eq!(got, want);
             let unlimited = parse_cpu_max(&format!("max {period}\n")).map_err(|e| e.fault);
-            let want = if period == 0 { Err(CpuMaxFault::PeriodZero) } else { Ok(Quota::Unlimited) };
+            let want = if period == 0 { Err(CpuMaxErrorKind::PeriodZero) } else { Ok(Quota::Unlimited) };
             proptest::prop_assert_eq!(unlimited, want);
         }
 

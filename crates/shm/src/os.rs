@@ -1,5 +1,5 @@
 //! Makes the channel's system calls: the shared memory object and its mapping, the address wait and wake, and the
-//! host's wake pipe. It is the crate's one file with platform `#[cfg]`s and its only caller of the OS; each failure
+//! caller's wake pipe. It is the crate's one file with platform `#[cfg]`s and its only caller of the OS; each failure
 //! goes back as the call that failed and the errno it gave, without a log line.
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -68,8 +68,8 @@ fn failed(call: Syscall) -> impl FnOnce(Errno) -> SyscallError {
 }
 
 /// Creates a shared memory object of `bytes` zeroed bytes whose size is fixed for good, close-on-exec. Every peer
-/// holds the fd and runs user C extensions; one that shrank the object would make the host's next touch of a cut
-/// page a SIGBUS that ends the host, so on Linux the size is sealed before the fd leaves.
+/// holds the fd and runs user C extensions; one that shrank the object would make the caller's next touch of a cut
+/// page a SIGBUS that ends the caller, so on Linux the size is sealed before the fd leaves.
 #[cfg(target_os = "linux")]
 pub(crate) fn shared_memory(bytes: u64) -> Result<OwnedFd, SyscallError> {
     use rustix::fs::{MemfdFlags, SealFlags};
@@ -396,10 +396,10 @@ mod tests {
         }
     }
 
-    /// Runs the shrink a peer could attempt from a real second process holding the fd the host hands out, then
+    /// Runs the shrink a peer could attempt from a real second process holding the fd the caller hands out, then
     /// touches the last byte of the mapping: a shrink that went through would end this test process with SIGBUS.
     #[test]
-    fn a_peer_process_cannot_shrink_the_shared_memory_under_the_host() {
+    fn a_peer_process_cannot_shrink_the_shared_memory_under_the_caller() {
         use std::os::fd::AsRawFd;
         let bytes = 1 << 16;
         let fd = shared_memory(bytes as u64).unwrap();

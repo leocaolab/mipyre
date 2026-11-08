@@ -60,11 +60,6 @@ pub async fn tpc_accept_loop_inline<D: TransportDriver>(
         // Nothing needs collecting before any request ran, so the first tick is one period out.
         tokio::time::interval_at(tokio::time::Instant::now() + tick, tick)
     });
-    let ws = upgrade_target(
-        &tpc_thread.site,
-        tpc_thread.async_pool.as_deref(),
-        tpc_thread.main.as_deref(),
-    );
     let stop = LocalStop::follow(&shutdown);
     let stopped = stop.stopped();
     tokio::pin!(stopped);
@@ -78,6 +73,7 @@ pub async fn tpc_accept_loop_inline<D: TransportDriver>(
     )
     .map_err(ServeError::LaneHost)?;
     let tracker = LocalTasks::new();
+    let ws = upgrade_target(&tpc_thread, &conn_stop, &tracker);
     let ended = loop {
         let event = tokio::select! {
             biased;

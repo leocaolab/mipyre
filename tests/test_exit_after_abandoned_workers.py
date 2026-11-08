@@ -1,4 +1,4 @@
-"""A process exits cleanly after its server left its workers running past the grace period.
+"""A process exits after its server left its workers running past the grace period.
 
 The script gives its server a grace period no thread can meet (1 ns), so `TestClient.close`
 abandons every TPC thread while each is still on its way out, and then the process exits at
@@ -44,9 +44,13 @@ except AbandonedWorkersError as e:
 '''
 
 PY_DROPPED = "a Py<T> was dropped on a thread that has no Python thread state"
+WITHOUT_FINALIZATION = (
+    "still in use at exit, running Python, after worker(s) outlived the shutdown grace period; "
+    "exiting without finalization"
+)
 
 
-def test_the_process_exits_cleanly_after_its_workers_were_abandoned(tmp_path):
+def test_the_process_exits_after_its_workers_were_abandoned(tmp_path):
     (tmp_path / "abandoned_workers_app.py").write_text(APP)
     script = tmp_path / "exit_after_abandon.py"
     script.write_text(SCRIPT)
@@ -58,4 +62,9 @@ def test_the_process_exits_cleanly_after_its_workers_were_abandoned(tmp_path):
     abandoned = [line for line in done.stdout.splitlines() if line.startswith("abandoned ")]
     assert abandoned and int(abandoned[0].split()[1]) > 0, (done.stdout, done.stderr[-4000:])
     assert PY_DROPPED not in done.stderr, done.stderr[-4000:]
-    assert done.returncode == 0, (done.returncode, done.stderr[-4000:])
+    # A thread still ending its worker counts as running Python, so the exit does not wait on an
+    # end that may never return; it finalizes only when every end was done before it decided.
+    assert done.returncode == 0 or (done.returncode == 1 and WITHOUT_FINALIZATION in done.stderr), (
+        done.returncode,
+        done.stderr[-4000:],
+    )

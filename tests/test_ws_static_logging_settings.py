@@ -81,39 +81,20 @@ from mipyre import Mipyre, ServerFlags
 app = Mipyre(runtime="main")
 
 @app.websocket("/echo")
-async def echo(ws):
-    while True:
-        msg = await ws.recv()
-        if msg is None:
-            break
-        await ws.send(f"echo: {{len(msg)}}")
-
-@app.websocket("/strict")
-async def strict(ws):
-    while True:
-        try:
-            msg = await ws.recv()
-        except TypeError:
-            data = await ws.recv_bytes()
-            await ws.send(f"binary:{{len(data)}}")
-            continue
-        if msg is None:
-            break
-        await ws.send(f"text:{{msg}}")
+def echo(ws, msg):
+    return f"echo: {{len(msg)}}"
 
 @app.websocket("/kinds")
-async def kinds(ws):
-    async for msg in ws:
-        await ws.send(type(msg).__name__)
+def kinds(ws, msg):
+    return f"{{type(msg).__name__}}:{{len(msg)}}"
 
 @app.websocket("/big-send")
-async def big_send(ws):
-    await ws.recv()
+def big_send(ws, msg):
     try:
-        await ws.send("x" * (2 * {MIB}))
-        await ws.send("sent")
+        ws.send("x" * (2 * {MIB}))
+        return "sent"
     except ValueError as e:
-        await ws.send(f"ValueError: {{e}}")
+        return f"ValueError: {{e}}"
 
 @app.get("/health")
 def health(req):
@@ -158,6 +139,17 @@ async def test_ws_small_message_still_echoes(ws_server):
 
 
 @pytest.mark.asyncio
+async def test_ws_messages_on_both_sides_of_the_read_buffer_arrive_whole(ws_server):
+    """The server reads its socket 4 KiB at a time; a longer frame grows the buffer to fit."""
+    import websockets
+
+    async with websockets.connect(f"ws://127.0.0.1:{ws_server.port}/echo") as ws:
+        for size in (4 * 1024 - 16, 4 * 1024 + 1, 512 * 1024):
+            await ws.send("z" * size)
+            assert await asyncio.wait_for(ws.recv(), timeout=5) == f"echo: {size}"
+
+
+@pytest.mark.asyncio
 async def test_ws_send_over_max_message_size_raises_value_error(ws_server):
     """The outgoing cap counts bytes, not messages: an oversized send raises."""
     import websockets
@@ -170,25 +162,14 @@ async def test_ws_send_over_max_message_size_raises_value_error(ws_server):
 
 
 @pytest.mark.asyncio
-async def test_ws_recv_does_not_drop_binary(ws_server):
-    import websockets
-
-    async with websockets.connect(f"ws://127.0.0.1:{ws_server.port}/strict") as ws:
-        await ws.send(b"\x01\x02\x03")
-        await ws.send("hi")
-        assert await asyncio.wait_for(ws.recv(), timeout=5) == "binary:3"
-        assert await asyncio.wait_for(ws.recv(), timeout=5) == "text:hi"
-
-
-@pytest.mark.asyncio
-async def test_ws_recv_message_returns_str_or_bytes(ws_server):
+async def test_ws_binary_and_text_both_reach_the_handler_in_order(ws_server):
     import websockets
 
     async with websockets.connect(f"ws://127.0.0.1:{ws_server.port}/kinds") as ws:
-        await ws.send(b"\x00")
-        assert await asyncio.wait_for(ws.recv(), timeout=5) == "bytes"
-        await ws.send("t")
-        assert await asyncio.wait_for(ws.recv(), timeout=5) == "str"
+        await ws.send(b"\x01\x02\x03")
+        await ws.send("hi")
+        assert await asyncio.wait_for(ws.recv(), timeout=5) == "bytes:3"
+        assert await asyncio.wait_for(ws.recv(), timeout=5) == "str:2"
 
 
 def test_ws_limit_setters_reject_bad_values():

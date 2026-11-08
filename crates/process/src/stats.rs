@@ -4,7 +4,7 @@ use super::host::LaneRunError;
 use super::pid::Pid;
 use super::run::{RunPhase, ServerLanes};
 use crate::sync::{AtomicU64, Mutex, Ordering::*};
-use mipyre_shm::channel::WaitTotals;
+use mipyre_shm::channel::Waits;
 
 /// Caps the respawn latencies kept for `stats()` to the most recent ones, so a server that
 /// loses workers for months does not grow by them.
@@ -35,11 +35,11 @@ pub struct StatsSnapshot {
     pub respawn_us: Vec<u64>,
     pub worker_pids: Vec<Option<Pid>>,
     pub requests_in_lanes: usize,
-    pub host_waits: WaitTotals,
-    pub worker_waits: WaitTotals,
-    pub host_events: HostEvents,
+    pub host_waits: Waits,
+    pub worker_waits: Waits,
+    pub host_events: HostEventCounts,
     pub host_failures: u64,
-    pub lanes_broken: usize,
+    pub broken_lanes: usize,
     pub fatal: Option<LaneRunError>,
 }
 
@@ -51,76 +51,66 @@ impl StatsSnapshot {
     }
 }
 
-/// Holds a counter whose one writer adds with a plain load and store instead of a
-/// read-modify-write; others only read it.
-#[derive(Default)]
-pub(crate) struct OwnCounter(AtomicU64);
-
-impl OwnCounter {
-    /// Adds `n`; only the counter's one writer may call it.
-    #[inline]
-    pub(crate) fn add(&self, n: u64) {
-        self.0.store(self.0.load(Relaxed).wrapping_add(n), Relaxed);
-    }
-
-    fn read(&self) -> u64 {
-        self.0.load(Relaxed)
-    }
+/// Adds `n` to a counter with one writer by a plain load and store instead of a read-modify-write;
+/// only that writer calls it, others only read the counter.
+#[inline]
+pub(crate) fn add_sole_writer(counter: &AtomicU64, n: u64) {
+    counter.store(counter.load(Relaxed).wrapping_add(n), Relaxed);
 }
 
 /// Counts how a host waited for its lanes' answers: each spin before its thread parks.
 #[derive(Default)]
 pub(crate) struct HostWaitCounts {
-    pub(crate) waits: OwnCounter,
-    pub(crate) spin_rounds: OwnCounter,
-    pub(crate) parks: OwnCounter,
+    pub(crate) waits: AtomicU64,
+    pub(crate) spin_rounds: AtomicU64,
+    pub(crate) parks: AtomicU64,
     /// Counts the times a publish woke the lane's sleeping worker.
-    pub(crate) wakes: OwnCounter,
+    pub(crate) wakes: AtomicU64,
 }
 
 impl HostWaitCounts {
-    fn read(&self) -> WaitTotals {
-        WaitTotals {
-            waits: self.waits.read(),
-            spin_rounds: self.spin_rounds.read(),
-            parks: self.parks.read(),
-            wakes: self.wakes.read(),
+    fn read(&self) -> Waits {
+        Waits {
+            waits: self.waits.load(Relaxed),
+            spin_rounds: self.spin_rounds.load(Relaxed),
+            parks: self.parks.load(Relaxed),
+            wakes: self.wakes.load(Relaxed),
         }
     }
 }
 
 /// What one host counted: how it waited for its lanes' answers, where it read them, and how
-/// often its thread's park hook ran. The host's thread is the only writer ([`OwnCounter`]).
+/// often its thread's park hook ran. The host's thread is the only writer ([`add_sole_writer`]).
 #[derive(Default)]
 pub(crate) struct HostCounts {
     pub(crate) waits: HostWaitCounts,
     /// Counts answers read by a submit on this thread, the busy path.
-    pub(crate) read_by_submit: OwnCounter,
+    pub(crate) read_by_submit: AtomicU64,
     /// Counts answers read after the spin before the thread parks
     /// ([`LaneHost::spin_for_next_request`](super::host::LaneHost::spin_for_next_request)).
-    pub(crate) read_by_spin: OwnCounter,
+    pub(crate) read_by_spin: AtomicU64,
     /// Counts answers read by the poller task ([`LaneHost::run`](super::host::LaneHost::run)).
-    pub(crate) read_by_poller: OwnCounter,
-    pub(crate) park_hooks: OwnCounter,
+    pub(crate) read_by_poller: AtomicU64,
+    pub(crate) park_hooks: AtomicU64,
     /// Counts the times the poller went to sleep on the wake pipe, and the times a worker's byte
     /// woke it.
-    pub(crate) sleeps: OwnCounter,
-    pub(crate) pipe_wakes: OwnCounter,
+    pub(crate) sleeps: AtomicU64,
+    pub(crate) pipe_wakes: AtomicU64,
     /// Counts requests this host's thread handed to a less loaded host while its handlers ran long.
-    pub(crate) spread_forwards: OwnCounter,
+    pub(crate) spread_forwards: AtomicU64,
     /// Counts requests this host's thread forwarded to another host because its own lanes were full.
-    pub(crate) overflow_forwards: OwnCounter,
+    pub(crate) overflow_forwards: AtomicU64,
     /// Counts queued or forwarded requests this host dropped unrun because nobody waited for them.
-    pub(crate) unawaited_skips: OwnCounter,
+    pub(crate) unawaited_skips: AtomicU64,
 }
 
 /// How often each thing [`HostCounts`] counts, besides its waits, happened on a host, or on all of
 /// them summed.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct HostEvents {
-    pub by_submit: u64,
-    pub by_spin: u64,
-    pub by_poller: u64,
+pub struct HostEventCounts {
+    pub read_by_submit: u64,
+    pub read_by_spin: u64,
+    pub read_by_poller: u64,
     pub park_hooks: u64,
     pub sleeps: u64,
     pub pipe_wakes: u64,
@@ -130,27 +120,27 @@ pub struct HostEvents {
 }
 
 impl HostCounts {
-    pub(crate) fn events(&self) -> HostEvents {
-        HostEvents {
-            by_submit: self.read_by_submit.read(),
-            by_spin: self.read_by_spin.read(),
-            by_poller: self.read_by_poller.read(),
-            park_hooks: self.park_hooks.read(),
-            sleeps: self.sleeps.read(),
-            pipe_wakes: self.pipe_wakes.read(),
-            spread_forwards: self.spread_forwards.read(),
-            overflow_forwards: self.overflow_forwards.read(),
-            unawaited_skips: self.unawaited_skips.read(),
+    pub(crate) fn event_counts(&self) -> HostEventCounts {
+        HostEventCounts {
+            read_by_submit: self.read_by_submit.load(Relaxed),
+            read_by_spin: self.read_by_spin.load(Relaxed),
+            read_by_poller: self.read_by_poller.load(Relaxed),
+            park_hooks: self.park_hooks.load(Relaxed),
+            sleeps: self.sleeps.load(Relaxed),
+            pipe_wakes: self.pipe_wakes.load(Relaxed),
+            spread_forwards: self.spread_forwards.load(Relaxed),
+            overflow_forwards: self.overflow_forwards.load(Relaxed),
+            unawaited_skips: self.unawaited_skips.load(Relaxed),
         }
     }
 }
 
-impl HostEvents {
-    fn plus(self, b: HostEvents) -> HostEvents {
-        HostEvents {
-            by_submit: self.by_submit.wrapping_add(b.by_submit),
-            by_spin: self.by_spin.wrapping_add(b.by_spin),
-            by_poller: self.by_poller.wrapping_add(b.by_poller),
+impl HostEventCounts {
+    fn plus(self, b: HostEventCounts) -> HostEventCounts {
+        HostEventCounts {
+            read_by_submit: self.read_by_submit.wrapping_add(b.read_by_submit),
+            read_by_spin: self.read_by_spin.wrapping_add(b.read_by_spin),
+            read_by_poller: self.read_by_poller.wrapping_add(b.read_by_poller),
             park_hooks: self.park_hooks.wrapping_add(b.park_hooks),
             sleeps: self.sleeps.wrapping_add(b.sleeps),
             pipe_wakes: self.pipe_wakes.wrapping_add(b.pipe_wakes),
@@ -161,8 +151,8 @@ impl HostEvents {
     }
 }
 
-pub(crate) fn sum_waits(counts: impl Iterator<Item = WaitTotals>) -> WaitTotals {
-    counts.fold(WaitTotals::default(), |a, b| WaitTotals {
+pub(crate) fn sum_waits(counts: impl Iterator<Item = Waits>) -> Waits {
+    counts.fold(Waits::default(), |a, b| Waits {
         waits: a.waits.wrapping_add(b.waits),
         spin_rounds: a.spin_rounds.wrapping_add(b.spin_rounds),
         parks: a.parks.wrapping_add(b.parks),
@@ -187,19 +177,19 @@ impl ServerLanes {
         }
     }
 
-    pub(crate) fn host_waits_total(&self) -> WaitTotals {
+    pub(crate) fn host_waits_total(&self) -> Waits {
         sum_waits(self.host_counts.iter().map(|c| c.0.waits.read()))
     }
 
-    pub(crate) fn host_events_total(&self) -> HostEvents {
+    pub(crate) fn host_events_total(&self) -> HostEventCounts {
         self.host_counts
             .iter()
-            .map(|c| c.0.events())
-            .fold(HostEvents::default(), HostEvents::plus)
+            .map(|c| c.0.event_counts())
+            .fold(HostEventCounts::default(), HostEventCounts::plus)
     }
 
-    pub(crate) fn worker_waits_total(&self) -> WaitTotals {
-        let ended = *self.ended_peer_waits.lock();
+    pub(crate) fn worker_waits_total(&self) -> Waits {
+        let ended = *self.ended_worker_waits.lock();
         match &*self.run.read() {
             RunPhase::Serving(run) => {
                 sum_waits(std::iter::once(ended).chain(run.channels.iter().map(|c| c.peer_waits())))
@@ -253,7 +243,7 @@ impl ServerLanes {
             worker_waits: self.worker_waits_total(),
             host_events: self.host_events_total(),
             host_failures: s.host_failures.load(Relaxed),
-            lanes_broken: self.broken_lanes(),
+            broken_lanes: self.broken_lanes(),
             fatal: self.fatal(),
         }
     }

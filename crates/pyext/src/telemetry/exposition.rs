@@ -5,7 +5,7 @@
 
 use std::fmt::Display;
 
-use mipyre_http::plan::answer::{MethodKind, StatusClass, DURATION_BOUNDS_US};
+use mipyre_http::plan::request_metrics::{MethodKind, StatusClass, LATENCY_BOUNDS_US};
 
 use super::Counters;
 use mipyre_runtime::WorkerTally;
@@ -63,11 +63,11 @@ fn seconds(us: u64) -> String {
     format!("{}.{:06}", us / 1_000_000, us % 1_000_000)
 }
 
-fn answers(out: &mut String, counts: &AnswerCounts) {
+fn responses(out: &mut String, counts: &AnswerCounts) {
     let AnswerCounts {
         answers,
-        duration_buckets,
-        duration_sum_us,
+        latency_buckets,
+        latency_sum_us,
     } = counts;
 
     let name = "mipyre_http_requests_total";
@@ -96,14 +96,14 @@ fn answers(out: &mut String, counts: &AnswerCounts) {
     );
     let bucket = format!("{name}_bucket");
     let mut below = 0;
-    for (bound, count) in DURATION_BOUNDS_US.iter().zip(duration_buckets) {
+    for (bound, count) in LATENCY_BOUNDS_US.iter().zip(latency_buckets) {
         below += count;
         let le = (*bound as f64) / 1e6;
         sample(out, &bucket, &format!("{{le=\"{le}\"}}"), below);
     }
-    let all: u64 = duration_buckets.iter().sum();
+    let all: u64 = latency_buckets.iter().sum();
     sample(out, &bucket, "{le=\"+Inf\"}", all);
-    sample(out, &format!("{name}_sum"), "", seconds(*duration_sum_us));
+    sample(out, &format!("{name}_sum"), "", seconds(*latency_sum_us));
     sample(out, &format!("{name}_count"), "", all);
 }
 
@@ -138,7 +138,7 @@ fn run_counts(out: &mut String, run: &ServerCounts, workers: &WorkerTally) {
 
     // A run that does not count its answers has none to show; its refusals are still counted.
     if let Some(counts) = answer_counts {
-        answers(out, counts);
+        responses(out, counts);
     }
     family(
         out,
@@ -479,10 +479,10 @@ mod tests {
         let get = MethodKind::Get.index();
         counts.answers[get][1] = 2;
         counts.answers[MethodKind::Other.index()][4] = 1;
-        counts.duration_buckets[0] = 1;
-        counts.duration_buckets[6] = 1;
-        counts.duration_buckets[16] = 1;
-        counts.duration_sum_us = 100 + 7_000 + 12_000_001;
+        counts.latency_buckets[0] = 1;
+        counts.latency_buckets[6] = 1;
+        counts.latency_buckets[16] = 1;
+        counts.latency_sum_us = 100 + 7_000 + 12_000_001;
         ServerCounts {
             answers: Some(counts),
             refused: 1,
@@ -511,7 +511,7 @@ mod tests {
     fn the_buckets_add_up_to_the_count_and_never_fall() {
         let page = render(&run_with_answers(), &WorkerTally::default(), 0, &process());
         let buckets = lines_of(&page, "mipyre_http_request_duration_seconds_bucket");
-        assert_eq!(buckets.len(), DURATION_BOUNDS_US.len() + 1);
+        assert_eq!(buckets.len(), LATENCY_BOUNDS_US.len() + 1);
         assert_eq!(
             buckets[0],
             "mipyre_http_request_duration_seconds_bucket{le=\"0.0001\"} 1"

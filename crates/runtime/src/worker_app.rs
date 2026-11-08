@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use pyo3::prelude::*;
 
 use mipyre_http::plan::limits::Limits;
-use mipyre_http::plan::route::{ExpectedRoute, RouteKey, RouteManifest, WsPlace, WsRoute};
+use mipyre_http::plan::route::{CallConvention, ExpectedRoute, RouteKey, RouteManifest, WsHandlers, WsPlace, WsRoute};
 use mipyre_pg::{PgHandle, RunPools};
 
 use super::shared_map::AppStore;
@@ -152,7 +152,7 @@ impl EngineModule {
 pub struct WorkerRoutes<'py> {
     pub(crate) routes: Vec<WorkerRoute<'py>>,
     /// Is indexed like main's WebSocket routes, `None` for one that runs on main.
-    pub(crate) websockets: Vec<Option<Bound<'py, PyAny>>>,
+    pub(crate) websockets: Vec<Option<WsHandlers<Bound<'py, PyAny>>>>,
     pub(crate) before_hooks: Vec<Bound<'py, PyAny>>,
     pub(crate) after_hooks: Vec<Bound<'py, PyAny>>,
     /// Holds the limits the script set, which are never served because main's app is; it is
@@ -162,6 +162,7 @@ pub struct WorkerRoutes<'py> {
 
 pub(crate) struct WorkerRoute<'py> {
     pub(crate) key: RouteKey,
+    pub(crate) convention: CallConvention,
     /// Is `None` for a route that runs elsewhere; main never sends it to this worker.
     pub(crate) handler: Option<Bound<'py, PyAny>>,
 }
@@ -195,7 +196,7 @@ pub struct AppRoute<'py> {
 
 pub struct AppWebSocket<'py> {
     pub route: WsRoute,
-    pub handler: Bound<'py, PyAny>,
+    pub handlers: WsHandlers<Bound<'py, PyAny>>,
 }
 
 impl ScriptRegistrations<'_> {
@@ -292,18 +293,24 @@ pub(crate) fn worker_routes(py: Python<'_>) -> PyResult<Option<WorkerRoutes<'_>>
 fn align<'py>(own: ScriptRegistrations<'py>, expected: &RouteManifest) -> PyResult<WorkerRoutes<'py>> {
     let mut routes = Vec::with_capacity(expected.routes.len());
     let mut missing = Vec::new();
-    for ExpectedRoute { key, on_worker } in &expected.routes {
+    for want in &expected.routes {
+        let ExpectedRoute {
+            key,
+            on_worker,
+            convention,
+        } = want;
         if !on_worker {
             routes.push(WorkerRoute {
                 key: key.clone(),
+                convention: *convention,
                 handler: None,
             });
             continue;
         }
-        let found = own.routes.iter().find(|r| r.route.key == *key && r.route.on_worker);
-        match found {
+        match own.routes.iter().find(|r| r.route == *want) {
             Some(r) => routes.push(WorkerRoute {
                 key: key.clone(),
+                convention: *convention,
                 handler: Some(r.handler.clone()),
             }),
             None => missing.push(key.to_string()),
@@ -312,7 +319,11 @@ fn align<'py>(own: ScriptRegistrations<'py>, expected: &RouteManifest) -> PyResu
     // A route only this worker has means the app diverged between interpreters, for example
     // under `if _in_worker()`.
     for AppRoute { route, .. } in &own.routes {
-        if !expected.routes.iter().any(|r| r.key == route.key) {
+        if !expected
+            .routes
+            .iter()
+            .any(|r| r.key == route.key && r.convention == route.convention)
+        {
             missing.push(format!("{} (only in this worker)", route.key));
         }
     }
@@ -350,7 +361,7 @@ fn align_websockets<'py>(
     own: &[AppWebSocket<'py>],
     expected: &[WsRoute],
     missing: &mut Vec<String>,
-) -> Vec<Option<Bound<'py, PyAny>>> {
+) -> Vec<Option<WsHandlers<Bound<'py, PyAny>>>> {
     let aligned = expected
         .iter()
         .map(|WsRoute { path, place }| {
@@ -367,7 +378,7 @@ fn align_websockets<'py>(
             if found.is_none() {
                 missing.push(format!("websocket {path}"));
             }
-            found.map(|w| w.handler.clone())
+            found.map(|w| w.handlers.clone())
         })
         .collect();
     for AppWebSocket { route, .. } in own {

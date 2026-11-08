@@ -3,13 +3,11 @@
 //! CORS and writes the access-log line.
 
 use mipyre_http::io::request_head::{RequestHead, RequestLabel};
-use mipyre_http::plan::limits::{Limits, RequestBudget};
+use mipyre_http::plan::limits::Limits;
 
-use futures_util::FutureExt as _;
 use hyper::body::{Body as _, Incoming};
 use hyper::header::HeaderValue;
 use hyper::{Method, Request, Response};
-use tokio::sync::oneshot;
 
 use crate::error_response::render;
 use crate::site::{in_sample, next_roll, samples, Site};
@@ -24,9 +22,9 @@ use mipyre_http::plan::reject::SiteMiss;
 use mipyre_http::plan::request::{decide, RequestDecision, StaticMissAnswer};
 use mipyre_http::plan::request_id::RequestId;
 use mipyre_http::plan::response::site_miss_response;
-use mipyre_http::plan::route::{GrpcMethod, HandlerCall, Params};
+use mipyre_http::plan::route::{HandlerCall, Params};
 use mipyre_http::plan::site::{AccessLog, ServeSettings};
-use mipyre_runtime::exchange::{refuse, HandlerError, ReplyHolder, UnansweredError};
+use mipyre_runtime::exchange::HandlerError;
 use mipyre_transport::driver::Peer;
 
 /// It is written to the access log as the `source` field.
@@ -306,9 +304,6 @@ pub(crate) async fn preprocess(req: Request<Incoming>, site: &Site, peer: Peer) 
     // The decision, and any answer to a request with no route, use the request as hyper handed
     // it; it is taken apart only for a handler.
     let (call, params) = match decide(req.method(), req.uri().path(), req.headers(), &site.rules.routes) {
-        RequestDecision::Grpc(GrpcMethod::BenchmarkGetSum) => {
-            return grpc_get_sum(req, site, timer, client).await.map(Disposition::Answered)
-        }
         RequestDecision::Fast(fast) => {
             let resp = full_body(fast.to_response().map(http_body_util::Full::new));
             return Ok(Disposition::Answered(finish(
@@ -442,30 +437,6 @@ fn forwarded_client(peer: Peer, headers: &hyper::HeaderMap, proxies: &Proxies) -
     }
 }
 
-/// gRPC needs HTTP/2 trailers (`grpc-status`) the normal response path can't model, so the
-/// benchmark method is answered outside the route table.
-async fn grpc_get_sum(
-    req: Request<Incoming>,
-    site: &Site,
-    timer: AccessTimer,
-    client: Peer,
-) -> Result<Response<ResponseBody>, hyper::Error> {
-    let origin = cors_origin(site, req.headers());
-    // The request moves into the call, so its id is taken first.
-    let request_id = RequestId::of(req.headers(), site.rules.settings.request_id_header.as_ref());
-    let resp = crate::grpc::handle_get_sum(req, &site.rules.settings.limits).await?;
-    Ok(finish(
-        resp,
-        site,
-        &Method::POST,
-        GrpcMethod::BenchmarkGetSum.path(),
-        Requester::Given(&request_id, &client),
-        timer,
-        origin,
-        ResponseSource::Engine,
-    ))
-}
-
 /// Reads the whole body, at most the app's `max_body` bytes, within [`Limits::body_time`].
 pub(crate) async fn collect_body(body: Incoming, limits: &Limits) -> Result<BodyFrames, HandlerError> {
     Ok(mipyre_http::io::body::read_body(body, limits).await?)
@@ -476,27 +447,6 @@ pub(crate) async fn collect_body(body: Incoming, limits: &Limits) -> Result<Body
 #[inline]
 pub(crate) fn fail(error: HandlerError, request: &RequestLabel, counters: &SiteCounters) -> Response<ResponseBody> {
     full_body(render(error.log(request), counters))
-}
-
-/// Waits at most `budget` for a handler's reply; `reply` already maps a reply that never came (a
-/// closed channel, a panicked task) to an error.
-pub(crate) async fn await_reply<T>(
-    budget: RequestBudget,
-    reply: impl std::future::Future<Output = Result<T, HandlerError>>,
-) -> Result<T, HandlerError> {
-    match tokio::time::timeout(budget.get(), reply).await {
-        Ok(answer) => answer,
-        Err(_) => Err(refuse(UnansweredError::TimedOut(budget.get()))),
-    }
-}
-
-/// Waits for the reply `holder` was handed the sender of; the sender dropped unsent means the
-/// holder lost the request.
-pub(crate) fn reply_or_lost<T>(
-    reply: oneshot::Receiver<T>,
-    holder: ReplyHolder,
-) -> impl std::future::Future<Output = Result<T, HandlerError>> {
-    reply.map(move |reply| reply.map_err(|_| refuse(UnansweredError::WorkerLost(holder))))
 }
 
 #[cfg(test)]

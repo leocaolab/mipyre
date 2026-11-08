@@ -9,14 +9,7 @@ license.workspace = true
 [dependencies]
 
 [dev-dependencies]
-# The microbenches' harness and counting allocator.
-mipyre_microbench = { path = "../microbench" }
 proptest = "1"
 
 [lints]
 workspace = true
-
-# The per-call bench (`mipyre_microbench::run`).
-[[bench]]
-name = "throttle"
-harness = false

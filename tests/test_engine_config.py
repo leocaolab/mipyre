@@ -198,15 +198,13 @@ def _default_len(req):
 
 
 @_default.websocket("/echo")
-async def _default_echo(ws):
-    while (msg := await ws.recv()) is not None:
-        await ws.send(msg)
+def _default_echo(ws, msg):
+    return msg
 
 
 @_small.websocket("/echo")
-async def _small_echo(ws):
-    while (msg := await ws.recv()) is not None:
-        await ws.send(msg)
+def _small_echo(ws, msg):
+    return msg
 
 
 def test_two_apps_in_one_process_keep_their_own_max_body_size():
@@ -413,10 +411,10 @@ def test_testclient_reports_the_port_the_engine_bound():
 def test_a_duplicate_websocket_path_is_an_error():
     from mipyre.engine import MipyreApp
 
-    async def first(ws):
+    def first(ws, msg):
         pass
 
-    async def second(ws):
+    def second(ws, msg):
         pass
 
     app = MipyreApp()

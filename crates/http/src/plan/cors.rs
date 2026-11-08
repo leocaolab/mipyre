@@ -35,6 +35,13 @@ pub struct Cors {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CorsOrigin(usize);
 
+impl CorsOrigin {
+    /// Returns the origin's place in [`Cors::origins`].
+    pub fn place(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorsSetting {
     Methods,
@@ -79,6 +86,11 @@ pub enum CorsError {
 }
 
 impl Cors {
+    /// Returns the origins the rule allows, in the order it was given them.
+    pub fn origins(&self) -> &[HeaderValue] {
+        &self.origins
+    }
+
     /// Parses the app's CORS settings into headers. Each of `origins` is an origin, or `*`, which
     /// allows any; an origin is kept as a browser writes its `Origin` (lower-case, without the
     /// scheme's default port), which is the form both the answer and [`Cors::trusts`] compare.
@@ -215,7 +227,7 @@ impl Cors {
 /// the scheme and host in lower case, an IPv6 host in its canonical form and the scheme's default
 /// port left out; `None` when `entry` is anything else (another scheme, a path, user info, `null`,
 /// a host that is not ASCII).
-fn browser_origin(entry: &str) -> Option<String> {
+pub fn browser_origin(entry: &str) -> Option<String> {
     let (scheme, rest) = entry.split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
     let default_port = match scheme.as_str() {
@@ -255,9 +267,6 @@ fn browser_origin(entry: &str) -> Option<String> {
         _ => format!("{scheme}://{host}"),
     })
 }
-
-#[cfg(test)]
-mod fuzz;
 
 #[cfg(test)]
 mod tests {

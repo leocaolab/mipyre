@@ -1,4 +1,5 @@
-//! The Postgres pools a server run owns, and the handles code holds to them.
+//! The Postgres pools a server run owns, and the handles code holds to them; [`numeric`] converts Postgres's NUMERIC
+//! wire format to and from decimal text.
 //!
 //! `PgPool.connect()` makes a [`PgHandle`]: what the call asked for, bound to no pool yet. The
 //! engine records it with the interpreter that made it; when a run seals it takes every live
@@ -15,6 +16,7 @@
 
 mod db_runtime;
 mod dsn;
+pub mod numeric;
 mod pool;
 mod sync;
 
@@ -113,7 +115,7 @@ impl RunPools {
         let requests: Vec<&PoolRequest> = handles.iter().map(|h| &h.request).collect();
         let default_threads =
             db_runtime::default_runtime_threads().map_err(|e| RunPoolsError::Runtime(TaskError::RuntimeNotBuilt(e)))?;
-        let plan = pool::plan_run(&requests, default_threads).map_err(RunPoolsError::Conflicts)?;
+        let plan = pool::plan_pools(&requests, default_threads).map_err(RunPoolsError::Conflicts)?;
         let shared: Vec<HandleConflict> = handles
             .iter()
             .filter_map(|handle| {
@@ -213,10 +215,10 @@ impl From<String> for ModuleKey {
 pub struct PgHandle {
     request: PoolRequest,
     owner: ModuleKey,
-    binding: crate::sync::RwLock<HandlePool>,
+    binding: crate::sync::RwLock<HandleBinding>,
 }
 
-enum HandlePool {
+enum HandleBinding {
     /// No run has it, and it has not queried yet.
     Unbound,
     /// A run's pool; when the run is gone the handle opens its own on its next query.
@@ -227,7 +229,7 @@ enum HandlePool {
 
 /// Why a handle's own pool could not be opened.
 #[derive(Debug, thiserror::Error)]
-pub enum OwnPoolError {
+pub enum OpenOwnPoolError {
     #[error(transparent)]
     Runtime(#[from] TaskError),
     #[error("PgPool connect: {0}")]
@@ -239,7 +241,7 @@ impl PgHandle {
         Arc::new(PgHandle {
             request,
             owner,
-            binding: crate::sync::RwLock::new(HandlePool::Unbound),
+            binding: crate::sync::RwLock::new(HandleBinding::Unbound),
         })
     }
 
@@ -251,13 +253,13 @@ impl PgHandle {
     /// The run this handle is bound to while it serves.
     fn serving_run(&self) -> Option<RunLabel> {
         match &*self.binding.read() {
-            HandlePool::Run { run, .. } => run.upgrade().map(|run| run.label.clone()),
-            HandlePool::Unbound | HandlePool::Own(_) => None,
+            HandleBinding::Run { run, .. } => run.upgrade().map(|run| run.label.clone()),
+            HandleBinding::Unbound | HandleBinding::Own(_) => None,
         }
     }
 
     fn bind(&self, run: &Arc<RunPools>, index: usize) {
-        *self.binding.write() = HandlePool::Run {
+        *self.binding.write() = HandleBinding::Run {
             run: Arc::downgrade(run),
             index,
         };
@@ -269,16 +271,16 @@ impl PgHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`OwnPoolError`] when its own pool cannot be opened.
-    pub fn open(&self, stack_size: usize) -> Result<OpenPool, OwnPoolError> {
+    /// Returns [`OpenOwnPoolError`] when its own pool cannot be opened.
+    pub fn open(&self, stack_size: usize) -> Result<OpenPool, OpenOwnPoolError> {
         match &*self.binding.read() {
-            HandlePool::Own(open) => return Ok(open.clone()),
-            HandlePool::Run { run, index } => {
+            HandleBinding::Own(open) => return Ok(open.clone()),
+            HandleBinding::Run { run, index } => {
                 if let Some(open) = run.upgrade().and_then(|run| run.open(*index)) {
                     return Ok(open);
                 }
             }
-            HandlePool::Unbound => {}
+            HandleBinding::Unbound => {}
         }
         // Opened outside the lock, so a slow connect holds up no other query; a second thread
         // racing here keeps whichever was installed first and drops its own.
@@ -287,19 +289,19 @@ impl PgHandle {
             .request
             .settings()
             .open(&runtime)?
-            .map_err(OwnPoolError::ConnectFailed)?;
+            .map_err(OpenOwnPoolError::ConnectFailed)?;
         let opened = OpenPool { pool, runtime };
         let mut binding = self.binding.write();
         match &*binding {
-            HandlePool::Own(installed) => return Ok(installed.clone()),
-            HandlePool::Run { run, index } => {
+            HandleBinding::Own(installed) => return Ok(installed.clone()),
+            HandleBinding::Run { run, index } => {
                 if let Some(open) = run.upgrade().and_then(|run| run.open(*index)) {
                     return Ok(open);
                 }
             }
-            HandlePool::Unbound => {}
+            HandleBinding::Unbound => {}
         }
-        *binding = HandlePool::Own(opened.clone());
+        *binding = HandleBinding::Own(opened.clone());
         Ok(opened)
     }
 }

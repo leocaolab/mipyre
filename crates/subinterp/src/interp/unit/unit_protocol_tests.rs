@@ -8,35 +8,37 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::test_gil::{Gil, Held};
-use super::test_phase::phase_of_run;
-use super::{InterruptError, RunId, UnitHost, UnitPhase, UnitState, COUNT_MASK};
+use super::test_gil::{Gil, GilToken};
+use super::test_phase::phase_of_unit;
+use super::word::{UnitId, UnitPhase};
+use super::{Interpreter, InterruptFailure, Interruption, NewThreadStateError, SlotInner, ThreadGone};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Call {
-    Visit {
-        alive: bool,
-    },
-    /// `None` means the exception was cleared.
-    SetRaise(Option<RunId>),
+    Visit { alive: bool },
+    Raise(UnitId),
+    Clear,
     GaveUpGil,
 }
 
-struct RecordingHost {
+struct FakeInterpreter {
     gil: Gil,
     alive: Mutex<bool>,
-    pending: Mutex<Option<RunId>>,
+    /// Whether a visit can make a thread state, as `PyThreadState_New` may not.
+    thread_states: Mutex<bool>,
+    pending: Mutex<Option<UnitId>>,
     calls: Mutex<Vec<Call>>,
-    /// An interruption runs this once it is counted in, before it asks for the interpreter.
+    /// An interrupter runs this once it is counted in, before it asks for the interpreter.
     before_visit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     gave_up_gil: Mutex<Option<Sender<()>>>,
 }
 
-impl RecordingHost {
+impl FakeInterpreter {
     fn new() -> Self {
-        RecordingHost {
+        FakeInterpreter {
             gil: Gil::new(),
             alive: Mutex::new(true),
+            thread_states: Mutex::new(true),
             pending: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
             before_visit: Mutex::new(None),
@@ -53,14 +55,17 @@ impl RecordingHost {
     }
 }
 
-impl UnitHost for RecordingHost {
-    type Gil<'py> = Held<'py>;
-    type Exception = RunId;
+impl Interpreter for FakeInterpreter {
+    type Gil<'py> = GilToken<'py>;
+    type Exception = UnitId;
 
-    fn visit<R>(&self, f: impl for<'py> FnOnce(Held<'py>) -> R) -> Option<R> {
+    fn visit<R>(&self, f: impl for<'py> FnOnce(GilToken<'py>) -> R) -> Result<R, NewThreadStateError> {
         let pause = self.before_visit.lock().take();
         if let Some(pause) = pause {
             pause();
+        }
+        if !*self.thread_states.lock() {
+            return Err(NewThreadStateError);
         }
         let gil = self.gil.take();
         self.record(Call::Visit {
@@ -68,24 +73,25 @@ impl UnitHost for RecordingHost {
         });
         let out = f(gil);
         self.gil.give();
-        Some(out)
+        Ok(out)
     }
 
-    /// Sets or clears only while the thread state is there, as CPython does.
-    fn set_raise(&self, _gil: Held<'_>, exc: Option<RunId>) -> bool {
-        self.record(Call::SetRaise(exc));
-        let found = *self.alive.lock();
-        if found {
-            *self.pending.lock() = exc;
+    /// Sets only while the thread state is there, as CPython does.
+    fn raise(&self, _gil: GilToken<'_>, exc: UnitId) -> Result<(), ThreadGone> {
+        self.record(Call::Raise(exc));
+        if !*self.alive.lock() {
+            return Err(ThreadGone);
         }
-        found
+        *self.pending.lock() = Some(exc);
+        Ok(())
     }
 
-    fn thread_gone(&self, _gil: Held<'_>) -> InterruptError {
-        InterruptError::UnitThreadGone { thread: 0, interp: 0 }
+    fn clear(&self, _gil: GilToken<'_>) {
+        self.record(Call::Clear);
+        *self.pending.lock() = None;
     }
 
-    fn without_gil(&self, _gil: Held<'_>, f: impl FnOnce()) {
+    fn without_gil(&self, _gil: GilToken<'_>, f: impl FnOnce()) {
         self.record(Call::GaveUpGil);
         self.gil.give();
         if let Some(told) = self.gave_up_gil.lock().take() {
@@ -96,33 +102,36 @@ impl UnitHost for RecordingHost {
     }
 }
 
-fn new_slot() -> Arc<UnitState<RecordingHost>> {
-    Arc::new(UnitState::new(RecordingHost::new()))
+fn new_slot() -> Arc<SlotInner<FakeInterpreter>> {
+    Arc::new(SlotInner::new(FakeInterpreter::new()))
 }
 
-/// Ends `slot`'s run in its GIL, as `WorkUnit::end` does, and checks that the end returns the
-/// phase it left.
-fn end(slot: &UnitState<RecordingHost>) {
-    let gil = slot.host.gil.take();
-    let ended = slot.end_attached(gil);
-    assert_eq!(
-        ended,
-        slot.phase(),
-        "the end returned a phase other than the one it left"
-    );
-    slot.host.gil.give();
+fn begin(slot: &SlotInner<FakeInterpreter>) -> UnitId {
+    let gil = slot.interpreter.gil.take();
+    let unit = slot.begin(gil);
+    slot.interpreter.gil.give();
+    unit
 }
 
-fn thread_state_gone(slot: &UnitState<RecordingHost>) {
-    *slot.host.alive.lock() = false;
+/// Ends `slot`'s unit in its GIL, as `WorkUnit::end` does, and returns whether it reported the
+/// unit interrupted.
+fn end(slot: &SlotInner<FakeInterpreter>, taken_back: bool) -> bool {
+    let gil = slot.interpreter.gil.take();
+    let interrupted = slot.end_attached(gil, taken_back);
+    slot.interpreter.gil.give();
+    interrupted
 }
 
-/// Pauses the next interruption before it asks for the interpreter; it reports the pause on
-/// the receiver and resumes when the sender is sent to.
-fn pause_before_visit(slot: &UnitState<RecordingHost>) -> (Receiver<()>, Sender<()>) {
+fn thread_state_gone(slot: &SlotInner<FakeInterpreter>) {
+    *slot.interpreter.alive.lock() = false;
+}
+
+/// Pauses the next interrupter before it asks for the interpreter; it reports the pause on the
+/// receiver and resumes when the sender is sent to.
+fn pause_before_visit(slot: &SlotInner<FakeInterpreter>) -> (Receiver<()>, Sender<()>) {
     let (paused_tx, paused_rx) = mpsc::channel::<()>();
     let (go_tx, go_rx) = mpsc::channel::<()>();
-    *slot.host.before_visit.lock() = Some(Box::new(move || {
+    *slot.interpreter.before_visit.lock() = Some(Box::new(move || {
         paused_tx.send(()).expect("the test listens");
         go_rx.recv().expect("the test lets it go");
     }));
@@ -132,95 +141,101 @@ fn pause_before_visit(slot: &UnitState<RecordingHost>) -> (Receiver<()>, Sender<
 #[test]
 fn an_end_waits_for_an_interruption_in_flight_which_then_sets_nothing() {
     let slot = new_slot();
-    let (run, _) = slot.begin_run();
+    let unit = begin(&slot);
     let (paused, go) = pause_before_visit(&slot);
     let interrupting = {
         let slot = Arc::clone(&slot);
-        std::thread::spawn(move || slot.interrupt(run, run))
+        std::thread::spawn(move || slot.interrupt(unit, unit))
     };
-    paused.recv().expect("the interruption is counted in");
-    assert_eq!(slot.in_flight(), 1);
+    paused.recv().expect("the interrupter is counted in");
+    assert_eq!(slot.load().in_flight, 1);
 
     let (gave_up_tx, gave_up) = mpsc::channel::<()>();
-    *slot.host.gave_up_gil.lock() = Some(gave_up_tx);
-    let (ended_tx, ended) = mpsc::channel::<()>();
+    *slot.interpreter.gave_up_gil.lock() = Some(gave_up_tx);
+    let (ended_tx, ended) = mpsc::channel::<bool>();
     let worker = {
         let slot = Arc::clone(&slot);
         std::thread::spawn(move || {
-            end(&slot);
+            let interrupted = end(&slot, false);
             thread_state_gone(&slot);
-            ended_tx.send(()).expect("the test listens");
+            ended_tx.send(interrupted).expect("the test listens");
         })
     };
     gave_up.recv().expect("the end gives the GIL up to wait");
-    // The interruption holds its pass, so the end cannot have returned.
+    // The interrupter holds its pass, so the end cannot have returned.
     assert!(
         ended.try_recv().is_err(),
         "the end returned with an interruption in flight"
     );
 
-    go.send(()).expect("the interruption is paused");
-    interrupting
-        .join()
-        .expect("the interruption ends")
-        .expect("the host always enters");
-    ended.recv().expect("the end returns once the interruption has left");
+    go.send(()).expect("the interrupter is paused");
+    assert_eq!(
+        interrupting.join().expect("the interrupter ends"),
+        Ok(Interruption::UnitEnded)
+    );
+    assert!(!ended.recv().expect("the end returns once the interrupter has left"));
     worker.join().expect("the worker ends");
 
     assert_eq!(
-        slot.host.calls(),
+        slot.interpreter.calls(),
         [Call::GaveUpGil, Call::Visit { alive: true }],
-        "the interruption entered after the end, while the interpreter was alive, and set nothing"
+        "the interrupter entered after the end, while the interpreter was alive, and set nothing"
     );
-    assert_eq!(*slot.host.pending.lock(), None);
-    assert_eq!(slot.in_flight(), 0);
-    let phase = phase_of_run(&slot, run).expect("no run began since");
+    assert_eq!(*slot.interpreter.pending.lock(), None);
+    assert_eq!(slot.load().in_flight, 0);
     assert_eq!(
-        phase,
-        UnitPhase::Ended,
-        "an interruption that set nothing marked the run"
+        phase_of_unit(&slot, unit),
+        Some(UnitPhase::Ended { interrupted: false })
     );
 }
 
 #[test]
-fn a_late_interruption_of_an_ended_run_does_not_enter_the_interpreter() {
+fn a_late_interruption_of_an_ended_unit_does_not_enter_the_interpreter() {
     let slot = new_slot();
-    let (run, _) = slot.begin_run();
-    end(&slot);
+    let unit = begin(&slot);
+    end(&slot, false);
     thread_state_gone(&slot);
 
-    slot.interrupt(run, run).expect("an ended run is not an error");
+    assert_eq!(slot.interrupt(unit, unit), Ok(Interruption::UnitEnded));
 
-    assert_eq!(slot.host.calls(), []);
-    assert_eq!(phase_of_run(&slot, run), Some(UnitPhase::Ended));
+    assert_eq!(slot.interpreter.calls(), []);
+    assert_eq!(
+        phase_of_unit(&slot, unit),
+        Some(UnitPhase::Ended { interrupted: false })
+    );
 }
 
 #[test]
-fn an_interruption_aimed_at_an_earlier_run_does_not_reach_the_next_one() {
+fn an_interruption_aimed_at_an_earlier_unit_does_not_reach_the_next_one() {
     let slot = new_slot();
-    let (first, _) = slot.begin_run();
-    end(&slot);
-    let (next, before) = slot.begin_run();
+    let first = begin(&slot);
+    end(&slot, false);
+    let next = begin(&slot);
     assert_ne!(next, first);
-    assert!(UnitPhase::from_word(before).has_ended());
 
-    slot.interrupt(first, first).expect("a stale target is not an error");
+    assert_eq!(slot.interrupt(first, first), Ok(Interruption::UnitEnded));
 
-    assert_eq!(slot.host.calls(), []);
-    assert_eq!(phase_of_run(&slot, first), None, "an earlier run's state is not kept");
-    assert_eq!(phase_of_run(&slot, next), Some(UnitPhase::Running));
+    assert_eq!(slot.interpreter.calls(), []);
+    assert_eq!(phase_of_unit(&slot, first), None, "an earlier unit's state is not kept");
+    assert_eq!(
+        phase_of_unit(&slot, next),
+        Some(UnitPhase::Running { outstanding: false })
+    );
 }
 
 #[test]
 fn an_interruption_is_set_marked_and_taken_back_once() {
     let slot = new_slot();
-    let (run, _) = slot.begin_run();
+    let unit = begin(&slot);
 
-    slot.interrupt(run, run).expect("the host always enters");
-    assert_eq!(*slot.host.pending.lock(), Some(run));
-    assert_eq!(phase_of_run(&slot, run), Some(UnitPhase::RunningInterruptOutstanding));
+    assert_eq!(slot.interrupt(unit, unit), Ok(Interruption::Set));
+    assert_eq!(*slot.interpreter.pending.lock(), Some(unit));
+    assert_eq!(
+        phase_of_unit(&slot, unit),
+        Some(UnitPhase::Running { outstanding: true })
+    );
 
-    let gil = slot.host.gil.take();
+    let gil = slot.interpreter.gil.take();
     assert!(
         slot.take_interruption(gil),
         "the outstanding interruption is taken back"
@@ -229,75 +244,123 @@ fn an_interruption_is_set_marked_and_taken_back_once() {
         !slot.take_interruption(gil),
         "nothing is outstanding after the take-back"
     );
-    slot.host.gil.give();
-    end(&slot);
+    slot.interpreter.gil.give();
+    assert!(
+        end(&slot, true),
+        "a unit whose interruption was taken back was interrupted"
+    );
 
     assert_eq!(
-        slot.host.calls(),
-        [
-            Call::Visit { alive: true },
-            Call::SetRaise(Some(run)),
-            Call::SetRaise(None),
-        ]
+        slot.interpreter.calls(),
+        [Call::Visit { alive: true }, Call::Raise(unit), Call::Clear]
     );
-    assert_eq!(*slot.host.pending.lock(), None);
-    assert_eq!(phase_of_run(&slot, run), Some(UnitPhase::EndedInterrupted));
+    assert_eq!(*slot.interpreter.pending.lock(), None);
 }
 
 #[test]
 fn the_end_clears_an_interruption_left_outstanding() {
     let slot = new_slot();
-    let (run, _) = slot.begin_run();
-    slot.interrupt(run, run).expect("the host always enters");
+    let unit = begin(&slot);
+    assert_eq!(slot.interrupt(unit, unit), Ok(Interruption::Set));
 
-    end(&slot);
+    assert!(end(&slot, false));
 
     assert_eq!(
-        slot.host.calls(),
-        [
-            Call::Visit { alive: true },
-            Call::SetRaise(Some(run)),
-            Call::SetRaise(None),
-        ]
+        slot.interpreter.calls(),
+        [Call::Visit { alive: true }, Call::Raise(unit), Call::Clear]
     );
-    assert_eq!(*slot.host.pending.lock(), None);
-    assert_eq!(phase_of_run(&slot, run), Some(UnitPhase::EndedInterrupted));
+    assert_eq!(*slot.interpreter.pending.lock(), None);
 }
 
-/// Covers a unit leaked while running, never ended or dropped, whose thread state then goes.
+/// A unit leaked rather than ended: the next begin ends it, taking its interruption back and
+/// waiting for its interrupters, before the next unit runs.
 #[test]
-fn an_interruption_of_a_run_that_outlived_its_thread_state_reports_it() {
+fn a_begin_after_a_leaked_unit_ends_it_first() {
     let slot = new_slot();
-    let (run, _) = slot.begin_run();
+    let leaked = begin(&slot);
+    assert_eq!(slot.interrupt(leaked, leaked), Ok(Interruption::Set));
+
+    let next = begin(&slot);
+
+    assert_ne!(next, leaked);
+    assert_eq!(
+        *slot.interpreter.pending.lock(),
+        None,
+        "the leaked unit's interruption is pending"
+    );
+    assert_eq!(
+        slot.interpreter.calls(),
+        [Call::Visit { alive: true }, Call::Raise(leaked), Call::Clear]
+    );
+    assert_eq!(slot.interrupt(leaked, leaked), Ok(Interruption::UnitEnded));
+    assert_eq!(
+        phase_of_unit(&slot, next),
+        Some(UnitPhase::Running { outstanding: false })
+    );
+}
+
+#[test]
+fn an_interruption_of_a_unit_that_outlived_its_thread_state_reports_it() {
+    let slot = new_slot();
+    let unit = begin(&slot);
     thread_state_gone(&slot);
 
-    assert!(matches!(
-        slot.interrupt(run, run),
-        Err(InterruptError::UnitThreadGone { .. })
-    ));
+    assert_eq!(slot.interrupt(unit, unit), Err(InterruptFailure::ThreadGone));
 
     assert_eq!(
-        slot.host.calls(),
-        [Call::Visit { alive: false }, Call::SetRaise(Some(run))]
+        slot.interpreter.calls(),
+        [Call::Visit { alive: false }, Call::Raise(unit)]
     );
-    assert_eq!(*slot.host.pending.lock(), None);
-    assert_eq!(phase_of_run(&slot, run), Some(UnitPhase::Running));
-    assert_eq!(slot.in_flight(), 0);
+    assert_eq!(*slot.interpreter.pending.lock(), None);
+    assert_eq!(
+        phase_of_unit(&slot, unit),
+        Some(UnitPhase::Running { outstanding: false })
+    );
+    assert_eq!(slot.load().in_flight, 0);
 }
 
 #[test]
-fn a_full_in_flight_count_refuses_one_more_visit() {
+fn an_interruption_that_gets_no_thread_state_reports_it_and_sets_nothing() {
     let slot = new_slot();
-    let (run, _) = slot.begin_run();
-    let mut passes: Vec<_> = (0..COUNT_MASK - 1)
-        .map(|_| slot.enter_visit(run).expect("room left"))
-        .collect();
-    passes.push(slot.enter_visit(run).expect("the last place is taken"));
-    assert_eq!(slot.in_flight(), COUNT_MASK);
-    assert!(slot.enter_visit(run).is_none(), "a full count took one more");
-    assert_eq!(slot.in_flight(), COUNT_MASK, "a refused visit changed the count");
+    let unit = begin(&slot);
+    *slot.interpreter.thread_states.lock() = false;
+
+    assert_eq!(
+        slot.interrupt(unit, unit),
+        Err(InterruptFailure::NoThreadState(NewThreadStateError))
+    );
+
+    assert_eq!(slot.interpreter.calls(), []);
+    assert_eq!(
+        phase_of_unit(&slot, unit),
+        Some(UnitPhase::Running { outstanding: false })
+    );
+    assert_eq!(slot.load().in_flight, 0);
+    assert!(!end(&slot, false));
+}
+
+/// 255 interrupters are counted in; the 256th is refused, sets nothing, and says so.
+#[test]
+fn a_full_in_flight_count_refuses_one_more_interruption() {
+    let slot = new_slot();
+    let unit = begin(&slot);
+    let mut passes: Vec<_> = (0..u8::MAX).map(|_| slot.admit(unit).expect("room left")).collect();
+    assert_eq!(slot.load().in_flight, u8::MAX);
+
+    assert_eq!(slot.interrupt(unit, unit), Err(InterruptFailure::TooManyInFlight));
+    assert_eq!(
+        slot.load().in_flight,
+        u8::MAX,
+        "a refused interrupter changed the count"
+    );
+    assert_eq!(slot.interpreter.calls(), []);
 
     passes.pop();
-    assert!(slot.enter_visit(run).is_some(), "a freed place is taken again");
-    assert_eq!(phase_of_run(&slot, run), Some(UnitPhase::Running));
+    assert_eq!(
+        slot.interrupt(unit, unit),
+        Ok(Interruption::Set),
+        "a freed place is taken again"
+    );
+    drop(passes);
+    assert_eq!(slot.load().in_flight, 0);
 }

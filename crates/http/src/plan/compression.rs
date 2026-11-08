@@ -367,7 +367,7 @@ impl GzipStream {
 /// # Errors
 ///
 /// Returns an error when the encoder fails; `out` may then hold partial output after what it held.
-pub fn brotli(data: &[u8], quality: BrotliQuality, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+pub fn encode_brotli(data: &[u8], quality: BrotliQuality, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     brotli_compress(data, quality, out).map_err(|source| EncodeError {
         codec: Codec::Brotli(quality),
         source,
@@ -564,9 +564,6 @@ pub fn apply(data: &mut HandlerResponse, compressed: Bytes, codec: Codec) {
 }
 
 #[cfg(test)]
-mod fuzz;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::plan::response::HeaderLines;
@@ -599,7 +596,7 @@ mod tests {
     fn encode(data: &[u8], codec: Codec, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         match codec {
             Codec::Gzip(level) => GzipStream::default().encode(data, level, out),
-            Codec::Brotli(quality) => brotli(data, quality, out),
+            Codec::Brotli(quality) => encode_brotli(data, quality, out),
         }
     }
 
@@ -610,7 +607,7 @@ mod tests {
         ]
     }
 
-    /// Builds the JSON body `benches/compression.rs` measures.
+    /// Builds the JSON body the `compression` bench measures.
     fn json_items(items: u32) -> Vec<u8> {
         let records: Vec<String> = (0..items)
             .map(|id| format!(r#"{{"id":{id},"name":"mipyre","tags":["a","b","c"],"price":12.5,"ok":true}}"#))

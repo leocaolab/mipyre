@@ -16,9 +16,11 @@ use pyo3::prelude::*;
 use pyo3::types::PyString;
 
 use crate::exchange::body_stream;
+use crate::exchange::grpc_error::GrpcError;
 use crate::exchange::http_exception::HttpException;
 use mipyre_http::io::body::BodyReadError;
 use mipyre_http::io::request_head::RequestLabel;
+use mipyre_http::plan::grpc::GrpcCode;
 use mipyre_http::plan::request_id::RequestId;
 use mipyre_http::plan::response::HandlerResponse;
 use mipyre_http::plan::route::RuntimeChoice;
@@ -123,6 +125,11 @@ pub enum ResponseError {
     StreamConsumed,
     #[error("could not build the Response an after_request hook receives: {0}")]
     ResponseNotBuilt(PyException),
+    #[error(
+        "a gRPC method handler returned {type_name}, not bytes; return the serialized reply \
+         message (for example reply.SerializeToString())"
+    )]
+    NotBytes { type_name: String },
 }
 
 impl ResponseError {
@@ -132,7 +139,10 @@ impl ResponseError {
             | ResponseError::SerializerUnavailable(e)
             | ResponseError::NotUnicode(e)
             | ResponseError::ResponseNotBuilt(e) => Some(e),
-            ResponseError::NotAResponse { .. } | ResponseError::StreamInWorker | ResponseError::StreamConsumed => None,
+            ResponseError::NotAResponse { .. }
+            | ResponseError::StreamInWorker
+            | ResponseError::StreamConsumed
+            | ResponseError::NotBytes { .. } => None,
         }
     }
 }
@@ -193,6 +203,14 @@ pub enum HandlerError {
         stage: RequestStage,
         answer: Box<HandlerResponse>,
     },
+    /// The status a gRPC method's handler chose: not a server failure, so it is logged at debug,
+    /// without a traceback.
+    #[error("{stage} raised GrpcError({}){}", .code.name(), .details.as_deref().map(|d| format!(": {d}")).unwrap_or_default())]
+    Grpc {
+        stage: RequestStage,
+        code: GrpcCode,
+        details: Option<String>,
+    },
     #[error("could not start the thread that runs the handler: {0}")]
     ThreadNotSpawned(#[source] std::io::Error),
     /// The awaitable is not run, because that would mix two interpreters' objects.
@@ -218,7 +236,6 @@ pub enum ReplyHolder {
     PoolWorker,
     Main,
     AsyncEngine,
-    WebsocketHandler,
 }
 
 impl fmt::Display for ReplyHolder {
@@ -227,9 +244,6 @@ impl fmt::Display for ReplyHolder {
             ReplyHolder::PoolWorker => "the sub-interpreter worker dropped the request",
             ReplyHolder::Main => "the runtime='main' threads dropped the request",
             ReplyHolder::AsyncEngine => "the async engine dropped the request without answering it",
-            ReplyHolder::WebsocketHandler => {
-                "the WebSocket connection's task let go of it before answering the upgrade"
-            }
         })
     }
 }
@@ -309,6 +323,9 @@ pub enum UnansweredError {
     /// way; the route is numbered by registration order.
     #[error("route #{0} has no handler on this worker, but main sent it here")]
     NotOnWorker(usize),
+    /// This is the same mistake for a WebSocket route, numbered among the WebSocket routes.
+    #[error("websocket route #{0} has no handler on this worker, but the server sent it here")]
+    WebSocketNotOnWorker(usize),
     /// The thread takes no more connections while the others serve; the text is the worker's own
     /// words for why it retired.
     #[error("this thread's sub-interpreter worker retired: {0}")]
@@ -357,6 +374,7 @@ impl UnansweredError {
             | UnansweredError::WorkersDied { .. }
             | UnansweredError::NoWorkers(_)
             | UnansweredError::NotOnWorker(_)
+            | UnansweredError::WebSocketNotOnWorker(_)
             | UnansweredError::WorkerRetired(_)
             | UnansweredError::WorkerLost(_)
             | UnansweredError::TimedOut(_)
@@ -378,6 +396,7 @@ impl UnansweredError {
             UnansweredError::WorkersDied { .. }
             | UnansweredError::NoWorkers(_)
             | UnansweredError::NotOnWorker(_)
+            | UnansweredError::WebSocketNotOnWorker(_)
             | UnansweredError::WorkerRetired(_)
             | UnansweredError::WorkerLost(_)
             | UnansweredError::TimedOut(_)
@@ -427,6 +446,19 @@ impl HandlerError {
         }
     }
 
+    /// Turns what a gRPC method's handler raised into the status it chose when it is a
+    /// `GrpcError`, and otherwise as [`HandlerError::python`] does. Only a gRPC method reads
+    /// `GrpcError`: raised by an HTTP route's handler it is an exception like any other.
+    pub(crate) fn grpc_method(py: Python<'_>, stage: RequestStage, err: &PyErr) -> Self {
+        match err.value(py).cast::<GrpcError>() {
+            Ok(raised) => {
+                let (code, details) = raised.get().status();
+                HandlerError::Grpc { stage, code, details }
+            }
+            Err(_) => HandlerError::python(py, stage, err),
+        }
+    }
+
     pub(crate) fn panic(payload: Box<dyn Any + Send>) -> Self {
         HandlerError::Panicked {
             payload: panic_message(&*payload),
@@ -444,6 +476,7 @@ impl HandlerError {
             | HandlerError::Panicked { .. }
             | HandlerError::BodyRejected(_)
             | HandlerError::Http { .. }
+            | HandlerError::Grpc { .. }
             | HandlerError::ThreadNotSpawned(_)
             | HandlerError::ForeignEventLoop { .. }
             | HandlerError::LaneAnswerMalformed(_) => None,
@@ -474,7 +507,7 @@ impl HandlerError {
             ),
             LogTreatment::Answered => tracing::debug!(
                 target: "mipyre::handler", request_id = %id, method, path,
-                error = %self, "request answered with the HTTPException it raised"
+                error = %self, "request answered with the exception it raised"
             ),
             LogTreatment::Error => tracing::error!(
                 target: "mipyre::handler", request_id = %id, method, path,
@@ -519,7 +552,7 @@ fn treatment(err: &HandlerError) -> LogTreatment {
         }
         HandlerError::BodyRejected(BodyReadError::ConnectionLost(_)) => LogTreatment::Warn,
         HandlerError::BodyRejected(BodyReadError::TooLarge | BodyReadError::TimedOut(_)) => LogTreatment::Debug,
-        HandlerError::Http { .. } => LogTreatment::Answered,
+        HandlerError::Http { .. } | HandlerError::Grpc { .. } => LogTreatment::Answered,
         HandlerError::Raised { .. }
         | HandlerError::ContextNotExited { .. }
         | HandlerError::ContextLost { .. }

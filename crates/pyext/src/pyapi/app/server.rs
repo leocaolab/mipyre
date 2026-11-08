@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 
 use mipyre_http::plan::site::Protocols;
-use mipyre_transport::endpoint::{Endpoints, ListenerSet, ListenerSpec};
+use mipyre_transport::endpoint::{Endpoints, ListenerSet};
 use mipyre_transport::memory::{MemoryConnectError, MemoryConnector, MemorySource};
 use pyo3::prelude::*;
 use tokio_util::sync::CancellationToken;
@@ -83,7 +83,7 @@ pub(super) fn listener_set(values: &ServerFlagValues) -> PyResult<ListenerSet> {
             .as_ref()
             .map_or_else(Vec::new, |ports| ports.value().iter().map(|p| p.get()).collect())
     };
-    ListenerSpec::set(
+    ListenerSet::new(
         addr,
         tls,
         &ports(&values.extra_tls_ports),
@@ -166,11 +166,11 @@ fn handed_socket_errors(
 
 /// Parses `host` as an IPv4 or IPv6 address, bare or in brackets; a name such as `localhost`
 /// is refused, not resolved.
-fn socket_addr(host: &str, port: u16) -> Result<SocketAddr, BadHost> {
+fn socket_addr(host: &str, port: u16) -> Result<SocketAddr, ParseHostError> {
     let ip = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
     ip.parse::<std::net::IpAddr>()
         .map(|ip| SocketAddr::new(ip, port))
-        .map_err(|source| BadHost {
+        .map_err(|source| ParseHostError {
             host: host.to_string(),
             source,
         })
@@ -181,13 +181,13 @@ fn socket_addr(host: &str, port: u16) -> Result<SocketAddr, BadHost> {
     "host {host:?} is not an IP address ({source}); use e.g. \"127.0.0.1\", \"0.0.0.0\" or \
      \"::1\" (host names such as \"localhost\" are not resolved)"
 )]
-pub(super) struct BadHost {
+pub(super) struct ParseHostError {
     host: String,
     source: std::net::AddrParseError,
 }
 
-impl From<BadHost> for PyErr {
-    fn from(e: BadHost) -> Self {
+impl From<ParseHostError> for PyErr {
+    fn from(e: ParseHostError) -> Self {
         pyo3::exceptions::PyValueError::new_err(e.to_string())
     }
 }

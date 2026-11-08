@@ -17,7 +17,7 @@ use mipyre_runtime::{
     AbandonedWorker, CommandLine, InterpreterPool, LiveWorkers, MainThreadHandles, MainThreads, PoolError, PoolThreads,
     WorkerCounters, WorkerCounts, WorkerKind, WorkerKindLoss, WorkerProgram, WorkerRecipe,
 };
-use mipyre_server::{upgrade_target, IoThreadServers, MultiThreadServer, Site};
+use mipyre_server::{main_upgrade_target, IoThreadServers, MultiThreadServer, Site};
 use mipyre_server::{AcceptMode, Disposition, ServerRunStop, ServerStop, StopSignalDispositions};
 use mipyre_subinterp::gc::GcPolicy;
 use mipyre_tpc::ShutdownDeadline;
@@ -418,8 +418,9 @@ fn run_gil<D: TransportDriver>(
     }
 
     let counters = Arc::clone(&site.counters.run);
-    let ws = upgrade_target(&site, None, main.as_ref());
-    let servers = io_thread_servers(py, &site, io_threads, None, main.map(Arc::new));
+    let main = main.map(Arc::new);
+    let ws = main_upgrade_target(&site, main.as_ref());
+    let servers = io_thread_servers(py, &site, io_threads, None, main);
     // The copies' last references drop here, attached, as `ServerRun::serve`'s keepalive does.
     let _io_thread_sites_keepalive = Keepalive::new(servers.sites());
     let served = py.detach(move || mipyre_server::serve_multi_thread(transport, servers, stop, deadline, counters, ws));
@@ -516,8 +517,9 @@ fn run_subinterp<D: TransportDriver>(
     }
 
     let counters = Arc::clone(&site.counters.run);
-    let ws = upgrade_target(&site, Some(&pool), main.as_ref());
-    let servers = io_thread_servers(py, &site, io_threads, Some(Arc::new(pool)), main.map(Arc::new));
+    let main = main.map(Arc::new);
+    let ws = main_upgrade_target(&site, main.as_ref());
+    let servers = io_thread_servers(py, &site, io_threads, Some(Arc::new(pool)), main);
     // The copies' last references drop here, attached, as `ServerRun::serve`'s keepalive does.
     let _io_thread_sites_keepalive = Keepalive::new(servers.sites());
     let served = py.detach(move || mipyre_server::serve_multi_thread(transport, servers, stop, deadline, counters, ws));

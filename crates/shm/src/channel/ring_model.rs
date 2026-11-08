@@ -2,7 +2,7 @@
 //! the peer's corrupting writes among them, goes to both ends of a channel on heap memory and to a model a reader can
 //! check by eye, and every step's outcome must agree.
 //!
-//! The model keeps the host's requests in flight in a `VecDeque`, believes a counter the peer wrote only when it is
+//! The model keeps the caller's requests in flight in a `VecDeque`, believes a counter the peer wrote only when it is
 //! one of those requests (or `sent`), and reads every slot from a plain copy of what was last written there. It never
 //! does the ring's arithmetic; that is the Kani proofs' job in `plan/ring.rs`.
 
@@ -15,11 +15,11 @@ use proptest::prelude::*;
 
 use super::memory::sealed::Access;
 use super::{
-    sleep_all, wake_all, Channel, DeadPeerAnswer, DeadPeerError, HeapMemory, HostEnd, MessageView, PeerEnd, PeerFault,
-    SleepVerdict, Wait,
+    finish_wait, prepare_to_wait, Channel, DeadPeerResponse, HeapMemory, MessageView, PeerEnd, PeerFault, RequesterEnd,
+    SleepDecision, TakeOverError, WaitOutcome,
 };
 use crate::plan::geometry::{Geometry, SlotBytes};
-use crate::plan::ring::{slot_state, PeerCounterError, RingDepth, Seq, SlotState, Window};
+use crate::plan::ring::{slot_state, PeerCounterError, RingDepth, RingWindow, Seq, SlotState};
 use crate::plan::slot_len::SlotLengthError;
 use crate::plan::spin_window::SpinWindow;
 use crate::protocol::doorbell::{AtomicU32, Doorbell, Parker};
@@ -32,20 +32,20 @@ const ROOM: u32 = 56;
 /// One thing an end does, or the peer writes where no correct peer would.
 #[derive(Clone, Debug)]
 enum Op {
-    /// The host sends a request of this many bytes (past the slot's room it is refused, and sent empty).
+    /// The caller sends a request of this many bytes (past the slot's room it is refused, and sent empty).
     Send(u32),
     /// The peer takes the next request and does not answer it yet.
     PeerTake,
     /// The peer answers the request it took, or else takes the next one and answers it, with this many bytes.
-    PeerAnswer(u32),
-    /// The host takes every answer it believes is ready.
+    PeerResponds(u32),
+    /// The caller takes every answer it believes is ready.
     Collect,
-    /// The host asks which request the peer is running.
+    /// The caller asks which request the peer is running.
     Running,
-    /// The host says it is about to sleep and looks once more.
-    HostSleeps,
-    HostWakes,
-    /// The peer exits; the host takes over from it and a new peer starts where the counters were left.
+    /// The caller says it is about to sleep and looks once more.
+    RequesterSleeps,
+    RequesterWakes,
+    /// The peer exits; the caller takes over from it and a new peer starts where the counters were left.
     PeerDies,
     Corrupt(Field, Scribble),
 }
@@ -55,7 +55,7 @@ enum Op {
 enum Field {
     Taken,
     RespHead,
-    /// The length word of the answer slot the host reads next.
+    /// The length word of the answer slot the caller reads next.
     Len,
 }
 
@@ -66,17 +66,17 @@ enum Scribble {
     Any(u32),
 }
 
-/// An operation of a correct host and a correct peer.
+/// An operation of a correct caller and a correct peer.
 fn honest_op() -> impl Strategy<Value = Op> {
     let len = 0..=ROOM + 4;
     prop_oneof![
         4 => len.clone().prop_map(Op::Send),
         2 => Just(Op::PeerTake),
-        4 => len.prop_map(Op::PeerAnswer),
+        4 => len.prop_map(Op::PeerResponds),
         3 => Just(Op::Collect),
         1 => Just(Op::Running),
-        1 => Just(Op::HostSleeps),
-        1 => Just(Op::HostWakes),
+        1 => Just(Op::RequesterSleeps),
+        1 => Just(Op::RequesterWakes),
         1 => Just(Op::PeerDies),
     ]
 }
@@ -88,16 +88,16 @@ fn op() -> impl Strategy<Value = Op> {
     prop_oneof![8 => honest_op(), 1 => (field, scribble).prop_map(|(f, v)| Op::Corrupt(f, v))]
 }
 
-/// The bytes the host writes for request `seq`, or the peer for its answer.
+/// The bytes the caller writes for request `seq`, or the peer for its answer.
 fn message(seq: u32, len: u32, answer: bool) -> Vec<u8> {
     let tag = if answer { 0xA5 } else { 0x00 };
     (0..len).map(|i| (seq as u8).wrapping_add(i as u8) ^ tag).collect()
 }
 
 /// A doorbell that only says it rang.
-struct Bell;
+struct StubDoorbell;
 
-impl Doorbell for Bell {
+impl Doorbell for StubDoorbell {
     type Outcome = ();
     type Error = Infallible;
     fn ring(&self, _: &AtomicU32) -> Result<(), Infallible> {
@@ -106,17 +106,17 @@ impl Doorbell for Bell {
 }
 
 /// A parker whose every sleep ends at once.
-struct Awake;
+struct StubParker;
 
-impl Parker for Awake {
+impl Parker for StubParker {
     type Error = Infallible;
     fn park(&self, _: &AtomicU32, _: u32, _: u64) -> Result<(), Infallible> {
         Ok(())
     }
 }
 
-type Host = HostEnd<HeapMemory, Bell>;
-type Peer = PeerEnd<HeapMemory, Bell, Awake>;
+type Requester = RequesterEnd<HeapMemory, StubDoorbell>;
+type Peer = PeerEnd<HeapMemory, StubDoorbell, StubParker>;
 
 /// What was last written into one slot: its length word and its bytes.
 #[derive(Clone)]
@@ -146,7 +146,7 @@ impl SlotCopy {
     }
 }
 
-/// What the model says a take-over hands the host: each answer the dead peer published, and the request it died
+/// What the model says a take-over hands the caller: each answer the dead peer published, and the request it died
 /// running.
 struct TakeOver {
     answered: Vec<(u32, Result<Vec<u8>, SlotLengthError>)>,
@@ -156,11 +156,11 @@ struct TakeOver {
 /// The reference model.
 struct RingModel {
     depth: u32,
-    /// The requests the host sent and has not read the answers of, oldest first.
+    /// The requests the caller sent and has not read the answers of, oldest first.
     flight: VecDeque<u32>,
     sent: u32,
     fault: Option<PeerFault>,
-    host_sleeping: bool,
+    requester_sleeping: bool,
     /// The next request the peer takes, and whether it took it already.
     cursor: u32,
     running: bool,
@@ -183,7 +183,7 @@ impl RingModel {
             flight: VecDeque::new(),
             sent: 0,
             fault: None,
-            host_sleeping: false,
+            requester_sleeping: false,
             cursor: 0,
             running: false,
             taken: 0,
@@ -242,7 +242,7 @@ impl RingModel {
         *self.fault.insert(fault)
     }
 
-    /// Looks at `resp_head` as the host does before it reads anything.
+    /// Looks at `resp_head` as the caller does before it reads anything.
     fn observe(&mut self) -> Result<u32, PeerFault> {
         if let Some(fault) = self.fault {
             return Err(fault);
@@ -314,7 +314,7 @@ impl RingModel {
         self.running = false;
     }
 
-    /// Takes over from a dead peer as the host does, or gives up every request when its counters are past belief.
+    /// Takes over from a dead peer as the caller does, or gives up every request when its counters are past belief.
     fn take_over(&mut self) -> Result<TakeOver, PeerCounterError> {
         let checked = self.check_published().and_then(|published| {
             let from_published = self.check_taken(published)?;
@@ -347,11 +347,11 @@ impl RingModel {
 }
 
 /// Both ends of one channel, run by the test, beside the model; and, for the property that a faulted channel leaves
-/// its neighbours alone, a second host end whose peer wrote nonsense before the first step.
+/// its neighbours alone, a second caller end whose peer wrote nonsense before the first step.
 struct Harness {
     model: RingModel,
-    /// `hosts[0]` is the end the model follows; `hosts[1]`, when there, is the faulted neighbour.
-    hosts: Vec<Host>,
+    /// `requesters[0]` is the end the model follows; `requesters[1]`, when there, is the faulted neighbour.
+    requesters: Vec<Requester>,
     peer: Peer,
 }
 
@@ -360,21 +360,21 @@ impl Harness {
         let g = Geometry::new(RingDepth::new(depth).unwrap(), SlotBytes::new(SLOT_BYTES).unwrap()).unwrap();
         assert_eq!(g.max_message(), ROOM);
         let channel = Arc::new(Channel::new(HeapMemory::new(&g)));
-        let mut hosts = vec![HostEnd::new(Arc::clone(&channel), Bell)];
+        let mut requesters = vec![RequesterEnd::new(Arc::clone(&channel), StubDoorbell)];
         if faulted_neighbour {
             let neighbour = Arc::new(Channel::new(HeapMemory::new(&g)));
             neighbour.memory.header().resp_head.store(u32::MAX, Relaxed);
-            hosts.push(HostEnd::new(neighbour, Bell));
+            requesters.push(RequesterEnd::new(neighbour, StubDoorbell));
         }
         Harness {
             model: RingModel::new(depth),
-            hosts,
-            peer: PeerEnd::new(channel, Bell, Awake),
+            requesters,
+            peer: PeerEnd::new(channel, StubDoorbell, StubParker),
         }
     }
 
     fn channel(&self) -> &Channel<HeapMemory> {
-        self.hosts[0].channel()
+        self.requesters[0].channel()
     }
 
     /// Runs one operation on the channel and on the model; `Ok(Some(sent))` for a `Send`, saying whether it was.
@@ -383,35 +383,35 @@ impl Harness {
         match *op {
             Op::Send(len) => sent = Some(self.send(len)?),
             Op::PeerTake => self.peer_take()?,
-            Op::PeerAnswer(len) => self.peer_answer(len)?,
+            Op::PeerResponds(len) => self.peer_answer(len)?,
             Op::Collect => {
-                let real = take_all(&mut self.hosts[0]);
+                let real = take_all(&mut self.requesters[0]);
                 prop_assert_eq!(real, self.model.collect());
             }
             Op::Running => {
-                let real = self.hosts[0].running().map(|r| r.map(Seq::get));
+                let real = self.requesters[0].running().map(|r| r.map(Seq::get));
                 prop_assert_eq!(real, self.model.running_request());
             }
-            Op::HostSleeps => {
-                let verdict = sleep_all(&mut self.hosts);
-                self.model.host_sleeping = true;
+            Op::RequesterSleeps => {
+                let verdict = prepare_to_wait(&mut self.requesters);
+                self.model.requester_sleeping = true;
                 let found = self.model.fault.is_none()
                     && self
                         .model
                         .observe()
                         .map_or(true, |published| published != self.model.read());
-                if self.hosts.len() == 1 {
+                if self.requesters.len() == 1 {
                     let want = if found {
-                        SleepVerdict::Collect
+                        SleepDecision::Collect
                     } else {
-                        SleepVerdict::Park
+                        SleepDecision::Park
                     };
                     prop_assert_eq!(verdict, want);
                 }
             }
-            Op::HostWakes => {
-                wake_all(&mut self.hosts);
-                self.model.host_sleeping = false;
+            Op::RequesterWakes => {
+                finish_wait(&mut self.requesters);
+                self.model.requester_sleeping = false;
             }
             Op::PeerDies => self.peer_dies()?,
             Op::Corrupt(field, value) => self.corrupt(field, value),
@@ -423,8 +423,8 @@ impl Harness {
     fn send(&mut self, len: u32) -> Result<bool, TestCaseError> {
         let m = &mut self.model;
         let has_room = m.fault.is_none() && (m.flight.len() as u32) < m.depth;
-        let channel = Arc::clone(self.hosts[0].channel());
-        let Some(mut slot) = self.hosts[0].request_slot() else {
+        let channel = Arc::clone(self.requesters[0].channel());
+        let Some(mut slot) = self.requesters[0].request_slot() else {
             prop_assert!(!has_room, "no request slot, though the model has room");
             return Ok(false);
         };
@@ -434,8 +434,16 @@ impl Harness {
         let put = slot.write(|w| w.put(&bytes));
         prop_assert_eq!(put.is_ok(), len <= ROOM);
         if !m.scribbled {
-            let writing = state_as_read(&channel, Window::new(Seq::new(m.read()), Seq::new(m.sent)), slot.seq());
-            prop_assert_eq!(writing, Ok(SlotState::Empty), "Writing is an Empty slot the host holds");
+            let writing = state_as_read(
+                &channel,
+                RingWindow::new(Seq::new(m.read()), Seq::new(m.sent)),
+                slot.seq(),
+            );
+            prop_assert_eq!(
+                writing,
+                Ok(SlotState::Empty),
+                "Writing is an Empty slot the caller holds"
+            );
         }
         prop_assert_eq!(slot.publish(), Ok(None), "the peer never sleeps here, so nothing rings");
         let at = m.slot(m.sent);
@@ -465,11 +473,11 @@ impl Harness {
         let available = self.model.cursor != self.model.sent;
         let model = &mut self.model;
         match self.peer.wait_for_request(SpinWindow::until(0), || 0, 1) {
-            Ok(Wait::Request(request)) => {
+            Ok(WaitOutcome::Request(request)) => {
                 prop_assert!(available, "a request handed out, though none was sent");
                 Self::handed(model, request.seq(), request.bytes())?;
             }
-            Ok(Wait::SliceOver) => prop_assert!(!available, "no request handed out, though one was sent"),
+            Ok(WaitOutcome::SliceOver) => prop_assert!(!available, "no request handed out, though one was sent"),
             Err(never) => match never {},
         }
         Ok(())
@@ -479,8 +487,8 @@ impl Harness {
         let available = self.model.running || self.model.cursor != self.model.sent;
         let model = &mut self.model;
         let request = match self.peer.wait_for_request(SpinWindow::until(0), || 0, 1) {
-            Ok(Wait::Request(request)) => request,
-            Ok(Wait::SliceOver) => {
+            Ok(WaitOutcome::Request(request)) => request,
+            Ok(WaitOutcome::SliceOver) => {
                 prop_assert!(!available, "no request handed out, though one was sent");
                 return Ok(());
             }
@@ -489,7 +497,7 @@ impl Harness {
         prop_assert!(available, "a request handed out, though none was sent");
         Self::handed(model, request.seq(), request.bytes())?;
         if !model.scribbled {
-            let processing = state_as_read(self.hosts[0].channel(), self.hosts[0].window(), request.seq());
+            let processing = state_as_read(self.requesters[0].channel(), self.requesters[0].window(), request.seq());
             prop_assert_eq!(
                 processing,
                 Ok(SlotState::TakenByPeer),
@@ -498,9 +506,9 @@ impl Harness {
         }
         let bytes = message(model.cursor, len, true);
         let mut put = None;
-        let rung = request.answer(|w| put = Some(w.put(&bytes)));
+        let rung = request.respond(|w| put = Some(w.put(&bytes)));
         prop_assert_eq!(put.map(|p| p.is_ok()), Some(len <= ROOM));
-        prop_assert_eq!(rung, Ok(model.host_sleeping.then_some(())));
+        prop_assert_eq!(rung, Ok(model.requester_sleeping.then_some(())));
         let at = model.slot(model.cursor);
         model.answers[at].write(&bytes);
         model.cursor = model.cursor.wrapping_add(1);
@@ -509,11 +517,11 @@ impl Harness {
         Ok(())
     }
 
-    /// The peer exits; the host takes over, and a new peer starts on the counters the take-over left.
+    /// The peer exits; the caller takes over, and a new peer starts on the counters the take-over left.
     fn peer_dies(&mut self) -> Result<(), TestCaseError> {
         let abandoned = (self.model.read(), self.model.sent);
         let mut answered = Vec::new();
-        let real = self.hosts[0].take_over(&mut answered);
+        let real = self.requesters[0].take_over(&mut answered);
         match self.model.take_over() {
             Ok(TakeOver {
                 answered: want,
@@ -523,12 +531,12 @@ impl Harness {
                 prop_assert_eq!(split.running().map(Seq::get), running);
                 let got: Vec<_> = answered
                     .into_iter()
-                    .map(|DeadPeerAnswer { seq, message }| (seq.get(), message.map(|b| b.to_vec())))
+                    .map(|DeadPeerResponse { seq, message }| (seq.get(), message.map(|b| b.to_vec())))
                     .collect();
                 prop_assert_eq!(got, want);
             }
             Err(cause) => {
-                let DeadPeerError {
+                let TakeOverError {
                     cause: got,
                     abandoned: range,
                 } = real
@@ -539,7 +547,7 @@ impl Harness {
                 prop_assert!(answered.is_empty());
             }
         }
-        self.peer = PeerEnd::new(Arc::clone(self.hosts[0].channel()), Bell, Awake);
+        self.peer = PeerEnd::new(Arc::clone(self.requesters[0].channel()), StubDoorbell, StubParker);
         Ok(())
     }
 
@@ -562,35 +570,35 @@ impl Harness {
             Scribble::Any(v) => v,
         };
         let value = *word;
-        let memory = &self.hosts[0].channel().memory;
+        let memory = &self.requesters[0].channel().memory;
         let h = memory.header();
         match field {
             Field::Taken => h.taken.store(value, Relaxed),
             Field::RespHead => h.resp_head.store(value, Relaxed),
             Field::Len => {
-                let slot = memory.slot(memory.geometry().answer_slot(Seq::new(m.read())));
+                let slot = memory.slot(memory.geometry().response_offset(Seq::new(m.read())));
                 slot.len_word().store(value, Relaxed);
             }
         }
     }
 
-    /// What holds after every step: the host's window is the model's, never past the ring's depth, and both say the
+    /// What holds after every step: the caller's window is the model's, never past the ring's depth, and both say the
     /// same about news waiting.
     fn check_invariants(&self) -> Result<(), TestCaseError> {
-        let (host, m) = (&self.hosts[0], &self.model);
-        prop_assert_eq!(host.window(), Window::new(Seq::new(m.read()), Seq::new(m.sent)));
-        prop_assert_eq!(host.in_flight(), m.flight.len() as u32);
-        prop_assert!(host.in_flight() <= m.depth, "in flight past the depth");
+        let (caller, m) = (&self.requesters[0], &self.model);
+        prop_assert_eq!(caller.window(), RingWindow::new(Seq::new(m.read()), Seq::new(m.sent)));
+        prop_assert_eq!(caller.in_flight(), m.flight.len() as u32);
+        prop_assert!(caller.in_flight() <= m.depth, "in flight past the depth");
         let moved = m.resp_head != m.read();
-        prop_assert_eq!(host.has_answers(), m.fault.is_none() && moved);
-        prop_assert_eq!(host.has_news(), m.fault.is_some() || moved);
+        prop_assert_eq!(caller.has_responses(), m.fault.is_none() && moved);
+        prop_assert_eq!(caller.has_responses_or_fault(), m.fault.is_some() || moved);
         let h = self.channel().memory.header();
         prop_assert_eq!(
             (h.taken.load(Relaxed), h.resp_head.load(Relaxed)),
             (m.taken, m.resp_head)
         );
         for (seq, named) in m.named_states().unwrap_or_default() {
-            let read = state_as_read(self.channel(), host.window(), Seq::new(seq));
+            let read = state_as_read(self.channel(), caller.window(), Seq::new(seq));
             prop_assert_eq!(read, Ok(named), "request {}", seq);
         }
         Ok(())
@@ -598,7 +606,7 @@ impl Harness {
 }
 
 /// Returns the state of request `seq`'s slot from the counters the peer wrote in `channel`, against `window`.
-fn state_as_read(channel: &Channel<HeapMemory>, window: Window, seq: Seq) -> Result<SlotState, PeerCounterError> {
+fn state_as_read(channel: &Channel<HeapMemory>, window: RingWindow, seq: Seq) -> Result<SlotState, PeerCounterError> {
     let h = channel.memory.header();
     slot_state(
         &window,
@@ -609,8 +617,8 @@ fn state_as_read(channel: &Channel<HeapMemory>, window: Window, seq: Seq) -> Res
     )
 }
 
-fn take_all(host: &mut Host) -> Result<Vec<(u32, Vec<u8>)>, PeerFault> {
-    let mut ready = host.answers()?;
+fn take_all(caller: &mut Requester) -> Result<Vec<(u32, Vec<u8>)>, PeerFault> {
+    let mut ready = caller.responses()?;
     let mut out = Vec::new();
     loop {
         let mut buf = BytesMut::new();
@@ -643,7 +651,7 @@ proptest! {
         run(&ops, depth, false)?;
     }
 
-    /// A channel beside one whose peer wrote nonsense, sharing its host's sleeps, still answers as the model.
+    /// A channel beside one whose peer wrote nonsense, sharing its caller's sleeps, still answers as the model.
     #[test]
     #[cfg_attr(miri, ignore = "proptest reads its regression file, which Miri's isolation refuses; the unit tests \
                                run the same code under Miri")]

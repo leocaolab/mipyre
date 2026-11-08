@@ -127,7 +127,7 @@ fn text_bytes(py: Python<'_>, s: &Bound<'_, PyString>) -> Result<Bytes, Response
     Ok(Bytes::copy_from_slice(text.as_bytes()))
 }
 
-fn type_name(obj: &Bound<'_, PyAny>) -> String {
+pub(crate) fn type_name(obj: &Bound<'_, PyAny>) -> String {
     match obj.get_type().name() {
         Ok(name) => name.to_string(),
         Err(e) => format!("<type name unavailable: {e}>"),
@@ -149,7 +149,7 @@ pub(crate) fn response_to_py<'py>(
             body: body.unbind(),
             status: data.status,
             content_type: Some(data.content_type().clone()),
-            header_type: None,
+            content_type_header: None,
             headers: data.header_lines(),
             validation_errors: data.validation_errors(),
         },

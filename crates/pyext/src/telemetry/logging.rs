@@ -18,7 +18,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer, Registry};
 
-use super::log_writer::{FenceError, LogChannel, LogDrops, LogQueue, LogWriter};
+use super::log_writer::{FlushError, LogChannel, LogDrops, LogQueue, LogWriter};
 use mipyre_server::{JsonLines, ACCESS_TARGET};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,9 +173,9 @@ pub(crate) enum LoggerError {
         source: tracing_subscriber::filter::ParseError,
     },
     #[error(transparent)]
-    LogWriterStopped(#[from] FenceError),
+    LogWriterStopped(#[from] FlushError),
     #[error("could not start the log's writer thread: {0}")]
-    WriterThread(#[source] std::io::Error),
+    WriterThreadNotStarted(#[source] std::io::Error),
 }
 
 impl From<LoggerError> for PyErr {
@@ -186,7 +186,7 @@ impl From<LoggerError> for PyErr {
             | LoggerError::AlreadyConfigured { .. }
             | LoggerError::InvalidFilter { .. }
             | LoggerError::LogWriterStopped(_)
-            | LoggerError::WriterThread(_) => PyRuntimeError::new_err(e.to_string()),
+            | LoggerError::WriterThreadNotStarted(_) => PyRuntimeError::new_err(e.to_string()),
         }
     }
 }
@@ -273,7 +273,9 @@ fn install(config: &LoggerConfig) -> Result<GlobalSubscriber, LoggerError> {
     let stderr = std::io::stderr();
     let ansi = stderr.is_terminal();
     let queue = LogQueue::new();
-    let writer = queue.start_writer(stderr).map_err(LoggerError::WriterThread)?;
+    let writer = queue
+        .start_writer(stderr)
+        .map_err(LoggerError::WriterThreadNotStarted)?;
     let direct = Arc::new(AtomicBool::new(false));
     let sink = LogSink {
         queue: queue.channel().clone(),
@@ -398,7 +400,7 @@ pub(crate) fn start_log_writer() -> Result<(), LoggerError> {
         installed
             .queue
             .start_writer(std::io::stderr())
-            .map_err(LoggerError::WriterThread)?,
+            .map_err(LoggerError::WriterThreadNotStarted)?,
     );
     installed.direct.store(false, Ordering::Release);
     Ok(())
@@ -624,9 +626,9 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    struct FakeStderr(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
-    impl std::io::Write for Lines {
+    impl std::io::Write for FakeStderr {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
             Ok(buf.len())
@@ -636,15 +638,15 @@ mod tests {
         }
     }
 
-    impl<'a> MakeWriter<'a> for Lines {
-        type Writer = Lines;
-        fn make_writer(&'a self) -> Lines {
+    impl<'a> MakeWriter<'a> for FakeStderr {
+        type Writer = FakeStderr;
+        fn make_writer(&'a self) -> FakeStderr {
             self.clone()
         }
     }
 
     fn text_line(ansi: bool) -> String {
-        let lines = Lines::default();
+        let lines = FakeStderr::default();
         let subscriber = tracing_subscriber::registry()
             .with(EnvFilter::new("info"))
             .with(fmt_layer(LogFormat::Text, lines.clone(), ansi));

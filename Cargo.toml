@@ -2,9 +2,10 @@
 # the engine is `mipyre_pyext` in `crates/pyext` (maturin finds it through pyproject.toml's
 # `manifest-path`).
 #
-# Every directory under `crates/` is a package, so one glob names them all. `[profile]` and the `[patch]` at
-# the bottom must stay in this file: cargo reads both only from the workspace root and ignores them in a
-# member, with a warning.
+# Every directory under `crates/` is a package, so one glob names them all. What only benches and fuzz targets run
+# is under `dev/`: the tools they run on, and a `dev/harness/<crate>` per production crate; no package under `crates/`
+# depends on it. `[profile]` and the `[patch]` at the bottom must stay in this file: cargo reads both only from the
+# workspace root and ignores them in a member, with a warning.
 [workspace]
 members = ["crates/*"]
 # Vendored crates are patched in below, not members: they keep their own manifests and lints.
@@ -23,7 +24,7 @@ resolver = "2"
 # reads: under `--cfg loom` tokio swaps its own internals for Loom's and stops building (`tokio::net` is gone, the
 # runtime builder has no `on_thread_park`), so every package that uses tokio could not be built for a model at all.
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sync_model)", "cfg(sync_shuttle)", "cfg(sync_shuttle_random)", "cfg(shm_model)", "cfg(shm_shuttle)", "cfg(shm_shuttle_random)", "cfg(lane_dst_random)", "cfg(shm_wrap_nightly)", "cfg(kani)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sync_model)", "cfg(sync_shuttle)", "cfg(sync_shuttle_random)", "cfg(shm_model)", "cfg(shm_shuttle)", "cfg(shm_shuttle_random)", "cfg(lane_dst_random)", "cfg(shm_wrap_nightly)", "cfg(kani)", "cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 allow_attributes = "deny"
@@ -35,7 +36,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [workspace.package]
-version = "3.0.1"
+version = "4.0.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -72,7 +73,8 @@ inherits = "gate"
 incremental = true
 
 # What `cargo bolero test` builds the fuzz targets with (its default profile name): optimized, with the checks a
-# test build has. The corpora it grows are what plain `cargo test` replays (`src/**/__fuzz__/*/corpus`).
+# test build has. The corpora it grows (`dev/harness/*/src/__fuzz__/*/corpus`) are what plain `cargo test` replays,
+# compiled into the test binary (dev/fuzz_corpus).
 [profile.fuzz]
 inherits = "dev"
 opt-level = 3

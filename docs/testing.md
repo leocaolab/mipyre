@@ -121,9 +121,8 @@ Each client has its own cookie jar: cookies the server sets are sent back on tha
 
 ```python
 @app.websocket("/ws")
-async def echo(ws):
-    async for msg in ws:
-        await ws.send(f"echo: {msg}")
+def echo(ws, msg):
+    return f"echo: {msg}"
 ```
 
 a test reads:

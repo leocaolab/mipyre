@@ -154,7 +154,7 @@ impl TransportDriver for MemorySource {
         match tokio::net::UnixStream::from_std(connection) {
             Ok(stream) => Some(stream),
             Err(e) => {
-                if let Some(held) = events::degrade(StreamEvent::RegisterFailed) {
+                if let Some(held) = events::count_and_admit(StreamEvent::RegisterFailed) {
                     tracing::warn!(
                         error = %e,
                         held,

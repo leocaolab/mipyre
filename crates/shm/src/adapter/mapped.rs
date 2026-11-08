@@ -1,4 +1,4 @@
-//! Keeps a channel's memory in a shared memory object both processes map: the host creates it, the peer attaches
+//! Keeps a channel's memory in a shared memory object both processes map: the caller creates it, the peer attaches
 //! to the fd it was handed.
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -133,11 +133,11 @@ mod tests {
         let (created, fd) = MappedMemory::create(&g).unwrap();
         let attached = MappedMemory::attach(&g, fd.as_fd()).unwrap();
         created.header().req_head.store(3, Relaxed);
-        let slot = created.slot(g.request_slot(Seq::new(1)));
+        let slot = created.slot(g.request_offset(Seq::new(1)));
         assert_eq!(slot.copy_in(0, b"hello"), Ok(5));
         slot.len_word().store(5, Relaxed);
         assert_eq!(attached.header().req_head.load(Relaxed), 3);
-        let seen = attached.slot(g.request_slot(Seq::new(1)));
+        let seen = attached.slot(g.request_offset(Seq::new(1)));
         assert_eq!(seen.view_message().map(|v| v.to_vec()), Ok(b"hello".to_vec()));
     }
 

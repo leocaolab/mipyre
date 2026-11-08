@@ -12,7 +12,7 @@ use mipyre_util::throttle::{ThrottlePeriod, ThrottleState};
 
 /// Counts the lines a keyed line that goes out was held back for, and says whose they were.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeldLines {
+pub enum SuppressedLines {
     /// The lines of this key held back since its last line.
     OfKey(u64),
     /// The lines held back since the last such line of every key not remembered, this one
@@ -54,7 +54,7 @@ impl<K: Hash + Eq> PerKeyThrottles<K> {
 
     /// Returns the lines held back that this line carries when it should be logged, and `None`
     /// when it is held back. The key is copied only when it is not remembered yet.
-    pub fn admit<Q>(&mut self, key: &Q, now: Duration) -> Option<HeldLines>
+    pub fn admit<Q>(&mut self, key: &Q, now: Duration) -> Option<SuppressedLines>
     where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq + ToOwned<Owned = K>,
@@ -63,7 +63,7 @@ impl<K: Hash + Eq> PerKeyThrottles<K> {
         let seen = self.calls;
         if let Some(entry) = self.remembered.get_mut(key) {
             entry.seen = seen;
-            return entry.throttle.admit(now, self.period).map(HeldLines::OfKey);
+            return entry.throttle.admit(now, self.period).map(SuppressedLines::OfKey);
         }
         if self.remembered.len() >= self.capacity.get() {
             let expired = self
@@ -71,20 +71,20 @@ impl<K: Hash + Eq> PerKeyThrottles<K> {
                 .values()
                 .filter(|e| e.throttle.is_over(now))
                 .min_by_key(|e| e.seen)
-                .map(|e| (e.seen, e.throttle.held()));
+                .map(|e| (e.seen, e.throttle.suppressed()));
             let Some((forgotten, held)) = expired else {
                 return self
                     .unremembered
                     .admit(now, self.period)
-                    .map(HeldLines::OfUnrememberedKeys);
+                    .map(SuppressedLines::OfUnrememberedKeys);
             };
             self.remembered.retain(|_, e| e.seen != forgotten);
-            self.unremembered.add_held(held);
+            self.unremembered.add_suppressed(held);
         }
         let mut throttle = ThrottleState::new();
         let admitted = throttle.admit(now, self.period);
         self.remembered.insert(key.to_owned(), RecentKey { throttle, seen });
-        admitted.map(HeldLines::OfKey)
+        admitted.map(SuppressedLines::OfKey)
     }
 }
 
@@ -102,7 +102,7 @@ impl<K: Hash + Eq> KeyedLogThrottle<K> {
     }
 
     /// Decides `key`'s line as [`PerKeyThrottles::admit`] does, under the lock.
-    pub(crate) fn admit<Q>(&self, key: &Q, now: Duration) -> Option<HeldLines>
+    pub(crate) fn admit<Q>(&self, key: &Q, now: Duration) -> Option<SuppressedLines>
     where
         K: Borrow<Q>,
         Q: ?Sized + Hash + Eq + ToOwned<Owned = K>,

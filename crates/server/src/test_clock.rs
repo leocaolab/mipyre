@@ -4,7 +4,7 @@ use mipyre_http::io::clock::Clock;
 
 /// Is held by each test that ends a connection without a first request, since such a test counts
 /// the process's `FirstRequestTimedOut` and one running beside it would add to the count.
-pub(crate) static NO_FIRST_REQUEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static NO_FIRST_REQUEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 std::thread_local! {
     static TEST_CLOCK: std::cell::Cell<Option<&'static Clock>> = const { std::cell::Cell::new(None) };

@@ -13,9 +13,9 @@ use pyo3::prelude::*;
 use pyo3::sync::PerInterpreterCell;
 use pyo3::types::{PyTuple, PyType};
 
-use super::numeric::NumericError;
 use super::query::QueryMethod;
-use mipyre_pg::{OwnPoolError, PoolSettingDifferences, TaskError};
+use mipyre_pg::numeric::NumericError;
+use mipyre_pg::{OpenOwnPoolError, PoolSettingDifferences, TaskError};
 
 pyo3::create_exception!(
     mipyre.engine,
@@ -54,7 +54,7 @@ pub(crate) enum DbError {
     /// Postgres always describes the parameters' types, so this means the server or driver
     /// broke that promise; `count` is the parameter count it did give, if any.
     #[error("{op}: the server did not describe the statement's parameter types (count: {count:?})")]
-    Undescribed { op: QueryMethod, count: Option<usize> },
+    ParamTypesUndescribed { op: QueryMethod, count: Option<usize> },
     #[error(transparent)]
     Param(#[from] ParamError),
     #[error(transparent)]
@@ -94,7 +94,7 @@ impl DbError {
                 }
             },
             Self::QueryFailed { .. } => database_error(py, message, self.sqlstate()),
-            Self::Undescribed { .. } => database_error(py, message, None),
+            Self::ParamTypesUndescribed { .. } => database_error(py, message, None),
         }
     }
 }
@@ -185,7 +185,7 @@ pub(crate) enum ParamError {
          float, str, bool, bytes, None, dict, list, datetime.date, datetime.datetime, \
          uuid.UUID, decimal.Decimal)"
     )]
-    Unsupported { index: usize, python_type: String },
+    UnsupportedPythonType { index: usize, python_type: String },
     /// Reading the value out of Python raised, as for a `str` with a lone surrogate or a
     /// `dict` that isn't JSON.
     #[error("parameter ${index}: {source}")]
@@ -206,11 +206,11 @@ pub(crate) enum ParamValueError {
     Numeric(#[from] NumericError),
 }
 
-impl From<OwnPoolError> for DbError {
-    fn from(e: OwnPoolError) -> Self {
+impl From<OpenOwnPoolError> for DbError {
+    fn from(e: OpenOwnPoolError) -> Self {
         match e {
-            OwnPoolError::Runtime(e) => DbError::Task(e),
-            OwnPoolError::ConnectFailed(e) => DbError::ConnectFailed(e),
+            OpenOwnPoolError::Runtime(e) => DbError::Task(e),
+            OpenOwnPoolError::ConnectFailed(e) => DbError::ConnectFailed(e),
         }
     }
 }
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn a_pool_timeout_is_a_database_error_without_sqlstate() {
         let timed_out = DbError::QueryFailed {
-            op: QueryMethod::Answer(FetchMode::Scalar),
+            op: QueryMethod::Fetch(FetchMode::Scalar),
             source: sqlx::Error::PoolTimedOut,
         };
         assert_eq!(timed_out.sqlstate(), None);

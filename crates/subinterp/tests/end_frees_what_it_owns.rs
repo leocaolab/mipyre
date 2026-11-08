@@ -48,11 +48,11 @@ impl Releasable for Nothing {
     fn release(self, _py: Python<'_>) {}
 }
 
-fn create_and_end(label: String) -> Result<(), NewInterpreterError> {
-    SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(label, std::convert::identity, |_py| {
-        Ok(Nothing)
-    })?
-    .end_on_own_thread();
+fn create_and_end() -> Result<(), NewInterpreterError> {
+    drop(SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
+        std::convert::identity,
+        |_py| Ok(Nothing),
+    )?);
     Ok(())
 }
 
@@ -63,9 +63,9 @@ fn a_created_and_ended_worker_leaves_nothing_on_the_rust_heap() {
         .stack_size(PYTHON_THREAD_STACK)
         .spawn(|| {
             // The first worker on a thread may set up what every later one reuses.
-            create_and_end("warm-up".into()).expect("the warm-up worker");
+            create_and_end().expect("the warm-up worker");
             let before = LIVE_BYTES.with(Cell::get);
-            create_and_end("x".repeat(64)).expect("the measured worker");
+            create_and_end().expect("the measured worker");
             LIVE_BYTES.with(Cell::get) - before
         })
         .expect("spawn the worker thread")

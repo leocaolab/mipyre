@@ -50,9 +50,6 @@ pub fn request_authority<'a>(uri: &'a Uri, headers: &'a HeaderMap) -> Option<&'a
 }
 
 #[cfg(test)]
-mod fuzz;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

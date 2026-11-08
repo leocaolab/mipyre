@@ -36,15 +36,15 @@ use pyo3::ffi;
 
 /// Holds, from first use, the install's failure as `Err` when another recorder was installed
 /// first, so the dump says why no sample arrived instead of printing an empty histogram.
-static SNAPSHOTTER: OnceLock<Result<Snapshotter, RecorderInstallError>> = OnceLock::new();
+static SNAPSHOTTER: OnceLock<Result<Snapshotter, InstallRecorderError>> = OnceLock::new();
 
 #[derive(Debug, thiserror::Error)]
 #[error("another metrics recorder is already installed in this process")]
-pub struct RecorderInstallError(#[source] SetRecorderError<DebuggingRecorder>);
+pub struct InstallRecorderError(#[source] SetRecorderError<DebuggingRecorder>);
 
 /// Returns why leak detection runs without its recorder, or `None` while it has one or none was
 /// asked for yet.
-pub fn degraded() -> Option<&'static RecorderInstallError> {
+pub fn degraded() -> Option<&'static InstallRecorderError> {
     SNAPSHOTTER.get().and_then(|installed| installed.as_ref().err())
 }
 
@@ -56,7 +56,7 @@ fn ensure_recorder_installed() -> Option<&'static Snapshotter> {
             recorder.install().map(|()| snap).map_err(|e| {
                 tracing::error!(target: "mipyre::server", error = %e,
                     "leak diagnostic disabled: the metrics recorder could not be installed");
-                RecorderInstallError(e)
+                InstallRecorderError(e)
             })
         })
         .as_ref()

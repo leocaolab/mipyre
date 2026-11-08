@@ -29,39 +29,63 @@ fn request(method: http::Method, target: &str) -> LaneRequest {
             parts,
             params: Default::default(),
             client: Peer::InMemory,
-            request_id: RequestId::Server(ServerRequestId { process: 1, number: 2 }),
+            request_id: RequestId::Server(ServerRequestId {
+                process_seed: 1,
+                number: 2,
+            }),
         },
         body: Default::default(),
     }
 }
 
+/// Every form of request target `http::Uri` parses.
+const TARGETS: [(&str, &str); 12] = [
+    ("GET", "/"),
+    ("GET", "/a/b?c=d&e"),
+    ("GET", "/%zz?%00"),
+    ("GET", "//double//slash"),
+    ("GET", "/?"),
+    ("OPTIONS", "*"),
+    ("CONNECT", "example.com:443"),
+    ("CONNECT", "[::1]:8080"),
+    ("GET", "http://example.com"),
+    ("GET", "http://user:pw@example.com:8080/p?q=1"),
+    ("GET", "https://EXAMPLE.com/P"),
+    ("GET", "http://[::1]/x"),
+];
+
+fn encoded(sent: &LaneRequest) -> bytes::Bytes {
+    let (fits, bytes) = written(ROOM, |w| encode_request(w, sent));
+    fits.unwrap();
+    bytes
+}
+
 /// Every form of request target `http::Uri` parses comes back to the worker as the same URI.
 #[test]
 fn every_request_target_the_http_side_parses_reaches_the_worker_unchanged() {
-    let targets = [
-        ("GET", "/"),
-        ("GET", "/a/b?c=d&e"),
-        ("GET", "/%zz?%00"),
-        ("GET", "//double//slash"),
-        ("GET", "/?"),
-        ("OPTIONS", "*"),
-        ("CONNECT", "example.com:443"),
-        ("CONNECT", "[::1]:8080"),
-        ("GET", "http://example.com"),
-        ("GET", "http://user:pw@example.com:8080/p?q=1"),
-        ("GET", "https://EXAMPLE.com/P"),
-        ("GET", "http://[::1]/x"),
-    ];
-    for (method, target) in targets {
+    for (method, target) in TARGETS {
         let method = http::Method::from_bytes(method.as_bytes()).unwrap();
         let uri: http::Uri = target.parse().unwrap_or_else(|e| panic!("{target}: {e}"));
         let sent = request(method, target);
         assert_eq!(sent.head.parts.uri, uri);
-        let (fits, bytes) = written(ROOM, |w| encode_request(w, &sent));
-        fits.unwrap();
+        let bytes = encoded(&sent);
         let back = decode_request(&bytes).unwrap_or_else(|e| panic!("{target}: {e}"));
         assert_eq!(back.head.parts.uri.to_string(), uri.to_string(), "{target}");
         assert_eq!(back.head.parts.uri, uri, "{target}");
+    }
+}
+
+/// The size a request is checked against a slot with is never less than its encoding, for every form of target.
+#[test]
+fn a_request_is_sized_at_no_less_than_its_encoding_for_every_target() {
+    for (method, target) in TARGETS {
+        let sent = request(http::Method::from_bytes(method.as_bytes()).unwrap(), target);
+        let len = encoded(&sent).len();
+        assert!(
+            sent.approx_message_len() >= len,
+            "{target}: sized {} for {len} bytes",
+            sent.approx_message_len()
+        );
     }
 }
 

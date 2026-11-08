@@ -15,11 +15,11 @@ use std::collections::HashMap;
 use super::*;
 
 /// A seeded generator (xorshift64*): the world's only source of choice.
-struct Dice(u64);
+struct XorShiftRng(u64);
 
-impl Dice {
+impl XorShiftRng {
     fn new(seed: u64) -> Self {
-        Dice(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        XorShiftRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
     }
 
     fn next(&mut self) -> u64 {
@@ -50,9 +50,9 @@ enum Event {
 }
 
 /// A lane's worker as the world plays it.
-struct SimWorker {
-    tag: WorkerTag,
-    end: PeerEnd<MappedMemory, NoBell, NoSleep>,
+struct FakeWorker {
+    tag: WorkerId,
+    end: PeerEnd<MappedMemory, StubDoorbell, StubParker>,
     /// It refuses to start: it reports nothing and exits with `START_REFUSED`.
     refuses: bool,
     /// The host killed it; it goes on taking and answering requests until the kill takes.
@@ -61,26 +61,26 @@ struct SimWorker {
 
 /// What the world knows of a worker that is gone, for the host to be told.
 struct Death {
-    tag: WorkerTag,
+    tag: WorkerId,
     exit: WorkerExit,
 }
 
 /// The host's effects, as the world carries them out.
 #[derive(Default)]
-struct SimFx {
-    seen: Seen,
+struct SpyHostEffects {
+    seen: Coverage,
     attempts: u32,
-    kills: Vec<WorkerTag>,
+    kills: Vec<WorkerId>,
     forks: Vec<(LaneIndex, Attempt)>,
     lost: Vec<(LaneIndex, bool)>,
 }
 
-impl HostEffects for SimFx {
+impl HostEffects for SpyHostEffects {
     fn take_attempt(&mut self) -> Attempt {
         self.attempts += 1;
         Attempt::new(self.attempts)
     }
-    fn kill(&mut self, worker: WorkerTag) {
+    fn kill(&mut self, worker: WorkerId) {
         self.kills.push(worker);
     }
     fn fork(&mut self, lane: LaneIndex, attempt: Attempt) {
@@ -89,13 +89,13 @@ impl HostEffects for SimFx {
     fn drop_fork(&mut self, lane: LaneIndex) {
         self.forks.retain(|&(l, _)| l != lane);
     }
-    fn forget(&mut self, _worker: WorkerTag) {}
+    fn forget(&mut self, _worker: WorkerId) {}
     fn woke_worker(&mut self) {}
     fn skipped_unawaited(&mut self) {}
     fn reply(&mut self, reply: LaneReplySender, outcome: Result<HandlerResponse, LaneRequestError>) {
         answer_lane(reply, outcome);
     }
-    fn say(&mut self, notice: LaneNotice) {
+    fn report(&mut self, notice: LaneNotice) {
         let seen = &mut self.seen;
         match notice {
             LaneNotice::WorkerDied { .. } => seen.deaths += 1,
@@ -119,7 +119,7 @@ impl HostEffects for SimFx {
 /// What the runs went through, summed over seeds: the simulation is worth its seeds only if they reach each of
 /// these.
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
-struct Seen {
+struct Coverage {
     deaths: u32,
     faults: u32,
     crash_loops: u32,
@@ -135,8 +135,8 @@ struct Seen {
     taken_after_kill: u32,
 }
 
-impl Seen {
-    fn add(&mut self, b: Seen) {
+impl Coverage {
+    fn add(&mut self, b: Coverage) {
         self.deaths += b.deaths;
         self.faults += b.faults;
         self.crash_loops += b.crash_loops;
@@ -151,38 +151,38 @@ impl Seen {
 }
 
 /// A request the client sent: who waits for its answer, until it has it.
-enum Answer {
-    Waiting(Sent),
+enum ClientRequest {
+    Waiting(ResponseReceiver),
     Got { served: bool },
 }
 
 /// What one seed's run went through and how it went: two runs of a seed are the same run only if all of it is
 /// equal.
 #[derive(Debug, PartialEq)]
-struct Ran {
-    seen: Seen,
+struct Trace {
+    seen: Coverage,
     events: Vec<Event>,
     /// Whether each request, by its number, got a worker's answer rather than a refusal or a 5xx.
     served: Vec<bool>,
 }
 
 /// A request the client sent: who waits for its answer.
-type Sent = tokio::sync::oneshot::Receiver<Result<HandlerResponse, LaneRequestError>>;
+type ResponseReceiver = tokio::sync::oneshot::Receiver<Result<HandlerResponse, LaneRequestError>>;
 
 /// One seeded run of a host with `LANES` lanes.
 struct World {
-    rng: Dice,
+    rng: XorShiftRng,
     now: u64,
     config: CoreConfig,
     core: HostCore,
     fds: Vec<OwnedFd>,
-    workers: Vec<Option<SimWorker>>,
+    workers: Vec<Option<FakeWorker>>,
     deaths: Vec<Death>,
-    fx: SimFx,
-    sent: Vec<Answer>,
+    fx: SpyHostEffects,
+    sent: Vec<ClientRequest>,
     /// The workers that took each request (by its number). A worker that took one and dropped it unanswered
     /// takes it again at its next wait (its cursor moves only when it answers): still one worker.
-    runs: HashMap<u32, Vec<WorkerTag>>,
+    runs: HashMap<u32, Vec<WorkerId>>,
     buf: BytesMut,
     done: Completions,
     stopping: bool,
@@ -211,22 +211,22 @@ const BACKOFF: CrashBackoff = CrashBackoff {
 impl World {
     fn new(seed: u64) -> Self {
         let geometry = lane_geometry(DEPTH, MIN_SLOT_BYTES).unwrap();
-        let mut fx = SimFx::default();
+        let mut fx = SpyHostEffects::default();
         let (mut lanes, mut ends, mut fds, mut workers) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for i in 0..LANES {
             let (memory, fd) = MappedMemory::create(&geometry).unwrap();
             let channel = Arc::new(Channel::new(memory));
-            let mut end = HostEnd::new(Arc::clone(&channel), FutexDoorbell);
+            let mut end = RequesterEnd::new(Arc::clone(&channel), FutexDoorbell);
             let attempt = fx.take_attempt();
             end.begin_attempt(attempt);
-            let tag = WorkerTag {
+            let tag = WorkerId {
                 lane: LaneIndex(i),
                 attempt,
                 pid: Pid::new(1000 + i as i32).unwrap(),
             };
             lanes.push(LocalLane {
                 index: LaneIndex(i),
-                waiting: (0..DEPTH).map(|_| None).collect(),
+                waiters: (0..DEPTH).map(|_| None).collect(),
                 queued: Default::default(),
                 worker: LaneWorker::Running {
                     worker: tag,
@@ -236,9 +236,9 @@ impl World {
             });
             ends.push(end);
             fds.push(fd);
-            workers.push(Some(SimWorker {
+            workers.push(Some(FakeWorker {
                 tag,
-                end: PeerEnd::new(channel, NoBell, NoSleep),
+                end: PeerEnd::new(channel, StubDoorbell, StubParker),
                 refuses: false,
                 killed: false,
             }));
@@ -249,13 +249,13 @@ impl World {
             crash_backoff: BACKOFF,
         };
         World {
-            rng: Dice::new(seed),
+            rng: XorShiftRng::new(seed),
             now: 1_000_000_000,
             config,
             core: HostCore {
                 lanes,
                 ends,
-                crash_runs: Vec::new(),
+                crash_streaks: Vec::new(),
             },
             fds,
             workers,
@@ -333,10 +333,10 @@ impl World {
                 // The crash-loop watch ends with the run (`watch_crash_loops`), so a stopping host forks no lane
                 // out of its wait.
                 if !self.stopping {
-                    self.core.tend(self.now, &self.config, &mut self.fx);
+                    self.core.check_crash_streaks(self.now, &self.config, &mut self.fx);
                 }
                 let now = self.now;
-                self.core.look_at_starts(|| now, &self.config, &mut self.fx);
+                self.core.check_replacement_starts(|| now, &self.config, &mut self.fx);
             }
         }
         self.carry_out_kills();
@@ -348,7 +348,7 @@ impl World {
             return;
         }
         let (job, answer) = numbered_job(id);
-        self.sent.push(Answer::Waiting(answer));
+        self.sent.push(ClientRequest::Waiting(answer));
         // The shell refuses a request once the run stops, before the core sees it (`ServerLanes::submit`).
         if self.stopping {
             answer_lane(
@@ -359,8 +359,8 @@ impl World {
         }
         match self.core.submit(job, DEPTH as usize, &mut self.fx) {
             Ok(()) => {}
-            Err(Rejection::Refused(why, job)) => answer_lane(job.reply, Err(why)),
-            Err(Rejection::NoLane(job)) => {
+            Err(SubmitError::Refused(why, job)) => answer_lane(job.reply, Err(why)),
+            Err(SubmitError::NoLane(job)) => {
                 let refusal = self
                     .core
                     .no_lane_refusal(&self.config.crash_backoff, self.stopping, self.now, 0);
@@ -377,7 +377,7 @@ impl World {
         if worker.refuses {
             return;
         }
-        let Ok(Wait::Request(request)) = worker.end.wait_for_request(SpinWindow::until(0), || 0, 0) else {
+        let Ok(WaitOutcome::Request(request)) = worker.end.wait_for_request(SpinWindow::until(0), || 0, 0) else {
             return;
         };
         let id = {
@@ -404,7 +404,7 @@ impl World {
                 mipyre_http::plan::response::JSON,
                 mipyre_http::plan::response::HeaderLines::new(),
             );
-            let Ok(_) = request.answer(|w| wire::encode_response(w, &ok).expect("fits"));
+            let Ok(_) = request.respond(|w| wire::encode_handler_response(w, &ok).expect("fits"));
         }
     }
 
@@ -461,18 +461,18 @@ impl World {
             let i = lane.0;
             match self.rng.below(10) {
                 0 => {
-                    let why = LaneLossError::NotRespawned(ForkError::NoTemplate);
+                    let why = LaneLossError::NotRespawned(ForkError::NoForkServer);
                     self.core.forked(lane, Err(why), &self.config, &mut self.fx);
                 }
                 k => {
                     self.next_pid += 1;
-                    let tag = WorkerTag {
+                    let tag = WorkerId {
                         lane,
                         attempt,
                         pid: Pid::new(self.next_pid).unwrap(),
                     };
                     let channel = Arc::clone(self.core.ends[i].channel());
-                    let end = PeerEnd::new(channel, NoBell, NoSleep);
+                    let end = PeerEnd::new(channel, StubDoorbell, StubParker);
                     let refuses = k == 1;
                     if refuses {
                         self.deaths.push(Death {
@@ -481,7 +481,7 @@ impl World {
                         });
                     } else {
                         end.report_ready(attempt).unwrap();
-                        self.workers[i] = Some(SimWorker {
+                        self.workers[i] = Some(FakeWorker {
                             tag,
                             end,
                             refuses,
@@ -498,7 +498,7 @@ impl World {
     /// recorded for no more than that.
     fn slots_conserved(&self) -> Result<(), String> {
         for (lane, end) in self.core.lanes.iter().zip(self.core.ends.iter()) {
-            let waiting = lane.waiting.iter().filter(|w| w.is_some()).count();
+            let waiting = lane.waiters.iter().filter(|w| w.is_some()).count();
             if end.in_flight() > DEPTH || waiting > DEPTH as usize {
                 return Err(format!(
                     "lane {}: {} in flight, {waiting} waiting, depth {DEPTH}",
@@ -536,7 +536,7 @@ impl World {
 }
 
 /// Builds request number `id` (`GET /r<id>`) and who waits for it.
-fn numbered_job(id: u32) -> (LaneJob, Sent) {
+fn numbered_job(id: u32) -> (LaneJob, ResponseReceiver) {
     let (job, answer) = job();
     let LaneJob { mut request, reply } = job;
     request.route_key.path = format!("/r{id}");
@@ -544,7 +544,7 @@ fn numbered_job(id: u32) -> (LaneJob, Sent) {
 }
 
 /// `NoDuplicate`: no request was taken by two workers.
-fn no_duplicate(runs: &HashMap<u32, Vec<WorkerTag>>) -> Result<(), String> {
+fn no_duplicate(runs: &HashMap<u32, Vec<WorkerId>>) -> Result<(), String> {
     match runs.iter().find(|(_, takers)| takers.len() > 1) {
         Some((id, takers)) => Err(format!(
             "request {id} was taken by {} workers: {takers:?}",
@@ -558,7 +558,7 @@ fn no_duplicate(runs: &HashMap<u32, Vec<WorkerTag>>) -> Result<(), String> {
 fn held(core: &HostCore) -> usize {
     core.lanes
         .iter()
-        .map(|l| l.waiting.iter().flatten().count() + l.queued.len())
+        .map(|l| l.waiters.iter().flatten().count() + l.queued.len())
         .sum()
 }
 
@@ -574,14 +574,14 @@ fn ended_host_leaves_nothing(core: &HostCore, forks: &[(LaneIndex, Attempt)]) ->
 
 /// `AnsweredOrFailed`, after every step: no request sent is lost — each has its answer (a 5xx counting) or is still
 /// held by the host, never dropped unanswered; and once the host `closed`, each has its answer.
-fn answered_or_failed(sent: &mut [Answer], closed: bool) -> Result<(), String> {
+fn answered_or_failed(sent: &mut [ClientRequest], closed: bool) -> Result<(), String> {
     for (id, answer) in sent.iter_mut().enumerate() {
-        let Answer::Waiting(receiver) = answer else {
+        let ClientRequest::Waiting(receiver) = answer else {
             continue;
         };
         match receiver.try_recv() {
             Ok(outcome) => {
-                *answer = Answer::Got {
+                *answer = ClientRequest::Got {
                     served: outcome.is_ok(),
                 }
             }
@@ -593,7 +593,7 @@ fn answered_or_failed(sent: &mut [Answer], closed: bool) -> Result<(), String> {
 }
 
 /// Runs seed `seed` to its end and returns the first invariant it broke, with the step; else how it went.
-fn run(seed: u64) -> Result<Ran, String> {
+fn run(seed: u64) -> Result<Trace, String> {
     let mut world = World::new(seed);
     let stop_at = world.rng.below(STEPS as u64) as usize;
     for step in 0..stop_at {
@@ -627,9 +627,9 @@ fn run(seed: u64) -> Result<Ran, String> {
     let served = world
         .sent
         .iter()
-        .map(|a| matches!(a, Answer::Got { served: true }))
+        .map(|a| matches!(a, ClientRequest::Got { served: true }))
         .collect();
-    Ok(Ran {
+    Ok(Trace {
         seen: world.fx.seen,
         events: world.events,
         served,
@@ -644,7 +644,7 @@ const REGRESSIONS: &[u64] = &[];
 
 #[test]
 fn a_host_under_crashes_faults_timeouts_failed_forks_and_a_stop_answers_every_request_once() {
-    let mut seen = Seen::default();
+    let mut seen = Coverage::default();
     for seed in SEEDS.chain(REGRESSIONS.iter().copied()) {
         match run(seed) {
             Ok(one) => seen.add(one.seen),
@@ -652,7 +652,7 @@ fn a_host_under_crashes_faults_timeouts_failed_forks_and_a_stop_answers_every_re
         }
     }
     // The seeds reach every kind of trouble, so a green run says something about each.
-    let Seen {
+    let Coverage {
         deaths,
         faults,
         crash_loops,
@@ -708,7 +708,7 @@ fn a_host_under_random_schedules_answers_every_request_once() {
 /// worker's requests to the next one would leave) is `NoDuplicate`'s red; one taken once is green.
 #[test]
 fn the_duplicate_judgment_is_red_for_a_request_taken_twice_and_green_once() {
-    let worker = |attempt| WorkerTag {
+    let worker = |attempt| WorkerId {
         lane: LaneIndex(0),
         attempt: Attempt::new(attempt),
         pid: Pid::new(1000 + attempt as i32).unwrap(),
@@ -726,9 +726,9 @@ fn the_lost_request_judgment_is_red_for_a_dropped_sender_and_green_for_a_refusal
         job.reply,
         Err(LaneRequestError::Rejected(LaneUnansweredError::ShuttingDown)),
     );
-    assert!(answered_or_failed(&mut [Answer::Waiting(answer)], true).is_ok());
+    assert!(answered_or_failed(&mut [ClientRequest::Waiting(answer)], true).is_ok());
     let (held, answer) = numbered_job(1);
-    let mut sent = [Answer::Waiting(answer)];
+    let mut sent = [ClientRequest::Waiting(answer)];
     assert!(answered_or_failed(&mut sent, false).is_ok(), "still held by the host");
     assert!(
         answered_or_failed(&mut sent, true).is_err(),
@@ -794,7 +794,7 @@ fn a_killed_worker_keeps_its_slot_and_gets_no_replacement_until_its_death_is_tol
     world.step(Event::Deaths);
     assert_eq!(held(&world), (0, 1), "its death told");
     assert!(matches!(world.core.lanes[lane].worker, LaneWorker::Forking { .. }));
-    let Answer::Waiting(answer) = &mut world.sent[0] else {
+    let ClientRequest::Waiting(answer) = &mut world.sent[0] else {
         panic!("the request was answered before its worker died");
     };
     assert!(matches!(

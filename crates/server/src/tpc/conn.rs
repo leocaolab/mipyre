@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use mipyre_http::io::body::ResponseBody;
 use mipyre_http::plan::response::HandlerResponse;
-use mipyre_http::plan::route::RouteId;
+use mipyre_http::plan::route::{RouteId, WsRouteId};
 use mipyre_tpc::StopWaiter;
 use mipyre_transport::driver::{Peer, TransportDriver};
 
@@ -21,8 +21,11 @@ use crate::conn::{drive_connection, drive_local_connection, ConnectionTimeouts, 
 use crate::site::Site;
 use crate::websocket::{upgrade_or, WsUpgrade};
 use mipyre_http::io::clock::Clock;
-use mipyre_runtime::exchange::{self, HandlerError};
-use mipyre_runtime::{MainThreads, Retirement, SubInterpreterWorker, ThreadResident, WorkerIndex, WorkerLife};
+use mipyre_runtime::exchange::{self, HandlerError, Outbox, WsClose};
+use mipyre_runtime::{
+    MainThreads, Retirement, SubInterpreterWorker, ThreadResident, WorkerIndex, WorkerLife, WsEvent, WsSession,
+    WsUpgradeAnswer,
+};
 
 /// The thread's connection tasks share it through an `Rc`, one non-atomic clone per request, and
 /// it never leaves the thread.
@@ -119,12 +122,18 @@ impl ThreadWorker {
         }
     }
 
+    /// Lets go of a WebSocket session without calling its `on_close`, whether or not the worker
+    /// still serves.
+    pub(crate) fn ws_release(&self, session: WsSession) {
+        self.worker.borrow_mut().ws_release(session);
+    }
+
     /// Ends the worker on its own thread; one still serving stops counting as live first.
     pub(crate) fn end(self) {
         if let Some(life) = self.life.into_inner() {
             life.stopped();
         }
-        self.worker.into_inner().end_on_own_thread();
+        drop(self.worker.into_inner());
     }
 }
 
@@ -153,6 +162,61 @@ impl WorkerLease<'_> {
         }
         served.response
     }
+
+    /// Runs the gRPC method `method` on the worker as [`Self::serve`] runs a route.
+    #[inline(always)]
+    pub(crate) fn serve_unary(
+        self,
+        method: RouteId,
+        request: exchange::Request,
+    ) -> Result<HandlerResponse, HandlerError> {
+        let WorkerLease { mut worker, owner } = self;
+        let served = worker.serve_unary_inline(method, request);
+        drop(worker);
+        if let Some(retirement) = &served.retired {
+            owner.retire(retirement);
+        }
+        served.response
+    }
+
+    /// Opens a WebSocket connection's session on the worker; a failed `gc.collect()` after it
+    /// retires the worker as a request's does.
+    pub(crate) fn ws_open(
+        self,
+        route: WsRouteId,
+        request: exchange::Request,
+        outbox: Arc<Outbox>,
+    ) -> Result<WsUpgradeAnswer, HandlerError> {
+        let WorkerLease { mut worker, owner } = self;
+        let opened = worker.ws_open(route, request, outbox);
+        drop(worker);
+        if let Some(retirement) = &opened.retired {
+            owner.retire(retirement);
+        }
+        opened.response
+    }
+
+    /// Calls a WebSocket connection's handler for `event` on the worker.
+    pub(crate) fn ws_call(self, route: WsRouteId, session: &WsSession, event: WsEvent) -> Result<(), HandlerError> {
+        let WorkerLease { mut worker, owner } = self;
+        let called = worker.ws_call(route, session, event);
+        drop(worker);
+        if let Some(retirement) = &called.retired {
+            owner.retire(retirement);
+        }
+        called.response
+    }
+
+    /// Calls a WebSocket connection's `on_close` on the worker and lets go of its session.
+    pub(crate) fn ws_close(self, route: WsRouteId, session: WsSession, close: &WsClose) -> Result<(), HandlerError> {
+        let WorkerLease { mut worker, owner } = self;
+        let closed = worker.ws_close(route, session, close);
+        drop(worker);
+        if let Some(retirement) = &closed.retired {
+            owner.retire(retirement);
+        }
+        closed.response
+    }
 }
 
 impl TpcThread {
@@ -177,7 +241,7 @@ impl TpcThread {
 
 impl ThreadResident for ThreadWorker {
     fn end_here(self) {
-        self.into_worker().end_on_own_thread()
+        drop(self.into_worker());
     }
 }
 

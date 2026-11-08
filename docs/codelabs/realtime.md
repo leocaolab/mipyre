@@ -87,15 +87,8 @@ def index(req):
 
 
 @app.websocket("/ws")
-async def echo(ws):
-    try:
-        async for msg in ws:
-            if isinstance(msg, bytes):
-                await ws.send_bytes(msg)
-            else:
-                await ws.send(f"echo: {msg}")
-    except ConnectionError:
-        pass  # the client left
+def echo(ws, msg):
+    return msg if isinstance(msg, bytes) else f"echo: {msg}"
 
 
 if __name__ == "__main__":
@@ -104,12 +97,13 @@ if __name__ == "__main__":
 
 A `str` body goes out as `text/plain` unless you name the content type, so `index` returns a `Response` with `text/html`; a browser would show the page's source otherwise.
 
-A WebSocket handler is an `async def`: it gets the connection and owns it until it returns, and every receive and send is awaited.
+A WebSocket handler is a `def` called once per message, with the connection and the message.
 
-- `async for msg in ws` yields each message, `str` for a text frame and `bytes` for a binary one, until the connection ends. `await ws.recv_message()` reads one message the same way and returns `None` once the connection has ended; `recv()` and `recv_bytes()` read one kind only and raise `TypeError` if the next message is the other kind, so a client sending a binary frame to a `recv()` loop ends the handler with an error in the log.
-- `await ws.send(...)` and `await ws.send_bytes(...)` queue a message. While a client that isn't reading has let the send buffer fill, the await lasts until there is room. They raise `ConnectionError` once the connection is closed, which this handler takes as the end of the conversation.
+- `msg` is `str` for a text frame and `bytes` for a binary one. What the handler returns is sent back the same way: `str` as text, `bytes` as binary, `None` as nothing.
+- `ws.send(...)` queues one more message, written with the return value once the handler returns, and returns `True`. A client that reads more slowly than the server sends is closed with `1008`: a connection holds at most one message of `max_websocket_message_size` unsent, and a `send` that does not fit returns `False`, as does one after the connection has closed.
+- `@app.websocket("/ws", on_connect=..., on_close=...)` adds `on_connect(ws)`, called once the upgrade is answered (its return value is sent too), and `on_close(ws, code, reason)`, called once when the connection ends. `ws.data` keeps whatever the handlers need between calls; `ws.subscribe(topic)` and `ws.publish(topic, msg)` (or `mipyre.publish(topic, msg)` from any route) fan a message out to every connection on a topic.
 
-A WebSocket route runs where the app's runtime says, like any other route: on the default `subinterp` runtime each connection is a task on one of the sub-interpreter workers' event loops, so handlers on different workers run in parallel and a connection waiting for a message holds no thread. Module globals are per worker, as for every `subinterp` route; share state through `app.state`. `@app.websocket("/ws", runtime="main")` runs the handler on the main interpreter's event loop instead, where every connection sees the same globals and shares one GIL; `runtime="process"` is refused. Write the `before_request` hooks of an app with WebSocket routes as `async def`: a `def` hook that blocks holds up every connection on its event loop.
+One connection's calls run one at a time, in the order its messages arrived, and the connection is not read while a call runs. A WebSocket route runs where the app's runtime says, like any other route: on the default `subinterp` runtime the calls run inline on the sub-interpreter worker of the thread that holds the connection, as that thread's `def` routes do, and a connection waiting for a message holds no thread. Module globals are per worker, as for every `subinterp` route; share state through `app.state`. `@app.websocket("/ws", runtime="main")` runs the handlers on the main interpreter instead, where every connection sees the same globals and shares one GIL; `runtime="process"` is refused, and so is a `subinterp` WebSocket route with `MIPYRE_TPC=0`.
 
 Start the server:
 

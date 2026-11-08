@@ -9,7 +9,7 @@ license.workspace = true
 # no `#[global_allocator]`.
 [dependencies]
 thiserror = "2"
-# The host copies each answer into a `BytesMut` of its own, which the engine's decoder slices without another copy.
+# The caller copies each answer into a `BytesMut` of its own, which the engine's decoder slices without another copy.
 bytes = "1"
 # `CacheLine`: each header word on a line of its own, the one definition the workspace shares.
 mipyre_cpu = { path = "../cpu" }
@@ -20,13 +20,6 @@ libc = "0.2"
 [dev-dependencies]
 # The reference model of the ring (src/channel/ring_model.rs), on the fixed seed (.cargo/config.toml).
 proptest = "1"
-# The `slot_take` fuzz target (src/channel/slot_fuzz.rs): `cargo test` replays its committed corpus, `cargo bolero
-# test` mutates it under libFuzzer.
-# Exactly 0.13.4: from 0.13.5 on its derive crate pins indexmap to =2.11.2, which would move the workspace's
-# shipping indexmap (h2, sqlx) back from 2.14.
-bolero = "=0.13.4"
-# The counting allocator of tests/allocations.rs.
-mipyre_microbench = { path = "../microbench" }
 
 # The Loom models, built only under `--cfg shm_model`, which swaps `src/sync.rs`'s names for Loom's and builds the
 # core without os.rs and adapter/.

@@ -12,11 +12,11 @@ __all__ = [
     "_driver_start_template", "_driver_spawn_template", "_driver_start_import_worker", "_driver_fork_worker",
     "_routers_to_load",
     "_set_routers_to_load", "DeclarationError", "MissingAppFileError", "LateRegistrationError", "LogLevel",
-    "Compression", "Request", "Response", "Cookie", "SameSite", "Headers", "WebSocket", "SharedState", "Stream", "BodyStream",
-    "AbandonedWorker", "WorkerException", "BodyReadError", "HTTPException", "PgPool", "PgCursor", "DatabaseError", "IntegrityError",
+    "Compression", "Request", "Response", "Cookie", "SameSite", "Headers", "WebSocket", "publish", "SharedState", "Stream", "BodyStream",
+    "AbandonedWorker", "WorkerException", "BodyReadError", "HTTPException", "GrpcError", "PgPool", "PgCursor", "DatabaseError", "IntegrityError",
     "UniqueViolation", "ParamError", "Metrics", "RunMetrics", "Flag", "_flags", "Deployment", "EntryPoint", "ConfigError", "ServerFlags", "LaneRecipe", "get_gil_metrics", "reset_peaks", "init_logger", "flush_logs", "_stop_log_writer", "_start_log_writer", "_user_cache_dir", "_log_writer_thread",
     "emit_python_log", "_python_log_level", "workrequest_counts", "_in_worker", "_exit_without_finalization", "_physical_cores", "_route_params", "encode_json", "_is_async_handler",
-    "_worker_take", "_worker_send", "_worker_fail", "_worker_to_response", "_LoopWaits", "_WsJob", "_ConnectionInbox",
+    "_worker_take", "_worker_send", "_worker_fail", "_worker_to_response",
     "_note_isolated",
 ]
 
@@ -562,57 +562,49 @@ class Cookie:
 
 @final
 class WebSocket:
-    """One WebSocket connection, handed to an ``@app.websocket`` handler, which is an
-    ``async def``: every receive and send is awaited.
-
-    Every receive returns ``None`` once the connection has ended (the peer
-    closed it, or it was dropped after a read error, which the server logs);
-    ``async for msg in ws`` yields each message (``str`` or ``bytes``) until then.
-    One task receives at a time: a receive while another task awaits one raises
-    ``RuntimeError``.
-
-    The ``before_request`` hooks run on the upgrade request before the 101 is
-    sent; a hook that returns a response refuses the upgrade with it.
-    """
+    """One WebSocket connection, handed to its route's handlers: ``on_message(ws, msg)``,
+    ``on_connect(ws)`` and ``on_close(ws, code, reason)``."""
 
     request: Request
     """The upgrade request (method, path, query, headers such as ``Origin``
     and ``Cookie``, client IP); the object the ``before_request`` hooks saw."""
+    data: Any
+    """Whatever the handlers keep for this connection; ``None`` until they set it."""
 
-    def recv_message(self) -> Awaitable[Optional[str | bytes]]:
-        """Receive the next message: ``str`` for text, ``bytes`` for binary."""
-        ...
-    def recv(self) -> Awaitable[Optional[str]]:
-        """Receive the next text message.
+    def send(self, msg: str | bytes) -> bool:
+        """Queue a text (``str``) or binary (``bytes``) message, written once the handler
+        returns, and return True. Return False when the client reads too slowly for it to
+        fit, which closes the connection with 1008, or once the connection is closing.
 
-        :raises TypeError: if the next message is binary; it stays queued for
-            ``recv_bytes()`` / ``recv_message()``.
+        :raises ValueError: the message is longer than ``max_websocket_message_size``; the
+            connection stays open. Only a message within that limit that does not fit the
+            outgoing budget closes it with 1008.
+        :raises TypeError: ``msg`` is neither ``str`` nor ``bytes``.
         """
         ...
-    def recv_bytes(self) -> Awaitable[Optional[bytes]]:
-        """Receive the next binary message.
+    def close(self, code: int = 1000, reason: str = "") -> None:
+        """Close the connection with ``code`` and ``reason`` once what was sent before is
+        written; later sends return False.
 
-        :raises TypeError: if the next message is text; it stays queued for
-            ``recv()`` / ``recv_message()``.
+        :raises ValueError: a code an endpoint may not send, or a reason over 123 bytes.
         """
         ...
-    def __aiter__(self) -> WebSocket: ...
-    def __anext__(self) -> Awaitable[str | bytes]: ...
-    def send(self, msg: str) -> Awaitable[None]:
-        """Queue a text message; while a slow client has let the connection's buffer fill,
-        the await lasts until there is room.
+    def subscribe(self, topic: str) -> None:
+        """Receive what is published to ``topic`` until ``unsubscribe`` or the connection ends."""
+        ...
+    def unsubscribe(self, topic: str) -> None: ...
+    def publish(self, topic: str, msg: str | bytes) -> None:
+        """Send ``msg`` to every connection subscribed to ``topic`` but this one; a subscriber
+        that cannot take it is closed with 1008."""
+        ...
 
-        :raises ValueError: the message exceeds ``max_websocket_message_size``.
-        :raises ConnectionError: the connection is closed.
-        """
-        ...
-    def send_bytes(self, data: bytes) -> Awaitable[None]:
-        """Queue a binary message. Same errors as ``send``."""
-        ...
-    def close(self) -> None:
-        """Close the connection once what is queued has been sent; a send still waiting for
-        room raises ``ConnectionError`` when it wakes, and any later send at once."""
-        ...
+def publish(topic: str, msg: str | bytes) -> None:
+    """Send ``msg`` to every WebSocket connection subscribed to ``topic``; a subscriber that
+    cannot take it is closed with 1008.
+
+    :raises TypeError: ``msg`` is neither ``str`` nor ``bytes``.
+    """
+    ...
 
 @final
 class Stream:
@@ -831,7 +823,14 @@ class MipyreApp:
     def fallback(self, handler: Callable[..., Any]) -> None:
         """:raises LateRegistrationError: registered after the first server started."""
         ...
-    def websocket(self, path: str, handler: Callable[..., Any], runtime: RuntimeChoice = ...) -> None:
+    def websocket(
+        self,
+        path: str,
+        on_message: Callable[..., Any],
+        on_connect: Optional[Callable[..., Any]] = None,
+        on_close: Optional[Callable[..., Any]] = None,
+        runtime: RuntimeChoice = ...,
+    ) -> None:
         """:raises ValueError: a handler is already registered for ``path``, or ``path`` is
         not a valid route path (``{name}`` parameters land in ``ws.request.params``)."""
         ...
@@ -948,9 +947,12 @@ class MipyreApp:
         in ``header``. ``ValueError`` for an invalid header name, or for a
         second call naming another header."""
         ...
-    def enable_grpc_benchmark(self) -> None:
-        """Answer ``POST /benchmark.BenchmarkService/GetSum`` (``application/grpc*``)
-        with the built-in HttpArena service. Off by default."""
+    def unary_unary(self, path: str, handler: Callable[[bytes], bytes]) -> None:
+        """Serve the gRPC unary method at ``path`` (``/package.Service/Method``) with the
+        ``def`` ``handler``, which takes the request message and returns the reply message,
+        both ``bytes``, on the sub-interpreter workers. ``ValueError`` for a path that is not
+        a method's or is registered twice, ``TypeError`` for an ``async def``,
+        ``LateRegistrationError`` once the app is sealed."""
         ...
     @property
     def state(self) -> SharedState: ...
@@ -1244,6 +1246,23 @@ class HTTPException(Exception):
         """A new dict on every read."""
         ...
 
+@disjoint_base
+class GrpcError(Exception):
+    """Raised by a gRPC method's handler, ends the call with ``code`` and ``details`` as
+    ``grpc-status`` and ``grpc-message``, logged at debug with no traceback. Raised by an
+    HTTP route's handler it is an exception like any other.
+
+    :param code: a gRPC status code other than ``OK`` (1..=16, ``mipyre.grpc.StatusCode``);
+        any other raises ``ValueError``.
+    :param details: what the caller reads as ``grpc-message``; none is sent without it.
+    """
+
+    def __init__(self, code: int, details: Optional[str] = None) -> None: ...
+    @property
+    def code(self) -> int: ...
+    @property
+    def details(self) -> Optional[str]: ...
+
 def _route_params(path: str) -> List[str]:
     """The parameter names of a route path, in order (``{*rest}`` gives ``rest``).
     ``ValueError`` for a ``:name`` segment, which the router would take literally."""
@@ -1291,27 +1310,6 @@ class _AsyncJob:
     @property
     def request(self) -> Request: ...
 def _worker_take(inbox: _AsyncInbox) -> Optional[List[_AsyncJob]]: ...
-@final
-class _LoopWaits:
-    def __new__(cls, event_loop: Any) -> _LoopWaits: ...
-    @property
-    def doorbell(self) -> int: ...
-    def run(self) -> None: ...
-@final
-class _WsJob:
-    @property
-    def route(self) -> int: ...
-    @property
-    def request(self) -> Request: ...
-    def accept(self, waits: _LoopWaits) -> Optional[WebSocket]: ...
-    def refuse(self, value: Any) -> None: ...
-    def fail(self, exception: BaseException) -> None: ...
-    def raised(self, exception: BaseException) -> None: ...
-@final
-class _ConnectionInbox:
-    @property
-    def doorbell(self) -> int: ...
-    def take(self) -> List[_WsJob]: ...
 def _worker_send(job: _AsyncJob, response: Any) -> None: ...
 def _worker_fail(job: _AsyncJob, exception: BaseException) -> None: ...
 def _worker_to_response(value: Any) -> Response: ...

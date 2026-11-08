@@ -15,8 +15,12 @@ import tomllib
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # `tracing::warn!(target: "x", ...)` / `log::info!(target: "x", ...)`, the macro's arguments
-# possibly spread over several lines.
-LITERAL_TARGET = re.compile(r"\btarget\s*:\s*\"([^\"]*)\"")
+# possibly spread over several lines. Only a log macro's first argument counts: a struct field named
+# `target` set to a string is not a log target.
+LITERAL_TARGET = re.compile(
+    r"\b(?:trace|debug|info|warn|error|event|log|(?:trace|debug|info|warn|error)_span|span)!\s*\(\s*"
+    r"target\s*:\s*\"([^\"]*)\""
+)
 
 SERVER_PARTS = {"mipyre_process", "mipyre_runtime", "mipyre_server"}
 
@@ -54,6 +58,20 @@ def literal_targets(root: str) -> dict[str, int]:
                 if count:
                     found[os.path.relpath(path, root)] = count
     return found
+
+
+def test_a_log_macro_target_is_found_and_a_field_named_target_is_not():
+    code = """
+        tracing::warn!(target: "a", "x");
+        log::info!(
+            target: "b",
+            "y"
+        );
+        event!(target: "c", Level::INFO, "z");
+        let corpus = Corpus { target: "d", files: &[] };
+        warn!("target: \\"e\\"");
+    """
+    assert LITERAL_TARGET.findall(code) == ["a", "b", "c"]
 
 
 def test_the_shared_crates_are_found_and_the_engine_and_its_parts_are_not():

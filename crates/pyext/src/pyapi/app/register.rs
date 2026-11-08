@@ -62,9 +62,9 @@ impl App {
                 .ws_routes()
                 .iter()
                 .zip(table.ws_handlers())
-                .map(|(route, handler)| AppWebSocket {
+                .map(|(route, handlers)| AppWebSocket {
                     route: route.clone(),
-                    handler: handler.bind(py).clone(),
+                    handlers: handlers.map(|h| h.bind(py).clone()),
                 })
                 .collect(),
             before_hooks: bind(table.before_hooks()),
@@ -122,6 +122,7 @@ impl App {
         site.pg = self.seal_pg(py)?;
         let site: Arc<Site> = Arc::new(site);
         let topology = Topology::resolve(InterpreterMode::of(&site.rules.routes), &recipe, cpus)?;
+        crate::boot::check_websockets(topology, site.rules.routes.ws_routes())?;
         let counts = mipyre_http::plan::route::PlaceCounts::of(&site.rules.routes);
         let layout = crate::boot::ServerLayout {
             topology,
@@ -356,6 +357,36 @@ impl App {
             .insert(method, path, handler, handler_name, place)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("route error: {e}")))?;
         Ok(kind == HandlerKind::Async)
+    }
+
+    pub(super) fn add_grpc_method(&mut self, py: Python<'_>, path: &str, handler: Py<PyAny>) -> PyResult<()> {
+        let handler_obj = handler.bind(py);
+        if !handler_obj.is_callable() {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "gRPC method {path}: the handler {} is not callable",
+                handler_obj.repr()?
+            )));
+        }
+        if is_async_handler(handler_obj)? {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "gRPC method {path}: {} is an `async def`; a gRPC method handler is a `def`, run on \
+                 a sub-interpreter worker",
+                handler_obj.repr()?
+            )));
+        }
+        let handler_name = handler.getattr(py, "__name__")?.extract::<String>(py)?;
+        let mut routes = self.routes.write();
+        if routes.is_sealed() {
+            return Err(LateRegistrationError::new_err(format!(
+                "gRPC method {path} is registered after app.run() started (for example from an \
+                 on_startup hook); register it at module level, where every worker's script \
+                 registers it too"
+            )));
+        }
+        routes
+            .add_grpc_method(path, handler, handler_name)
+            .map(drop)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 }
 

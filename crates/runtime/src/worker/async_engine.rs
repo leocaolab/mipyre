@@ -2,7 +2,6 @@
 //! app itself and serves on its own loop, fed by an [`EngineInbox`].
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -12,10 +11,7 @@ use super::start::WorkerStartError;
 use super::{RequestRunner, SubInterpreterWorker, WorkerIndex};
 use crate::engine_queue::{EngineInbox, EngineJob};
 use crate::exchange::error::PyException;
-use crate::exchange::loop_wait::LoopMailbox;
-use crate::websocket::WsConnection;
 use crate::worker_api::AsyncInbox;
-use crate::worker_api::ConnectionInbox;
 use crate::worker_app::WorkerRoutes;
 use mipyre_subinterp::gc::GcPolicy;
 use mipyre_util::panic_message;
@@ -65,10 +61,9 @@ impl SubInterpreterWorker<AsyncEngine> {
     pub(crate) fn run_async_engine(
         &mut self,
         inbox: EngineInbox,
-        connections: Option<Arc<LoopMailbox<WsConnection>>>,
     ) -> (Result<(), AsyncEngineError>, VecDeque<EngineJob>) {
         let worker = self.worker_id();
-        self.with_gil(|_, py| run_engine(py, worker, inbox, connections))
+        self.with_gil(|_, py| run_engine(py, worker, inbox))
             .unwrap_or_else(|payload| {
                 let panicked = AsyncEngineError::Panicked {
                     worker,
@@ -83,9 +78,8 @@ fn run_engine(
     py: Python<'_>,
     worker: WorkerIndex,
     inbox: EngineInbox,
-    connections: Option<Arc<LoopMailbox<WsConnection>>>,
 ) -> (Result<(), AsyncEngineError>, VecDeque<EngineJob>) {
-    let routes = match crate::worker_api::worker_engine_routes(py, connections) {
+    let routes = match crate::worker_api::worker_engine_routes(py) {
         Ok(routes) => routes,
         Err(e) => {
             let exception = PyException::capture(py, &e);
@@ -107,15 +101,6 @@ pub(crate) struct EngineRoutes {
     pub(crate) before: Vec<Py<PyAny>>,
     pub(crate) after: Vec<Py<PyAny>>,
     pub(crate) streams: bool,
-    /// Is `None` for an engine that serves no WebSocket route.
-    pub(crate) websockets: Option<EngineWebSockets>,
-}
-
-/// The WebSocket handlers an engine serves, indexed by route (`None` for one it does not serve),
-/// and where their connections are handed to it.
-pub(crate) struct EngineWebSockets {
-    pub(crate) handlers: Vec<Option<Py<PyAny>>>,
-    pub(crate) connections: Arc<LoopMailbox<WsConnection>>,
 }
 
 /// How an async engine ended other than by its inbox closing.
@@ -151,14 +136,7 @@ fn run_module(py: Python<'_>, inbox: &Py<AsyncInbox>, routes: EngineRoutes) -> R
         before,
         after,
         streams,
-        websockets,
     } = routes;
-    let websockets = match websockets {
-        Some(EngineWebSockets { handlers, connections }) => {
-            Some((Py::new(py, ConnectionInbox(connections)).map_err(setup)?, handlers))
-        }
-        None => None,
-    };
     let module = new_module(py, ASYNC_ENGINE_MODULE, None)
         .and_then(|m| {
             m.setattr("INBOX", inbox.clone_ref(py))?;
@@ -172,7 +150,6 @@ fn run_module(py: Python<'_>, inbox: &Py<AsyncInbox>, routes: EngineRoutes) -> R
                 PyTuple::empty(py)
             };
             m.setattr("UNHOOKED", unhooked)?;
-            m.setattr("WEBSOCKETS", websockets)?;
             Ok(m)
         })
         .map_err(setup)?;

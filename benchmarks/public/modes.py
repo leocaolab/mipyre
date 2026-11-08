@@ -37,9 +37,9 @@ class Mode:
     def slug(self) -> str:
         return "-".join(filter(None, (self.runtime, self.process_start, self.server.value)))
 
-    def run_args(self) -> list[str]:
-        start = ["--process-start", self.process_start] if self.process_start else []
-        return ["--runtime", self.runtime, *start]
+    def env(self) -> dict[str, str]:
+        start = {"MIPYRE_PROCESS_START": self.process_start} if self.process_start else {}
+        return {"BENCH_RUNTIME": self.runtime, **self.server.env(), **start}
 
 
 class Body(enum.Enum):

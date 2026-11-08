@@ -2,6 +2,49 @@
 
 All notable changes to mipyre are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/): within 1.x, the public API does not break.
 
+## [4.0.0] — unreleased
+
+A WebSocket handler is a `def` called once per message, and an app serves gRPC unary methods with a Python handler. The WebSocket change breaks the 3.0 API; it is listed under Breaking.
+
+### Breaking
+
+- `@app.websocket(path, on_connect=None, on_close=None, runtime=None)` decorates `def on_message(ws, msg)`, called once per message with `str` (text) or `bytes` (binary). Its return value is the reply: `None` sends nothing, `str` a text message, `bytes` a binary one. `on_connect(ws)` is called once the upgrade is answered and its return value is sent the same way; `on_close(ws, code, reason)` is called once when the connection ends, only if `on_connect` was, and its return value is not sent. An `async def` for any of them raises `TypeError` at registration.
+- The calls run where `def` routes run: on the sub-interpreter worker of the thread-per-core thread that holds the connection, or with `runtime="main"` on the main interpreter's `def` threads. One connection's calls run one at a time, in the order its messages arrived, and the connection is not read while a call runs. A sub-interpreter WebSocket route with `MIPYRE_TPC=0` refuses to start, saying to use `runtime="main"` or the thread-per-core server.
+- `ws` has `request`, `data` (the connection's own slot, `None` at first), `send(msg) -> bool`, `close(code=1000, reason="")`, `subscribe(topic)`, `unsubscribe(topic)` and `publish(topic, msg)` (to every subscriber but itself); `mipyre.publish(topic, msg)` publishes from anywhere. `send` queues the message, written with the reply once the handler returns; it returns `False` once the connection is closing, and when the message does not fit the connection's outgoing budget of one `max_websocket_message_size`, which closes the connection with `1008`. A `send` of a message longer than `max_websocket_message_size` raises `ValueError`. A handler that raises closes the connection with `1011`.
+- Removed: `ws.recv()`, `recv_bytes()`, `recv_message()`, `async for msg in ws`, `send_bytes()` and awaiting a send. A loop such as
+
+  ```python
+  @app.websocket("/ws")
+  async def echo(ws):
+      async for msg in ws:
+          await ws.send(msg)
+  ```
+
+  is now
+
+  ```python
+  @app.websocket("/ws")
+  def echo(ws, msg):
+      return msg
+  ```
+
+  and state that lived in the loop's locals goes in `ws.data`, set up in `on_connect` and finished in `on_close`.
+- `app.enable_grpc_benchmark()` is gone: register `GetSum` as any other method, with `app.unary_unary`.
+
+### Added
+
+- `@app.unary_unary(path)` (or `app.unary_unary(path, handler)`) serves a gRPC unary method at `/package.Service/Method`. Its handler is a `def` that takes the request message as `bytes` and returns the reply message as `bytes`; the app encodes and decodes them (with `protobuf`, for example). It runs on a sub-interpreter worker, as a `def` route does, and `before_request` / `after_request` hooks do not run for it. An `async def` handler raises `TypeError` at registration; a path that is not `/service/method`, or is registered twice, raises `ValueError`.
+- `mipyre.grpc` has `StatusCode` (the 17 codes, by grpcio's names) and `GrpcError(code, details=None)`: a handler that raises it ends the call with that `grpc-status`, and `details` as `grpc-message`. Any other exception ends the call with `UNKNOWN`, a reply that is not `bytes` with `INTERNAL`, and `HTTPException(status)` with gRPC's code for that HTTP status.
+
+### Changed
+
+- A WebSocket connection reads into a 4 KiB buffer that grows only for a longer frame, not 128 KiB cleared before every read: less memory per connection, and about 7,000 fewer instructions per message on an echo.
+- After a stop that had to abandon sub-interpreter workers still running Python, the process exits with status 1 and says so, instead of waiting on an end that may never return.
+
+### Fixed
+
+- The directories under `~/.cache/mipyre` that mipyre creates are each `0700` whatever the umask. With umask `0002` an intermediate level was created `0775`, and a later start refused it as writable by other users.
+
 ## [3.0.1] — 2026-10-27
 
 ### Fixed

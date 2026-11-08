@@ -167,7 +167,7 @@ fn sync_path(
                 serve();
             }
             let counts: Vec<_> = (0..COUNTED).map(|_| objects_made(&mut serve).1).collect();
-            worker.end_on_own_thread();
+            drop(worker);
             assert!(
                 counts.windows(2).all(|w| w[0] == w[1]),
                 "every request makes the same objects: {counts:#?}"
@@ -503,7 +503,7 @@ fn async_engine() {
                     })
                 }
                 .expect("the worker ran the windows");
-                worker.end_on_own_thread();
+                drop(worker);
                 windows
             })
             .expect("spawn the worker thread")

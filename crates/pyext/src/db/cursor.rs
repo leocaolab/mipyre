@@ -184,7 +184,7 @@ impl PgCursor {
     /// # Errors
     ///
     /// Returns [`TaskError`] when waiting for the channel fails.
-    fn next_message(&self, py: Python<'_>) -> Result<Option<CursorItem>, TaskError> {
+    fn next_item(&self, py: Python<'_>) -> Result<Option<CursorItem>, TaskError> {
         if let Some(mut rows) = self.rows.try_lock() {
             if let Some(msg) = rows.buf.pop_front() {
                 return Ok(Some(msg));
@@ -203,7 +203,7 @@ impl PgCursor {
     /// Return the next row as a dict; raise `StopIteration` at the end and `DatabaseError` on a
     /// database error.
     fn __next__(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        match self.next_message(py).map_err(|e| DbError::from(e).into_pyerr(py))? {
+        match self.next_item(py).map_err(|e| DbError::from(e).into_pyerr(py))? {
             Some(Ok(row)) => cell::row_to_dict(py, &row),
             Some(Err(e)) => Err(e.into_pyerr(py)),
             None => Err(PyStopIteration::new_err(py.None())),

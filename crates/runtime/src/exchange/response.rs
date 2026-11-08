@@ -43,23 +43,23 @@ pub(crate) fn response_headers_from_py(dict: &Bound<'_, PyDict>) -> PyResult<Hea
 
 /// A `content-type` given among a `Response`'s `headers=` is the type the response goes out with.
 #[derive(Clone, Debug)]
-pub struct HeaderType {
+pub struct ContentTypeHeader {
     pub(crate) value: HeaderValue,
     /// This counts the other header names before it, so `Response.headers` shows it in its place.
     at: usize,
 }
 
 /// Sets the first `content-type` apart while the other lines keep the order given.
-fn response_lines_from_py(dict: &Bound<'_, PyDict>) -> PyResult<(HeaderLines, Option<HeaderType>)> {
+fn response_lines_from_py(dict: &Bound<'_, PyDict>) -> PyResult<(HeaderLines, Option<ContentTypeHeader>)> {
     let mut lines = HeaderLines::with_capacity(dict.len().min(MAX_HANDLER_LINES));
-    let mut header_type = None;
+    let mut content_type_header = None;
     each_header_line(dict, |name, value| {
         if let Some(value) = lines.append(name, value) {
             let at = lines.as_map().keys_len();
-            header_type.get_or_insert(HeaderType { value, at });
+            content_type_header.get_or_insert(ContentTypeHeader { value, at });
         }
     })?;
-    Ok((lines, header_type))
+    Ok((lines, content_type_header))
 }
 
 /// Hands `put` each line, at most [`MAX_HANDLER_LINES`] of them: a name with a list of values is a
@@ -93,12 +93,12 @@ pub(crate) fn response_headers_to_py<'py>(map: &HeaderMap, py: Python<'py>) -> P
 
 fn lines_to_py<'py>(
     map: &HeaderMap,
-    header_type: Option<&HeaderType>,
+    content_type_header: Option<&ContentTypeHeader>,
     py: Python<'py>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     let put_type = |at: usize| -> PyResult<()> {
-        match header_type {
+        match content_type_header {
             Some(t) if t.at == at => dict.set_item("content-type", header_text(&t.value)?),
             _ => Ok(()),
         }
@@ -217,9 +217,9 @@ pub struct Response {
     #[pyo3(get)]
     pub body: Py<PyAny>,
     pub status: StatusCode,
-    /// The type is `None` when it comes from the body, and `header_type` overrides it.
+    /// The type is `None` when it comes from the body, and `content_type_header` overrides it.
     pub content_type: Option<HeaderValue>,
-    pub header_type: Option<HeaderType>,
+    pub content_type_header: Option<ContentTypeHeader>,
     /// These are every header line except the `Content-Type`, in the order given.
     pub headers: HeaderLines,
     /// Set on the 422 a request that failed validation gets, with its number of errors.
@@ -229,7 +229,7 @@ pub struct Response {
 impl Response {
     /// Returns `None` when the type comes from the body.
     pub(crate) fn sent_content_type(&self) -> Option<&HeaderValue> {
-        match &self.header_type {
+        match &self.content_type_header {
             Some(t) => Some(&t.value),
             None => self.content_type.as_ref(),
         }
@@ -251,12 +251,12 @@ impl Response {
     ) -> PyResult<Self> {
         let status = http_status(status_code)?;
         let content_type = content_type.map(content_type_value).transpose()?;
-        let (headers, header_type) = headers.map(response_lines_from_py).transpose()?.unwrap_or_default();
+        let (headers, content_type_header) = headers.map(response_lines_from_py).transpose()?.unwrap_or_default();
         Ok(Response {
             body,
             status,
             content_type,
-            header_type,
+            content_type_header,
             headers,
             validation_errors: None,
         })
@@ -273,7 +273,7 @@ impl Response {
             body,
             status: StatusCode::UNPROCESSABLE_ENTITY,
             content_type: Some(HeaderValue::from_static("application/json")),
-            header_type: None,
+            content_type_header: None,
             headers: HeaderLines::default(),
             validation_errors: Some(errors),
         })
@@ -293,7 +293,7 @@ impl Response {
     /// Returns `{name: str}`, or a list for a header on several lines, with names lower-cased as on the wire.
     #[getter]
     fn headers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        lines_to_py(self.headers.as_map(), self.header_type.as_ref(), py)
+        lines_to_py(self.headers.as_map(), self.content_type_header.as_ref(), py)
     }
 }
 

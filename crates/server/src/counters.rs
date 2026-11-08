@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 use hyper::{Method, StatusCode};
-use mipyre_http::plan::answer::{duration_bucket, MethodKind, StatusClass, DURATION_BUCKETS};
+use mipyre_http::plan::request_metrics::{duration_bucket, MethodKind, StatusClass, LATENCY_BUCKETS};
 use mipyre_util::throttle::LogThrottle;
 
 use crate::sync::{AtomicU64, Mutex, Ordering};
@@ -23,16 +23,16 @@ const STATUS_CLASSES: usize = StatusClass::ALL.len();
 
 /// One thread's request counts. Only that thread writes them, with a load and a store and no
 /// read-modify-write.
-struct RequestCounts {
+struct RequestCounters {
     refused: AtomicU64,
     /// It is `None` in a run that does not count its answers, which then carries no table; it is
     /// out of line and padded, so a slot stays small and no two threads' tables share a line.
-    answers: Option<Box<CachePadded<AnswerCounters>>>,
+    answers: Option<Box<CachePadded<ResponseCounters>>>,
 }
 
-impl RequestCounts {
+impl RequestCounters {
     fn new(counts_answers: bool) -> Self {
-        RequestCounts {
+        RequestCounters {
             refused: AtomicU64::new(0),
             answers: counts_answers.then(Box::default),
         }
@@ -41,19 +41,19 @@ impl RequestCounts {
 
 /// One thread's answers, by method kind and status class, and how long they took.
 #[derive(Default)]
-struct AnswerCounters {
+struct ResponseCounters {
     answers: [[AtomicU64; STATUS_CLASSES]; METHOD_KINDS],
     /// Each bucket counts the answers that fell in it alone, not those below it too.
-    duration_buckets: [AtomicU64; DURATION_BUCKETS],
-    duration_sum_us: AtomicU64,
+    latency_buckets: [AtomicU64; LATENCY_BUCKETS],
+    latency_sum_us: AtomicU64,
 }
 
-impl AnswerCounters {
+impl ResponseCounters {
     #[inline]
-    fn record(&self, kind: MethodKind, class: StatusClass, elapsed_us: u64, writer: Writer) {
+    fn record(&self, kind: MethodKind, class: StatusClass, elapsed_us: u64, writer: WriteAccess) {
         writer.add(&self.answers[kind.index()][class.index()], 1);
-        writer.add(&self.duration_buckets[duration_bucket(elapsed_us)], 1);
-        writer.add(&self.duration_sum_us, elapsed_us);
+        writer.add(&self.latency_buckets[duration_bucket(elapsed_us)], 1);
+        writer.add(&self.latency_sum_us, elapsed_us);
     }
 
     fn read(&self) -> AnswerCounts {
@@ -62,11 +62,11 @@ impl AnswerCounters {
                 .answers
                 .each_ref()
                 .map(|row| row.each_ref().map(|count| count.load(Ordering::Relaxed))),
-            duration_buckets: self
-                .duration_buckets
+            latency_buckets: self
+                .latency_buckets
                 .each_ref()
                 .map(|count| count.load(Ordering::Relaxed)),
-            duration_sum_us: self.duration_sum_us.load(Ordering::Relaxed),
+            latency_sum_us: self.latency_sum_us.load(Ordering::Relaxed),
         }
     }
 }
@@ -74,18 +74,18 @@ impl AnswerCounters {
 /// Who writes a set of counts: a thread its slot belongs to, or any of the threads that count
 /// late, which share one set.
 #[derive(Clone, Copy)]
-enum Writer {
-    Sole,
+enum WriteAccess {
+    Exclusive,
     Shared,
 }
 
-impl Writer {
+impl WriteAccess {
     #[inline]
     fn add(self, counter: &AtomicU64, n: u64) {
         match self {
             // No other thread writes it, so a load and a store do without a locked instruction.
-            Writer::Sole => counter.store(counter.load(Ordering::Relaxed) + n, Ordering::Relaxed),
-            Writer::Shared => {
+            WriteAccess::Exclusive => counter.store(counter.load(Ordering::Relaxed) + n, Ordering::Relaxed),
+            WriteAccess::Shared => {
                 counter.fetch_add(n, Ordering::Relaxed);
             }
         }
@@ -98,9 +98,9 @@ impl Writer {
 pub struct AnswerCounts {
     pub answers: [[u64; STATUS_CLASSES]; METHOD_KINDS],
     /// Each bucket holds the answers that fell in it alone; the bounds are
-    /// [`mipyre_http::plan::answer::DURATION_BOUNDS_US`].
-    pub duration_buckets: [u64; DURATION_BUCKETS],
-    pub duration_sum_us: u64,
+    /// [`mipyre_http::plan::request_metrics::LATENCY_BOUNDS_US`].
+    pub latency_buckets: [u64; LATENCY_BUCKETS],
+    pub latency_sum_us: u64,
 }
 
 impl AnswerCounts {
@@ -115,23 +115,23 @@ impl AnswerCounts {
                 *count += other_count;
             }
         }
-        for (count, other_count) in self.duration_buckets.iter_mut().zip(&other.duration_buckets) {
+        for (count, other_count) in self.latency_buckets.iter_mut().zip(&other.latency_buckets) {
             *count += other_count;
         }
-        self.duration_sum_us += other.duration_sum_us;
+        self.latency_sum_us += other.latency_sum_us;
         self
     }
 }
 
 /// A run's request counts take one cache line per thread that answered, because one shared
 /// counter would have every serving core take the same line exclusively on every request.
-struct PerThreadCounts {
+struct PerThreadCounters {
     /// A thread id is never reused in a process, so a slot has one writer for good. A thread that
     /// answers for two runs has a slot in each.
-    slots: Mutex<Vec<(SlotOwner, Arc<CachePadded<RequestCounts>>)>>,
+    slots: Mutex<Vec<(SlotOwner, Arc<CachePadded<RequestCounters>>)>>,
     /// A thread already tearing down its thread-locals counts here, atomically because several
     /// such threads may count at once.
-    late: RequestCounts,
+    late: RequestCounters,
 }
 
 /// Who writes a slot: the thread it was made for on that thread's first count, found by its id,
@@ -145,25 +145,25 @@ enum SlotOwner {
 struct ThreadSlot {
     /// The run is compared by address, and a weak reference keeps the address from being reused
     /// while held.
-    run: Weak<PerThreadCounts>,
-    counts: Arc<CachePadded<RequestCounts>>,
+    run: Weak<PerThreadCounters>,
+    counts: Arc<CachePadded<RequestCounters>>,
 }
 
 thread_local! {
     static LAST_SLOT: Cell<Option<ThreadSlot>> = const { Cell::new(None) };
 }
 
-impl PerThreadCounts {
+impl PerThreadCounters {
     fn new(counts_answers: bool) -> Self {
-        PerThreadCounts {
+        PerThreadCounters {
             slots: Mutex::default(),
-            late: RequestCounts::new(counts_answers),
+            late: RequestCounters::new(counts_answers),
         }
     }
 
     /// Returns this thread's slot, making it on the thread's first answer for this run, with an
     /// answer table when the run counts its answers, as `late` has.
-    fn slot_of(&self, thread: ThreadId) -> Arc<CachePadded<RequestCounts>> {
+    fn slot_of(&self, thread: ThreadId) -> Arc<CachePadded<RequestCounters>> {
         let mut slots = self.slots.lock();
         if let Some((_, slot)) = slots.iter().find(|(owner, _)| *owner == SlotOwner::Thread(thread)) {
             return Arc::clone(slot);
@@ -174,19 +174,19 @@ impl PerThreadCounts {
     }
 
     /// Returns a slot for a site copy, which no thread looks up.
-    fn site_slot(&self) -> Arc<CachePadded<RequestCounts>> {
+    fn site_slot(&self) -> Arc<CachePadded<RequestCounters>> {
         let slot = self.new_slot();
         self.slots.lock().push((SlotOwner::SiteCopy, Arc::clone(&slot)));
         slot
     }
 
-    fn new_slot(&self) -> Arc<CachePadded<RequestCounts>> {
-        Arc::new(CachePadded::new(RequestCounts::new(self.late.answers.is_some())))
+    fn new_slot(&self) -> Arc<CachePadded<RequestCounters>> {
+        Arc::new(CachePadded::new(RequestCounters::new(self.late.answers.is_some())))
     }
 
     /// Runs `record` on this thread's slot, or on `late` when the thread is tearing down.
     #[inline]
-    fn count_on_this_thread(self: &Arc<Self>, record: impl Fn(&RequestCounts, Writer)) {
+    fn count_on_this_thread(self: &Arc<Self>, record: impl Fn(&RequestCounters, WriteAccess)) {
         let counted = LAST_SLOT.try_with(|last| {
             let slot = match last.take() {
                 Some(slot) if std::ptr::eq(slot.run.as_ptr(), Arc::as_ptr(self)) => slot,
@@ -195,11 +195,11 @@ impl PerThreadCounts {
                     counts: self.slot_of(std::thread::current().id()),
                 },
             };
-            record(&slot.counts, Writer::Sole);
+            record(&slot.counts, WriteAccess::Exclusive);
             last.set(Some(slot));
         });
         if counted.is_err() {
-            record(&self.late, Writer::Shared);
+            record(&self.late, WriteAccess::Shared);
         }
     }
 
@@ -232,7 +232,7 @@ pub struct ServerCounters {
     /// refusals are always counted. It is read on every request, so it is kept here rather than
     /// behind the slots, whose tables are there exactly when it is true.
     metrics: bool,
-    answers: Arc<PerThreadCounts>,
+    per_thread: Arc<PerThreadCounters>,
     cpu_pin_failures: AtomicU64,
     cpu_qos_failures: AtomicU64,
     cpu_affinity_unreadable: AtomicU64,
@@ -290,7 +290,7 @@ impl ServerCounters {
     pub fn new(metrics: bool) -> Self {
         ServerCounters {
             metrics,
-            answers: Arc::new(PerThreadCounts::new(metrics)),
+            per_thread: Arc::new(PerThreadCounters::new(metrics)),
             cpu_pin_failures: AtomicU64::new(0),
             cpu_qos_failures: AtomicU64::new(0),
             cpu_affinity_unreadable: AtomicU64::new(0),
@@ -316,7 +316,7 @@ impl ServerCounters {
     }
 
     /// Counts a start whose TPC threads run unpinned because
-    /// [`mipyre_cpu::HostCpus::pin_order`] could not say which CPUs to pin to.
+    /// [`mipyre_cpu::AvailableCpus::pin_order`] could not say which CPUs to pin to.
     /// The run says why it runs unpinned (`ServerCounts::unpinned_because`).
     pub(crate) fn unpinned_start(&self, why: &mipyre_cpu::PinOrderError) {
         match why {
@@ -375,8 +375,8 @@ impl ServerCounters {
 
     pub fn read(&self) -> ServerCounts {
         ServerCounts {
-            answers: self.answers.answers(),
-            refused: self.answers.refused(),
+            answers: self.per_thread.answers(),
+            refused: self.per_thread.refused(),
             cpu_pin_failures: self.cpu_pin_failures.load(Ordering::Relaxed),
             cpu_qos_failures: self.cpu_qos_failures.load(Ordering::Relaxed),
             cpu_affinity_unreadable: self.cpu_affinity_unreadable.load(Ordering::Relaxed),
@@ -401,7 +401,7 @@ impl ServerCounters {
 pub struct SiteCounters {
     pub run: Arc<ServerCounters>,
     /// Only the TPC thread the copy belongs to counts through it, so the slot has one writer.
-    own: Option<Arc<CachePadded<RequestCounts>>>,
+    own: Option<Arc<CachePadded<RequestCounters>>>,
 }
 
 impl SiteCounters {
@@ -415,7 +415,7 @@ impl SiteCounters {
     pub(crate) fn for_thread(&self) -> Self {
         SiteCounters {
             run: Arc::clone(&self.run),
-            own: Some(self.run.answers.site_slot()),
+            own: Some(self.run.per_thread.site_slot()),
         }
     }
 
@@ -449,10 +449,10 @@ impl SiteCounters {
     }
 
     #[inline]
-    fn count(&self, record: impl Fn(&RequestCounts, Writer)) {
+    fn count(&self, record: impl Fn(&RequestCounters, WriteAccess)) {
         match &self.own {
-            Some(slot) => record(slot, Writer::Sole),
-            None => self.run.answers.count_on_this_thread(record),
+            Some(slot) => record(slot, WriteAccess::Exclusive),
+            None => self.run.per_thread.count_on_this_thread(record),
         }
     }
 }
@@ -489,12 +489,12 @@ mod tests {
         };
         assert_eq!((cell(MethodKind::Get, 200), cell(MethodKind::Post, 500)), (1, 2));
         assert_eq!(answers.total(), 3);
-        let mut buckets = [0; DURATION_BUCKETS];
+        let mut buckets = [0; LATENCY_BUCKETS];
         buckets[0] = 1;
         buckets[1] = 1;
-        buckets[DURATION_BUCKETS - 1] = 1;
-        assert_eq!(answers.duration_buckets, buckets);
-        assert_eq!(answers.duration_sum_us, 100 + 101 + 60_000_000);
+        buckets[LATENCY_BUCKETS - 1] = 1;
+        assert_eq!(answers.latency_buckets, buckets);
+        assert_eq!(answers.latency_sum_us, 100 + 101 + 60_000_000);
     }
 
     #[test]
@@ -544,8 +544,8 @@ mod tests {
         assert_eq!((total(&a.run.read()), a.run.read().refused), (Some(4), 0));
         assert_eq!((total(&b.run.read()), b.run.read().refused), (Some(3), 3));
         // Switching runs keeps one slot per thread and run.
-        assert_eq!(a.run.answers.slots.lock().len(), 1);
-        assert_eq!(b.run.answers.slots.lock().len(), 1);
+        assert_eq!(a.run.per_thread.slots.lock().len(), 1);
+        assert_eq!(b.run.per_thread.slots.lock().len(), 1);
     }
 
     #[test]
@@ -572,9 +572,9 @@ mod tests {
         answer(&copy);
         answer(&copy);
         assert_eq!(total(&site.run.read()), Some(2));
-        assert_eq!(site.run.answers.slots.lock().len(), 1);
+        assert_eq!(site.run.per_thread.slots.lock().len(), 1);
         answer(&site);
-        assert_eq!(site.run.answers.slots.lock().len(), 2);
+        assert_eq!(site.run.per_thread.slots.lock().len(), 2);
     }
 
     #[test]

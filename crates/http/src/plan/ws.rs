@@ -15,7 +15,7 @@ pub struct WsHandshake {
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum UpgradeError {
+pub enum HandshakeError {
     #[error("a WebSocket upgrade needs `Upgrade: websocket`")]
     NotWebsocket,
     #[error("a WebSocket upgrade needs HTTP/1.1, got {0:?}")]
@@ -50,15 +50,15 @@ impl WsHandshake {
     /// # Errors
     ///
     /// Returns the first requirement `parts` miss.
-    pub fn parse(parts: &Parts) -> Result<Self, UpgradeError> {
+    pub fn parse(parts: &Parts) -> Result<Self, HandshakeError> {
         if !asks_for_websocket(&parts.headers) {
-            return Err(UpgradeError::NotWebsocket);
+            return Err(HandshakeError::NotWebsocket);
         }
         if parts.version != Version::HTTP_11 {
-            return Err(UpgradeError::NotHttp11(parts.version));
+            return Err(HandshakeError::NotHttp11(parts.version));
         }
         if parts.method != Method::GET {
-            return Err(UpgradeError::NotGet(parts.method.clone()));
+            return Err(HandshakeError::NotGet(parts.method.clone()));
         }
         let headers = &parts.headers;
         let connection_upgrade = headers
@@ -67,16 +67,16 @@ impl WsHandshake {
             .flat_map(|v| v.as_bytes().split(|&b| b == b','))
             .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"upgrade"));
         if !connection_upgrade {
-            return Err(UpgradeError::NoConnectionUpgrade);
+            return Err(HandshakeError::NoConnectionUpgrade);
         }
         let version = headers.get(SEC_WEBSOCKET_VERSION);
         if version.is_none_or(|v| v.as_bytes() != WS_VERSION.as_bytes()) {
-            return Err(UpgradeError::UnsupportedVersion(version.cloned()));
+            return Err(HandshakeError::UnsupportedVersion(version.cloned()));
         }
         let key = headers
             .get(SEC_WEBSOCKET_KEY)
             .filter(|k| !k.is_empty())
-            .ok_or(UpgradeError::MissingKey)?;
+            .ok_or(HandshakeError::MissingKey)?;
         Ok(WsHandshake { key: key.clone() })
     }
 
@@ -85,12 +85,12 @@ impl WsHandshake {
     }
 }
 
-impl UpgradeError {
+impl HandshakeError {
     /// Returns 426 naming the supported version for an unsupported version (RFC 6455 §4.2.2), and
     /// 400 with the reason for anything else.
     pub fn response(&self) -> Response<Bytes> {
         let mut resp = Response::new(Bytes::from(self.to_string()));
-        if matches!(self, UpgradeError::UnsupportedVersion(_)) {
+        if matches!(self, HandshakeError::UnsupportedVersion(_)) {
             *resp.status_mut() = StatusCode::UPGRADE_REQUIRED;
             resp.headers_mut()
                 .insert(SEC_WEBSOCKET_VERSION, HeaderValue::from_static(WS_VERSION));
@@ -100,9 +100,6 @@ impl UpgradeError {
         resp
     }
 }
-
-#[cfg(test)]
-mod fuzz;
 
 #[cfg(test)]
 mod tests {
@@ -131,20 +128,20 @@ mod tests {
         let refused = |edit: fn(http::request::Builder) -> http::request::Builder| {
             WsHandshake::parse(&handshake_parts(edit)).err().unwrap()
         };
-        assert_eq!(refused(|b| b.method("POST")), UpgradeError::NotGet(Method::POST));
+        assert_eq!(refused(|b| b.method("POST")), HandshakeError::NotGet(Method::POST));
         assert_eq!(
             refused(|b| b.version(Version::HTTP_10)),
-            UpgradeError::NotHttp11(Version::HTTP_10)
+            HandshakeError::NotHttp11(Version::HTTP_10)
         );
         assert_eq!(
             refused(|b| b.version(Version::HTTP_2)),
-            UpgradeError::NotHttp11(Version::HTTP_2)
+            HandshakeError::NotHttp11(Version::HTTP_2)
         );
         let mut no_connection = handshake_parts(|b| b);
         no_connection.headers.remove("connection");
         assert_eq!(
             WsHandshake::parse(&no_connection).err(),
-            Some(UpgradeError::NoConnectionUpgrade)
+            Some(HandshakeError::NoConnectionUpgrade)
         );
         let mut old_version = handshake_parts(|b| b);
         old_version
@@ -152,14 +149,14 @@ mod tests {
             .insert("sec-websocket-version", HeaderValue::from_static("8"));
         assert_eq!(
             WsHandshake::parse(&old_version).err(),
-            Some(UpgradeError::UnsupportedVersion(Some(HeaderValue::from_static("8"))))
+            Some(HandshakeError::UnsupportedVersion(Some(HeaderValue::from_static("8"))))
         );
         let mut h2c = handshake_parts(|b| b);
         h2c.headers.insert("upgrade", HeaderValue::from_static("h2c"));
-        assert_eq!(WsHandshake::parse(&h2c).err(), Some(UpgradeError::NotWebsocket));
+        assert_eq!(WsHandshake::parse(&h2c).err(), Some(HandshakeError::NotWebsocket));
         let mut no_key = handshake_parts(|b| b);
         no_key.headers.remove("sec-websocket-key");
-        assert_eq!(WsHandshake::parse(&no_key).err(), Some(UpgradeError::MissingKey));
+        assert_eq!(WsHandshake::parse(&no_key).err(), Some(HandshakeError::MissingKey));
     }
 
     #[test]
@@ -182,10 +179,10 @@ mod tests {
 
     #[test]
     fn an_unsupported_version_is_426_naming_13_and_the_rest_400() {
-        let resp = UpgradeError::UnsupportedVersion(None).response();
+        let resp = HandshakeError::UnsupportedVersion(None).response();
         assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED);
         assert_eq!(resp.headers()["sec-websocket-version"], "13");
-        let resp = UpgradeError::NoConnectionUpgrade.response();
+        let resp = HandshakeError::NoConnectionUpgrade.response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

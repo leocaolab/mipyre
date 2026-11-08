@@ -140,13 +140,13 @@ impl Geometry {
 
     /// Returns where request `seq`'s slot starts.
     #[inline]
-    pub const fn request_slot(&self, seq: Seq) -> SlotOffset {
+    pub const fn request_offset(&self, seq: Seq) -> SlotOffset {
         SlotOffset(HEADER_PAGE + (seq.slot_index(self.depth) << self.slot_shift))
     }
 
     /// Returns where answer `seq`'s slot starts: the answer ring follows the request ring.
     #[inline]
-    pub const fn answer_slot(&self, seq: Seq) -> SlotOffset {
+    pub const fn response_offset(&self, seq: Seq) -> SlotOffset {
         let ring = (self.depth.get() as usize) << self.slot_shift;
         SlotOffset(HEADER_PAGE + ring + (seq.slot_index(self.depth) << self.slot_shift))
     }
@@ -174,10 +174,10 @@ mod tests {
         let g = geometry(4, 4097).unwrap();
         let stride = 8192;
         assert_eq!(g.total_bytes(), HEADER_PAGE + 2 * 4 * stride);
-        assert_eq!(g.request_slot(Seq::new(0)).get(), HEADER_PAGE);
-        assert_eq!(g.request_slot(Seq::new(5)).get(), HEADER_PAGE + stride);
-        assert_eq!(g.answer_slot(Seq::new(0)).get(), HEADER_PAGE + 4 * stride);
-        assert_eq!(g.answer_slot(Seq::new(7)).get(), HEADER_PAGE + 7 * stride);
+        assert_eq!(g.request_offset(Seq::new(0)).get(), HEADER_PAGE);
+        assert_eq!(g.request_offset(Seq::new(5)).get(), HEADER_PAGE + stride);
+        assert_eq!(g.response_offset(Seq::new(0)).get(), HEADER_PAGE + 4 * stride);
+        assert_eq!(g.response_offset(Seq::new(7)).get(), HEADER_PAGE + 7 * stride);
         assert_eq!(g.max_message(), 4097 - 8);
     }
 
@@ -253,11 +253,11 @@ pub(super) mod proofs {
     fn every_slot_lies_inside_the_mapping() {
         let g = any_geometry();
         let seq = Seq::new(kani::any());
-        for at in [g.request_slot(seq), g.answer_slot(seq)] {
+        for at in [g.request_offset(seq), g.response_offset(seq)] {
             assert!(at.get() >= HEADER_PAGE);
             assert!(at.get() + g.slot_bytes().get() <= g.total_bytes());
         }
-        assert!(g.request_slot(seq).get() + g.slot_bytes().get() <= g.answer_slot(Seq::new(0)).get());
+        assert!(g.request_offset(seq).get() + g.slot_bytes().get() <= g.response_offset(Seq::new(0)).get());
     }
 
     /// The message after a slot's header starts on an 8-byte boundary, which copying it by words needs.
@@ -265,8 +265,8 @@ pub(super) mod proofs {
     fn a_slots_payload_starts_word_aligned() {
         let g = any_geometry();
         let seq = Seq::new(kani::any());
-        assert!((g.request_slot(seq).get() + SLOT_HEADER) % 8 == 0);
-        assert!((g.answer_slot(seq).get() + SLOT_HEADER) % 8 == 0);
+        assert!((g.request_offset(seq).get() + SLOT_HEADER) % 8 == 0);
+        assert!((g.response_offset(seq).get() + SLOT_HEADER) % 8 == 0);
     }
 
     /// A ring holds at most `depth` consecutive sequence numbers at once, across the wrap of `u32`.

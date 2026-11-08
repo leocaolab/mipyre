@@ -19,10 +19,9 @@ mod awaitable;
 mod cell;
 mod cursor;
 mod error;
-mod kind;
 mod module_key;
-mod numeric;
 mod param;
+mod pg_type;
 mod py_types;
 mod query;
 
@@ -59,7 +58,7 @@ fn run_blocking(
     sql: String,
     params: Vec<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
-    refuse_in_lane_worker()?;
+    refuse_in_worker_process()?;
     let stmt = SqlQuery::from_py(py, sql, &params)?;
     let outcome = py
         .detach(|| {
@@ -86,15 +85,15 @@ fn run_awaitable<'py>(
     sql: String,
     params: Vec<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    refuse_async_in_worker(py, fetch)?;
-    refuse_in_lane_worker()?;
+    refuse_async_in_subinterpreter(py, fetch)?;
+    refuse_in_worker_process()?;
     let stmt = SqlQuery::from_py(py, sql, &params)?;
     let OpenPool { pool, runtime } = open(py, handle)?;
     awaitable::await_on_loop(
         py,
         &runtime,
         query::run(pool, stmt, fetch),
-        |py, outcome: query::QueryAnswer| outcome.into_py(py),
+        |py, outcome: query::FetchResult| outcome.into_py(py),
     )
 }
 
@@ -151,7 +150,7 @@ impl PgPool {
                     .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("runtime_threads must be at least 1, got 0"))
             })
             .transpose()?;
-        refuse_in_lane_worker()?;
+        refuse_in_worker_process()?;
         let request = PoolRequest {
             dsn: Dsn::new(dsn),
             max_connections,
@@ -217,7 +216,7 @@ impl PgPool {
     /// ```
     #[pyo3(signature = (sql, *params))]
     fn fetch_iter(&self, py: Python<'_>, sql: String, params: Vec<Py<PyAny>>) -> PyResult<PgCursor> {
-        refuse_in_lane_worker()?;
+        refuse_in_worker_process()?;
         let stmt = SqlQuery::from_py(py, sql, &params)?;
         Ok(PgCursor::open(open(py, &self.handle)?, stmt))
     }
@@ -262,14 +261,14 @@ impl PgPool {
 }
 
 /// Refuses `PgPool` in a process-lane worker, a process apart from the server's pool.
-fn refuse_in_lane_worker() -> PyResult<()> {
+fn refuse_in_worker_process() -> PyResult<()> {
     mipyre_process::refuse_in_lane_worker("PgPool")
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
 
 /// Refuses `*_async` outside the main interpreter with a `NotImplementedError` that names the
 /// sync method and `runtime="main"`.
-fn refuse_async_in_worker(py: Python<'_>, fetch: FetchMode) -> PyResult<()> {
+fn refuse_async_in_subinterpreter(py: Python<'_>, fetch: FetchMode) -> PyResult<()> {
     if mipyre_subinterp::attach::on_main(py) {
         return Ok(());
     }

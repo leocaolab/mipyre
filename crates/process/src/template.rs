@@ -2,8 +2,8 @@
 //! carries them.
 //!
 //! The socket carries two families of messages, one per direction: the server's commands to the
-//! template ([`TemplateCommand`], only encoded here) and the template's reports to the server
-//! ([`TemplateReport`], only decoded here; python/mipyre/_process_lane/template.py is the other
+//! template ([`ForkServerCommand`], only encoded here) and the template's reports to the server
+//! ([`ForkServerReport`], only decoded here; python/mipyre/_process_lane/template.py is the other
 //! side). Each is one frame: a 4-byte little-endian length, then that many bytes, the first of
 //! which is the tag. The template is another process that ran the app's imports, so its frames
 //! are read as untrusted: a length past [`MAX_FRAME_BYTES`] is refused from the header alone,
@@ -38,12 +38,12 @@ mod tag {
     pub(super) const EXITED: u8 = 5;
     pub(super) const IMPORT_FAILED: u8 = 6;
     pub(super) const LANE_FDS_MISSING: u8 = 7;
-    pub(super) const RUN: u8 = 8;
+    pub(super) const COMMAND_LINE: u8 = 8;
 }
 
 /// What the server tells the template.
 #[derive(Debug)]
-pub(super) enum TemplateCommand<'a> {
+pub(super) enum ForkServerCommand<'a> {
     /// What a worker must import and how the lanes are laid out, as JSON.
     Setup(CommandBody<'a>),
     /// The shared memory and the wake-pipe write end of lane `lane`, attached to the frame.
@@ -52,7 +52,7 @@ pub(super) enum TemplateCommand<'a> {
     /// it, and the answer carries it back.
     Start { lane: LaneIndex, attempt: Attempt },
     /// The command line of the run whose workers come next, as `CommandLine.encode()` JSON.
-    Run(CommandBody<'a>),
+    CommandLine(CommandBody<'a>),
 }
 
 /// The body of a setup or run command. It fits a frame after its tag, because only `new` makes
@@ -61,7 +61,7 @@ pub(super) enum TemplateCommand<'a> {
 pub(super) struct CommandBody<'a>(&'a [u8]);
 
 impl<'a> CommandBody<'a> {
-    pub(super) fn new(bytes: &'a [u8]) -> Result<Self, BodyTooLong> {
+    pub(super) fn new(bytes: &'a [u8]) -> Result<Self, BodyTooLongError> {
         body_fits(bytes.len())?;
         Ok(CommandBody(bytes))
     }
@@ -69,39 +69,39 @@ impl<'a> CommandBody<'a> {
 
 /// A command body of `bytes` bytes, more than [`MAX_BODY_BYTES`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct BodyTooLong {
+pub(super) struct BodyTooLongError {
     pub(super) bytes: usize,
 }
 
-fn body_fits(bytes: usize) -> Result<(), BodyTooLong> {
+fn body_fits(bytes: usize) -> Result<(), BodyTooLongError> {
     if bytes <= MAX_BODY_BYTES {
         Ok(())
     } else {
-        Err(BodyTooLong { bytes })
+        Err(BodyTooLongError { bytes })
     }
 }
 
-impl TemplateCommand<'_> {
+impl ForkServerCommand<'_> {
     /// The command's name, for an error that says which frame did not go.
     pub(super) fn name(&self) -> &'static str {
         match self {
-            TemplateCommand::Setup(_) => "setup",
-            TemplateCommand::Lane { .. } => "lane",
-            TemplateCommand::Start { .. } => "start",
-            TemplateCommand::Run(_) => "run",
+            ForkServerCommand::Setup(_) => "setup",
+            ForkServerCommand::Lane { .. } => "lane",
+            ForkServerCommand::Start { .. } => "start",
+            ForkServerCommand::CommandLine(_) => "run",
         }
     }
 
     /// The command's frame.
     pub(super) fn frame(&self) -> Vec<u8> {
         let (tag, body) = match self {
-            TemplateCommand::Setup(json) => (tag::SETUP, json.0.to_vec()),
-            TemplateCommand::Lane { lane, .. } => (tag::LANE, wire_lane(*lane).to_le_bytes().to_vec()),
-            TemplateCommand::Start { lane, attempt } => (
+            ForkServerCommand::Setup(json) => (tag::SETUP, json.0.to_vec()),
+            ForkServerCommand::Lane { lane, .. } => (tag::LANE, wire_lane(*lane).to_le_bytes().to_vec()),
+            ForkServerCommand::Start { lane, attempt } => (
                 tag::START,
                 [wire_lane(*lane).to_le_bytes(), attempt.get().to_le_bytes()].concat(),
             ),
-            TemplateCommand::Run(json) => (tag::RUN, json.0.to_vec()),
+            ForkServerCommand::CommandLine(json) => (tag::COMMAND_LINE, json.0.to_vec()),
         };
         framed(tag, &body)
     }
@@ -109,8 +109,8 @@ impl TemplateCommand<'_> {
     /// The fds that ride on the frame's first byte.
     pub(super) fn fds(&self) -> &[BorrowedFd<'_>] {
         match self {
-            TemplateCommand::Lane { fds, .. } => fds,
-            TemplateCommand::Setup(_) | TemplateCommand::Start { .. } | TemplateCommand::Run(_) => &[],
+            ForkServerCommand::Lane { fds, .. } => fds,
+            ForkServerCommand::Setup(_) | ForkServerCommand::Start { .. } | ForkServerCommand::CommandLine(_) => &[],
         }
     }
 }
@@ -131,8 +131,8 @@ fn framed(tag: u8, body: &[u8]) -> Vec<u8> {
 
 /// What the template tells the server.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum TemplateReport {
-    /// The answer to [`TemplateCommand::Start`]: the worker it started, or why it could not.
+pub(super) enum ForkServerReport {
+    /// The answer to [`ForkServerCommand::Start`]: the worker it started, or why it could not.
     Forked {
         lane: LaneIndex,
         attempt: Attempt,
@@ -143,13 +143,13 @@ pub(super) enum TemplateReport {
     /// With start="fork" the template could not import the app; this is the traceback, cut
     /// to fit a frame. The template ends after it.
     ImportFailed(String),
-    /// A [`TemplateCommand::Lane`] frame came with `got` fds, not two. The template ends after it.
+    /// A [`ForkServerCommand::Lane`] frame came with `got` fds, not two. The template ends after it.
     LaneFdsMissing { lane: LaneIndex, got: u32 },
 }
 
 /// Why bytes from the template are no frame the server can take.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum TemplateFrameError {
+pub enum DecodeReportError {
     #[error("a frame of {len} bytes, past the {max}-byte limit")]
     TooLong { len: u32, max: u32 },
     #[error("a frame of 0 bytes, which has no tag")]
@@ -169,16 +169,13 @@ pub enum TemplateFrameError {
 /// Decodes the first frame in `buf`, from a template serving `lanes` lanes: the report and the
 /// bytes it took, `None` while the frame is not whole yet. The length is judged as soon as the
 /// header is in, so a frame past [`MAX_FRAME_BYTES`] fails before its body is waited for.
-pub(super) fn decode_template_report(
-    buf: &[u8],
-    lanes: usize,
-) -> Result<Option<(TemplateReport, usize)>, TemplateFrameError> {
+pub(super) fn decode_report(buf: &[u8], lanes: usize) -> Result<Option<(ForkServerReport, usize)>, DecodeReportError> {
     let Some((&header, rest)) = buf.split_first_chunk::<HEADER_BYTES>() else {
         return Ok(None);
     };
     let len = u32::from_le_bytes(header);
     if len > MAX_FRAME_BYTES {
-        return Err(TemplateFrameError::TooLong {
+        return Err(DecodeReportError::TooLong {
             len,
             max: MAX_FRAME_BYTES,
         });
@@ -186,10 +183,10 @@ pub(super) fn decode_template_report(
     let Some(frame) = rest.get(..len as usize) else {
         return Ok(None);
     };
-    let (&tag, body) = frame.split_first().ok_or(TemplateFrameError::Untagged)?;
+    let (&tag, body) = frame.split_first().ok_or(DecodeReportError::Untagged)?;
     let lane = |raw: u32| match usize::try_from(raw) {
         Ok(i) if i < lanes => Ok(LaneIndex(i)),
-        _ => Err(TemplateFrameError::LaneOutOfRange { lane: raw, lanes }),
+        _ => Err(DecodeReportError::LaneOutOfRange { lane: raw, lanes }),
     };
     let report = match tag {
         tag::FORKED => {
@@ -198,9 +195,9 @@ pub(super) fn decode_template_report(
             let result = match (Pid::new(raw), raw.checked_neg()) {
                 (Some(pid), _) => Ok(pid),
                 (None, Some(errno)) if errno > 0 => Err(Errno::from_raw_os_error(errno)),
-                (None, _) => return Err(TemplateFrameError::NeitherPidNorErrno { raw }),
+                (None, _) => return Err(DecodeReportError::NeitherPidNorErrno { raw }),
             };
-            TemplateReport::Forked {
+            ForkServerReport::Forked {
                 lane: lane(l)?,
                 attempt: Attempt::new(a),
                 result,
@@ -208,26 +205,26 @@ pub(super) fn decode_template_report(
         }
         tag::EXITED => {
             let [l, p, s] = words(tag, body)?;
-            let pid = Pid::new(p as i32).ok_or(TemplateFrameError::NoProcess { raw: p as i32 })?;
-            TemplateReport::Exited {
+            let pid = Pid::new(p as i32).ok_or(DecodeReportError::NoProcess { raw: p as i32 })?;
+            ForkServerReport::Exited {
                 lane: lane(l)?,
                 pid,
                 status: s as i32,
             }
         }
-        tag::IMPORT_FAILED => TemplateReport::ImportFailed(String::from_utf8_lossy(body).into_owned()),
+        tag::IMPORT_FAILED => ForkServerReport::ImportFailed(String::from_utf8_lossy(body).into_owned()),
         tag::LANE_FDS_MISSING => {
             let [l, got] = words(tag, body)?;
-            TemplateReport::LaneFdsMissing { lane: lane(l)?, got }
+            ForkServerReport::LaneFdsMissing { lane: lane(l)?, got }
         }
-        other => return Err(TemplateFrameError::UnknownTag(other)),
+        other => return Err(DecodeReportError::UnknownTag(other)),
     };
     Ok(Some((report, HEADER_BYTES + len as usize)))
 }
 
 /// The `N` little-endian 4-byte words that make a body of tag `tag`.
-fn words<const N: usize>(tag: u8, body: &[u8]) -> Result<[u32; N], TemplateFrameError> {
-    let mismatch = || TemplateFrameError::BodyLength {
+fn words<const N: usize>(tag: u8, body: &[u8]) -> Result<[u32; N], DecodeReportError> {
+    let mismatch = || DecodeReportError::BodyLength {
         tag,
         len: body.len(),
         want: 4 * N,
@@ -242,42 +239,46 @@ fn words<const N: usize>(tag: u8, body: &[u8]) -> Result<[u32; N], TemplateFrame
 /// How the connection to the template ended: a value, not an error of its own. The first end
 /// seen is kept, and every later use of the connection gets it.
 #[derive(Clone, Debug)]
-pub enum LinkEnd {
+pub enum DisconnectCause {
     Closed,
     RecvFailed(Errno),
     /// The template sent bytes that are no frame; `prefix` is the first of them (at most 64).
     BadFrame {
-        error: TemplateFrameError,
+        error: DecodeReportError,
         prefix: Vec<u8>,
     },
     /// The template could not import the app (start="fork"), said so with this traceback
-    /// ([`TemplateReport::ImportFailed`]), and ended.
+    /// ([`ForkServerReport::ImportFailed`]), and ended.
     ImportFailed(String),
     /// The template got `got` fds on lane `lane`'s frame, not two
-    /// ([`TemplateReport::LaneFdsMissing`]), and ended.
+    /// ([`ForkServerReport::LaneFdsMissing`]), and ended.
     LaneFdsMissing {
         lane: LaneIndex,
         got: u32,
     },
 }
 
-impl std::fmt::Display for LinkEnd {
+impl std::fmt::Display for DisconnectCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LinkEnd::Closed => write!(f, "the template closed the connection"),
-            LinkEnd::RecvFailed(errno) => write!(f, "reading from the template: {errno}"),
-            LinkEnd::BadFrame { error, prefix } => {
+            DisconnectCause::Closed => write!(f, "the template closed the connection"),
+            DisconnectCause::RecvFailed(errno) => write!(f, "reading from the template: {errno}"),
+            DisconnectCause::BadFrame { error, prefix } => {
                 write!(f, "the template sent {error} (it began ")?;
                 prefix.iter().try_for_each(|b| write!(f, "{b:02x}"))?;
                 write!(f, ")")
             }
-            LinkEnd::ImportFailed(traceback) => write!(f, "the template could not import the app:\n{traceback}"),
-            LinkEnd::LaneFdsMissing { lane, got } => write!(f, "the template got {got} fds on lane {lane}'s frame"),
+            DisconnectCause::ImportFailed(traceback) => {
+                write!(f, "the template could not import the app:\n{traceback}")
+            }
+            DisconnectCause::LaneFdsMissing { lane, got } => {
+                write!(f, "the template got {got} fds on lane {lane}'s frame")
+            }
         }
     }
 }
 
-/// How many bytes of a bad frame its [`LinkEnd::BadFrame`] keeps.
+/// How many bytes of a bad frame its [`DisconnectCause::BadFrame`] keeps.
 const BAD_FRAME_PREFIX: usize = 64;
 
 /// A command frame that did not reach the template.
@@ -290,7 +291,7 @@ pub struct TemplateSendError {
 }
 
 /// The wait status of the last worker the template reported reaped, per lane. Filled from the
-/// template's [`TemplateReport::Exited`] frames, by whoever reads the socket; read by pid, so a
+/// template's [`ForkServerReport::Exited`] frames, by whoever reads the socket; read by pid, so a
 /// report about another worker of the lane is never taken for this one.
 pub(super) struct ExitReports(Mutex<Vec<Option<(Pid, i32)>>>);
 
@@ -322,11 +323,11 @@ impl ExitReports {
 /// The server's side of the template socket: the socket, the bytes read from it that make no
 /// whole frame yet, and how the connection ended once it has.
 /// Whoever holds it is the only reader and writer of the socket.
-pub(super) struct TemplateLink {
+pub(super) struct ForkServerConnection {
     template: Pid,
     sock: OwnedFd,
     read: Vec<u8>,
-    ended: Option<LinkEnd>,
+    ended: Option<DisconnectCause>,
     /// Counts the fork requests that gave up before their answer came: each answer still on its
     /// way names a worker nobody takes, which only a read of the socket ends.
     late_answers: usize,
@@ -336,16 +337,16 @@ pub(super) struct TemplateLink {
 
 /// Says whether someone must read the socket though no fork request waits on it: the answers owed
 /// to requests that gave up name workers that live until they are read.
-pub(super) fn awaits_late_answers(late_answers: usize, ended: bool) -> bool {
+pub(super) fn awaits_late_replies(late_answers: usize, ended: bool) -> bool {
     late_answers > 0 && !ended
 }
 
 /// How much one `recv` from the template asks for.
 const RECV_BYTES: usize = 4096;
 
-impl TemplateLink {
+impl ForkServerConnection {
     pub(super) fn new(template: Pid, sock: OwnedFd) -> Self {
-        TemplateLink {
+        ForkServerConnection {
             template,
             sock,
             read: Vec::new(),
@@ -356,19 +357,19 @@ impl TemplateLink {
     }
 
     /// Owes an answer to a fork request that gave up waiting for it.
-    pub(super) fn give_up_answer(&mut self) {
+    pub(super) fn give_up_reply(&mut self) {
         self.late_answers = self.late_answers.saturating_add(1);
     }
 
     /// Takes one answer to a request that gave up as come.
-    pub(super) fn late_answer_came(&mut self) {
+    pub(super) fn late_reply_came(&mut self) {
         self.late_answers = self.late_answers.saturating_sub(1);
     }
 
     /// Says whether a watch on the socket must start now for the late answers, and takes it as
     /// started when it must.
     pub(super) fn start_watch(&mut self) -> bool {
-        let start = !self.watched && awaits_late_answers(self.late_answers, self.ended.is_some());
+        let start = !self.watched && awaits_late_replies(self.late_answers, self.ended.is_some());
         self.watched |= start;
         start
     }
@@ -376,7 +377,7 @@ impl TemplateLink {
     /// Says whether the watch is done, every late answer read or the connection ended, and takes
     /// it as ended when it is.
     pub(super) fn end_watch(&mut self) -> bool {
-        let done = !awaits_late_answers(self.late_answers, self.ended.is_some());
+        let done = !awaits_late_replies(self.late_answers, self.ended.is_some());
         if done {
             self.watched = false;
         }
@@ -390,18 +391,18 @@ impl TemplateLink {
     }
 
     /// How the connection ended, once it has.
-    pub(super) fn ended(&self) -> Option<&LinkEnd> {
+    pub(super) fn ended(&self) -> Option<&DisconnectCause> {
         self.ended.as_ref()
     }
 
     /// Returns the socket, for a wait that wakes when a report comes; the reports are still read
-    /// through [`TemplateLink::next_report`].
+    /// through [`ForkServerConnection::next_report`].
     pub(super) fn socket(&self) -> BorrowedFd<'_> {
         self.sock.as_fd()
     }
 
     /// Sends `command` whole, its fds on its first byte.
-    pub(super) fn send(&self, command: &TemplateCommand<'_>) -> Result<(), TemplateSendError> {
+    pub(super) fn send(&self, command: &ForkServerCommand<'_>) -> Result<(), TemplateSendError> {
         let frame = command.frame();
         send_with_fds(self.sock.as_fd(), &frame, command.fds()).map_err(|source| TemplateSendError {
             frame: command.name(),
@@ -412,7 +413,7 @@ impl TemplateLink {
 
     /// Keeps `end` as how the connection ended, and says so once: nothing more comes from the
     /// template, and its next fork request fails with it.
-    pub(super) fn end(&mut self, end: LinkEnd) {
+    pub(super) fn end(&mut self, end: DisconnectCause) {
         tracing::error!(
             target: "mipyre::server",
             template = self.template.as_raw(),
@@ -429,9 +430,9 @@ impl TemplateLink {
         &mut self,
         lanes: usize,
         deadline: Option<Instant>,
-    ) -> Result<Option<TemplateReport>, LinkEnd> {
+    ) -> Result<Option<ForkServerReport>, DisconnectCause> {
         loop {
-            match decode_template_report(&self.read, lanes) {
+            match decode_report(&self.read, lanes) {
                 Ok(Some((report, used))) => {
                     self.read.drain(..used);
                     return Ok(Some(report));
@@ -440,7 +441,7 @@ impl TemplateLink {
                 Err(error) => {
                     let prefix = self.read[..self.read.len().min(BAD_FRAME_PREFIX)].to_vec();
                     self.read.clear();
-                    self.end(LinkEnd::BadFrame { error, prefix });
+                    self.end(DisconnectCause::BadFrame { error, prefix });
                 }
             }
             if let Some(end) = &self.ended {
@@ -452,7 +453,7 @@ impl TemplateLink {
                     Ok(false) => return Ok(None),
                     Err(Errno::INTR) => continue,
                     Err(errno) => {
-                        self.end(LinkEnd::RecvFailed(errno));
+                        self.end(DisconnectCause::RecvFailed(errno));
                         continue;
                     }
                 }
@@ -466,12 +467,12 @@ impl TemplateLink {
             );
             self.read.truncate(at + got.map_or(0, |(n, _)| n));
             match got {
-                Ok((0, _)) => self.end(LinkEnd::Closed),
+                Ok((0, _)) => self.end(DisconnectCause::Closed),
                 Ok(_) | Err(Errno::INTR) => {}
                 Err(Errno::AGAIN) if deadline.is_none() => return Ok(None),
                 // Readable, then nothing to read: another wait.
                 Err(Errno::AGAIN) => {}
-                Err(errno) => self.end(LinkEnd::RecvFailed(errno)),
+                Err(errno) => self.end(DisconnectCause::RecvFailed(errno)),
             }
         }
     }
@@ -576,16 +577,16 @@ pub(super) mod tests {
     /// connection is still there to bring it.
     #[test]
     fn late_answers_are_awaited_only_while_owed_on_an_open_connection() {
-        assert!(!awaits_late_answers(0, false));
-        assert!(awaits_late_answers(1, false));
-        assert!(!awaits_late_answers(1, true));
+        assert!(!awaits_late_replies(0, false));
+        assert!(awaits_late_replies(1, false));
+        assert!(!awaits_late_replies(1, true));
     }
 
     /// A report as the template encodes it (`report_frame` in template.py).
-    pub(in super::super) fn report_frame(report: &TemplateReport) -> Vec<u8> {
+    pub(in super::super) fn report_frame(report: &ForkServerReport) -> Vec<u8> {
         let lane = |l: LaneIndex| (l.0 as u32).to_le_bytes();
         match report {
-            TemplateReport::Forked {
+            ForkServerReport::Forked {
                 lane: l,
                 attempt,
                 result,
@@ -599,19 +600,19 @@ pub(super) mod tests {
                     &[lane(*l), attempt.get().to_le_bytes(), raw.to_le_bytes()].concat(),
                 )
             }
-            TemplateReport::Exited { lane: l, pid, status } => framed(
+            ForkServerReport::Exited { lane: l, pid, status } => framed(
                 tag::EXITED,
                 &[lane(*l), pid.as_raw().to_le_bytes(), status.to_le_bytes()].concat(),
             ),
-            TemplateReport::ImportFailed(text) => framed(tag::IMPORT_FAILED, text.as_bytes()),
-            TemplateReport::LaneFdsMissing { lane: l, got } => {
+            ForkServerReport::ImportFailed(text) => framed(tag::IMPORT_FAILED, text.as_bytes()),
+            ForkServerReport::LaneFdsMissing { lane: l, got } => {
                 framed(tag::LANE_FDS_MISSING, &[lane(*l), got.to_le_bytes()].concat())
             }
         }
     }
 
-    fn exited(lane: usize) -> TemplateReport {
-        TemplateReport::Exited {
+    fn exited(lane: usize) -> ForkServerReport {
+        ForkServerReport::Exited {
             lane: LaneIndex(lane),
             pid: Pid::new(4321).unwrap(),
             status: 9,
@@ -622,9 +623,9 @@ pub(super) mod tests {
     #[test]
     fn a_whole_frame_decodes_and_one_byte_short_waits() {
         let frame = report_frame(&exited(1));
-        assert_eq!(decode_template_report(&frame, 2), Ok(Some((exited(1), frame.len()))));
-        assert_eq!(decode_template_report(&frame[..frame.len() - 1], 2), Ok(None));
-        assert_eq!(decode_template_report(&frame[..3], 2), Ok(None));
+        assert_eq!(decode_report(&frame, 2), Ok(Some((exited(1), frame.len()))));
+        assert_eq!(decode_report(&frame[..frame.len() - 1], 2), Ok(None));
+        assert_eq!(decode_report(&frame[..3], 2), Ok(None));
     }
 
     /// An exit report for the last lane is taken; one for the lane past it is refused (it
@@ -632,12 +633,12 @@ pub(super) mod tests {
     #[test]
     fn a_report_for_the_last_lane_is_taken_and_one_past_it_refused() {
         assert_eq!(
-            decode_template_report(&report_frame(&exited(1)), 2).map(|r| r.map(|(r, _)| r)),
+            decode_report(&report_frame(&exited(1)), 2).map(|r| r.map(|(r, _)| r)),
             Ok(Some(exited(1)))
         );
         assert_eq!(
-            decode_template_report(&report_frame(&exited(2)), 2),
-            Err(TemplateFrameError::LaneOutOfRange { lane: 2, lanes: 2 })
+            decode_report(&report_frame(&exited(2)), 2),
+            Err(DecodeReportError::LaneOutOfRange { lane: 2, lanes: 2 })
         );
     }
 
@@ -645,37 +646,34 @@ pub(super) mod tests {
     #[test]
     fn an_unknown_tag_and_an_empty_frame_are_refused() {
         assert_eq!(
-            decode_template_report(&framed(tag::START, &[0; 8]), 2),
-            Err(TemplateFrameError::UnknownTag(tag::START))
+            decode_report(&framed(tag::START, &[0; 8]), 2),
+            Err(DecodeReportError::UnknownTag(tag::START))
         );
         assert_eq!(
-            decode_template_report(&framed(99, &[]), 2),
-            Err(TemplateFrameError::UnknownTag(99))
+            decode_report(&framed(99, &[]), 2),
+            Err(DecodeReportError::UnknownTag(99))
         );
-        assert_eq!(
-            decode_template_report(&0u32.to_le_bytes(), 2),
-            Err(TemplateFrameError::Untagged)
-        );
+        assert_eq!(decode_report(&0u32.to_le_bytes(), 2), Err(DecodeReportError::Untagged));
     }
 
     /// A frame of exactly the limit waits for its body; one byte more is refused from the header
     /// alone.
     #[test]
     fn the_length_limit_is_judged_from_the_header() {
-        assert_eq!(decode_template_report(&MAX_FRAME_BYTES.to_le_bytes(), 2), Ok(None));
+        assert_eq!(decode_report(&MAX_FRAME_BYTES.to_le_bytes(), 2), Ok(None));
         assert_eq!(
-            decode_template_report(&(MAX_FRAME_BYTES + 1).to_le_bytes(), 2),
-            Err(TemplateFrameError::TooLong {
+            decode_report(&(MAX_FRAME_BYTES + 1).to_le_bytes(), 2),
+            Err(DecodeReportError::TooLong {
                 len: MAX_FRAME_BYTES + 1,
                 max: MAX_FRAME_BYTES
             })
         );
         let mut whole = framed(tag::IMPORT_FAILED, &vec![b'x'; MAX_FRAME_BYTES as usize - 1]);
         assert!(
-            matches!(decode_template_report(&whole, 2), Ok(Some((TemplateReport::ImportFailed(t), _))) if t.len() == MAX_FRAME_BYTES as usize - 1)
+            matches!(decode_report(&whole, 2), Ok(Some((ForkServerReport::ImportFailed(t), _))) if t.len() == MAX_FRAME_BYTES as usize - 1)
         );
         whole.pop();
-        assert_eq!(decode_template_report(&whole, 2), Ok(None));
+        assert_eq!(decode_report(&whole, 2), Ok(None));
     }
 
     #[test]
@@ -683,7 +681,7 @@ pub(super) mod tests {
         assert_eq!(body_fits(MAX_FRAME_BYTES as usize - 1), Ok(()));
         assert_eq!(
             body_fits(MAX_FRAME_BYTES as usize),
-            Err(BodyTooLong {
+            Err(BodyTooLongError {
                 bytes: MAX_FRAME_BYTES as usize
             })
         );
@@ -700,14 +698,14 @@ pub(super) mod tests {
                 &[0u32.to_le_bytes(), 5u32.to_le_bytes(), raw.to_le_bytes()].concat(),
             )
         };
-        let result = |raw| match decode_template_report(&answer(raw), 1) {
-            Ok(Some((TemplateReport::Forked { result, .. }, _))) => Ok(result),
+        let result = |raw| match decode_report(&answer(raw), 1) {
+            Ok(Some((ForkServerReport::Forked { result, .. }, _))) => Ok(result),
             other => Err(other),
         };
         assert_eq!(result(42), Ok(Ok(Pid::new(42).unwrap())));
         assert_eq!(result(-libc::EAGAIN), Ok(Err(Errno::AGAIN)));
         for raw in [0, i32::MIN] {
-            assert_eq!(result(raw), Err(Err(TemplateFrameError::NeitherPidNorErrno { raw })));
+            assert_eq!(result(raw), Err(Err(DecodeReportError::NeitherPidNorErrno { raw })));
         }
     }
 
@@ -715,8 +713,8 @@ pub(super) mod tests {
     #[test]
     fn a_body_of_the_wrong_length_is_refused() {
         assert_eq!(
-            decode_template_report(&framed(tag::EXITED, &[0; 11]), 2),
-            Err(TemplateFrameError::BodyLength {
+            decode_report(&framed(tag::EXITED, &[0; 11]), 2),
+            Err(DecodeReportError::BodyLength {
                 tag: tag::EXITED,
                 len: 11,
                 want: 12
@@ -727,14 +725,14 @@ pub(super) mod tests {
     /// A traceback that is not UTF-8 still arrives, its bad bytes replaced.
     #[test]
     fn a_traceback_that_is_not_utf8_still_arrives() {
-        let got = decode_template_report(&framed(tag::IMPORT_FAILED, b"bad \xff byte"), 1);
+        let got = decode_report(&framed(tag::IMPORT_FAILED, b"bad \xff byte"), 1);
         assert_eq!(
             got.map(|r| r.map(|(r, _)| r)),
-            Ok(Some(TemplateReport::ImportFailed("bad \u{fffd} byte".into())))
+            Ok(Some(ForkServerReport::ImportFailed("bad \u{fffd} byte".into())))
         );
     }
 
-    fn any_report(lanes: usize) -> impl Strategy<Value = TemplateReport> {
+    fn any_report(lanes: usize) -> impl Strategy<Value = ForkServerReport> {
         let lane = (0..lanes).prop_map(LaneIndex);
         let pid = (1..=i32::MAX).prop_map(|raw| Pid::new(raw).unwrap());
         prop_oneof![
@@ -746,18 +744,18 @@ pub(super) mod tests {
                     (1..=4095i32).prop_map(|e| Err(Errno::from_raw_os_error(e))),
                 ]
             )
-                .prop_map(|(lane, a, result)| TemplateReport::Forked {
+                .prop_map(|(lane, a, result)| ForkServerReport::Forked {
                     lane,
                     attempt: Attempt::new(a),
                     result
                 }),
-            (lane.clone(), pid, any::<i32>()).prop_map(|(lane, pid, status)| TemplateReport::Exited {
+            (lane.clone(), pid, any::<i32>()).prop_map(|(lane, pid, status)| ForkServerReport::Exited {
                 lane,
                 pid,
                 status
             }),
-            "\\PC{0,200}".prop_map(TemplateReport::ImportFailed),
-            (lane, any::<u32>()).prop_map(|(lane, got)| TemplateReport::LaneFdsMissing { lane, got }),
+            "\\PC{0,200}".prop_map(ForkServerReport::ImportFailed),
+            (lane, any::<u32>()).prop_map(|(lane, got)| ForkServerReport::LaneFdsMissing { lane, got }),
         ]
     }
 
@@ -767,13 +765,13 @@ pub(super) mod tests {
         stream: &[u8],
         pieces: &[usize],
         lanes: usize,
-    ) -> (Vec<TemplateReport>, Option<TemplateFrameError>) {
+    ) -> (Vec<ForkServerReport>, Option<DecodeReportError>) {
         let mut buf = Vec::new();
         let mut reports = Vec::new();
         let mut fed = 0;
         let mut sizes = pieces.iter().copied().cycle();
         loop {
-            match decode_template_report(&buf, lanes) {
+            match decode_report(&buf, lanes) {
                 Ok(Some((report, used))) => {
                     reports.push(report);
                     buf.drain(..used);
@@ -794,7 +792,7 @@ pub(super) mod tests {
         #[test]
         fn a_report_decodes_to_what_was_encoded(report in any_report(8)) {
             let frame = report_frame(&report);
-            prop_assert_eq!(decode_template_report(&frame, 8), Ok(Some((report, frame.len()))));
+            prop_assert_eq!(decode_report(&frame, 8), Ok(Some((report, frame.len()))));
         }
 
         /// However the socket cuts a stream of frames, the same reports come out in the same
@@ -816,7 +814,7 @@ pub(super) mod tests {
         /// the bytes given.
         #[test]
         fn any_bytes_decode_without_panic(bytes in proptest::collection::vec(any::<u8>(), 0..300), lanes in 1usize..5) {
-            if let Ok(Some((_, used))) = decode_template_report(&bytes, lanes) {
+            if let Ok(Some((_, used))) = decode_report(&bytes, lanes) {
                 prop_assert!(used <= bytes.len());
             }
         }

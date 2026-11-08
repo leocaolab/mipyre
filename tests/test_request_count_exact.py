@@ -38,12 +38,8 @@ app.add_fast_response("GET", "/fast", b"fast")
 
 
 @app.websocket("/ws")
-async def ws_echo(ws):
-    while True:
-        msg = await ws.recv()
-        if msg is None:
-            break
-        await ws.send(msg)
+def ws_echo(ws, msg):
+    return msg
 
 
 @pytest.fixture(scope="module")

@@ -19,16 +19,16 @@ use super::{LiveWorkers, WorkerCounters, WorkerKind, WorkerKindLoss, WorkerLife}
 
 /// The losses the kinds told, in the order they arrived.
 #[derive(Clone, Default)]
-struct Told(Arc<Mutex<Vec<WorkerKindLoss>>>);
+struct LossSpy(Arc<Mutex<Vec<WorkerKindLoss>>>);
 
-impl Told {
+impl LossSpy {
     fn losses(&self) -> Vec<WorkerKindLoss> {
         self.0.lock().unwrap().clone()
     }
 }
 
 /// Returns `workers` lives of `kind`, whose loss is told to `told`.
-fn kind(kind: WorkerKind, workers: usize, told: &Told) -> (LiveWorkers, Vec<WorkerLife>) {
+fn kind(kind: WorkerKind, workers: usize, told: &LossSpy) -> (LiveWorkers, Vec<WorkerLife>) {
     let told = told.clone();
     let tell = Arc::new(move |loss| told.0.lock().unwrap().push(loss));
     LiveWorkers::new(kind, workers, tell, &Arc::new(WorkerCounters::new()))
@@ -41,7 +41,7 @@ fn die(life: WorkerLife, cause: &'static str) -> thread::JoinHandle<Option<Arc<s
 #[test]
 fn of_two_workers_dying_at_once_the_last_tells_the_loss_once_with_the_first_cause() {
     loom::model(|| {
-        let told = Told::default();
+        let told = LossSpy::default();
         let (kind, lives) = kind(WorkerKind::TpcThread, 2, &told);
         let mut lives = lives.into_iter();
         let (Some(one), Some(two)) = (lives.next(), lives.next()) else {
@@ -75,7 +75,7 @@ fn of_two_workers_dying_at_once_the_last_tells_the_loss_once_with_the_first_caus
 #[test]
 fn of_two_kinds_whose_last_workers_die_at_once_each_tells_its_own_loss() {
     loom::model(|| {
-        let told = Told::default();
+        let told = LossSpy::default();
         let (_, sync) = kind(WorkerKind::PoolSync, 1, &told);
         let (_, r#async) = kind(WorkerKind::PoolAsync, 1, &told);
         let (Some(sync), Some(r#async)) = (sync.into_iter().next(), r#async.into_iter().next()) else {

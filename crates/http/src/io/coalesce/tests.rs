@@ -4,8 +4,8 @@
 use super::*;
 use crate::plan::coalesce::{COALESCE_LIMIT, H2_PREFACE};
 
-use mipyre_transport::stream::linger::{Close, LingerBounds};
-use mipyre_transport::stream::stall::WriteStall;
+use mipyre_transport::stream::linger::{CloseStyle, LingerBounds};
+use mipyre_transport::stream::stall::TimeoutStream;
 use tokio::io::AsyncWriteExt;
 
 /// Bounds a lingering finish far past what a scripted read takes, so a test's reads end it.
@@ -24,20 +24,20 @@ fn run<F: std::future::Future<Output = ()>>(test: F) {
 
 /// Accepts at most `per_call` bytes per write and refuses every other write with `Pending`,
 /// waking the task at once like a socket that drains immediately.
-struct ChokedIo {
+struct ShortWriteSocket {
     written: Vec<u8>,
     per_call: usize,
     refuse_next: bool,
     writes: usize,
 }
 
-impl AsyncRead for ChokedIo {
+impl AsyncRead for ShortWriteSocket {
     fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Poll::Pending
     }
 }
 
-impl AsyncWrite for ChokedIo {
+impl AsyncWrite for ShortWriteSocket {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         if self.refuse_next {
             self.refuse_next = false;
@@ -61,7 +61,7 @@ impl AsyncWrite for ChokedIo {
 #[test]
 fn partial_and_refused_writes_keep_the_rest_and_its_order() {
     run(async {
-        let choked = ChokedIo {
+        let choked = ShortWriteSocket {
             written: Vec::new(),
             per_call: 7,
             refuse_next: true,
@@ -87,7 +87,7 @@ fn partial_and_refused_writes_keep_the_rest_and_its_order() {
 
 #[test]
 fn the_http2_preface_switches_the_layer_to_passthrough() {
-    let choked = || ChokedIo {
+    let choked = || ShortWriteSocket {
         written: Vec::new(),
         per_call: usize::MAX,
         refuse_next: false,
@@ -118,7 +118,7 @@ enum WriteStep {
 }
 
 #[derive(Default)]
-struct Wire {
+struct FakeSocketState {
     landed: Vec<u8>,
     /// Makes written bytes wait in `buffered` until a flush lands them, as a TLS stream does.
     buffers: bool,
@@ -129,14 +129,14 @@ struct Wire {
     write_calls: usize,
 }
 
-struct ScriptedIo(Arc<Mutex<Wire>>);
+struct FakeSocket(Arc<Mutex<FakeSocketState>>);
 
-fn wire() -> (ScriptedIo, Arc<Mutex<Wire>>) {
-    let wire = Arc::new(Mutex::new(Wire::default()));
-    (ScriptedIo(Arc::clone(&wire)), wire)
+fn wire() -> (FakeSocket, Arc<Mutex<FakeSocketState>>) {
+    let wire = Arc::new(Mutex::new(FakeSocketState::default()));
+    (FakeSocket(Arc::clone(&wire)), wire)
 }
 
-impl AsyncRead for ScriptedIo {
+impl AsyncRead for FakeSocket {
     /// Delivers the next scripted read, where `None` is EOF and an empty script is `Pending`.
     fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         match self.0.lock().reads.pop_front() {
@@ -150,7 +150,7 @@ impl AsyncRead for ScriptedIo {
     }
 }
 
-impl AsyncWrite for ScriptedIo {
+impl AsyncWrite for FakeSocket {
     fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let mut wire = self.0.lock();
         wire.write_calls += 1;
@@ -192,13 +192,13 @@ enum Call {
 
 /// Stands in for hyper's connection future: each poll makes the next group of calls, and the
 /// last group ends it. Results are recorded, not acted on, as hyper ignores a `Pending`.
-struct Conn<'a> {
-    io: &'a mut CoalescingIo<ScriptedIo>,
+struct FakeConnection<'a> {
+    io: &'a mut CoalescingIo<FakeSocket>,
     polls: VecDeque<Vec<Call>>,
     errors: Vec<io::ErrorKind>,
 }
 
-impl std::future::Future for Conn<'_> {
+impl std::future::Future for FakeConnection<'_> {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = &mut *self;
@@ -232,7 +232,7 @@ impl std::future::Future for Conn<'_> {
     }
 }
 
-fn bracket(conn: &mut Conn<'_>, flusher: &Flusher<ScriptedIo>) -> Poll<()> {
+fn bracket(conn: &mut FakeConnection<'_>, flusher: &Flusher<FakeSocket>) -> Poll<()> {
     let mut cx = Context::from_waker(Waker::noop());
     let pinned = Pin::new(conn);
     std::future::Future::poll(Pin::new(&mut CoalescedPoll::new(pinned, flusher)), &mut cx)
@@ -249,7 +249,7 @@ const PIPELINED: &[u8] = b"GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n";
 fn the_end_of_a_poll_writes_what_the_poll_kept_in_one_write() {
     let (io, wire) = wire();
     let (mut io, flusher) = coalesce(io);
-    let mut conn = Conn {
+    let mut conn = FakeConnection {
         io: &mut io,
         polls: polls(&[&[Call::Read, Call::Write(b"one;"), Call::Write(b"two;")], &[]]),
         errors: Vec::new(),
@@ -266,7 +266,7 @@ fn a_flush_while_requests_are_unread_waits_and_a_pending_read_lets_the_next_flus
     let (io, wire) = wire();
     wire.lock().reads.push_back(Some(b"GET / HTTP/1.1\r\n\r\n".to_vec()));
     let (mut io, flusher) = coalesce(io);
-    let mut conn = Conn {
+    let mut conn = FakeConnection {
         io: &mut io,
         // The first answer is kept, because no read has yet found the client's queue empty.
         polls: polls(&[&[Call::Read, Call::Write(b"first;"), Call::Flush], &[]]),
@@ -293,7 +293,7 @@ fn bytes_a_buffering_inner_holds_are_flushed_when_the_connection_ends() {
     wire.lock().buffers = true;
     wire.lock().reads.push_back(Some(b"GET /ws HTTP/1.1\r\n\r\n".to_vec()));
     let (mut io, flusher) = coalesce(io);
-    let mut conn = Conn {
+    let mut conn = FakeConnection {
         io: &mut io,
         // The 101 is kept because a request was just read, and the connection future ends
         // without a shutdown.
@@ -314,7 +314,7 @@ fn an_upgraded_stream_carries_on_a_write_out_the_connection_left_blocked() {
         w.writes.push_back(WriteStep::Full);
     }
     let (mut io, flusher) = coalesce(io);
-    let mut conn = Conn {
+    let mut conn = FakeConnection {
         io: &mut io,
         polls: polls(&[&[Call::Read, Call::Write(b"HTTP/1.1 101\r\n\r\n"), Call::Flush]]),
         errors: Vec::new(),
@@ -361,7 +361,7 @@ fn a_failed_write_is_tried_once_and_reported_once() {
     let (io, wire) = wire();
     wire.lock().writes.push_back(WriteStep::Fail(io::ErrorKind::BrokenPipe));
     let (mut io, flusher) = coalesce(io);
-    let mut conn = Conn {
+    let mut conn = FakeConnection {
         io: &mut io,
         polls: polls(&[&[Call::Write(b"response"), Call::Flush]]),
         errors: Vec::new(),
@@ -386,7 +386,7 @@ fn a_failed_write_is_tried_once_and_reported_once() {
 fn a_poll_whose_write_came_back_pending_does_not_write_again_at_its_end() {
     let (io, wire) = wire();
     let (mut io, flusher) = coalesce(io);
-    let mut conn = Conn {
+    let mut conn = FakeConnection {
         io: &mut io,
         polls: polls(&[&[Call::Read, Call::Write(b"response")], &[Call::Flush], &[]]),
         errors: Vec::new(),
@@ -445,7 +445,7 @@ fn a_write_out_a_poll_end_failed_is_reported_once_by_the_next_call() {
     wire.lock().writes.push_back(WriteStep::Fail(io::ErrorKind::BrokenPipe));
     wire.lock().reads.push_back(Some(PIPELINED.to_vec()));
     let (mut io, flusher) = coalesce(io);
-    let mut conn = Conn {
+    let mut conn = FakeConnection {
         io: &mut io,
         polls: polls(&[
             &[Call::Read, Call::Write(b"response")],
@@ -478,7 +478,7 @@ fn finish_writes_what_a_connection_that_ended_without_a_shutdown_left_blocked() 
         wire.lock().writes.push_back(WriteStep::Full);
         wire.lock().reads.push_back(Some(PIPELINED.to_vec()));
         let (mut io, flusher) = coalesce(io);
-        let mut conn = Conn {
+        let mut conn = FakeConnection {
             io: &mut io,
             polls: polls(&[&[Call::Read, Call::Write(b"HTTP/1.1 200 OK\r\n\r\n")]]),
             errors: Vec::new(),
@@ -488,7 +488,7 @@ fn finish_writes_what_a_connection_that_ended_without_a_shutdown_left_blocked() 
         drop(io);
         assert!(wire.lock().landed.is_empty(), "the socket was full at the poll's end");
         flusher
-            .finish(Close::Now, BOUNDS, std::future::pending())
+            .finish(CloseStyle::Now, BOUNDS, std::future::pending())
             .await
             .unwrap();
         assert_eq!(wire.lock().landed, b"HTTP/1.1 200 OK\r\n\r\n");
@@ -504,7 +504,7 @@ fn finish_reports_a_write_out_the_last_poll_failed_and_nothing_else_does() {
             .push_back(WriteStep::Fail(io::ErrorKind::PermissionDenied));
         wire.lock().reads.push_back(Some(PIPELINED.to_vec()));
         let (mut io, flusher) = coalesce(io);
-        let mut conn = Conn {
+        let mut conn = FakeConnection {
             io: &mut io,
             polls: polls(&[&[Call::Read, Call::Write(b"response")]]),
             errors: Vec::new(),
@@ -517,7 +517,7 @@ fn finish_reports_a_write_out_the_last_poll_failed_and_nothing_else_does() {
         drop(conn);
         drop(io);
         let e = flusher
-            .finish(Close::Now, BOUNDS, std::future::pending())
+            .finish(CloseStyle::Now, BOUNDS, std::future::pending())
             .await
             .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
@@ -531,7 +531,7 @@ fn a_lingering_finish_reads_what_the_client_still_sends_until_it_closes() {
         let (io, wire) = wire();
         wire.lock().reads.push_back(Some(PIPELINED.to_vec()));
         let (mut io, flusher) = coalesce(io);
-        let mut conn = Conn {
+        let mut conn = FakeConnection {
             io: &mut io,
             polls: polls(&[&[Call::Read, Call::Write(b"HTTP/1.1 413\r\n\r\n")]]),
             errors: Vec::new(),
@@ -543,7 +543,7 @@ fn a_lingering_finish_reads_what_the_client_still_sends_until_it_closes() {
             .reads
             .extend([Some(b"the unread body".to_vec()), Some(b"more of it".to_vec()), None]);
         flusher
-            .finish(Close::Lingering, BOUNDS, std::future::pending())
+            .finish(CloseStyle::Lingering, BOUNDS, std::future::pending())
             .await
             .unwrap();
         assert!(wire.lock().reads.is_empty(), "read up to the client's close");
@@ -557,7 +557,7 @@ fn a_lingering_finish_does_not_wait_for_a_client_that_has_closed() {
         let (io, wire) = wire();
         wire.lock().reads.extend([Some(PIPELINED.to_vec()), None]);
         let (mut io, flusher) = coalesce(io);
-        let mut conn = Conn {
+        let mut conn = FakeConnection {
             io: &mut io,
             polls: polls(&[&[Call::Read, Call::Write(b"HTTP/1.1 200 OK\r\n\r\n"), Call::Read]]),
             errors: Vec::new(),
@@ -567,7 +567,7 @@ fn a_lingering_finish_does_not_wait_for_a_client_that_has_closed() {
         drop(io);
         wire.lock().reads.push_back(Some(b"never read".to_vec()));
         flusher
-            .finish(Close::Lingering, BOUNDS, std::future::pending())
+            .finish(CloseStyle::Lingering, BOUNDS, std::future::pending())
             .await
             .unwrap();
         assert_eq!(wire.lock().reads.len(), 1, "nothing is read after the client's EOF");
@@ -581,7 +581,7 @@ fn finish_leaves_an_upgraded_stream_to_its_new_owner() {
         wire.lock().writes.push_back(WriteStep::Full);
         wire.lock().reads.push_back(Some(PIPELINED.to_vec()));
         let (mut io, flusher) = coalesce(io);
-        let mut conn = Conn {
+        let mut conn = FakeConnection {
             io: &mut io,
             polls: polls(&[&[Call::Read, Call::Write(b"HTTP/1.1 101\r\n\r\n")]]),
             errors: Vec::new(),
@@ -590,7 +590,7 @@ fn finish_leaves_an_upgraded_stream_to_its_new_owner() {
         drop(conn);
         // The upgrade's owner still holds `io`, so finish does not wait on it.
         flusher
-            .finish(Close::Now, BOUNDS, std::future::pending())
+            .finish(CloseStyle::Now, BOUNDS, std::future::pending())
             .await
             .unwrap();
         io.flush().await.unwrap();
@@ -640,8 +640,8 @@ fn captured_log(f: impl FnOnce()) -> String {
             .expect("no other test in this binary sets the global subscriber");
     });
     #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for Buf {
+    struct SpyWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SpyWriter {
         fn write(&mut self, data: &[u8]) -> io::Result<usize> {
             self.0.lock().extend_from_slice(data);
             Ok(data.len())
@@ -650,7 +650,7 @@ fn captured_log(f: impl FnOnce()) -> String {
             Ok(())
         }
     }
-    let buf = Buf::default();
+    let buf = SpyWriter::default();
     let sink = buf.clone();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -734,15 +734,15 @@ fn a_full_sockets_warning_does_not_hold_back_a_failed_writes() {
 }
 
 /// Takes no write, as a peer that stopped reading.
-struct NeverWrites;
+struct FullSocket;
 
-impl AsyncRead for NeverWrites {
+impl AsyncRead for FullSocket {
     fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Poll::Pending
     }
 }
 
-impl AsyncWrite for NeverWrites {
+impl AsyncWrite for FullSocket {
     fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
         Poll::Pending
     }
@@ -760,7 +760,7 @@ const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 async fn under_the_coalescing_layer_a_stall_is_reported_once_and_not_written_again() {
     use std::future::Future as _;
 
-    let (mut io, flusher) = coalesce(WriteStall::new(NeverWrites, STALL_LIMIT));
+    let (mut io, flusher) = coalesce(TimeoutStream::new(FullSocket, STALL_LIMIT));
     let mut cx = Context::from_waker(Waker::noop());
     let errors = std::cell::RefCell::new(Vec::new());
     let met = &errors;
@@ -794,7 +794,7 @@ async fn under_the_coalescing_layer_a_stall_is_reported_once_and_not_written_aga
     drop(conn);
     assert_eq!(*errors.borrow(), [io::ErrorKind::TimedOut]);
     flusher
-        .finish(Close::Now, BOUNDS, std::future::pending())
+        .finish(CloseStyle::Now, BOUNDS, std::future::pending())
         .await
         .expect("the stall was reported to the connection, not again");
 }

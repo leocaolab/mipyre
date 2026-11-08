@@ -2,8 +2,8 @@
 
 Every worker imports the real `mipyre` package and engine, so more than one interpreter has
 executed the engine. From that moment the PyO3 fork refuses a bare foreign-thread
-`Python::attach` (and `Py<T>` drop); GIL-bridge threads, main's async engine (WebSocket
-connections) and `/metrics` must keep serving the main interpreter.
+`Python::attach` (and `Py<T>` drop); GIL-bridge threads, main's `def` threads (WebSocket
+calls included) and `/metrics` must keep serving the main interpreter.
 """
 import os
 
@@ -33,13 +33,9 @@ async def main_async(req):
     return {"main": "async"}
 
 
-@app.websocket("/ws")
-async def echo(sock):
-    while True:
-        m = await sock.recv()
-        if m is None:
-            break
-        await sock.send("echo:" + m)
+@app.websocket("/ws", runtime="main")
+def echo(sock, m):
+    return "echo:" + m
 
 
 if __name__ == "__main__":

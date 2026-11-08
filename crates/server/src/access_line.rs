@@ -274,21 +274,21 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     /// A timestamp with characters JSON escapes, so both formats are compared on it too.
-    const ESCAPED_STAMP: Stamp = Stamp("2000-01-01T00:00:00.000001Z \"\\\u{1}");
+    const ESCAPED_STAMP: StubTimer = StubTimer("2000-01-01T00:00:00.000001Z \"\\\u{1}");
 
     #[derive(Clone)]
-    struct Stamp(&'static str);
+    struct StubTimer(&'static str);
 
-    impl FormatTime for Stamp {
+    impl FormatTime for StubTimer {
         fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
             w.write_str(self.0)
         }
     }
 
     #[derive(Clone, Default)]
-    struct Lines(Arc<Mutex<Vec<u8>>>);
+    struct FakeWriter(Arc<Mutex<Vec<u8>>>);
 
-    impl io::Write for Lines {
+    impl io::Write for FakeWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
             Ok(buf.len())
@@ -298,17 +298,17 @@ mod tests {
         }
     }
 
-    impl<'a> MakeWriter<'a> for Lines {
-        type Writer = Lines;
-        fn make_writer(&'a self) -> Lines {
+    impl<'a> MakeWriter<'a> for FakeWriter {
+        type Writer = FakeWriter;
+        fn make_writer(&'a self) -> FakeWriter {
             self.clone()
         }
     }
 
     /// Returns what tracing's JSON format and [`JsonLines`] write for what `log` logs.
     fn both_formats(log: impl Fn()) -> (String, String) {
-        let tracing_lines = Lines::default();
-        let ours = Lines::default();
+        let tracing_lines = FakeWriter::default();
+        let ours = FakeWriter::default();
         let tracing_format = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .json()
@@ -324,7 +324,7 @@ mod tests {
         mipyre_runtime::testkit::ask_every_subscriber();
         tracing::subscriber::with_default(tracing_format, &log);
         tracing::subscriber::with_default(our_format, &log);
-        let text = |lines: Lines| String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        let text = |lines: FakeWriter| String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
         (text(tracing_lines), text(ours))
     }
 
@@ -345,7 +345,7 @@ mod tests {
         ) {
             let id = match client_id {
                 Some(text) => RequestId::Client(ClientRequestId::parse(&text).unwrap()),
-                None => RequestId::Server(ServerRequestId { process: 7, number }),
+                None => RequestId::Server(ServerRequestId { process_seed: 7, number }),
             };
             let client = ip.map_or(Peer::InMemory, Peer::Ip);
             let (tracing_line, ours) = both_formats(|| {
@@ -429,10 +429,12 @@ mod tests {
     /// own.
     #[test]
     fn only_the_access_line_is_written_by_hand() {
-        let lines = Lines::default();
+        let lines = FakeWriter::default();
         let format = JsonLines {
-            tracing: tracing_subscriber::fmt::format().json().with_timer(Stamp("tracing's")),
-            timer: Stamp("by hand"),
+            tracing: tracing_subscriber::fmt::format()
+                .json()
+                .with_timer(StubTimer("tracing's")),
+            timer: StubTimer("by hand"),
         };
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()

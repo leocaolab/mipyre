@@ -1,53 +1,58 @@
 //! Creates, serves and ends one isolated sub-interpreter with its own GIL, all on one thread.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
 use pyo3::ffi;
 use pyo3::prelude::*;
+use pyo3::sync::PerInterpreterCell;
 
-use crate::entry::{marked, ThreadAtExit, IN_PYTHON, WATCHED};
-use crate::finalization::{FinalizationHold, Ownership, FINALIZATION};
+use crate::entry::{self, ThreadAtExit, ThreadStateSwap};
+use crate::finalization::{Finalization, OwnRefusal, Ownership, RegisterHookError, FINALIZATION};
 use crate::sync::AtomicPtr;
 use crate::sync::Ordering;
+use crate::NewThreadStateError;
 
 pub(super) mod unit;
 
 use self::unit::{UnitSlot, WorkUnit};
 
+/// Why no sub-interpreter was created; in every case none is left behind.
 #[derive(Debug, thiserror::Error)]
 pub enum NewInterpreterError {
-    /// The runtime refused `Py_NewInterpreterFromConfig` or a step a creation takes before it.
-    #[error(
-        "Py_NewInterpreterFromConfig failed{}: {}",
-        .func.as_deref().map(|f| format!(" in {f}")).unwrap_or_default(),
-        .message.as_deref().unwrap_or("it returned no error message and no thread state")
-    )]
-    Refused {
-        func: Option<String>,
-        message: Option<String>,
-    },
-    /// No interpreter is created once finalization begins, because the main interpreter a
-    /// creation starts from is going away.
+    #[error("no thread state could be made for the main interpreter to create from: {0}")]
+    NoMainThreadState(NewThreadStateError),
+    #[error(transparent)]
+    HookRefused(RegisterHookError),
+    #[error(transparent)]
+    Refused(PyStatusError),
+    /// The process's exit started deciding, and an interpreter created now could run Python
+    /// after it decided that none would.
+    #[error("the process is exiting: no sub-interpreter is created once its exit has started")]
+    Exiting,
+    #[error("the calling thread is ending: no sub-interpreter is created while its thread-locals are destroyed")]
+    ThreadEnding,
+    /// The main interpreter a creation starts from is going away.
     #[error("the process is finalizing: no sub-interpreter is created once Py_Finalize has begun")]
     Finalizing,
 }
 
-impl NewInterpreterError {
-    /// Builds a refusal from `PyStatus.func` and `PyStatus.err_msg`, each if CPython gave one.
-    pub fn new(func: Option<String>, message: Option<String>) -> Self {
-        NewInterpreterError::Refused { func, message }
-    }
+/// `Py_NewInterpreterFromConfig`'s error status: the CPython function that failed and its
+/// message, each when CPython gave one.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "Py_NewInterpreterFromConfig failed{}: {}",
+    .func.as_deref().map(|f| format!(" in {f}")).unwrap_or_default(),
+    .message.as_deref().unwrap_or("it returned no error message and no thread state")
+)]
+pub struct PyStatusError {
+    pub func: Option<String>,
+    pub message: Option<String>,
+}
 
-    fn no_main_thread_state() -> Self {
-        NewInterpreterError::Refused {
-            func: Some("PyThreadState_New".into()),
-            message: Some("could not make a thread state for the main interpreter".into()),
-        }
-    }
-
+impl PyStatusError {
     /// # Safety
     ///
     /// `status.func` and `status.err_msg` must be NULL or NUL-terminated, as CPython guarantees.
@@ -59,9 +64,18 @@ impl NewInterpreterError {
                 unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
             })
         };
-        NewInterpreterError::Refused {
+        PyStatusError {
             func: text(status.func),
             message: text(status.err_msg),
+        }
+    }
+}
+
+impl From<OwnRefusal> for NewInterpreterError {
+    fn from(refusal: OwnRefusal) -> Self {
+        match refusal {
+            OwnRefusal::ExitStarted => NewInterpreterError::Exiting,
+            OwnRefusal::ThreadEnding => NewInterpreterError::ThreadEnding,
         }
     }
 }
@@ -73,42 +87,91 @@ pub trait Releasable: Sized {
     fn release(self, py: Python<'_>);
 }
 
-/// A PEP 684 sub-interpreter with its own GIL, which only [`Self::end_on_own_thread`] or
-/// [`Self::abandon`] may dispose of.
+/// A PEP 684 sub-interpreter with its own GIL, ended on its thread when dropped.
 ///
 /// It is neither `Send` nor `Sync`, so every method runs on the thread that created it and the
 /// thread state they restore is that thread's.
+///
+/// Dropping it releases what it holds and ends the interpreter, which runs Python
+/// (`Py_EndInterpreter` joins the interpreter's non-daemon threads and runs its `atexit` and
+/// `__del__`) for as long as that takes; meanwhile the thread counts as running Python, so the
+/// process's exit does not wait for it. Once finalization has begun, dropping it leaves the
+/// interpreter to `Py_Finalize` instead and leaks what it holds.
 pub struct SubInterpreter<R: Releasable> {
     /// The thread state is saved while nothing runs on it.
     tstate: NonNull<ffi::PyThreadState>,
-    label: String,
-    /// A worker dropped without `end` leaks these rather than decref them into whatever
-    /// interpreter is current there.
-    held: ManuallyDrop<R>,
+    attachment: ManuallyDrop<R>,
     /// The slot is kept here rather than by the caller so that a unit is only ever begun in the
     /// interpreter its slot names; it is made by the first [`Self::with_unit`].
     units: Option<UnitSlot>,
-    /// Is taken only by what ends or gives up the interpreter, which happens once.
-    ownership: Option<Ownership>,
-}
-
-impl<R: Releasable> SubInterpreter<R> {
-    /// Tells finalization this thread no longer enters the interpreter.
-    fn give_up_ownership(&mut self) {
-        if let Some(owned) = self.ownership.take() {
-            FINALIZATION.give_up(owned);
-        }
-    }
+    /// Dropped after the interpreter ended, so the exit waits for the end.
+    #[expect(
+        dead_code,
+        reason = "held for its drop, which tells the exit this thread owns no interpreter"
+    )]
+    ownership: Ownership,
 }
 
 impl<R: Releasable> Drop for SubInterpreter<R> {
     fn drop(&mut self) {
-        self.give_up_ownership();
-        tracing::error!(
-            target: "mipyre_subinterp",
-            worker = %self.label,
-            "sub-interpreter worker dropped without being ended; leaking its interpreter"
-        );
+        let Some(_not_finalizing) = FINALIZATION.try_hold() else {
+            return;
+        };
+        // Otherwise the thread state saved as `previous` below could be this worker's kept one,
+        // and the restore after `Py_EndInterpreter` would bring it back destroyed.
+        detach_for_idle();
+        let span = PythonSpan::enter();
+        // SAFETY: The worker's thread state was made on this thread and is saved (detached above
+        // if kept), and the interpreter is alive: only this drop ends it, while finalization is
+        // held off.
+        let released = unsafe { self.end_here() };
+        drop(span);
+        // A thread already unwinding would abort on a second panic; the first is what it reports.
+        if let Err(panic) = released {
+            if !std::thread::panicking() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
+impl<R: Releasable> SubInterpreter<R> {
+    /// Ends a leaked unit, releases what the worker holds, and ends the interpreter; a panic in
+    /// the release is caught and returned once the interpreter has ended.
+    ///
+    /// Another interpreter's thread state current on this thread is saved and restored around
+    /// it.
+    ///
+    /// # Safety
+    ///
+    /// The worker's thread state must be saved, and finalization must not begin before this
+    /// returns. It is called once, by the drop.
+    unsafe fn end_here(&mut self) -> std::thread::Result<()> {
+        // SAFETY: The contract; `attachment` is taken once, because this runs once.
+        unsafe {
+            let previous = ffi::PyThreadState_GetUnchecked();
+            if !previous.is_null() {
+                ffi::PyEval_SaveThread();
+            }
+            ffi::PyEval_RestoreThread(self.tstate.as_ptr());
+            let attachment = ManuallyDrop::take(&mut self.attachment);
+            let units = self.units.take();
+            let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_assumed_attached(|py| {
+                    // Otherwise an interruption still aimed at a leaked unit could land in the
+                    // release below or enter the interpreter after it is gone.
+                    if let Some(units) = units {
+                        units.end_leaked_unit(py);
+                    }
+                    attachment.release(py);
+                })
+            }));
+            ffi::Py_EndInterpreter(ffi::PyThreadState_Get());
+            if !previous.is_null() {
+                ffi::PyEval_RestoreThread(previous);
+            }
+            released
+        }
     }
 }
 
@@ -131,7 +194,7 @@ impl TemporaryMainThreadState {
         let tstate = unsafe { ffi::PyThreadState_New(ffi::PyInterpreterState_Main()) };
         NonNull::new(tstate)
             .map(TemporaryMainThreadState)
-            .ok_or_else(NewInterpreterError::no_main_thread_state)
+            .ok_or(NewInterpreterError::NoMainThreadState(NewThreadStateError))
     }
 
     /// Attaches the thread state, taking the main GIL.
@@ -151,14 +214,13 @@ impl TemporaryMainThreadState {
     ///
     /// This thread state must be current on the calling thread.
     unsafe fn dispose_attached(self) {
-        // SAFETY: `self.0` is current (the contract), so the main GIL is held as clearing needs.
-        unsafe { ffi::PyThreadState_Clear(self.0.as_ptr()) };
-        // SAFETY: `self.0` is still current: clearing does not detach it.
-        let detached = unsafe { ffi::PyEval_SaveThread() };
-        debug_assert_eq!(detached, self.0.as_ptr());
-        // SAFETY: `self.0` was cleared and then detached above, and `self` is consumed here, so
-        // nothing uses the deleted state again.
-        unsafe { ffi::PyThreadState_Delete(self.0.as_ptr()) };
+        // SAFETY: `self.0` is current (the contract), so the main GIL is held as clearing needs,
+        // and clearing does not detach it; `DeleteCurrent` deletes it and releases the GIL, and
+        // `self` is consumed here, so nothing uses the deleted state again.
+        unsafe {
+            ffi::PyThreadState_Clear(self.0.as_ptr());
+            ffi::PyThreadState_DeleteCurrent();
+        }
     }
 
     /// # Safety
@@ -209,6 +271,13 @@ pub fn trace(label: &str) {
     );
 }
 
+/// Holds nothing; reaching it in a new interpreter makes PyO3's per-interpreter registry there.
+///
+/// Making that registry imports `atexit` and `gc`, which runs bytecode and clears whatever it
+/// raises. Made inside a unit, it would run an interruption pending on the unit's thread and
+/// swallow it, so a creation makes it before `prepare`.
+static PYO3_REGISTRY: PerInterpreterCell<()> = PerInterpreterCell::new();
+
 impl<R: Releasable> SubInterpreter<R> {
     /// Creates a sub-interpreter on the calling thread, which then serves it, and runs `prepare`
     /// in it to build what the worker holds.
@@ -219,34 +288,41 @@ impl<R: Releasable> SubInterpreter<R> {
     ///
     /// # Errors
     ///
-    /// Returns `refused`'s error when the runtime refuses or finalization has begun, and
-    /// `prepare`'s error after ending the interpreter. A panic in `prepare` also ends it.
+    /// Returns `refused`'s error when the runtime refuses, the process's exit has started or
+    /// finalization has begun, and `prepare`'s error after ending the interpreter. A panic in
+    /// `prepare` also ends it.
     ///
     /// # Aborts
     ///
     /// CPython aborts the process when another thread state is current on the calling thread,
     /// such as inside a `Python::attach`.
     pub fn create_on_this_thread<E>(
-        label: String,
         refused: impl FnOnce(NewInterpreterError) -> E,
         prepare: impl for<'py> FnOnce(Python<'py>) -> Result<R, E>,
     ) -> Result<Self, E> {
-        let Some(_not_finalizing) = FINALIZATION.not_begun() else {
+        let Some(_not_finalizing) = FINALIZATION.try_hold() else {
             return Err(refused(NewInterpreterError::Finalizing));
         };
         detach_for_idle();
+        // Owned from before the creation runs Python, so an exit that starts meanwhile watches
+        // this thread.
+        let ownership = match FINALIZATION.own() {
+            Ok(ownership) => ownership,
+            Err(refusal) => return Err(refused(refusal.into())),
+        };
+        let _span = PythonSpan::enter();
         // SAFETY: Finalization cannot begin while `_not_finalizing` is held, and no thread state
         // of ours is current after the detach; anyone else's makes CPython abort.
-        unsafe { Self::create_here(label, refused, prepare) }
+        unsafe { Self::create_here(refused, prepare, ownership) }
     }
 
     /// # Safety
     ///
     /// The main interpreter must not be finalized, nor begin to be, before this returns.
     unsafe fn create_here<E>(
-        label: String,
         refused: impl FnOnce(NewInterpreterError) -> E,
         prepare: impl for<'py> FnOnce(Python<'py>) -> Result<R, E>,
+        ownership: Ownership,
     ) -> Result<Self, E> {
         #[cfg(feature = "startup_trace")]
         trace("create_begin");
@@ -262,24 +338,11 @@ impl<R: Releasable> SubInterpreter<R> {
         #[cfg(feature = "startup_trace")]
         trace("main_attached");
         // SAFETY: The main interpreter's thread state was attached above.
-        let armed = unsafe {
-            with_assumed_attached(|py| {
-                FINALIZATION.arm(py).map_err(|e| {
-                    NewInterpreterError::new(
-                        Some("atexit.register".into()),
-                        Some(format!(
-                            "could not register the finalization hook: {}: {}",
-                            e.get_type(py),
-                            e.value(py)
-                        )),
-                    )
-                })
-            })
-        };
+        let armed = unsafe { with_assumed_attached(|py| FINALIZATION.arm(py)) };
         if let Err(error) = armed {
             // SAFETY: `main` is still current: registering the hook does not detach it.
             unsafe { main.dispose_attached() };
-            return Err(refused(error));
+            return Err(refused(NewInterpreterError::HookRefused(error)));
         }
 
         let mut new_tstate: *mut ffi::PyThreadState = std::ptr::null_mut();
@@ -304,11 +367,11 @@ impl<R: Releasable> SubInterpreter<R> {
             _ => {
                 // SAFETY: CPython sets a status's `func` and `err_msg` to NULL or to static
                 // NUL-terminated strings.
-                let error = unsafe { NewInterpreterError::from_status(&status) };
+                let error = unsafe { PyStatusError::from_status(&status) };
                 // SAFETY: The creation failed, and a failed creation attaches the main thread
                 // state again, so `main` is current.
                 unsafe { main.dispose_attached() };
-                return Err(refused(error));
+                return Err(refused(NewInterpreterError::Refused(error)));
             }
         };
 
@@ -319,28 +382,27 @@ impl<R: Releasable> SubInterpreter<R> {
             armed: true,
         };
         // SAFETY: The new interpreter's thread state is current after a successful creation.
-        let built = unsafe { with_assumed_attached(prepare) };
+        let built = unsafe {
+            with_assumed_attached(|py| {
+                PYO3_REGISTRY.get_or_init(py, || ());
+                prepare(py)
+            })
+        };
         unwind_guard.armed = false;
         // SAFETY: The guard is disarmed, so nothing else takes `main` out of it.
         let main = unsafe { ManuallyDrop::take(&mut unwind_guard.main) };
         #[cfg(feature = "startup_trace")]
         trace("prepared");
         let result = match built {
-            Ok(held) => {
+            Ok(attachment) => {
                 // SAFETY: The new interpreter's thread state is still current: `prepare` got only a
                 // token for it, and a detach inside `prepare` restores it before returning.
-                let saved = unsafe { ffi::PyEval_SaveThread() };
-                debug_assert_eq!(saved, new_tstate.as_ptr());
-                debug_assert!(
-                    crate::entry::aligned(saved),
-                    "a thread state's address has a bit the entry word uses"
-                );
+                unsafe { ffi::PyEval_SaveThread() };
                 Ok(SubInterpreter {
                     tstate: new_tstate,
-                    label,
-                    held: ManuallyDrop::new(held),
+                    attachment: ManuallyDrop::new(attachment),
                     units: None,
-                    ownership: Some(FINALIZATION.own()),
+                    ownership,
                 })
             }
             Err(e) => {
@@ -360,68 +422,13 @@ impl<R: Releasable> SubInterpreter<R> {
     }
 
     /// Returns what the worker holds without its GIL, for plain Rust fields only, never a `Py<T>`.
-    pub fn held(&self) -> &R {
-        &self.held
+    pub fn attachment(&self) -> &R {
+        &self.attachment
     }
 
     /// Returns whether [`Self::with_unit`] has run on this worker.
     pub fn unit_slot_made(&self) -> bool {
         self.units.is_some()
-    }
-
-    /// Ends a leaked unit, releases what the worker holds, and ends the interpreter.
-    ///
-    /// Another interpreter's thread state current on this thread is saved and restored around
-    /// it.
-    fn end(self, _not_finalizing: &FinalizationHold<'_>) {
-        let mut this = ManuallyDrop::new(self);
-        // `this` is never dropped (its `Drop` reports a worker that was not ended), so what it
-        // owns is moved out to be freed.
-        drop(std::mem::take(&mut this.label));
-        // Otherwise `previous` could be this worker's kept thread state, and the restore after
-        // `Py_EndInterpreter` would bring it back destroyed.
-        detach_for_idle();
-        // SAFETY: The worker's thread state was made on this thread and is saved, and the
-        // interpreter is alive because only this ends it while finalization is held off.
-        unsafe {
-            let previous = ffi::PyThreadState_GetUnchecked();
-            if !previous.is_null() {
-                ffi::PyEval_SaveThread();
-            }
-            ffi::PyEval_RestoreThread(this.tstate.as_ptr());
-            let held = ManuallyDrop::take(&mut this.held);
-            let units = this.units.take();
-            with_assumed_attached(|py| {
-                // Otherwise an interruption still aimed at a leaked unit could land in the release
-                // below or enter the interpreter after it is gone.
-                if let Some(units) = units {
-                    units.end_leaked_run(py);
-                }
-                held.release(py);
-            });
-            ffi::Py_EndInterpreter(ffi::PyThreadState_Get());
-            if !previous.is_null() {
-                ffi::PyEval_RestoreThread(previous);
-            }
-        }
-        this.give_up_ownership();
-    }
-
-    /// Gives up on this worker without touching Python, for use once finalization has begun.
-    ///
-    /// `Py_Finalize` then ends the interpreter itself, and restoring its thread state could be a
-    /// use-after-free; the OS reclaims the memory at exit.
-    pub fn abandon(mut self) {
-        self.give_up_ownership();
-        std::mem::forget(self);
-    }
-
-    /// Ends the worker, or abandons it to `Py_Finalize` once finalization has begun.
-    pub fn end_on_own_thread(self) {
-        match FINALIZATION.not_begun() {
-            Some(ending) => self.end(&ending),
-            None => self.abandon(),
-        }
     }
 
     /// Runs `f` with this worker's thread state current.
@@ -438,10 +445,10 @@ impl<R: Releasable> SubInterpreter<R> {
     /// CPython aborts the process when another thread state is current on the calling thread,
     /// such as inside a `Python::attach` or another worker's `with_gil`.
     pub fn with_gil<T>(&mut self, f: impl for<'py> FnOnce(&mut R, Python<'py>) -> T) -> std::thread::Result<T> {
-        let held = &mut *self.held;
+        let attachment = &mut *self.attachment;
         // SAFETY: `self.tstate` was made on this thread, which the worker never leaves, and lives
-        // until `end` consumes the worker.
-        unsafe { enter(self.tstate, |py| f(held, py)) }
+        // until the drop ends the worker.
+        unsafe { enter(self.tstate, |py| f(attachment, py)) }
     }
 
     /// Runs `f` as [`Self::with_gil`] does, with a unit of work another thread may interrupt.
@@ -459,13 +466,13 @@ impl<R: Releasable> SubInterpreter<R> {
         &mut self,
         f: impl for<'s, 'py> FnOnce(&mut R, WorkUnit<'s, 'py>, Python<'py>) -> T,
     ) -> std::thread::Result<T> {
-        let held = &mut *self.held;
+        let attachment = &mut *self.attachment;
         let units = &mut self.units;
         // SAFETY: The same holds as in `with_gil`.
         unsafe {
             enter(self.tstate, |py| {
                 let unit = units.get_or_insert_with(|| UnitSlot::new(py)).begin(py);
-                f(held, unit, py)
+                f(attachment, unit, py)
             })
         }
     }
@@ -488,29 +495,23 @@ unsafe fn enter<T>(
 ) -> std::thread::Result<T> {
     let tstate = tstate.as_ptr();
     // While `f` runs the thread state is in use, not kept, so `detach_for_idle` leaves it alone.
-    let mut kept = ENTRY.with(|e| e.swap(IN_PYTHON, Ordering::Relaxed));
-    if kept != tstate {
-        // Null, or this thread already in a unit: CPython aborts on the restore below then.
-        if kept.addr() & !IN_PYTHON.addr() == 0 {
-            // SAFETY: `tstate` is this thread's saved worker state (the contract), and the word
-            // kept none current; if this thread is already in a unit, CPython aborts here.
-            unsafe { ffi::PyEval_RestoreThread(tstate) };
-        } else {
-            if kept.addr() & WATCHED != 0 {
-                kept = python_entered_while_watched(kept);
-            }
-            if kept != tstate {
-                // Another worker kept on this thread is saved first, though a TPC thread has one.
-                if !kept.is_null() {
-                    // SAFETY: The word holds a thread state only while it is current on this
-                    // thread, so `kept` is current and is the state saved here.
-                    unsafe { ffi::PyEval_SaveThread() };
-                }
-                // SAFETY: None is current now, kept or just saved, and `tstate` is this thread's
-                // saved worker state (the contract).
-                unsafe { ffi::PyEval_RestoreThread(tstate) };
-            }
-        }
+    let before = ENTRY.with(|e| e.swap(in_python(), Ordering::Relaxed));
+    let (switch, watched) = entry::entering(before.addr(), tstate.addr());
+    if watched {
+        python_entered_while_watched();
+    }
+    match switch {
+        ThreadStateSwap::Stay => {}
+        // SAFETY: `tstate` is this thread's saved worker state (the contract), and the word kept
+        // none current; if this thread is already in a unit, CPython aborts here.
+        ThreadStateSwap::Restore => unsafe { ffi::PyEval_RestoreThread(tstate) },
+        // SAFETY: The word holds a thread state only while it is current on this thread, so the
+        // other worker's is current and is the state saved here; then none is, and `tstate` is
+        // this thread's saved worker state (the contract).
+        ThreadStateSwap::SaveThenRestore => unsafe {
+            ffi::PyEval_SaveThread();
+            ffi::PyEval_RestoreThread(tstate);
+        },
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: This worker's thread state is current and stays current for `f`.
@@ -521,27 +522,51 @@ unsafe fn enter<T>(
     } else {
         // SAFETY: `tstate` is current: `attach_current` leaves it so, also when `f` panicked,
         // which `catch_unwind` caught.
-        let saved = unsafe { ffi::PyEval_SaveThread() };
-        debug_assert_eq!(saved, tstate);
+        unsafe { ffi::PyEval_SaveThread() };
         ENTRY.with(|e| e.store(std::ptr::null_mut(), Ordering::Relaxed));
     }
     result
 }
 
-/// Tells the exit watching this thread that Python runs on it again, and returns the word
-/// `kept` without the exit's mark.
+fn in_python() -> *mut ffi::PyThreadState {
+    std::ptr::without_provenance_mut(entry::IN_PYTHON)
+}
+
+/// Tells the exit watching this thread that Python runs on it again.
 #[cold]
 #[inline(never)]
-fn python_entered_while_watched(kept: *mut ffi::PyThreadState) -> *mut ffi::PyThreadState {
+fn python_entered_while_watched() {
     FINALIZATION.python_entered_while_watched();
-    kept.with_addr(kept.addr() & !WATCHED)
+}
+
+/// Marks this thread as running Python for a creation or an end until dropped, as [`enter`] does
+/// for a unit.
+///
+/// The thread keeps no worker thread state current here (the caller detached it), so the word it
+/// leaves is null.
+struct PythonSpan;
+
+impl PythonSpan {
+    fn enter() -> PythonSpan {
+        let before = ENTRY.with(|e| e.swap(in_python(), Ordering::Relaxed));
+        if entry::watched(before.addr()) {
+            python_entered_while_watched();
+        }
+        PythonSpan
+    }
+}
+
+impl Drop for PythonSpan {
+    fn drop(&mut self) {
+        ENTRY.with(|e| e.store(std::ptr::null_mut(), Ordering::Relaxed));
+    }
 }
 
 /// A thread's entry word ([`crate::entry`]), for the exit to mark from another thread.
 ///
-/// [`Finalization::own`](crate::finalization) makes it on the owning thread and keeps it in the
-/// owners' list until that thread gives its interpreter up, which the thread does before it ends
-/// and its thread-locals are freed: so while one is held its word is alive.
+/// [`Finalization::own`] makes it on the owning thread and keeps it in the owners' list until the
+/// ownership drops or the thread ends ([`ThreadOwner`]), before its thread-locals are freed: so
+/// while one is in the list its word is alive.
 pub(crate) struct ThreadEntry(*const AtomicPtr<ffi::PyThreadState>);
 
 // SAFETY: The word is an atomic, alive while the entry is held (above).
@@ -553,13 +578,18 @@ impl ThreadEntry {
         ThreadEntry(ENTRY.with(std::ptr::from_ref))
     }
 
-    /// Marks the word for the exit unless a unit runs on the thread, and says which.
+    /// Returns whether both are the same thread's word.
+    pub(crate) fn is(&self, other: &ThreadEntry) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+
+    /// Marks the word for the exit unless Python runs on the thread, and says which.
     pub(crate) fn mark(&self) -> ThreadAtExit {
         // SAFETY: The word is alive while the entry is held (the type's invariant).
         let word = unsafe { &*self.0 };
         let mut seen = word.load(Ordering::Relaxed);
         loop {
-            let Some(marking) = marked(seen.addr()) else {
+            let Some(marking) = entry::marked(seen.addr()) else {
                 return ThreadAtExit::RunningPython;
             };
             match word.compare_exchange_weak(seen, seen.with_addr(marking), Ordering::Relaxed, Ordering::Relaxed) {
@@ -570,9 +600,39 @@ impl ThreadEntry {
     }
 }
 
+/// Takes this thread's entries out of every owners' list it joined when the thread ends, before
+/// its word is freed: a worker leaked with `mem::forget` never gives its entry up itself.
+struct ThreadOwner(RefCell<Vec<&'static Finalization>>);
+
+impl Drop for ThreadOwner {
+    fn drop(&mut self) {
+        let entry = ThreadEntry::this_thread();
+        for finalization in self.0.get_mut() {
+            finalization.thread_ended(&entry);
+        }
+    }
+}
+
+/// Makes this thread take its entries out of `finalization`'s list when it ends.
+///
+/// # Errors
+///
+/// Fails while the thread's thread-locals are being destroyed.
+pub(crate) fn forget_owners_at_thread_exit(
+    finalization: &'static Finalization,
+) -> Result<(), std::thread::AccessError> {
+    THREAD_OWNER.try_with(|owner| {
+        let mut joined = owner.0.borrow_mut();
+        if !joined.iter().any(|f| std::ptr::eq(*f, finalization)) {
+            joined.push(finalization);
+        }
+    })
+}
+
 thread_local! {
     static KEEP: Cell<bool> = const { Cell::new(false) };
     pub(crate) static ENTRY: AtomicPtr<ffi::PyThreadState> = const { AtomicPtr::new(std::ptr::null_mut()) };
+    static THREAD_OWNER: ThreadOwner = const { ThreadOwner(RefCell::new(Vec::new())) };
 }
 
 /// Keeps this thread's worker thread state current between units of work from now on.
@@ -589,15 +649,12 @@ pub fn detach_for_idle() {
         clippy::let_underscore_must_use,
         reason = "`try_with` fails only while this thread's thread-locals are being destroyed: the thread is ending, and there is no kept state left to read"
     )]
-    let _ = ENTRY.try_with(|entry| {
-        let word = entry.load(Ordering::Relaxed);
-        // Above `IN_PYTHON` is a thread state, marked or not: null, `WATCHED` alone and
-        // `IN_PYTHON` keep none.
-        if word.addr() > IN_PYTHON.addr() {
+    let _ = ENTRY.try_with(|word| {
+        if entry::keeps(word.load(Ordering::Relaxed).addr()) {
             // SAFETY: `enter` keeps a thread state in the word only while it is current, and only
             // this takes it out; the exit only adds `WATCHED`, which the clear below keeps.
             unsafe { ffi::PyEval_SaveThread() };
-            entry.fetch_and(WATCHED, Ordering::Relaxed);
+            word.fetch_and(entry::WATCHED, Ordering::Relaxed);
         }
     });
 }
@@ -664,14 +721,13 @@ mod tests {
         let serve = crate::python_thread("watched".into())
             .spawn(move || {
                 let mut worker = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                    "watched".into(),
                     std::convert::identity,
                     |_py| Ok(Nothing),
                 )
                 .expect("a sub-interpreter on its serving thread");
                 entry_out.send(ThreadEntry::this_thread()).unwrap();
                 let seen = worker
-                    .with_gil(|_held, _py| {
+                    .with_gil(|_attachment, _py| {
                         in_unit.send(()).unwrap();
                         has_looked.recv().unwrap()
                     })
@@ -679,8 +735,8 @@ mod tests {
                 unit_over.send(()).unwrap();
                 is_marked.recv().unwrap();
                 let marked_word = ENTRY.with(|e| e.load(Ordering::Relaxed)).addr();
-                let in_unit_word = worker.with_gil(|_held, _py| ENTRY.with(|e| e.load(Ordering::Relaxed)).addr());
-                worker.end_on_own_thread();
+                let in_unit_word = worker.with_gil(|_attachment, _py| ENTRY.with(|e| e.load(Ordering::Relaxed)).addr());
+                drop(worker);
                 (seen, marked_word, in_unit_word.expect("no panic"))
             })
             .expect("spawn the worker thread");
@@ -695,8 +751,8 @@ mod tests {
         let (seen, marked_word, in_unit_word) = serve.join().expect("the worker thread ends");
         assert_eq!(seen, ThreadAtExit::RunningPython);
         assert_eq!(after, ThreadAtExit::OutsidePython);
-        assert_eq!(marked_word & WATCHED, WATCHED);
-        assert_eq!(in_unit_word, IN_PYTHON.addr());
+        assert_eq!(marked_word & entry::WATCHED, entry::WATCHED);
+        assert_eq!(in_unit_word, entry::IN_PYTHON);
     }
 
     struct Nothing;
@@ -711,7 +767,6 @@ mod tests {
         let outcome = std::thread::spawn(|| {
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                    "prepare-panics".into(),
                     std::convert::identity,
                     |_py| -> Result<Nothing, NewInterpreterError> { panic!("prepare panics") },
                 )
@@ -730,7 +785,7 @@ mod tests {
         );
     }
 
-    /// Without the detach in `end`, the restore after `Py_EndInterpreter` would bring back the
+    /// Without the detach in the drop, the restore after `Py_EndInterpreter` would bring back the
     /// destroyed thread state.
     #[test]
     fn a_kept_worker_ended_without_detaching_leaves_no_thread_state() {
@@ -738,14 +793,13 @@ mod tests {
         let serve = crate::python_thread("keep-end-serve".into())
             .spawn(move || {
                 let mut worker = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                    "keep-end".into(),
                     std::convert::identity,
                     |_py| Ok(Nothing),
                 )
                 .expect("a sub-interpreter on its serving thread");
                 keep_attached_until_idle();
-                worker.with_gil(|_held, _py| {}).expect("no panic");
-                worker.end_on_own_thread();
+                worker.with_gil(|_attachment, _py| {}).expect("no panic");
+                drop(worker);
                 // SAFETY: This is always safe to call.
                 let current = unsafe { ffi::PyThreadState_GetUnchecked() };
                 assert!(
@@ -763,7 +817,6 @@ mod tests {
         std::thread::spawn(|| {
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                    "prepare-panics-then".into(),
                     std::convert::identity,
                     |_py| -> Result<Nothing, NewInterpreterError> { panic!("prepare boom") },
                 )
@@ -771,12 +824,11 @@ mod tests {
             .is_err();
             assert!(panicked);
             let again = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                "after-panic".into(),
                 std::convert::identity,
                 |_py| Ok(Nothing),
             )
             .expect("a second sub-interpreter can be built on the same thread");
-            again.end_on_own_thread();
+            drop(again);
             // SAFETY: This is always safe to call.
             assert!(unsafe { ffi::PyThreadState_GetUnchecked() }.is_null());
         })
@@ -802,11 +854,10 @@ mod tests {
     fn a_prepare_that_fails_ends_its_interpreter() {
         Python::initialize();
         let failed_in = std::thread::spawn(|| {
-            let failed = SubInterpreter::<Nothing>::create_on_this_thread::<PrepareError>(
-                "prepare-fails".into(),
-                PrepareError::Refused,
-                |py| Err(PrepareError::InInterpreter(InterpreterHandle::current(py).id())),
-            );
+            let failed =
+                SubInterpreter::<Nothing>::create_on_this_thread::<PrepareError>(PrepareError::Refused, |py| {
+                    Err(PrepareError::InInterpreter(InterpreterHandle::current(py).id()))
+                });
             let id = match failed {
                 Err(PrepareError::InInterpreter(id)) => id,
                 Err(PrepareError::Refused(e)) => panic!("the creation itself failed: {e}"),
@@ -815,12 +866,11 @@ mod tests {
             // SAFETY: This is always safe to call.
             assert!(unsafe { ffi::PyThreadState_GetUnchecked() }.is_null());
             let again = SubInterpreter::<Nothing>::create_on_this_thread::<NewInterpreterError>(
-                "after-failed-prepare".into(),
                 std::convert::identity,
                 |_py| Ok(Nothing),
             )
             .expect("a second sub-interpreter can be built on the same thread");
-            again.end_on_own_thread();
+            drop(again);
             id
         })
         .join()
@@ -848,7 +898,7 @@ mod tests {
             exitcode: 0,
         };
         // SAFETY: Both strings are NUL-terminated literals.
-        let err = unsafe { NewInterpreterError::from_status(&status) };
+        let err = unsafe { PyStatusError::from_status(&status) };
         assert_eq!(
             err.to_string(),
             "Py_NewInterpreterFromConfig failed in init_interp_create_gil: failed to create \
@@ -865,7 +915,7 @@ mod tests {
             exitcode: 0,
         };
         // SAFETY: NULL pointers are allowed.
-        let err = unsafe { NewInterpreterError::from_status(&status) };
+        let err = unsafe { PyStatusError::from_status(&status) };
         assert_eq!(
             err.to_string(),
             "Py_NewInterpreterFromConfig failed: it returned no error message and no thread \

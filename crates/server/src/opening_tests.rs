@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::conn::{drive_connection, ConnectionTimeouts, LocalExec};
-use crate::test_clock::{paused_runtime, ticking_clock, NO_FIRST_REQUEST};
+use crate::test_clock::{paused_runtime, ticking_clock, NO_FIRST_REQUEST_LOCK};
 use mipyre_http::io::body::ResponseBody;
 use mipyre_http::io::events::{self, HttpEvent};
 
@@ -47,13 +47,13 @@ async fn answer(req: hyper::Request<Incoming>) -> Result<hyper::Response<Respons
 }
 
 /// One connection served by `drive_connection`, and when it started.
-struct Conn {
+struct ServedConnection {
     client: DuplexStream,
     done: JoinHandle<()>,
     started: Instant,
 }
 
-fn open() -> Conn {
+fn open() -> ServedConnection {
     let clock = ticking_clock();
     let (client, server) = tokio::io::duplex(64 * 1024);
     // The task is polled before the paused clock can move, so this is its start.
@@ -66,7 +66,7 @@ fn open() -> Conn {
         clock,
         std::future::pending::<()>(),
     ));
-    Conn { client, done, started }
+    ServedConnection { client, done, started }
 }
 
 fn run<F: std::future::Future<Output = ()>>(test: F) {
@@ -76,7 +76,7 @@ fn run<F: std::future::Future<Output = ()>>(test: F) {
 
 /// Asserts the connection is still served at `deadline - TICK` and has ended by `deadline + TICK`,
 /// its task done and the server's end read closed by the client.
-async fn closed_at(c: &mut Conn, deadline: Instant) {
+async fn closed_at(c: &mut ServedConnection, deadline: Instant) {
     assert!(
         tokio::time::timeout_at(deadline - TICK, &mut c.done).await.is_err(),
         "the connection ended before {:?}",
@@ -94,7 +94,7 @@ async fn closed_at(c: &mut Conn, deadline: Instant) {
 }
 
 /// Asserts the connection is still served at `at`.
-async fn open_at(c: &mut Conn, at: Instant) {
+async fn open_at(c: &mut ServedConnection, at: Instant) {
     assert!(
         tokio::time::timeout_at(at, &mut c.done).await.is_err(),
         "the connection ended before {:?}",
@@ -155,7 +155,7 @@ async fn counted<F: std::future::Future<Output = ()>>(kind: HttpEvent, case: F) 
 /// request.
 #[test]
 fn a_connection_without_a_first_request_is_closed_at_the_request_head_timeout() {
-    let _alone = NO_FIRST_REQUEST
+    let _alone = NO_FIRST_REQUEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     run(async {

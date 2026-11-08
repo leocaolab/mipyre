@@ -14,17 +14,19 @@ use std::path::PathBuf;
 use core_affinity::CoreId;
 
 #[cfg(any(target_os = "linux", test))]
-use crate::plan::{decide, parse_cpu_max, perf_gap, perf_value, CoreGroups, CpuFacts, CpuSet, Facts};
+use crate::plan::{group_cores, parse_cpu_max, perf_gap, perf_value, Cores, CpuSet, CpuTopology, Topology};
 #[cfg(target_os = "linux")]
 use crate::plan::{parse_cpu_list, tightest, CpuMask, MAX_CPUS};
-use crate::plan::{threads_for, CpuListError, CpuMaskError, CpuMaxError, CpuOrder, Cpus, PerfValueError, Quota};
+use crate::plan::{
+    threads_for, CpuMaskError, CpuOrder, Cpus, ParseCpuListError, ParseCpuMaxError, PerfValueError, Quota,
+};
 
 /// Holds the counts the threads are sized from and the CPUs they are pinned to. On Linux the
 /// physical cores and the pin order come from one read, so they cannot disagree; the logical
 /// count is the OS's `available_parallelism`, read on its own.
 #[derive(Debug)]
-pub struct HostCpus {
-    pub cpus: Result<Cpus, CpuReadError>,
+pub struct AvailableCpus {
+    pub cpus: Result<Cpus, ReadCpusError>,
     pub pin_order: Result<PinOrder, PinOrderError>,
 }
 
@@ -35,45 +37,45 @@ pub enum PinOrder {
     Pinned {
         cpus: CpuOrder,
         /// Set when the cache domains were not read: one domain was assumed.
-        cache_unread: Option<TopologyReadError>,
+        cache_unread: Option<ReadTopologyError>,
         /// Set when the performance tiers were not read: one tier was assumed.
-        perf_unread: Option<TopologyReadError>,
+        perf_unread: Option<ReadTopologyError>,
     },
     Unsupported,
 }
 
 #[derive(Debug)]
-pub enum TopologyReadError {
-    /// The L3 lists, or a hybrid host's list of P-cores.
+pub enum ReadTopologyError {
+    /// The L3 lists, or a hybrid machine's list of P-cores.
     CpuList(CpuListFileError),
     Capacity(CapacityFileError),
     NotReadHere,
     Partial(PerfValueError),
 }
 
-impl fmt::Display for TopologyReadError {
+impl fmt::Display for ReadTopologyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TopologyReadError::CpuList(e) => write!(f, "{e}"),
-            TopologyReadError::Capacity(e) => write!(f, "{e}"),
-            TopologyReadError::NotReadHere => {
+            ReadTopologyError::CpuList(e) => write!(f, "{e}"),
+            ReadTopologyError::Capacity(e) => write!(f, "{e}"),
+            ReadTopologyError::NotReadHere => {
                 write!(f, "this platform does not read the CPU topology")
             }
-            TopologyReadError::Partial(e) => write!(f, "{e}"),
+            ReadTopologyError::Partial(e) => write!(f, "{e}"),
         }
     }
 }
 
 #[derive(Debug)]
-pub enum CpuReadError {
+pub enum ReadCpusError {
     Logical(io::Error),
     /// The physical cores come from the pin-order read, which failed; its error is in
-    /// [`HostCpus::pin_order`].
-    Cores {
+    /// [`AvailableCpus::pin_order`].
+    PinOrderFailed {
         logical: NonZeroUsize,
     },
     /// The physical cores were counted on their own, and that failed.
-    CoreCount {
+    CoreCountFailed {
         logical: NonZeroUsize,
         source: io::Error,
     },
@@ -83,22 +85,22 @@ pub enum CpuReadError {
     },
 }
 
-impl fmt::Display for CpuReadError {
+impl fmt::Display for ReadCpusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CpuReadError::Logical(e) => {
+            ReadCpusError::Logical(e) => {
                 write!(f, "the OS did not say how many CPUs this process may use: {e}")
             }
-            CpuReadError::Cores { logical } => write!(
+            ReadCpusError::PinOrderFailed { logical } => write!(
                 f,
                 "could not read this process's physical cores ({logical} logical CPUs): they come \
                  from the read of the CPUs to pin to, which failed"
             ),
-            CpuReadError::CoreCount { logical, source } => write!(
+            ReadCpusError::CoreCountFailed { logical, source } => write!(
                 f,
                 "could not read this process's physical cores ({logical} logical CPUs): {source}"
             ),
-            CpuReadError::CoresNotCountedHere { logical } => write!(
+            ReadCpusError::CoresNotCountedHere { logical } => write!(
                 f,
                 "this platform does not count physical cores ({logical} logical CPUs)"
             ),
@@ -106,11 +108,11 @@ impl fmt::Display for CpuReadError {
     }
 }
 
-impl std::error::Error for CpuReadError {
+impl std::error::Error for ReadCpusError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            CpuReadError::Logical(e) | CpuReadError::CoreCount { source: e, .. } => Some(e),
-            CpuReadError::Cores { .. } | CpuReadError::CoresNotCountedHere { .. } => None,
+            ReadCpusError::Logical(e) | ReadCpusError::CoreCountFailed { source: e, .. } => Some(e),
+            ReadCpusError::PinOrderFailed { .. } | ReadCpusError::CoresNotCountedHere { .. } => None,
         }
     }
 }
@@ -186,12 +188,12 @@ impl std::error::Error for FileError {
     }
 }
 
-/// A CPU list in sysfs (a core's SMT siblings, an L3 domain, a hybrid host's P-cores) that
+/// A CPU list in sysfs (a core's SMT siblings, an L3 domain, a hybrid machine's P-cores) that
 /// could not be used.
 #[derive(Debug)]
 pub enum CpuListFileError {
     Os(FileError),
-    Malformed { path: PathBuf, source: CpuListError },
+    Malformed { path: PathBuf, source: ParseCpuListError },
 }
 
 impl CpuListFileError {
@@ -255,7 +257,7 @@ impl std::error::Error for CapacityFileError {
 }
 
 #[derive(Debug)]
-pub enum QuotaReadError {
+pub enum ReadQuotaError {
     ProcCgroup(io::Error),
     NotCgroupV2 {
         text: String,
@@ -267,13 +269,13 @@ pub enum QuotaReadError {
     },
     Malformed {
         path: String,
-        source: CpuMaxError,
+        source: ParseCpuMaxError,
     },
     /// The cgroup path climbs out of the cgroup root with `..`, so no `cpu.max` above it is read.
     OutsideNamespace {
         group: String,
     },
-    /// The group has no directory under the cgroup root, as on a host that mounts the v2 tree
+    /// The group has no directory under the cgroup root, as on a machine that mounts the v2 tree
     /// elsewhere (v1 and v2 side by side), so the quota is unknown rather than none.
     NoGroupDir {
         group: String,
@@ -281,24 +283,24 @@ pub enum QuotaReadError {
     },
 }
 
-impl fmt::Display for QuotaReadError {
+impl fmt::Display for ReadQuotaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            QuotaReadError::ProcCgroup(e) => write!(f, "could not read /proc/self/cgroup: {e}"),
-            QuotaReadError::NotCgroupV2 { text } => write!(
+            ReadQuotaError::ProcCgroup(e) => write!(f, "could not read /proc/self/cgroup: {e}"),
+            ReadQuotaError::NotCgroupV2 { text } => write!(
                 f,
                 "/proc/self/cgroup has no cgroup v2 line (cpu.max is v2-only): {text:?}"
             ),
-            QuotaReadError::CpuMax { path, source } => {
+            ReadQuotaError::CpuMax { path, source } => {
                 write!(f, "could not read {path}: {source}")
             }
-            QuotaReadError::Malformed { path, source } => write!(f, "{path}: {source}"),
-            QuotaReadError::OutsideNamespace { group } => write!(
+            ReadQuotaError::Malformed { path, source } => write!(f, "{path}: {source}"),
+            ReadQuotaError::OutsideNamespace { group } => write!(
                 f,
                 "/proc/self/cgroup names the group {group:?}, which climbs out of the cgroup root \
                  with `..`; no cpu.max is read for it"
             ),
-            QuotaReadError::NoGroupDir { group, dir } => write!(
+            ReadQuotaError::NoGroupDir { group, dir } => write!(
                 f,
                 "/proc/self/cgroup names the group {group:?}, but {dir} does not exist: the \
                  cgroup v2 tree is not mounted there (v1 and v2 mounted side by side?), so its \
@@ -308,14 +310,14 @@ impl fmt::Display for QuotaReadError {
     }
 }
 
-impl std::error::Error for QuotaReadError {
+impl std::error::Error for ReadQuotaError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            QuotaReadError::ProcCgroup(e) | QuotaReadError::CpuMax { source: e, .. } => Some(e),
-            QuotaReadError::Malformed { source, .. } => Some(source),
-            QuotaReadError::NotCgroupV2 { .. }
-            | QuotaReadError::OutsideNamespace { .. }
-            | QuotaReadError::NoGroupDir { .. } => None,
+            ReadQuotaError::ProcCgroup(e) | ReadQuotaError::CpuMax { source: e, .. } => Some(e),
+            ReadQuotaError::Malformed { source, .. } => Some(source),
+            ReadQuotaError::NotCgroupV2 { .. }
+            | ReadQuotaError::OutsideNamespace { .. }
+            | ReadQuotaError::NoGroupDir { .. } => None,
         }
     }
 }
@@ -324,14 +326,14 @@ impl std::error::Error for QuotaReadError {
 #[derive(Debug)]
 pub struct PinError {
     pub core: CoreId,
-    pub fault: PinFault,
+    pub fault: PinErrorKind,
 }
 
 impl PinError {
     pub fn os_error(&self) -> Option<&io::Error> {
         match &self.fault {
-            PinFault::Os(e) => Some(e),
-            PinFault::NoRoom(_) | PinFault::Unsupported | PinFault::Refused => None,
+            PinErrorKind::Os(e) => Some(e),
+            PinErrorKind::NoRoom(_) | PinErrorKind::Unsupported | PinErrorKind::Refused => None,
         }
     }
 }
@@ -345,15 +347,15 @@ impl fmt::Display for PinError {
 impl std::error::Error for PinError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.fault {
-            PinFault::NoRoom(e) => Some(e),
-            PinFault::Os(e) => Some(e),
-            PinFault::Unsupported | PinFault::Refused => None,
+            PinErrorKind::NoRoom(e) => Some(e),
+            PinErrorKind::Os(e) => Some(e),
+            PinErrorKind::Unsupported | PinErrorKind::Refused => None,
         }
     }
 }
 
 #[derive(Debug)]
-pub enum PinFault {
+pub enum PinErrorKind {
     /// The CPU is at or past [`MAX_CPUS`](crate::MAX_CPUS), so no affinity mask holds it.
     NoRoom(CpuMaskError),
     Os(io::Error),
@@ -363,13 +365,13 @@ pub enum PinFault {
     Refused,
 }
 
-impl fmt::Display for PinFault {
+impl fmt::Display for PinErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PinFault::NoRoom(e) => write!(f, "{e}"),
-            PinFault::Os(e) => write!(f, "{e}"),
-            PinFault::Unsupported => write!(f, "this platform has no CPU pinning (macOS keeps no thread affinity)"),
-            PinFault::Refused => write!(f, "core_affinity::set_for_current refused (it gives no OS error code)"),
+            PinErrorKind::NoRoom(e) => write!(f, "{e}"),
+            PinErrorKind::Os(e) => write!(f, "{e}"),
+            PinErrorKind::Unsupported => write!(f, "this platform has no CPU pinning (macOS keeps no thread affinity)"),
+            PinErrorKind::Refused => write!(f, "core_affinity::set_for_current refused (it gives no OS error code)"),
         }
     }
 }
@@ -383,13 +385,13 @@ pub fn try_pin_current(core_id: Option<CoreId>) -> Result<(), PinError> {
 
 /// Threads started afterwards inherit the mask, and so do processes they fork.
 #[cfg(target_os = "linux")]
-fn pin_current(core: CoreId) -> Result<(), PinFault> {
-    let mask = CpuMask::of_one(core.id).map_err(PinFault::NoRoom)?;
+fn pin_current(core: CoreId) -> Result<(), PinErrorKind> {
+    let mask = CpuMask::of_one(core.id).map_err(PinErrorKind::NoRoom)?;
     // SAFETY: pid 0 is the calling thread; the kernel reads `mask.bytes()` from the mask's
     // words, which outlive the call.
     let rc = unsafe { libc::sched_setaffinity(0, mask.bytes(), mask.words().as_ptr().cast::<libc::cpu_set_t>()) };
     if rc != 0 {
-        return Err(PinFault::Os(io::Error::last_os_error()));
+        return Err(PinErrorKind::Os(io::Error::last_os_error()));
     }
     Ok(())
 }
@@ -397,16 +399,16 @@ fn pin_current(core: CoreId) -> Result<(), PinFault> {
 /// macOS has no CPU pinning: the affinity tag is only an L2-sharing hint, arm64 refuses it,
 /// and tag 0 means "no tag", so CPU 0 could never be tagged. Use the QoS class instead.
 #[cfg(target_os = "macos")]
-fn pin_current(_core: CoreId) -> Result<(), PinFault> {
-    Err(PinFault::Unsupported)
+fn pin_current(_core: CoreId) -> Result<(), PinErrorKind> {
+    Err(PinErrorKind::Unsupported)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn pin_current(core: CoreId) -> Result<(), PinFault> {
+fn pin_current(core: CoreId) -> Result<(), PinErrorKind> {
     if core_affinity::set_for_current(core) {
         Ok(())
     } else {
-        Err(PinFault::Refused)
+        Err(PinErrorKind::Refused)
     }
 }
 
@@ -432,10 +434,10 @@ pub fn elevate_thread_qos_macos() -> io::Result<()> {
     Ok(())
 }
 
-/// Counts cores within the affinity mask, not across sysfs: sysfs lists every host CPU, so a
+/// Counts cores within the affinity mask, not across sysfs: sysfs lists every machine CPU, so a
 /// container on 32 of 64 cores got 64 threads, half of them on the other half's SMT siblings.
 #[cfg(target_os = "linux")]
-impl HostCpus {
+impl AvailableCpus {
     pub fn read(quota: Quota) -> Self {
         let logical = std::thread::available_parallelism();
         let read = allowed_cpus()
@@ -445,7 +447,7 @@ impl HostCpus {
             Ok((cores, _)) => Some(threads_for(cores.top_count(), quota)),
             Err(_) => None,
         };
-        HostCpus {
+        AvailableCpus {
             cpus: counted(logical, cores),
             pin_order: read.map(|(_, pin_order)| pin_order),
         }
@@ -454,21 +456,21 @@ impl HostCpus {
 
 /// Takes `cores` as `None` when the pin-order read failed; that read keeps its own error.
 #[cfg(any(target_os = "linux", test))]
-fn counted(logical: io::Result<NonZeroUsize>, cores: Option<NonZeroUsize>) -> Result<Cpus, CpuReadError> {
+fn counted(logical: io::Result<NonZeroUsize>, cores: Option<NonZeroUsize>) -> Result<Cpus, ReadCpusError> {
     match (logical, cores) {
-        (Err(e), _) => Err(CpuReadError::Logical(e)),
+        (Err(e), _) => Err(ReadCpusError::Logical(e)),
         (Ok(logical), Some(cores)) => Ok(Cpus::new(logical, cores)),
-        (Ok(logical), None) => Err(CpuReadError::Cores { logical }),
+        (Ok(logical), None) => Err(ReadCpusError::PinOrderFailed { logical }),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-impl HostCpus {
+impl AvailableCpus {
     pub fn read(quota: Quota) -> Self {
         let cpus = std::thread::available_parallelism()
-            .map_err(CpuReadError::Logical)
+            .map_err(ReadCpusError::Logical)
             .and_then(|logical| cores_counted(logical).map(|cores| Cpus::new(logical, threads_for(cores, quota))));
-        HostCpus {
+        AvailableCpus {
             cpus,
             pin_order: read_pinning(),
         }
@@ -476,13 +478,13 @@ impl HostCpus {
 }
 
 #[cfg(target_os = "macos")]
-fn cores_counted(logical: NonZeroUsize) -> Result<NonZeroUsize, CpuReadError> {
-    physical_cores().map_err(|source| CpuReadError::CoreCount { logical, source })
+fn cores_counted(logical: NonZeroUsize) -> Result<NonZeroUsize, ReadCpusError> {
+    physical_cores().map_err(|source| ReadCpusError::CoreCountFailed { logical, source })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn cores_counted(logical: NonZeroUsize) -> Result<NonZeroUsize, CpuReadError> {
-    Err(CpuReadError::CoresNotCountedHere { logical })
+fn cores_counted(logical: NonZeroUsize) -> Result<NonZeroUsize, ReadCpusError> {
+    Err(ReadCpusError::CoresNotCountedHere { logical })
 }
 
 #[cfg(target_os = "macos")]
@@ -496,8 +498,8 @@ fn read_pinning() -> Result<PinOrder, PinOrderError> {
     let cpus = CpuOrder::new(ids).ok_or(PinOrderError::EmptyMask)?;
     Ok(PinOrder::Pinned {
         cpus,
-        cache_unread: Some(TopologyReadError::NotReadHere),
-        perf_unread: Some(TopologyReadError::NotReadHere),
+        cache_unread: Some(ReadTopologyError::NotReadHere),
+        perf_unread: Some(ReadTopologyError::NotReadHere),
     })
 }
 
@@ -515,7 +517,7 @@ fn cpu_file(cpu: CoreId, file: &str) -> PathBuf {
     PathBuf::from(format!("/sys/devices/system/cpu/cpu{}/{file}", cpu.id))
 }
 
-/// Returns `None` when there is no list: only a hybrid Intel host has `/sys/devices/cpu_core/cpus`.
+/// Returns `None` when there is no list: only a hybrid Intel machine has `/sys/devices/cpu_core/cpus`.
 #[cfg(target_os = "linux")]
 fn read_p_cores() -> Result<Option<CpuSet>, CpuListFileError> {
     match read_cpu_list_file(PathBuf::from("/sys/devices/cpu_core/cpus")) {
@@ -547,7 +549,7 @@ fn read_capacity(cpu: CoreId) -> Result<Option<u32>, CapacityFileError> {
 struct CpuFiles {
     siblings: Vec<CoreId>,
     cache: Result<Vec<CoreId>, CpuListFileError>,
-    /// `Ok(None)` when the CPU has no `cpu_capacity`, and on a host whose P-core list gives the
+    /// `Ok(None)` when the CPU has no `cpu_capacity`, and on a machine whose P-core list gives the
     /// tiers, where it is not read.
     capacity: Result<Option<u32>, CapacityFileError>,
 }
@@ -556,7 +558,7 @@ struct CpuFiles {
 /// unreadable siblings file fails the read instead of making the CPU its own core: with `/sys`
 /// masked in a container, that made every logical CPU a physical one.
 #[cfg(target_os = "linux")]
-fn read_order(allowed: &[CoreId]) -> Result<(CoreGroups, PinOrder), PinOrderError> {
+fn read_order(allowed: &[CoreId]) -> Result<(Cores, PinOrder), PinOrderError> {
     let p_cores = read_p_cores();
     let capacities_give_tiers = matches!(p_cores, Ok(None));
     let files = allowed
@@ -585,10 +587,10 @@ fn read_order(allowed: &[CoreId]) -> Result<(CoreGroups, PinOrder), PinOrderErro
 fn decided(
     files: BTreeMap<CoreId, CpuFiles>,
     p_cores: Result<Option<CpuSet>, CpuListFileError>,
-) -> Result<(CoreGroups, PinOrder), PinOrderError> {
+) -> Result<(Cores, PinOrder), PinOrderError> {
     let (p_cores, mut perf_unread) = match p_cores {
         Ok(p_cores) => (p_cores, None),
-        Err(e) => (None, Some(TopologyReadError::CpuList(e))),
+        Err(e) => (None, Some(ReadTopologyError::CpuList(e))),
     };
     let mut cache_unread = None;
     let mut cpus = BTreeMap::new();
@@ -596,27 +598,27 @@ fn decided(
         let cache = match files.cache {
             Ok(list) => Some(list),
             Err(e) => {
-                cache_unread.get_or_insert(TopologyReadError::CpuList(e));
+                cache_unread.get_or_insert(ReadTopologyError::CpuList(e));
                 None
             }
         };
         let capacity = match files.capacity {
             Ok(capacity) => capacity,
             Err(e) => {
-                perf_unread.get_or_insert(TopologyReadError::Capacity(e));
+                perf_unread.get_or_insert(ReadTopologyError::Capacity(e));
                 None
             }
         };
-        let facts = CpuFacts {
+        let facts = CpuTopology {
             siblings: files.siblings,
             cache,
             perf: perf_value(p_cores.as_ref(), cpu, capacity),
         };
         cpus.insert(cpu, facts);
     }
-    let perf_unread = perf_unread.or_else(|| perf_gap(&cpus).map(TopologyReadError::Partial));
-    let facts = Facts::new(cpus).ok_or(PinOrderError::EmptyMask)?;
-    let cores = decide(&facts);
+    let perf_unread = perf_unread.or_else(|| perf_gap(&cpus).map(ReadTopologyError::Partial));
+    let facts = Topology::new(cpus).ok_or(PinOrderError::EmptyMask)?;
+    let cores = group_cores(&facts);
     let cpus = cores.pin_order();
     Ok((
         cores,
@@ -630,19 +632,19 @@ fn decided(
 
 /// Walks the cgroups the same way std's `available_parallelism` does.
 #[cfg(target_os = "linux")]
-pub fn read_cpu_quota() -> Result<Quota, QuotaReadError> {
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").map_err(QuotaReadError::ProcCgroup)?;
+pub fn read_cpu_quota() -> Result<Quota, ReadQuotaError> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").map_err(ReadQuotaError::ProcCgroup)?;
     let Some(path) = cgroup.lines().find_map(|line| line.strip_prefix("0::")) else {
-        return Err(QuotaReadError::NotCgroupV2 { text: cgroup });
+        return Err(ReadQuotaError::NotCgroupV2 { text: cgroup });
     };
     quota_under(Path::new("/sys/fs/cgroup"), path)
 }
 
 /// Refuses a group with `..` in it: joined to `root`, it would read files outside the cgroup tree.
 #[cfg(target_os = "linux")]
-fn quota_under(root: &Path, group: &str) -> Result<Quota, QuotaReadError> {
+fn quota_under(root: &Path, group: &str) -> Result<Quota, ReadQuotaError> {
     if Path::new(group).components().any(|c| c == Component::ParentDir) {
-        return Err(QuotaReadError::OutsideNamespace {
+        return Err(ReadQuotaError::OutsideNamespace {
             group: group.to_owned(),
         });
     }
@@ -670,19 +672,19 @@ enum CpuMaxEntry {
 /// Looks at the directory only when `cpu.max` is not found, so a level with the file costs one
 /// read.
 #[cfg(target_os = "linux")]
-fn read_cpu_max_entry(dir: &Path) -> Result<CpuMaxEntry, QuotaReadError> {
+fn read_cpu_max_entry(dir: &Path) -> Result<CpuMaxEntry, ReadQuotaError> {
     let file = dir.join("cpu.max");
     match std::fs::read_to_string(&file) {
         Ok(text) => Ok(CpuMaxEntry::Text(text)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => match dir.try_exists() {
             Ok(true) => Ok(CpuMaxEntry::NoFile),
             Ok(false) => Ok(CpuMaxEntry::NoGroup),
-            Err(source) => Err(QuotaReadError::CpuMax {
+            Err(source) => Err(ReadQuotaError::CpuMax {
                 path: dir.display().to_string(),
                 source,
             }),
         },
-        Err(source) => Err(QuotaReadError::CpuMax {
+        Err(source) => Err(ReadQuotaError::CpuMax {
             path: file.display().to_string(),
             source,
         }),
@@ -692,14 +694,14 @@ fn read_cpu_max_entry(dir: &Path) -> Result<CpuMaxEntry, QuotaReadError> {
 /// A level without the file sets no limit; a level without the directory is not a cgroup at
 /// all, so its limit is unknown and the caller hears why.
 #[cfg(any(target_os = "linux", test))]
-fn level_quota(group: &str, dir: &Path, entry: CpuMaxEntry) -> Result<Quota, QuotaReadError> {
+fn level_quota(group: &str, dir: &Path, entry: CpuMaxEntry) -> Result<Quota, ReadQuotaError> {
     match entry {
-        CpuMaxEntry::Text(text) => parse_cpu_max(&text).map_err(|source| QuotaReadError::Malformed {
+        CpuMaxEntry::Text(text) => parse_cpu_max(&text).map_err(|source| ReadQuotaError::Malformed {
             path: dir.join("cpu.max").display().to_string(),
             source,
         }),
         CpuMaxEntry::NoFile => Ok(Quota::Unlimited),
-        CpuMaxEntry::NoGroup => Err(QuotaReadError::NoGroupDir {
+        CpuMaxEntry::NoGroup => Err(ReadQuotaError::NoGroupDir {
             group: group.to_owned(),
             dir: dir.display().to_string(),
         }),
@@ -707,7 +709,7 @@ fn level_quota(group: &str, dir: &Path, entry: CpuMaxEntry) -> Result<Quota, Quo
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn read_cpu_quota() -> Result<Quota, QuotaReadError> {
+pub fn read_cpu_quota() -> Result<Quota, ReadQuotaError> {
     Ok(Quota::Unlimited)
 }
 
@@ -837,8 +839,8 @@ mod reading_tests {
     }
 
     fn pinned(
-        read: Result<(CoreGroups, PinOrder), PinOrderError>,
-    ) -> (CoreGroups, Option<TopologyReadError>, Option<TopologyReadError>) {
+        read: Result<(Cores, PinOrder), PinOrderError>,
+    ) -> (Cores, Option<ReadTopologyError>, Option<ReadTopologyError>) {
         let (cores, pin_order) = read.unwrap();
         let PinOrder::Pinned {
             cache_unread,
@@ -872,7 +874,7 @@ mod reading_tests {
         });
         let (cores, cache_unread, perf_unread) = pinned(decided(files, Ok(None)));
         assert_eq!(domain_count(&cores), 1);
-        let Some(TopologyReadError::CpuList(e)) = &cache_unread else {
+        let Some(ReadTopologyError::CpuList(e)) = &cache_unread else {
             panic!("{cache_unread:?}")
         };
         assert_eq!(e.os_error().and_then(io::Error::raw_os_error), Some(libc::ENOENT));
@@ -894,7 +896,7 @@ mod reading_tests {
         let (cores, cache_unread, perf_unread) = pinned(decided(files, Ok(None)));
         assert_eq!(cores.top_count().get(), 4, "CPU 0 alone would be the fast tier");
         assert!(cache_unread.is_none());
-        let Some(TopologyReadError::Capacity(CapacityFileError::Os(e))) = &perf_unread else {
+        let Some(ReadTopologyError::Capacity(CapacityFileError::Os(e))) = &perf_unread else {
             panic!("{perf_unread:?}")
         };
         assert_eq!(e.source.raw_os_error(), Some(libc::EIO));
@@ -907,7 +909,7 @@ mod reading_tests {
         let p_cores = Err(CpuListFileError::Os(os_error(path, libc::EACCES)));
         let (cores, _, perf_unread) = pinned(decided(eight(|_, _| {}), p_cores));
         assert_eq!(cores.top_count().get(), 4);
-        let Some(TopologyReadError::CpuList(e)) = &perf_unread else {
+        let Some(ReadTopologyError::CpuList(e)) = &perf_unread else {
             panic!("{perf_unread:?}")
         };
         assert_eq!(e.os_error().and_then(io::Error::raw_os_error), Some(libc::EACCES));
@@ -931,7 +933,7 @@ mod reading_tests {
         let (cores, _, perf_unread) = pinned(decided(files, Ok(None)));
         assert_eq!(cores.top_count().get(), 4);
         assert!(
-            matches!(perf_unread, Some(TopologyReadError::Partial(PerfValueError::CapacityMissing { cpu })) if cpu.id == 7),
+            matches!(perf_unread, Some(ReadTopologyError::Partial(PerfValueError::CapacityMissing { cpu })) if cpu.id == 7),
             "{perf_unread:?}"
         );
     }
@@ -958,11 +960,11 @@ mod reading_tests {
     #[test]
     fn counts_read_are_counts_and_each_failure_is_its_own_error() {
         assert_eq!(counted(Ok(n(16)), Some(n(8))).unwrap(), Cpus::new(n(16), n(8)));
-        let Err(CpuReadError::Cores { logical }) = counted(Ok(n(16)), None) else {
+        let Err(ReadCpusError::PinOrderFailed { logical }) = counted(Ok(n(16)), None) else {
             panic!("no cores read")
         };
         assert_eq!(logical, n(16));
-        let Err(CpuReadError::Logical(e)) = counted(Err(io::Error::other("no parallelism")), Some(n(8))) else {
+        let Err(ReadCpusError::Logical(e)) = counted(Err(io::Error::other("no parallelism")), Some(n(8))) else {
             panic!("no logical count")
         };
         assert_eq!(e.to_string(), "no parallelism");
@@ -990,7 +992,7 @@ mod cgroup_level_tests {
     fn a_group_without_its_directory_is_an_error_naming_the_group_and_the_directory() {
         let dir = Path::new("/sys/fs/cgroup/user.slice/a.scope");
         let e = level_quota("/user.slice/a.scope", dir, CpuMaxEntry::NoGroup).unwrap_err();
-        let QuotaReadError::NoGroupDir { group, dir } = &e else {
+        let ReadQuotaError::NoGroupDir { group, dir } = &e else {
             panic!("{e}")
         };
         assert_eq!(group, "/user.slice/a.scope");
@@ -1005,7 +1007,7 @@ mod cgroup_level_tests {
         assert_eq!(level_quota("/a", dir, text("200000 100000\n")).unwrap(), cores(2));
         assert_eq!(level_quota("/a", dir, text("max 100000\n")).unwrap(), Quota::Unlimited);
         let e = level_quota("/a", dir, text("oops 100000")).unwrap_err();
-        let QuotaReadError::Malformed { path, .. } = &e else {
+        let ReadQuotaError::Malformed { path, .. } = &e else {
             panic!("{e}")
         };
         assert_eq!(path, "/sys/fs/cgroup/a/cpu.max");
@@ -1018,32 +1020,32 @@ mod macos_tests {
 
     #[test]
     fn this_mac_reads_no_pinning_and_refuses_a_pin_as_unsupported() {
-        let host = HostCpus::read(Quota::Unlimited);
+        let machine = AvailableCpus::read(Quota::Unlimited);
         assert!(
-            matches!(host.pin_order, Ok(PinOrder::Unsupported)),
+            matches!(machine.pin_order, Ok(PinOrder::Unsupported)),
             "{:?}",
-            host.pin_order
+            machine.pin_order
         );
         let e = try_pin_current(Some(CoreId { id: 0 })).unwrap_err();
-        assert!(matches!(e.fault, PinFault::Unsupported), "{e}");
+        assert!(matches!(e.fault, PinErrorKind::Unsupported), "{e}");
     }
 }
 
 #[cfg(test)]
-mod host_tests {
+mod machine_tests {
     use super::*;
 
     #[test]
-    fn this_host_reads_its_counts_and_pin_order() {
-        let host = HostCpus::read(Quota::Unlimited);
-        let cpus = host.cpus.expect("this host's CPU counts");
-        let pinning = host.pin_order;
+    fn this_machine_reads_its_counts_and_pin_order() {
+        let machine = AvailableCpus::read(Quota::Unlimited);
+        let cpus = machine.cpus.expect("this machine's CPU counts");
+        let pinning = machine.pin_order;
         eprintln!(
             "logical {} physical {} pinning {pinning:?}",
             cpus.logical(),
             cpus.physical(),
         );
-        assert!(pinning.is_ok(), "this host's pinning: {pinning:?}");
+        assert!(pinning.is_ok(), "this machine's pinning: {pinning:?}");
         assert!(cpus.physical() <= cpus.logical());
     }
 }
@@ -1080,7 +1082,7 @@ mod tests {
     #[test]
     fn a_cpu_past_max_cpus_is_refused_before_the_kernel_sees_it() {
         let e = pin_current(CoreId { id: MAX_CPUS }).unwrap_err();
-        assert!(matches!(e, PinFault::NoRoom(_)), "{e}");
+        assert!(matches!(e, PinErrorKind::NoRoom(_)), "{e}");
     }
 
     /// The kernel's own refusal cannot be made on demand, so this hits the CPU-number check.
@@ -1092,7 +1094,7 @@ mod tests {
             .expect("the pinning thread")
             .unwrap_err();
         assert_eq!(e.core, core);
-        assert!(matches!(e.fault, PinFault::NoRoom(_)), "{e}");
+        assert!(matches!(e.fault, PinErrorKind::NoRoom(_)), "{e}");
         assert!(e.os_error().is_none());
         assert!(e.to_string().contains("CPU 8192"), "{e}");
     }
@@ -1165,17 +1167,17 @@ mod tests {
         tree.level("a", Some("oops 100000")).unwrap();
         tree.level("a/b", None).unwrap();
         let e = quota_under(&tree.0, "/a/b").unwrap_err();
-        assert!(matches!(e, QuotaReadError::Malformed { .. }), "{e}");
+        assert!(matches!(e, ReadQuotaError::Malformed { .. }), "{e}");
     }
 
-    /// The shape of a host with v1 and v2 side by side: `/proc/self/cgroup` names a v2 group, but
+    /// The shape of a machine with v1 and v2 side by side: `/proc/self/cgroup` names a v2 group, but
     /// the tree read holds no directory for it.
     #[test]
     fn a_group_with_no_directory_under_the_root_is_an_error_not_no_limit() {
         let tree = Tree::new("nogroup").unwrap();
         tree.level("other", Some("100000 100000")).unwrap();
         let e = quota_under(&tree.0, "/user.slice/a.scope").unwrap_err();
-        let QuotaReadError::NoGroupDir { group, dir } = &e else {
+        let ReadQuotaError::NoGroupDir { group, dir } = &e else {
             panic!("{e}")
         };
         assert_eq!(group, "/user.slice/a.scope");
@@ -1190,19 +1192,19 @@ mod tests {
         tree.level("cg/a..b", Some("300000 100000")).unwrap();
         let root = tree.0.join("cg");
         let e = quota_under(&root, "/../outside").unwrap_err();
-        let QuotaReadError::OutsideNamespace { group } = &e else {
+        let ReadQuotaError::OutsideNamespace { group } = &e else {
             panic!("{e}")
         };
         assert_eq!(group, "/../outside");
         assert!(matches!(
             quota_under(&root, "/a/../../outside"),
-            Err(QuotaReadError::OutsideNamespace { .. })
+            Err(ReadQuotaError::OutsideNamespace { .. })
         ));
         assert_eq!(quota_under(&root, "/a..b").unwrap(), Quota::Cores(n(3)));
     }
 
     #[test]
-    fn the_host_sysfs_read_holds_the_pin_order_invariants() {
+    fn the_machine_sysfs_read_holds_the_pin_order_invariants() {
         let allowed = allowed_cpus().unwrap();
         let (cores, pin_order) = read_order(&allowed).unwrap();
         let PinOrder::Pinned { cpus, .. } = &pin_order else {
@@ -1223,7 +1225,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_topology_is_the_callers_error_not_an_empty_pin_order() {
-        // No host has this CPU, so its siblings file cannot be read.
+        // No machine has this CPU, so its siblings file cannot be read.
         let err = read_order(&[CoreId { id: 1 << 20 }]).unwrap_err();
         assert!(matches!(err, PinOrderError::Topology(_)), "{err}");
         assert_eq!(
@@ -1244,7 +1246,7 @@ mod tests {
         };
         assert_eq!(*named, path);
         let source = std::error::Error::source(&e).expect("the CPU list error");
-        assert!(source.is::<CpuListError>(), "{source}");
+        assert!(source.is::<ParseCpuListError>(), "{source}");
         assert!(e.to_string().contains("runs backwards"), "{e}");
         assert!(e.os_error().is_none());
     }

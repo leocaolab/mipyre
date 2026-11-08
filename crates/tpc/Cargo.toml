@@ -20,8 +20,6 @@ tracing = "0.1"
 
 # The paused clock (`start_paused`) for the drain's timeout tests.
 [dev-dependencies]
-# The microbenches' harness and counting allocator.
-mipyre_microbench = { path = "../microbench" }
 tokio = { version = "1", features = ["rt", "time", "test-util"] }
 
 # The Loom models (`src/threads/loom_model.rs`), built only under `--cfg sync_model`, which swaps `src/sync.rs`'s names
@@ -32,12 +30,3 @@ loom = "0.7"
 
 [lints]
 workspace = true
-
-# Microbenches, run by hand: `cargo bench -p mipyre_tpc --bench <name>` (not part of `cargo test`).
-[[bench]]
-name = "stop_poll"
-harness = false
-
-[[bench]]
-name = "local_tasks"
-harness = false

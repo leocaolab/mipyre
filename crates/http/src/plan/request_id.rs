@@ -6,7 +6,7 @@ use std::fmt::{self, Write as _};
 
 use http::header::HeaderValue;
 
-pub(crate) const MAX_CLIENT_ID_LEN: usize = 128;
+pub const MAX_CLIENT_ID_LEN: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RequestId {
@@ -18,7 +18,7 @@ pub enum RequestId {
 /// handed to writes it the same way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServerRequestId {
-    pub process: u64,
+    pub process_seed: u64,
     pub number: u64,
 }
 
@@ -99,7 +99,7 @@ impl ServerRequestId {
     /// Returns the id as its 32 lower-case hex digits, the process's seed first.
     fn hex(&self) -> [u8; 32] {
         const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let bytes = [self.process.to_be_bytes(), self.number.to_be_bytes()];
+        let bytes = [self.process_seed.to_be_bytes(), self.number.to_be_bytes()];
         let mut out = [0; 32];
         for (pair, byte) in out.as_chunks_mut::<2>().0.iter_mut().zip(bytes.iter().flatten()) {
             pair[0] = DIGITS[usize::from(byte >> 4)];
@@ -117,6 +117,3 @@ impl fmt::Display for RequestId {
         }
     }
 }
-
-#[cfg(test)]
-mod fuzz;

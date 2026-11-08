@@ -97,7 +97,7 @@ impl Clock {
     /// forgets the alarms nobody holds.
     pub fn tick(&self, now: Instant) {
         let now = self.since_origin(now);
-        // Sequentially consistent with `Deadline::poll`'s store and load: either this tick sees
+        // Sequentially consistent with `Sleep::poll`'s store and load: either this tick sees
         // the deadline, or the poll sees this tick's time.
         self.now.store(now, Ordering::SeqCst);
         for shard in &self.alarms {
@@ -140,8 +140,8 @@ impl Clock {
 
     /// Returns a deadline at `at` that wakes its task through `alarm`, which must be this clock's.
     #[inline]
-    pub fn deadline(&'static self, alarm: Arc<Alarm>, at: Instant) -> Deadline {
-        Deadline {
+    pub fn sleep_until(&'static self, alarm: Arc<Alarm>, at: Instant) -> Sleep {
+        Sleep {
             clock: self,
             at: self.since_origin(at),
             alarm,
@@ -188,13 +188,13 @@ impl Alarm {
 
 /// A future that is ready once its clock's time reaches `at`. It arms its alarm while it waits and
 /// disarms it when dropped, so only one deadline may use an alarm at a time.
-pub struct Deadline {
+pub struct Sleep {
     clock: &'static Clock,
     at: u64,
     alarm: Arc<Alarm>,
 }
 
-impl Deadline {
+impl Sleep {
     /// Moves the deadline to `at`.
     #[inline]
     pub fn reset(&mut self, at: Instant) {
@@ -202,7 +202,7 @@ impl Deadline {
     }
 }
 
-impl Future for Deadline {
+impl Future for Sleep {
     type Output = ();
 
     #[inline]
@@ -220,7 +220,7 @@ impl Future for Deadline {
     }
 }
 
-impl Drop for Deadline {
+impl Drop for Sleep {
     #[inline]
     fn drop(&mut self) {
         self.alarm.at.store(UNARMED, Ordering::Release);
@@ -251,7 +251,7 @@ impl hyper::rt::Timer for ConnectionTimer {
     }
 
     fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
-        Box::pin(self.clock.deadline(Arc::clone(&self.alarm), deadline))
+        Box::pin(self.clock.sleep_until(Arc::clone(&self.alarm), deadline))
     }
 
     fn now(&self) -> Instant {
@@ -259,14 +259,14 @@ impl hyper::rt::Timer for ConnectionTimer {
     }
 
     fn reset(&self, sleep: &mut Pin<Box<dyn hyper::rt::Sleep>>, new_deadline: Instant) {
-        match sleep.as_mut().downcast_mut_pin::<Deadline>() {
+        match sleep.as_mut().downcast_mut_pin::<Sleep>() {
             Some(deadline) => Pin::into_inner(deadline).reset(new_deadline),
             None => *sleep = self.sleep_until(new_deadline),
         }
     }
 }
 
-impl hyper::rt::Sleep for Deadline {}
+impl hyper::rt::Sleep for Sleep {}
 
 #[cfg(test)]
 mod tests {
@@ -275,15 +275,15 @@ mod tests {
     use std::task::{Wake, Waker};
 
     #[derive(Default)]
-    struct Count(AtomicUsize);
+    struct SpyWaker(AtomicUsize);
 
-    impl Wake for Count {
+    impl Wake for SpyWaker {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
-    impl Count {
+    impl SpyWaker {
         fn get(&self) -> usize {
             self.0.load(std::sync::atomic::Ordering::Relaxed)
         }
@@ -303,11 +303,11 @@ mod tests {
     #[test]
     fn a_waiting_deadline_is_woken_by_the_first_tick_at_or_past_it_and_only_once() {
         let clock = leaked();
-        let count = Arc::new(Count::default());
+        let count = Arc::new(SpyWaker::default());
         let waker = Waker::from(Arc::clone(&count));
         let mut cx = Context::from_waker(&waker);
         let at = clock.origin + Duration::from_secs(10);
-        let mut deadline = Box::pin(clock.deadline(clock.alarm(), at));
+        let mut deadline = Box::pin(clock.sleep_until(clock.alarm(), at));
 
         assert!(deadline.as_mut().poll(&mut cx).is_pending());
         clock.tick(at - Duration::from_nanos(1));
@@ -324,11 +324,11 @@ mod tests {
     #[test]
     fn a_dropped_deadline_wakes_nobody_and_its_alarm_is_forgotten() {
         let clock = leaked();
-        let count = Arc::new(Count::default());
+        let count = Arc::new(SpyWaker::default());
         let waker = Waker::from(Arc::clone(&count));
         let mut cx = Context::from_waker(&waker);
         let at = clock.origin + Duration::from_secs(1);
-        let mut deadline = Box::pin(clock.deadline(clock.alarm(), at));
+        let mut deadline = Box::pin(clock.sleep_until(clock.alarm(), at));
         assert!(deadline.as_mut().poll(&mut cx).is_pending());
         drop(deadline);
 
@@ -340,11 +340,11 @@ mod tests {
     #[test]
     fn a_reset_deadline_waits_for_its_new_time() {
         let clock = leaked();
-        let count = Arc::new(Count::default());
+        let count = Arc::new(SpyWaker::default());
         let waker = Waker::from(Arc::clone(&count));
         let mut cx = Context::from_waker(&waker);
         let first = clock.origin + Duration::from_secs(1);
-        let mut deadline = Box::pin(clock.deadline(clock.alarm(), first));
+        let mut deadline = Box::pin(clock.sleep_until(clock.alarm(), first));
         assert!(deadline.as_mut().poll(&mut cx).is_pending());
         deadline.as_mut().get_mut().reset(first + Duration::from_secs(1));
         assert!(deadline.as_mut().poll(&mut cx).is_pending());

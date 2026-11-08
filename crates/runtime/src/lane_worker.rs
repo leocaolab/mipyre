@@ -9,12 +9,12 @@ use pyo3::prelude::*;
 
 use crate::exchange::{catch_panic, HandlerReply, Request};
 use crate::in_reused_context;
-use mipyre_http::plan::route::{HandlerTarget, RouteKey};
+use mipyre_http::plan::route::{CallConvention, HandlerTarget, RouteKey};
 use mipyre_http::plan::site::SiteRules;
 use mipyre_process::{monotonic_ns, LaneDecodeError, LaneIndex, PeerLane, Pid, SlotRequest, WorkerFailure};
-use mipyre_shm::adapter::doorbell::{HostBellOutcome, PipeDoorbell};
+use mipyre_shm::adapter::doorbell::{PipeDoorbell, RequesterBellOutcome};
 use mipyre_shm::adapter::parker::FutexParker;
-use mipyre_shm::channel::{PeerEnd, SlotWriter, Wait};
+use mipyre_shm::channel::{PeerEnd, SlotWriter, WaitOutcome};
 use mipyre_shm::plan::spin_window::SpinWindow;
 use mipyre_shm::protocol::doorbell::{AtomicU32, Parker};
 use mipyre_shm::SyscallError;
@@ -26,7 +26,7 @@ enum ServeEnd {
     /// The template is gone, and the server with it.
     TemplateGone,
     /// The server closed its end of the wake pipe, so it is gone.
-    HostGone,
+    ServerGone,
     /// The OS refused the wait for requests: waiting again would return at once and spin.
     WaitRefused(SyscallError),
     /// The host's wake pipe cannot be written: an answer would wait for something else to wake a sleeping host.
@@ -44,7 +44,7 @@ const BELL_BROKEN_STATUS: i32 = 74;
 /// Returns the exit status a worker ends with for `end`.
 fn serve_end_status(end: &ServeEnd) -> i32 {
     match end {
-        ServeEnd::TemplateGone | ServeEnd::HostGone => 0,
+        ServeEnd::TemplateGone | ServeEnd::ServerGone => 0,
         ServeEnd::WaitRefused(_) => WAIT_REFUSED_STATUS,
         ServeEnd::BellBroken(_) => BELL_BROKEN_STATUS,
     }
@@ -53,7 +53,7 @@ fn serve_end_status(end: &ServeEnd) -> i32 {
 /// Ends this worker for `end`, without finalizing Python.
 fn end_worker(lane: LaneIndex, end: ServeEnd) -> ! {
     match &end {
-        ServeEnd::TemplateGone | ServeEnd::HostGone => {}
+        ServeEnd::TemplateGone | ServeEnd::ServerGone => {}
         ServeEnd::WaitRefused(e) => tracing::error!(
             target: "mipyre::server",
             lane = lane.0,
@@ -100,7 +100,7 @@ impl Parker for GilFreeParker<'_> {
 /// in a handler would outlive a template killed with SIGKILL. The worker never forks, so the extra
 /// thread is safe.
 fn die_with_template(template_pid: Pid) -> PyResult<()> {
-    use mipyre_process::{ExitWatch, ProcessHandle, Registration};
+    use mipyre_process::{ExitWatch, ExitWatchStatus, ProcessHandle};
     if mipyre_process::KERNEL_ENDS_ORPHANED_WORKERS {
         return Ok(());
     }
@@ -108,8 +108,8 @@ fn die_with_template(template_pid: Pid) -> PyResult<()> {
     let watch = ExitWatch::new().map_err(|e| os_err("the exit watch for the template", e))?;
     let template = ProcessHandle::open(template_pid.into()).map_err(|e| os_err("the template's handle", e.into()))?;
     match watch.add(&template, template_pid.into(), 0) {
-        Ok(Registration::Watching) => {}
-        Ok(Registration::Gone) => mipyre_process::exit_now(0),
+        Ok(ExitWatchStatus::Watching) => {}
+        Ok(ExitWatchStatus::AlreadyExited) => mipyre_process::exit_now(0),
         Err(e) => return Err(os_err("watching the template", e)),
     }
     std::thread::Builder::new()
@@ -154,7 +154,7 @@ pub fn serve<M>(
 ) -> PyResult<()> {
     mipyre_process::mark_lane_worker(mipyre_process::LaneWorkerProcess {
         lane: peer.lane,
-        template: template_pid,
+        fork_server: template_pid,
     })
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     die_with_template(template_pid)?;
@@ -162,8 +162,8 @@ pub fn serve<M>(
     let routes = routes_by_key(&rules);
     let mut end = PeerEnd::new(Arc::clone(&peer.channel), PipeDoorbell::new(bell), GilFreeParker { py });
     match end.report_ready(peer.attempt) {
-        Ok(None | Some(HostBellOutcome::Rung)) => {}
-        Ok(Some(HostBellOutcome::HostGone)) => end_worker(lane, ServeEnd::HostGone),
+        Ok(None | Some(RequesterBellOutcome::Rung)) => {}
+        Ok(Some(RequesterBellOutcome::RequesterGone)) => end_worker(lane, ServeEnd::ServerGone),
         Err(broken) => end_worker(lane, ServeEnd::BellBroken(broken)),
     }
     // A spin longer than u64 nanoseconds hold (584 years) never ends anyway, so it saturates.
@@ -175,8 +175,8 @@ pub fn serve<M>(
         // notices a template that is gone.
         let window = SpinWindow::until(last_done.saturating_add(spin_ns));
         let request = match end.wait_for_request(window, monotonic_ns, PARK_SLICE_NS) {
-            Ok(Wait::Request(request)) => request,
-            Ok(Wait::SliceOver) => {
+            Ok(WaitOutcome::Request(request)) => request,
+            Ok(WaitOutcome::SliceOver) => {
                 if template_gone(rustix::process::getppid(), template_pid) {
                     end_worker(lane, ServeEnd::TemplateGone);
                 }
@@ -199,9 +199,9 @@ pub fn serve<M>(
         drop(view);
         // The answer is published before the wake byte, and the byte is written only when the host said it sleeps
         // in its reactor.
-        match request.answer(|w| write_answer(lane, w, &result)) {
-            Ok(None | Some(HostBellOutcome::Rung)) => {}
-            Ok(Some(HostBellOutcome::HostGone)) => end_worker(lane, ServeEnd::HostGone),
+        match request.respond(|w| write_answer(lane, w, &result)) {
+            Ok(None | Some(RequesterBellOutcome::Rung)) => {}
+            Ok(Some(RequesterBellOutcome::RequesterGone)) => end_worker(lane, ServeEnd::ServerGone),
             Err(broken) => end_worker(lane, ServeEnd::BellBroken(broken)),
         }
         last_done = monotonic_ns();
@@ -214,8 +214,8 @@ fn write_answer(
     w: &mut SlotWriter<'_>,
     result: &Result<mipyre_http::plan::response::HandlerResponse, WorkerFailure>,
 ) {
-    if let Err(e) = mipyre_process::encode_answer(w, result) {
-        w.restart();
+    if let Err(e) = mipyre_process::encode_response(w, result) {
+        w.clear();
         // The lane's slots are at least `MIN_SLOT_BYTES`, which a failure always fits, so this is a slot this worker
         // was not given; the server reads the empty answer as malformed.
         tracing::error!(target: "mipyre::server", lane = lane.0, error = %e, "process lane answer refused");
@@ -271,6 +271,7 @@ fn routes_by_key<M>(rules: &SiteRules<Py<PyAny>, M>) -> HashMap<RouteKey, Handle
         .routes
         .routes()
         .iter()
+        .filter(|r| r.convention == CallConvention::Http)
         .map(|r| (r.key.clone(), r.handler))
         .collect()
 }
@@ -297,7 +298,7 @@ mod tests {
         };
         assert_eq!(serve_end_status(&ServeEnd::WaitRefused(refused)), 71);
         assert_eq!(serve_end_status(&ServeEnd::BellBroken(broken)), 74);
-        assert_eq!(serve_end_status(&ServeEnd::HostGone), 0);
+        assert_eq!(serve_end_status(&ServeEnd::ServerGone), 0);
         assert_eq!(serve_end_status(&ServeEnd::TemplateGone), 0);
     }
 

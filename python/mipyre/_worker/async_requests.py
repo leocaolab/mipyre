@@ -105,47 +105,6 @@ def job_runner(
     return run
 
 
-def connection_runner(
-    handlers: Sequence[Callable | None],
-    before: Sequence[Callable],
-    waits: Any,
-) -> Callable[[Any], Coroutine[Any, Any, None]]:
-    """Return the coroutine function that runs one WebSocket connection's job: the
-    ``before_request`` hooks on its upgrade request, which may refuse it with what one returns,
-    then its ``async def`` handler (``handlers[job.route]``) on the connection, whose waits are
-    ``waits``'s. A hook that raises refuses the upgrade with a 500; a handler that raises is
-    logged, the connection having no response left to carry it. A route without a handler here
-    is refused like a hook that raised."""
-
-    async def run(job: Any) -> None:
-        req = job.request
-        try:
-            handler = handlers[job.route]
-            if handler is None:
-                raise NoHandler(f"websocket route {job.route} has no handler on this engine")
-            for hook in before:
-                res = await _call(hook, req)
-                if res is not None:
-                    job.refuse(res)
-                    return
-        except BaseException as exc:
-            if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
-                raise
-            job.fail(exc)
-            return
-        ws = job.accept(waits)
-        if ws is None:
-            return
-        try:
-            await handler(ws)
-        except BaseException as exc:
-            if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
-                raise
-            job.raised(exc)
-
-    return run
-
-
 async def serve(
     doorbell: int,
     take: Callable[[], Sequence[Any] | None],

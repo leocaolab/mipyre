@@ -11,7 +11,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 
-use mipyre_subinterp::context::{await_slot, is_coroutine, AwaitSlot, ContextEntry, PyContext, SpareContext};
+use mipyre_subinterp::context::{await_kind, is_coroutine, AwaitKind, ContextEntry, PyContext, SpareContext};
 
 use crate::exchange::error::{HandlerError, PyException, RequestStage};
 
@@ -83,10 +83,10 @@ impl AwaitableKind {
     ///
     /// Fails when that `Future` check raises.
     pub(crate) fn of(obj: &Bound<'_, PyAny>) -> PyResult<Option<Self>> {
-        match await_slot(obj) {
-            AwaitSlot::Coroutine => return Ok(Some(AwaitableKind::InTask)),
-            AwaitSlot::Plain => return Ok(None),
-            AwaitSlot::Awaitable => {}
+        match await_kind(obj) {
+            AwaitKind::Coroutine => return Ok(Some(AwaitableKind::InTask)),
+            AwaitKind::Plain => return Ok(None),
+            AwaitKind::Awaitable => {}
         }
         Ok(Some(if is_future(obj)? {
             AwaitableKind::Future

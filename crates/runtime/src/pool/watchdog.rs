@@ -141,7 +141,7 @@ impl AbandonGauge {
     }
 }
 
-enum LaneWork<U> {
+enum WorkerActivity<U> {
     Idle,
     Serving {
         /// It is the number of the route the request is for.
@@ -155,7 +155,7 @@ enum LaneWork<U> {
 /// What the watchdog does about a lane when it looks: nothing yet, interrupt its request, or
 /// abandon its worker.
 #[derive(Debug, PartialEq, Eq)]
-enum LaneAction<U> {
+enum WatchdogAction<U> {
     Wait,
     Interrupt(U),
     Abandon,
@@ -165,30 +165,30 @@ enum LaneAction<U> {
 /// interrupted once, and a worker still in its request `grace` after that is abandoned. It changes
 /// `work` only to record the interruption.
 fn next_action<U: Clone>(
-    work: &mut LaneWork<U>,
+    work: &mut WorkerActivity<U>,
     now: Instant,
     zombie_after: Duration,
     grace: Duration,
-) -> LaneAction<U> {
-    let LaneWork::Serving {
+) -> WatchdogAction<U> {
+    let WorkerActivity::Serving {
         since,
         unit,
         interrupted,
         ..
     } = work
     else {
-        return LaneAction::Wait;
+        return WatchdogAction::Wait;
     };
     match *interrupted {
         None if now.saturating_duration_since(*since) >= zombie_after => match unit {
             Some(unit) => {
                 *interrupted = Some(now);
-                LaneAction::Interrupt(unit.clone())
+                WatchdogAction::Interrupt(unit.clone())
             }
-            None => LaneAction::Wait,
+            None => WatchdogAction::Wait,
         },
-        Some(at) if now.saturating_duration_since(at) >= grace => LaneAction::Abandon,
-        _ => LaneAction::Wait,
+        Some(at) if now.saturating_duration_since(at) >= grace => WatchdogAction::Abandon,
+        _ => WatchdogAction::Wait,
     }
 }
 
@@ -200,7 +200,7 @@ pub(crate) struct SyncLane {
     /// replacement when it abandons the worker, whose thread then ends counting nothing.
     life: Mutex<Option<WorkerLife>>,
     /// The worker writes it as a request begins and ends; the watchdog and the shutdown read it.
-    work: Mutex<LaneWork<InterruptTarget>>,
+    work: Mutex<WorkerActivity<InterruptTarget>>,
     /// The watchdog sets it on abandoning the worker; the thread ends after its current request.
     retired: AtomicBool,
     /// Whoever stops the thread takes it: the shutdown or the watchdog.
@@ -212,14 +212,14 @@ impl SyncLane {
         Arc::new(SyncLane {
             index,
             life: Mutex::new(life),
-            work: Mutex::new(LaneWork::Idle),
+            work: Mutex::new(WorkerActivity::Idle),
             retired: AtomicBool::new(false),
             handle: Mutex::new(None),
         })
     }
 
     pub(super) fn begin(&self, route: usize) {
-        *self.work.lock() = LaneWork::Serving {
+        *self.work.lock() = WorkerActivity::Serving {
             route,
             since: Instant::now(),
             unit: None,
@@ -228,20 +228,20 @@ impl SyncLane {
     }
 
     pub(super) fn publish_unit(&self, unit: InterruptTarget) {
-        if let LaneWork::Serving { unit: slot, .. } = &mut *self.work.lock() {
+        if let WorkerActivity::Serving { unit: slot, .. } = &mut *self.work.lock() {
             *slot = Some(unit);
         }
     }
 
     pub(super) fn end(&self) {
-        *self.work.lock() = LaneWork::Idle;
+        *self.work.lock() = WorkerActivity::Idle;
     }
 
     /// Returns the number of the route the lane's worker is running, or `None` while it is idle.
     pub(super) fn running_route(&self) -> Option<usize> {
         match *self.work.lock() {
-            LaneWork::Serving { route, .. } => Some(route),
-            LaneWork::Idle => None,
+            WorkerActivity::Serving { route, .. } => Some(route),
+            WorkerActivity::Idle => None,
         }
     }
 
@@ -340,15 +340,15 @@ pub(super) fn watch(
         for lane in live {
             let action = next_action(&mut lane.work.lock(), now, zombie_after, grace);
             match action {
-                LaneAction::Wait => {}
-                LaneAction::Interrupt(unit) => {
+                WatchdogAction::Wait => {}
+                WatchdogAction::Interrupt(unit) => {
                     interrupt(&lane, unit, interrupt_lines.admit(clock::now(), LOG_PERIOD));
                 }
-                LaneAction::Abandon if !at_limit(running, abandon_limit) => {
+                WatchdogAction::Abandon if !at_limit(running, abandon_limit) => {
                     abandon(&sup, &replacer, &lane);
                     running += 1;
                 }
-                LaneAction::Abandon => {}
+                WatchdogAction::Abandon => {}
             }
         }
         let next = AbandonGauge {
@@ -456,21 +456,21 @@ mod tests {
         let budget = Duration::from_secs(30);
         let grace = Duration::from_secs(2);
         let start = Instant::now();
-        let mut work = LaneWork::Serving {
+        let mut work = WorkerActivity::Serving {
             route: 0,
             since: start,
             unit: Some("unit"),
             interrupted: None,
         };
         let at = |secs: u64| start + Duration::from_secs(secs);
-        assert_eq!(next_action(&mut work, at(29), budget, grace), LaneAction::Wait);
+        assert_eq!(next_action(&mut work, at(29), budget, grace), WatchdogAction::Wait);
         assert_eq!(
             next_action(&mut work, at(31), budget, grace),
-            LaneAction::Interrupt("unit")
+            WatchdogAction::Interrupt("unit")
         );
-        assert_eq!(next_action(&mut work, at(31), budget, grace), LaneAction::Wait);
-        assert_eq!(next_action(&mut work, at(32), budget, grace), LaneAction::Wait);
-        assert_eq!(next_action(&mut work, at(34), budget, grace), LaneAction::Abandon);
+        assert_eq!(next_action(&mut work, at(31), budget, grace), WatchdogAction::Wait);
+        assert_eq!(next_action(&mut work, at(32), budget, grace), WatchdogAction::Wait);
+        assert_eq!(next_action(&mut work, at(34), budget, grace), WatchdogAction::Abandon);
     }
 
     #[test]
@@ -524,14 +524,14 @@ mod tests {
         let grace = Duration::from_secs(2);
         let start = Instant::now();
         let later = start + Duration::from_secs(60);
-        let mut not_begun: LaneWork<&str> = LaneWork::Serving {
+        let mut not_begun: WorkerActivity<&str> = WorkerActivity::Serving {
             route: 0,
             since: start,
             unit: None,
             interrupted: None,
         };
-        assert_eq!(next_action(&mut not_begun, later, budget, grace), LaneAction::Wait);
-        let mut idle: LaneWork<&str> = LaneWork::Idle;
-        assert_eq!(next_action(&mut idle, later, budget, grace), LaneAction::Wait);
+        assert_eq!(next_action(&mut not_begun, later, budget, grace), WatchdogAction::Wait);
+        let mut idle: WorkerActivity<&str> = WorkerActivity::Idle;
+        assert_eq!(next_action(&mut idle, later, budget, grace), WatchdogAction::Wait);
     }
 }

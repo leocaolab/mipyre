@@ -14,18 +14,18 @@ pub const NOTE_BYTES: u32 = 8 << 10;
 /// memory holds a header without being written.
 #[repr(C)]
 pub struct ChannelHeader {
-    /// Written by the host: one past the last request it published.
+    /// Written by the caller: one past the last request it published.
     pub(crate) req_head: CacheLine<AtomicU32>,
     /// Written by the peer: `k + 1` once it began request `k`.
     pub(crate) taken: CacheLine<AtomicU32>,
-    /// Written by the peer, and by the host when it takes over from a dead one: one past the last answer published.
+    /// Written by the peer, and by the caller when it takes over from a dead one: one past the last answer published.
     pub(crate) resp_head: CacheLine<AtomicU32>,
     /// Written by the peer: 1 while it sleeps, or is about to, on `req_head`.
     pub(crate) peer_sleeping: CacheLine<AtomicU32>,
-    /// Written by the host: 1 while it sleeps, or is about to, on `resp_head`.
-    pub(crate) host_sleeping: CacheLine<AtomicU32>,
+    /// Written by the caller: 1 while it sleeps, or is about to, on `resp_head`.
+    pub(crate) requester_sleeping: CacheLine<AtomicU32>,
     pub(crate) start: StartReportArea,
-    pub(crate) peer_waits: CacheLine<WaitCounts>,
+    pub(crate) peer_waits: CacheLine<WaitCounters>,
 }
 
 /// Where the start note's bytes begin in the header page: right after the header, word-aligned.
@@ -33,7 +33,7 @@ pub(crate) const NOTE_AT: usize = std::mem::size_of::<ChannelHeader>().next_mult
 
 const _: () = assert!(NOTE_AT + NOTE_BYTES as usize <= HEADER_PAGE);
 
-/// The report on one start attempt: the host picks the attempt's number and clears the rest before it starts a
+/// The report on one start attempt: the caller picks the attempt's number and clears the rest before it starts a
 /// peer, and the peer of that attempt alone writes `state` (and on a failure first `note_len`).
 #[repr(C)]
 pub struct StartReportArea {
@@ -42,51 +42,40 @@ pub struct StartReportArea {
     pub(crate) note_len: CacheLine<AtomicU32>,
 }
 
-/// Counts how the peer waited for requests; it has one writer, and the host reads it only for stats.
+/// Counts how the peer waited for requests; it has one writer, and the caller reads it only for stats.
 #[repr(C)]
 #[derive(Default)]
-pub struct WaitCounts {
+pub struct WaitCounters {
     /// One per request the peer did not find at once.
-    pub(crate) waits: OwnCounter,
-    pub(crate) spin_rounds: OwnCounter,
-    pub(crate) parks: OwnCounter,
-    pub(crate) wakes: OwnCounter,
+    pub(crate) waits: AtomicU64,
+    pub(crate) spin_rounds: AtomicU64,
+    pub(crate) parks: AtomicU64,
+    pub(crate) wakes: AtomicU64,
 }
 
-/// What [`WaitCounts`] held when it was read.
+/// What [`WaitCounters`] held when it was read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WaitTotals {
+pub struct Waits {
     pub waits: u64,
     pub spin_rounds: u64,
     pub parks: u64,
     pub wakes: u64,
 }
 
-/// Holds a counter with one writer, which adds with a plain load and store instead of a read-modify-write; others
-/// only read it.
-#[derive(Default)]
-#[repr(transparent)]
-pub struct OwnCounter(AtomicU64);
-
-impl OwnCounter {
-    /// Adds `n` with a plain load and store; only the counter's one writer calls it.
-    #[inline]
-    pub(crate) fn add(&self, n: u64) {
-        self.0.store(self.0.load(Relaxed).wrapping_add(n), Relaxed);
-    }
-
-    pub fn read(&self) -> u64 {
-        self.0.load(Relaxed)
-    }
+/// Adds `n` to a counter with one writer by a plain load and store instead of a read-modify-write; only that
+/// writer calls it, others only read the counter.
+#[inline]
+pub(crate) fn add_sole_writer(counter: &AtomicU64, n: u64) {
+    counter.store(counter.load(Relaxed).wrapping_add(n), Relaxed);
 }
 
-impl WaitCounts {
-    pub fn read(&self) -> WaitTotals {
-        WaitTotals {
-            waits: self.waits.read(),
-            spin_rounds: self.spin_rounds.read(),
-            parks: self.parks.read(),
-            wakes: self.wakes.read(),
+impl WaitCounters {
+    pub fn read(&self) -> Waits {
+        Waits {
+            waits: self.waits.load(Relaxed),
+            spin_rounds: self.spin_rounds.load(Relaxed),
+            parks: self.parks.load(Relaxed),
+            wakes: self.wakes.load(Relaxed),
         }
     }
 }
@@ -102,17 +91,17 @@ impl ChannelHeader {
             taken: word(),
             resp_head: word(),
             peer_sleeping: word(),
-            host_sleeping: word(),
+            requester_sleeping: word(),
             start: StartReportArea {
                 attempt: word(),
                 state: word(),
                 note_len: word(),
             },
-            peer_waits: CacheLine(WaitCounts {
-                waits: OwnCounter(AtomicU64::new(0)),
-                spin_rounds: OwnCounter(AtomicU64::new(0)),
-                parks: OwnCounter(AtomicU64::new(0)),
-                wakes: OwnCounter(AtomicU64::new(0)),
+            peer_waits: CacheLine(WaitCounters {
+                waits: AtomicU64::new(0),
+                spin_rounds: AtomicU64::new(0),
+                parks: AtomicU64::new(0),
+                wakes: AtomicU64::new(0),
             }),
         }
     }

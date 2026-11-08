@@ -12,10 +12,10 @@ use super::host::{LaneHost, HOST};
 use super::lane_failure::{LaneDecodeError, LaneUnansweredError, WorkerFailure};
 use super::os::monotonic_ns;
 use super::run::{RunPhase, RunState, ServerLanes};
+use super::stats::add_sole_writer;
 use super::wire::LaneRequest;
 use crate::sync::Ordering::*;
 use mipyre_core::HandoffBackend;
-use mipyre_http::io::request_head::RequestHead;
 use mipyre_http::plan::response::HandlerResponse;
 use mipyre_shm::channel::SlotRoomError;
 
@@ -107,21 +107,6 @@ fn next_turn() -> usize {
     })
 }
 
-/// The bytes a request takes in a slot, over-counted: its body, URI, headers and path
-/// parameters, with a margin for the fields' framing.
-fn approx_message_len(head: &RequestHead, body_len: usize) -> usize {
-    body_len
-        + head.parts.uri.to_string().len()
-        + head
-            .parts
-            .headers
-            .iter()
-            .map(|(k, v)| k.as_str().len() + v.len() + 8)
-            .sum::<usize>()
-        + head.params.located().map(|(name, _)| name.len() + 12).sum::<usize>()
-        + 256
-}
-
 fn fits(len: usize, room: u32) -> Result<(), SlotRoomError> {
     if len as u64 > u64::from(room) {
         return Err(SlotRoomError {
@@ -152,7 +137,7 @@ impl ServerLanes {
     /// Queues a request: on this thread's own lanes when it hosts some (no hand-off), else
     /// through a host's inbox. Never waits.
     pub(crate) fn submit(&self, job: LaneJob) -> Result<(), (LaneRequestError, LaneReplySender)> {
-        if let Err(e) = self.check_fits(&job.request.head, job.request.body.len()) {
+        if let Err(e) = self.check_fits(&job.request) {
             return Err((LaneRequestError::TooLarge(e), job.reply));
         }
         let local = HOST.with(|h| {
@@ -174,7 +159,7 @@ impl ServerLanes {
             // thread). When its own lanes are full, another host too, before 503.
             let job = match self.spread_target(&host) {
                 Some(k) => {
-                    host.counts().spread_forwards.add(1);
+                    add_sole_writer(&host.counts().spread_forwards, 1);
                     match run.hosts[k].send(job) {
                         Ok(()) => return Ok(()),
                         // Its inbox went since it was checked: this host's own lanes take it.
@@ -190,7 +175,7 @@ impl ServerLanes {
                     let start = next_turn() % run.hosts.len();
                     match run.hand_to(start, Some(host.index), job) {
                         Ok(()) => {
-                            host.counts().overflow_forwards.add(1);
+                            add_sole_writer(&host.counts().overflow_forwards, 1);
                             Ok(())
                         }
                         Err(job) => Err((refused, job.reply)),
@@ -220,7 +205,7 @@ impl ServerLanes {
             return None;
         }
         let own = run.hosts[host.index].load.load(Relaxed);
-        if !health::loaded_to_spread(own, host.owned.borrow().lanes.len()) || !host.running_long() {
+        if !health::loaded_to_spread(own, host.core.borrow().lanes.len()) || !host.running_long() {
             return None;
         }
         let start = next_turn() % run.hosts.len();
@@ -235,8 +220,8 @@ impl ServerLanes {
     }
 
     /// Checks that a request fits a slot, so one that does not gets 413 before it is queued.
-    fn check_fits(&self, head: &RequestHead, body_len: usize) -> Result<(), SlotRoomError> {
-        fits(approx_message_len(head, body_len), self.geometry.max_message())
+    fn check_fits(&self, request: &LaneRequest) -> Result<(), SlotRoomError> {
+        fits(request.approx_message_len(), self.geometry.max_message())
     }
 }
 

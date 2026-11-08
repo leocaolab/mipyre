@@ -18,16 +18,18 @@ mod sync;
 
 #[cfg(feature = "startup_trace")]
 pub use interp::trace;
-pub use interp::unit::{InterruptError, InterruptTarget, ThreadStateCreationFailure, UnitEnd, WorkUnit};
-pub use interp::{detach_for_idle, keep_attached_until_idle, NewInterpreterError, Releasable, SubInterpreter};
+pub use interp::unit::{InterruptError, InterruptTarget, Interruption, NewThreadStateError, UnitEnd, WorkUnit};
+pub use interp::{
+    detach_for_idle, keep_attached_until_idle, NewInterpreterError, PyStatusError, Releasable, SubInterpreter,
+};
 
-pub use finalization::ExitDecision;
+pub use finalization::{ExitDecision, RegisterHookError};
 
 /// Decides whether the process may finalize, from what every thread that owns a sub-interpreter
 /// is doing; on [`ExitDecision::Finalize`] it returns once the last has ended its interpreter.
 ///
-/// A thread owns its interpreter from its creation until it ends or gives it up. One that runs
-/// Python (a handler, possibly one that never returns) makes the decision
+/// A thread owns its interpreter from its creation until the interpreter is dropped or the thread
+/// ends. From the first call on no interpreter is created. One that runs Python (a handler, possibly one that never returns) makes the decision
 /// [`ExitDecision::ExitWithoutFinalizing`] at once. When none does, every one is only on its way
 /// to ending its interpreter, which is waited for without a deadline; a unit that begins on one
 /// meanwhile decides [`ExitDecision::ExitWithoutFinalizing`] as it enters.

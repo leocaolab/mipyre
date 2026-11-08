@@ -43,15 +43,8 @@ def index(req):
 
 
 @app.websocket("/ws")
-async def echo(ws):
-    try:
-        async for msg in ws:
-            if isinstance(msg, bytes):
-                await ws.send_bytes(msg)
-            else:
-                await ws.send(f"echo: {msg}")
-    except ConnectionError:
-        pass  # the client left
+def echo(ws, msg):
+    return msg if isinstance(msg, bytes) else f"echo: {msg}"
 
 
 if __name__ == "__main__":

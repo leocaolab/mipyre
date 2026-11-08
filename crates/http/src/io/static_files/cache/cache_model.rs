@@ -24,7 +24,7 @@ use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, Flag, Modify
 use notify::{Event, EventKind};
 use proptest::prelude::*;
 
-use super::super::send::HeldBytes;
+use super::super::send::BytesInFlight;
 use super::super::RequestPath;
 use super::super::{try_static_file, CanonicalDir, StaticMount};
 use super::{alias_cost, CacheBudget, MountCache, MountWatch};
@@ -79,16 +79,16 @@ enum Notice {
 
 /// A response's status, headers and body, compared whole.
 #[derive(Debug, PartialEq)]
-struct Answer {
+struct ResponseSnapshot {
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
 }
 
 /// Removes the directory at the end of a case.
-struct TempRoot(PathBuf);
+struct TempDir(PathBuf);
 
-impl Drop for TempRoot {
+impl Drop for TempDir {
     fn drop(&mut self) {
         if let Err(error) = std::fs::remove_dir_all(&self.0) {
             tracing::warn!(root = %self.0.display(), error = %error, "the test directory is left behind");
@@ -98,7 +98,7 @@ impl Drop for TempRoot {
 
 static ROOTS: AtomicU64 = AtomicU64::new(0);
 
-fn temp_root() -> TempRoot {
+fn temp_root() -> TempDir {
     let n = ROOTS.fetch_add(1, Counter::Relaxed);
     let root = std::env::temp_dir().join(format!("mipyre-cache-model-{}-{n}", std::process::id()));
     match std::fs::remove_dir_all(&root) {
@@ -107,7 +107,7 @@ fn temp_root() -> TempRoot {
     }
     std::fs::create_dir_all(root.join("d")).expect("the test directory is made");
     std::os::unix::fs::symlink("a.txt", root.join(LINK)).expect("the link is made");
-    TempRoot(std::fs::canonicalize(&root).expect("the test directory resolves"))
+    TempDir(std::fs::canonicalize(&root).expect("the test directory resolves"))
 }
 
 fn mount(root: &Path, copies: Copies, budget: &Arc<CacheBudget>, watch: MountWatch) -> StaticMount {
@@ -117,7 +117,7 @@ fn mount(root: &Path, copies: Copies, budget: &Arc<CacheBudget>, watch: MountWat
     StaticMount {
         rule: StaticMountRule::new("/static", copies).expect("the prefix starts with '/'"),
         cache: Arc::new(cache),
-        held: Arc::new(HeldBytes::new()),
+        in_flight: Arc::new(BytesInFlight::new()),
     }
 }
 
@@ -145,7 +145,7 @@ impl Disk {
 }
 
 struct Harness {
-    root: TempRoot,
+    root: TempDir,
     copies: Copies,
     cap: u64,
     budget: Arc<CacheBudget>,
@@ -313,7 +313,7 @@ impl Harness {
         Ok(())
     }
 
-    fn answer(&self, mount: &StaticMount, spelling: &str, headers: &HeaderMap) -> Option<Answer> {
+    fn answer(&self, mount: &StaticMount, spelling: &str, headers: &HeaderMap) -> Option<ResponseSnapshot> {
         let path = format!("/static/{spelling}");
         let response: Response<ResponseBody> =
             self.rt
@@ -324,7 +324,7 @@ impl Harness {
             .block_on(body.collect())
             .expect("nothing changes the disk while the model reads an answer")
             .to_bytes();
-        Some(Answer {
+        Some(ResponseSnapshot {
             status: parts.status,
             headers: parts.headers,
             body,

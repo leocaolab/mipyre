@@ -482,11 +482,14 @@ def guard(req):
     if req.path == "/ws" and req.headers.get("x-token") != "secret":
         return Response("denied", status_code=403)
 
-@app.websocket("/ws")
-async def ws_handler(ws):
+def greet(ws):
     r = ws.request
-    await ws.send(f"{r.method} {r.path} {r.query_params.get('q')} {r.headers.get('x-token')}")
+    ws.send(f"{r.method} {r.path} {r.query_params.get('q')} {r.headers.get('x-token')}")
     ws.close()
+
+@app.websocket("/ws", on_connect=greet)
+def ws_handler(ws, msg):
+    return None
 """ + RUN
 
 

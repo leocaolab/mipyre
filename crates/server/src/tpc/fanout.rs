@@ -172,11 +172,6 @@ async fn fanout_worker_loop<D: TransportDriver>(
     shutdown: CancellationToken,
     deadline: ShutdownDeadline,
 ) -> Result<(), ServeError> {
-    let ws = upgrade_target(
-        &tpc_thread.site,
-        tpc_thread.async_pool.as_deref(),
-        tpc_thread.main.as_deref(),
-    );
     let stop = LocalStop::follow(&shutdown);
     let stopped = stop.stopped();
     tokio::pin!(stopped);
@@ -190,6 +185,7 @@ async fn fanout_worker_loop<D: TransportDriver>(
     )
     .map_err(ServeError::LaneHost)?;
     let tracker = LocalTasks::new();
+    let ws = upgrade_target(&tpc_thread, &conn_stop, &tracker);
     let mut accepting = true;
     loop {
         tokio::select! {

@@ -18,10 +18,12 @@ from mipyre import Mipyre, ServerFlags
 
 app = Mipyre(runtime="main")
 
-@app.websocket("/room/{name}")
-async def room(ws):
-    await ws.send(ws.request.params["name"])
-    await ws.recv()
+def joined(ws):
+    return ws.request.params["name"]
+
+@app.websocket("/room/{name}", on_connect=joined)
+def room(ws, msg):
+    return None
 
 @app.get("/health")
 def health(req):
@@ -66,7 +68,7 @@ async def test_a_path_no_websocket_route_matches_is_not_upgraded(server):
             pass
 
 
-async def _handler(ws):
+def _handler(ws, msg):
     pass
 
 

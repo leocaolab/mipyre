@@ -3,7 +3,7 @@
 from collections.abc import Mapping as _Mapping
 
 from mipyre.engine import Request, Response, Headers, WebSocket, SharedState, Stream, BodyStream, Metrics, get_gil_metrics, reset_peaks, flush_logs, LogLevel, Compression, HTTPException
-from mipyre.engine import BodyReadError, DeclarationError, LateRegistrationError, MissingAppFileError, ServerFlags
+from mipyre.engine import BodyReadError, DeclarationError, LateRegistrationError, MissingAppFileError, ServerFlags, publish
 from mipyre.app import Mipyre
 from mipyre._routes import FastRoute, Route, Router, Runtime, RuntimeDeclarationError
 from mipyre._process_lane.settings import ProcessLanes
@@ -52,7 +52,7 @@ _Mapping.register(Headers)
 
 __all__ = [
     "Router", "Runtime", "ProcessLanes",
-    "Mipyre", "ServerFlags", "Route", "FastRoute", "Request", "Response", "Headers", "WebSocket", "SharedState", "Stream", "BodyStream",
+    "Mipyre", "ServerFlags", "Route", "FastRoute", "Request", "Response", "Headers", "WebSocket", "publish", "SharedState", "Stream", "BodyStream",
     "Metrics", "get_gil_metrics", "reset_peaks", "flush_logs",
     "LogLevel", "Compression",
     "redirect", "rpc", "RPCClient", "HealthProbes", "OpenApi",

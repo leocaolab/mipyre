@@ -204,11 +204,11 @@ pub(super) struct MissGeneration(Generation);
 pub(super) struct WatchError {
     root: PathBuf,
     #[source]
-    source: WatcherStartError,
+    source: StartWatcherError,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum WatcherStartError {
+pub(super) enum StartWatcherError {
     #[error(transparent)]
     Watch(#[from] notify::Error),
     #[error("the thread that starts the watcher could not be spawned: {0}")]
@@ -281,13 +281,13 @@ impl MountCache {
             .lock()
             .advance(MountWatch::Unstarted, MountWatch::Started)
         {
-            self.start_watching();
+            self.spawn_watcher();
         }
     }
 
     /// Starts the watcher on its own thread; if it fails, the mount is served uncached and the
     /// reason is logged once.
-    fn start_watching(&self) {
+    fn spawn_watcher(&self) {
         let root = self.root();
         let state = Arc::clone(&self.state);
         let slot = Arc::downgrade(&self.watcher);
@@ -299,7 +299,7 @@ impl MountCache {
             });
         // The thread ends once the watcher is up or has failed, so nothing joins it.
         if let Err(e) = spawned {
-            let error = not_watched(&self.root().0, &self.state, WatcherStartError::Thread(e));
+            let error = not_watched(&self.root().0, &self.state, StartWatcherError::Thread(e));
             tracing::error!(error = %error, "static mount is served uncached");
         }
     }
@@ -312,7 +312,7 @@ impl MountCache {
 
     /// Returns the file the cache holds at `resolved` for another request path, so a miss of a
     /// new path to it keeps an alias without reading the file again.
-    pub(super) fn held(&self, resolved: &Path) -> Option<Arc<StaticFile>> {
+    pub(super) fn cached_file(&self, resolved: &Path) -> Option<Arc<StaticFile>> {
         self.state.contents.get(resolved).map(|kept| Arc::clone(&kept.file))
     }
 
@@ -335,7 +335,7 @@ impl MountCache {
 
     /// Keeps `requested` as an alias of `file`, which [`Self::held`] returned, and returns the
     /// file kept under it, unless [`Self::insert_alias`] refuses it.
-    pub(super) fn keep_held(
+    pub(super) fn keep_cached(
         &self,
         key: Box<[u8]>,
         ticket: MissGeneration,
@@ -565,7 +565,7 @@ fn watch_tree(root: &Path, state: &Arc<CacheState>) -> Result<notify::Recommende
     // The directory holding each symlink on the configured path is watched too, so retargeting
     // one is an event; it is watched alone, since nothing in it but the link is served.
     let link_dirs = super::read::symlink_dirs(&state.configured)
-        .map_err(|source| not_watched(root, state, WatcherStartError::Links(source)))?;
+        .map_err(|source| not_watched(root, state, StartWatcherError::Links(source)))?;
     let handler_state = Arc::clone(state);
     let handler_root = root.to_path_buf();
     notify::RecommendedWatcher::new(
@@ -579,12 +579,12 @@ fn watch_tree(root: &Path, state: &Arc<CacheState>) -> Result<notify::Recommende
         }
         Ok(watcher)
     })
-    .map_err(|source| not_watched(root, state, WatcherStartError::Watch(source)))
+    .map_err(|source| not_watched(root, state, StartWatcherError::Watch(source)))
 }
 
 /// Records why the mount is served uncached before the watch reads as failed, as `on_event` does:
 /// whoever sees `Failed` finds the reason already there.
-fn not_watched(root: &Path, state: &CacheState, source: WatcherStartError) -> WatchError {
+fn not_watched(root: &Path, state: &CacheState, source: StartWatcherError) -> WatchError {
     let error = WatchError {
         root: root.to_path_buf(),
         source,
@@ -611,16 +611,16 @@ mod tests {
     use bytes::Bytes;
 
     /// A read of `resolved` under the root, asked for as `requested`, holding `original`.
-    struct Read {
+    struct CacheMiss {
         requested: RequestPath,
         file: Arc<StaticFile>,
     }
 
-    fn file(root: &Path) -> Read {
+    fn file(root: &Path) -> CacheMiss {
         named(root, "a.txt", "a.txt", b"x")
     }
 
-    fn named(root: &Path, requested: &str, resolved: &str, original: &'static [u8]) -> Read {
+    fn named(root: &Path, requested: &str, resolved: &str, original: &'static [u8]) -> CacheMiss {
         let file = StaticFile::new(
             FileContents {
                 bytes: Bytes::from_static(original),
@@ -629,7 +629,7 @@ mod tests {
             None,
             root.join(resolved),
         );
-        Read {
+        CacheMiss {
             requested: RequestPath {
                 path: root.join(requested),
                 link_dirs: Box::default(),
@@ -640,10 +640,10 @@ mod tests {
 
     /// Keeps `read` under `key` as a miss does: an alias of the file the cache holds, else the
     /// file read under a reservation of its size; and tells whether it was kept.
-    fn keep(cache: &MountCache, key: &str, ticket: MissGeneration, read: Read) -> bool {
+    fn keep(cache: &MountCache, key: &str, ticket: MissGeneration, read: CacheMiss) -> bool {
         let key = Box::from(key.as_bytes());
-        let kept = match cache.held(&read.file.resolved) {
-            Some(held) => cache.keep_held(key, ticket, read.requested, held),
+        let kept = match cache.cached_file(&read.file.resolved) {
+            Some(held) => cache.keep_cached(key, ticket, read.requested, held),
             None => cache
                 .reserve(read.file.cached_len())
                 .and_then(|reserved| cache.keep_read(key, ticket, read.requested, reserved, read.file)),

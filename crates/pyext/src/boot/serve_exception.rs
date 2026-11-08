@@ -19,17 +19,17 @@ pub(crate) fn listener_exception(e: ListenerError) -> PyErr {
 /// Raises a malformed activation environment or an unusable handed socket as `ValueError`, and a
 /// failed system call on one as `OSError(errno, text)`.
 #[cfg(unix)]
-pub(crate) fn passed_exception(e: mipyre_transport::tcp::passed::PassedError) -> PyErr {
-    use mipyre_transport::tcp::passed::PassedError;
+pub(crate) fn passed_exception(e: mipyre_transport::tcp::passed::SocketActivationError) -> PyErr {
+    use mipyre_transport::tcp::passed::SocketActivationError;
     match &e {
-        PassedError::SystemCallFailed { source, .. } => match source.raw_os_error() {
+        SocketActivationError::SystemCallFailed { source, .. } => match source.raw_os_error() {
             Some(errno) => PyOSError::new_err((errno, e.to_string())),
             None => PyOSError::new_err(e.to_string()),
         },
-        PassedError::NotListening { .. }
-        | PassedError::NotTcp { .. }
-        | PassedError::NoSockets
-        | PassedError::Environment { .. } => pyo3::exceptions::PyValueError::new_err(e.to_string()),
+        SocketActivationError::NotListening { .. }
+        | SocketActivationError::NotTcp { .. }
+        | SocketActivationError::NoSockets
+        | SocketActivationError::MalformedEnvironment { .. } => pyo3::exceptions::PyValueError::new_err(e.to_string()),
     }
 }
 

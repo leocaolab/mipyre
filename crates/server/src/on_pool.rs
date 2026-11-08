@@ -10,11 +10,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::site::Site;
 use mipyre_http::io::body::{collect, BodyGate, ResponseBody};
+use mipyre_http::plan::response::HandlerResponse;
 use mipyre_http::plan::route::{HandlerKind, RouteId};
 use mipyre_runtime::exchange;
 use mipyre_runtime::exchange::RequestBody;
-use mipyre_runtime::exchange::{refuse, Capacity, HandlerError, UnansweredError};
-use mipyre_runtime::InterpreterPool;
+use mipyre_runtime::exchange::{refuse, Capacity, ErrorRecord, HandlerError, UnansweredError};
+use mipyre_runtime::{InterpreterPool, PoolCall};
 
 use super::pipeline::{fail, finish, AcceptEncoding, HandlerRequest, Requester, ResponseSource};
 use super::respond::http_response;
@@ -150,20 +151,34 @@ async fn run_on_pool(
     };
     let _permit = admission.permit;
 
-    let ask = (route, kind, exchange::Request::new(head, RequestBody::buffered(body)));
-    let budget = settings.limits.request_budget;
+    let request = exchange::Request::new(head, RequestBody::buffered(body));
+    let answer = call_on_pool(pool, site, PoolCall::Route(route, kind), request, label).await;
+    http_response(answer, &accept_encoding, &site.counters).await
+}
+
+/// Runs `call` on `pool` within the request budget and returns its answer, or why there is none,
+/// logged.
+#[inline]
+pub(super) async fn call_on_pool(
+    pool: &InterpreterPool,
+    site: &Site,
+    call: PoolCall,
+    request: exchange::Request,
+    label: &RequestLabel,
+) -> Result<HandlerResponse, ErrorRecord> {
+    let budget = site.rules.settings.limits.request_budget;
     let failure = 'failed: {
-        let wait = match dispatch(pool, ask, budget, std::future::ready(())) {
+        let wait = match dispatch(pool, (call, request), budget, std::future::ready(())) {
             Ok(wait) => wait,
             Err(refusal) => break 'failed refuse(refusal),
         };
         match wait.await {
-            Some(Ok(result)) => return http_response(result, &accept_encoding, &site.counters).await,
+            Some(Ok(result)) => return result,
             Some(Err(failure)) => failure,
             None => refuse(UnansweredError::TimedOut(budget.get())),
         }
     };
-    fail(failure, label, &site.counters)
+    Err(failure.log(label))
 }
 
 #[cfg(test)]

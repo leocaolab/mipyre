@@ -8,7 +8,7 @@ use crate::sync::{fence, spin_loop, Ordering::*};
 pub use crate::sync::AtomicU32;
 
 /// Wakes the other side, which sleeps on `word`. Each direction has its own outcome and error: waking a peer that
-/// sleeps on a futex can neither fail nor find no one, while a byte to a host can find the host gone.
+/// sleeps on a futex can neither fail nor find no one, while a byte to a caller can find the caller gone.
 pub trait Doorbell {
     type Outcome;
     type Error;
@@ -41,8 +41,8 @@ pub struct SpinOutcome {
 /// Stores `value` into `counter` and rings `bell` when the other side said, in `sleeping`, that it sleeps;
 /// `Ok(None)` is a publish that rang nothing.
 ///
-/// The store and the look at `sleeping` are one half of a store-buffering pair, [`park_slice`] (or the host's
-/// `sleep_all`) the other: each side writes its own word, then a `SeqCst` fence, then reads the other's. Of the two
+/// The store and the look at `sleeping` are one half of a store-buffering pair, [`park_slice`] (or the caller's
+/// `prepare_to_wait`) the other: each side writes its own word, then a `SeqCst` fence, then reads the other's. Of the two
 /// fences one comes first, and the side after it reads what the side before it wrote, so either the sleeper sees
 /// the new value and does not sleep or the publisher sees it sleeping and rings. Fences and not `SeqCst` accesses,
 /// because Loom checks the fences exactly and treats a `SeqCst` access as `AcqRel`.
@@ -127,12 +127,12 @@ mod tests {
     use std::convert::Infallible;
 
     /// A bell that counts its rings and answers each with `outcome`.
-    struct FakeBell<O: Copy, E: Copy> {
+    struct SpyDoorbell<O: Copy, E: Copy> {
         rings: Cell<u32>,
         outcome: Result<O, E>,
     }
 
-    impl<O: Copy, E: Copy> Doorbell for FakeBell<O, E> {
+    impl<O: Copy, E: Copy> Doorbell for SpyDoorbell<O, E> {
         type Outcome = O;
         type Error = E;
         fn ring(&self, _: &AtomicU32) -> Result<O, E> {
@@ -141,17 +141,17 @@ mod tests {
         }
     }
 
-    fn bell<O: Copy, E: Copy>(outcome: Result<O, E>) -> FakeBell<O, E> {
-        FakeBell {
+    fn bell<O: Copy, E: Copy>(outcome: Result<O, E>) -> SpyDoorbell<O, E> {
+        SpyDoorbell {
             rings: Cell::new(0),
             outcome,
         }
     }
 
     /// A parker that runs `slice` in place of a sleep.
-    struct SliceParker<F: Fn(&AtomicU32) -> Result<(), &'static str>>(F);
+    struct StubParker<F: Fn(&AtomicU32) -> Result<(), &'static str>>(F);
 
-    impl<F: Fn(&AtomicU32) -> Result<(), &'static str>> Parker for SliceParker<F> {
+    impl<F: Fn(&AtomicU32) -> Result<(), &'static str>> Parker for StubParker<F> {
         type Error = &'static str;
         fn park(&self, word: &AtomicU32, _: u32, _: u64) -> Result<(), &'static str> {
             (self.0)(word)
@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn a_change_already_there_is_returned_without_parking() {
         let (counter, sleeping) = (AtomicU32::new(3), AtomicU32::new(0));
-        let parker = SliceParker(|_| panic!("no park for a change already there"));
+        let parker = StubParker(|_| panic!("no park for a change already there"));
         assert_eq!(
             park_slice(&counter, &sleeping, 2, 1, &parker),
             Ok(ParkOutcome::Changed(3))
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn a_slice_in_which_the_counter_moves_returns_its_value() {
         let (counter, sleeping) = (AtomicU32::new(0), AtomicU32::new(0));
-        let parker = SliceParker(|word| {
+        let parker = StubParker(|word| {
             assert_eq!(sleeping.load(SeqCst), 1, "the flag is up while parked");
             word.store(1, SeqCst);
             Ok(())
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn a_slice_that_passes_without_a_change_says_so() {
         let (counter, sleeping) = (AtomicU32::new(0), AtomicU32::new(0));
-        let parker = SliceParker(|_| Ok(()));
+        let parker = StubParker(|_| Ok(()));
         assert_eq!(
             park_slice(&counter, &sleeping, 0, 1, &parker),
             Ok(ParkOutcome::SliceOver)
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn a_refused_park_ends_the_slice_with_its_error_and_lowers_the_flag() {
         let (counter, sleeping) = (AtomicU32::new(0), AtomicU32::new(0));
-        let parker = SliceParker(|_| Err("refused"));
+        let parker = StubParker(|_| Err("refused"));
         assert_eq!(park_slice(&counter, &sleeping, 0, 1, &parker), Err("refused"));
         assert_eq!(sleeping.load(SeqCst), 0);
     }

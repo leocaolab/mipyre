@@ -17,7 +17,7 @@ use crate::sync::{AtomicU64, Ordering};
 use mipyre_util::clock;
 
 use super::degraded::{self, StaticDegradation};
-use super::keyed_log_throttle::HeldLines;
+use super::keyed_log_throttle::SuppressedLines;
 
 /// Reads a file in chunks of 64 KiB, the write-coalescing limit, so a chunk goes to the socket
 /// without being copied into the coalescing buffer.
@@ -25,9 +25,9 @@ pub(super) const CHUNK: usize = crate::plan::coalesce::COALESCE_LIMIT;
 
 /// Counts the bytes read from disk by answers being sent and not yet written out or dropped.
 #[derive(Debug)]
-pub(super) struct HeldBytes(AtomicU64);
+pub(super) struct BytesInFlight(AtomicU64);
 
-impl HeldBytes {
+impl BytesInFlight {
     pub(super) fn new() -> Self {
         Self(AtomicU64::new(0))
     }
@@ -39,27 +39,27 @@ impl HeldBytes {
 
 /// Holds a chunk's bytes inside the `Bytes` handed to the connection, and hands them back to the
 /// count when the connection drops the last reference.
-struct HeldChunk {
+struct InFlightChunk {
     bytes: Vec<u8>,
-    held: Arc<HeldBytes>,
+    in_flight: Arc<BytesInFlight>,
 }
 
-impl HeldChunk {
-    fn into_bytes(bytes: Vec<u8>, held: Arc<HeldBytes>) -> Bytes {
-        held.0.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        Bytes::from_owner(Self { bytes, held })
+impl InFlightChunk {
+    fn into_bytes(bytes: Vec<u8>, in_flight: Arc<BytesInFlight>) -> Bytes {
+        in_flight.0.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Bytes::from_owner(Self { bytes, in_flight })
     }
 }
 
-impl AsRef<[u8]> for HeldChunk {
+impl AsRef<[u8]> for InFlightChunk {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
     }
 }
 
-impl Drop for HeldChunk {
+impl Drop for InFlightChunk {
     fn drop(&mut self) {
-        self.held.0.fetch_sub(self.bytes.len() as u64, Ordering::Relaxed);
+        self.in_flight.0.fetch_sub(self.bytes.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -157,10 +157,10 @@ pub struct FileSendError {
 impl FileSendError {
     /// Counts the cut answer and logs it, throttled per file.
     pub fn report(&self) {
-        degraded::count(StaticDegradation::AnswerCut);
+        degraded::count(StaticDegradation::ResponseTruncated);
         match super::CUT_THROTTLE.admit(self.path.as_path(), clock::now()) {
-            Some(HeldLines::OfKey(held)) => tracing::warn!(error = %self, held, "static answer cut off"),
-            Some(HeldLines::OfUnrememberedKeys(held)) => {
+            Some(SuppressedLines::OfKey(held)) => tracing::warn!(error = %self, held, "static answer cut off"),
+            Some(SuppressedLines::OfUnrememberedKeys(held)) => {
                 tracing::warn!(error = %self, held_among_other_paths = held, "static answer cut off")
             }
             None => tracing::debug!(error = %self, "static answer cut off"),
@@ -184,13 +184,13 @@ struct Transfer {
     path: PathBuf,
     disk: Disk,
     check: SendCheck,
-    held: Arc<HeldBytes>,
+    in_flight: Arc<BytesInFlight>,
 }
 
 impl FileBody {
     /// Sends `len` bytes of `file` from where it stands; they must hash to `announced`. `len` is
     /// not zero: an empty file is answered with an empty whole body.
-    pub(super) fn new(file: File, path: PathBuf, len: u64, announced: u64, held: Arc<HeldBytes>) -> Self {
+    pub(super) fn new(file: File, path: PathBuf, len: u64, announced: u64, in_flight: Arc<BytesInFlight>) -> Self {
         Self(Box::new(Transfer {
             path,
             disk: Disk::Idle(file),
@@ -200,7 +200,7 @@ impl FileBody {
                 announced,
                 digest: Digest::default(),
             },
-            held,
+            in_flight,
         }))
     }
 }
@@ -223,7 +223,10 @@ impl Transfer {
             ChunkVerdict::Changed => return Err(self.cut(ChunkError::Changed)),
             ChunkVerdict::EndedEarly => return Err(self.cut(ChunkError::EndedEarly)),
         }
-        Ok(Frame::data(HeldChunk::into_bytes(chunk, Arc::clone(&self.held))))
+        Ok(Frame::data(InFlightChunk::into_bytes(
+            chunk,
+            Arc::clone(&self.in_flight),
+        )))
     }
 
     /// Ends the answer; the state is already `Done`, since every poll takes the disk out first.

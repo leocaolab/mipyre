@@ -18,7 +18,7 @@ const LOG_PERIOD: Duration = Duration::from_secs(60);
 /// `mipyre_cpu::CacheLine` again, which this package may not depend on, so each events module pads
 /// its own.
 #[repr(align(128))]
-struct OwnLine<T>(T);
+struct CachePadded<T>(T);
 
 /// Holds one value per kind, so a kind added without a field does not compile. The counts, which
 /// telemetry reads, and the log throttles, which are logging policy, are two of these, kept apart.
@@ -34,24 +34,24 @@ impl<T> TlsEventTable<T> {
     }
 }
 
-impl TlsEventTable<OwnLine<AtomicU64>> {
+impl TlsEventTable<CachePadded<AtomicU64>> {
     const fn counts() -> Self {
         TlsEventTable {
-            handshake_failed: OwnLine(AtomicU64::new(0)),
+            handshake_failed: CachePadded(AtomicU64::new(0)),
         }
     }
 }
 
-impl TlsEventTable<OwnLine<LogThrottle>> {
+impl TlsEventTable<CachePadded<LogThrottle>> {
     const fn throttles() -> Self {
         TlsEventTable {
-            handshake_failed: OwnLine(LogThrottle::new(LOG_PERIOD)),
+            handshake_failed: CachePadded(LogThrottle::new(LOG_PERIOD)),
         }
     }
 }
 
-static TLS_EVENT_COUNTS: TlsEventTable<OwnLine<AtomicU64>> = TlsEventTable::counts();
-static TLS_EVENT_THROTTLES: TlsEventTable<OwnLine<LogThrottle>> = TlsEventTable::throttles();
+static TLS_EVENT_COUNTS: TlsEventTable<CachePadded<AtomicU64>> = TlsEventTable::counts();
+static TLS_EVENT_THROTTLES: TlsEventTable<CachePadded<LogThrottle>> = TlsEventTable::throttles();
 
 /// Counts one `event` without deciding its log line.
 fn count(event: TlsEvent) {
@@ -60,12 +60,12 @@ fn count(event: TlsEvent) {
 
 /// Counts one `event` and returns, once a minute per kind, how many lines were held back since
 /// the last one went out.
-pub fn degrade(event: TlsEvent) -> Option<u64> {
+pub fn count_and_admit(event: TlsEvent) -> Option<u64> {
     count(event);
     admit(event)
 }
 
-/// Decides the log line as [`degrade`] does, for an event already counted.
+/// Decides the log line as [`count_and_admit`] does, for an event already counted.
 fn admit(event: TlsEvent) -> Option<u64> {
     TLS_EVENT_THROTTLES.of(event).0.admit(clock::now())
 }

@@ -18,7 +18,7 @@
 //! channel, re-checks, and waits in the thread's own kqueue/epoll (the runtime's reactor) on
 //! its lanes' wake pipes, one per lane, all registered once in one epoll/kqueue that the reactor waits on as one fd.
 //! A worker writes its pipe one byte only when it sees the flag, so a lane whose pipe brings
-//! more bytes than its answers allow is that lane's worker's fault ([`HostEnd::hear_wakes`](mipyre_shm::channel::HostEnd::hear_wakes)). Worker deaths come through the same reactor: a kqueue with `EVFILT_PROC`
+//! more bytes than its answers allow is that lane's worker's fault ([`RequesterEnd::record_wake_bytes`](mipyre_shm::channel::RequesterEnd::record_wake_bytes)). Worker deaths come through the same reactor: a kqueue with `EVFILT_PROC`
 //! (macOS) or an epoll of pidfds (Linux), registered as one more readable fd.
 //!
 //! When a worker dies the host answers the request it was running (502, or 504 when the
@@ -34,8 +34,9 @@ use std::time::{Duration, Instant};
 
 use super::core::{
     peer_corrupted, runs_queued, Completions, CoreConfig, DeathCause, HostCore, HostEffects, LaneNotice, LaneWorker,
-    LocalLane, Rejection, WorkerTag, START_REFUSED,
+    LocalLane, SubmitError, WorkerId, START_REFUSED,
 };
+use super::fork_server::{ForkError, FORK_REPLY_TIMEOUT};
 use super::health::{self, CrashLoopWait, FailureResponse, HeadOfLine};
 use super::lane_failure::{LaneIndex, WorkerExit};
 use super::monitor::{worker_exit, ProcessMonitor};
@@ -46,15 +47,14 @@ use super::poller::{
 };
 use super::route::{answer_lane, LaneJob, LaneReplySender, LaneRequestError};
 use super::run::{LaneEnd, RunLane, RunPhase, RunState, ServerLanes};
-use super::stats::{HostCounts, RESPAWN_SAMPLES};
-use super::template_host::{ForkError, FORK_ANSWER_TIMEOUT};
+use super::stats::{add_sole_writer, HostCounts, RESPAWN_SAMPLES};
 use super::worker_process::WorkerProcess;
 use crate::sync::Ordering::*;
 use bytes::BytesMut;
 use futures_util::FutureExt as _;
 use mipyre_http::plan::response::HandlerResponse;
 use mipyre_shm::adapter::doorbell::drain_once;
-use mipyre_shm::channel::{sleep_all, wake_all, Attempt, PeerFault, SleepVerdict};
+use mipyre_shm::channel::{finish_wait, prepare_to_wait, Attempt, PeerFault, SleepDecision};
 use mipyre_shm::plan::ring::RingDepth;
 use mipyre_shm::plan::spin_window::SpinWindow;
 use mipyre_shm::plan::start::StartReportError;
@@ -189,7 +189,7 @@ pub struct LaneHost {
     pub(crate) lanes: Arc<ServerLanes>,
     pub(crate) run: Arc<RunState>,
     pub(crate) index: usize,
-    pub(crate) owned: RefCell<HostCore>,
+    pub(crate) core: RefCell<HostCore>,
     /// Where each answer is copied out of its slot: it is split off whole, and its body and an
     /// uncommon content type are slices of it, so an answer is copied once.
     /// What is left of its room takes the next answers.
@@ -227,25 +227,25 @@ impl LaneHost {
             RunPhase::Serving(run) => Arc::clone(run),
             RunPhase::Idle | RunPhase::Starting => return Ok(None),
         };
-        let Some(run_lanes) = run.hosts.get(index).and_then(|h| h.start.lock().take()) else {
+        let Some(run_lanes) = run.hosts.get(index).and_then(|h| h.lanes.lock().take()) else {
             return Ok(None);
         };
         let depth = lanes.geometry.depth().get() as usize;
         let mut owned = HostCore {
             lanes: Vec::with_capacity(run_lanes.len()),
             ends: Vec::with_capacity(run_lanes.len()),
-            crash_runs: Vec::new(),
+            crash_streaks: Vec::new(),
         };
         let mut bells = Vec::with_capacity(run_lanes.len());
         for RunLane { index: j, end, bell } in run_lanes {
             owned.lanes.push(LocalLane {
                 index: j,
-                waiting: (0..depth).map(|_| None).collect(),
+                waiters: (0..depth).map(|_| None).collect(),
                 queued: VecDeque::new(),
                 worker: match lanes.processes[j.0].lock().as_ref() {
                     None => LaneWorker::Gone,
                     Some(worker) => LaneWorker::Running {
-                        worker: worker.tag(),
+                        worker: worker.id(),
                         starting: None,
                         head: None,
                     },
@@ -259,7 +259,7 @@ impl LaneHost {
             lanes: Arc::clone(lanes),
             run: Arc::clone(&run),
             index,
-            owned: RefCell::new(owned),
+            core: RefCell::new(owned),
             answer_bytes: RefCell::new(BytesMut::with_capacity(ANSWER_BUFFER_BYTES)),
             completions: RefCell::new(Completions::with_capacity(depth)),
             forks: RefCell::new(std::collections::HashMap::new()),
@@ -306,23 +306,23 @@ impl LaneHost {
     fn core_config(&self) -> CoreConfig {
         CoreConfig {
             depth: self.depth(),
-            timeout: self.lanes.host.timeout(),
-            crash_backoff: *self.lanes.host.crash_backoff(),
+            timeout: self.lanes.config.timeout(),
+            crash_backoff: *self.lanes.config.crash_backoff(),
         }
     }
 
     /// The process of `worker`, while it is its lane's current worker.
-    fn process_of(&self, worker: WorkerTag) -> Option<Arc<WorkerProcess>> {
+    fn process_of(&self, worker: WorkerId) -> Option<Arc<WorkerProcess>> {
         self.lanes.processes[worker.lane.0]
             .lock()
             .as_ref()
-            .filter(|p| p.tag() == worker)
+            .filter(|p| p.id() == worker)
             .cloned()
     }
 
     /// Kills `worker`, its lane's current worker. One the run's stop already took is killed by
     /// the stop (`ServerLanes::stop_run`).
-    fn kill(&self, worker: WorkerTag) {
+    fn kill(&self, worker: WorkerId) {
         if let Some(process) = self.process_of(worker) {
             process.kill();
         }
@@ -336,15 +336,15 @@ impl LaneHost {
     )]
     pub(crate) fn submit(&self, job: LaneJob) -> Result<(), (LaneRequestError, LaneJob)> {
         let placed =
-            self.owned
+            self.core
                 .borrow_mut()
-                .submit(job, self.lanes.host.queue_per_worker().get(), &mut ShellFx::new(self));
+                .submit(job, self.lanes.config.queue_per_worker().get(), &mut ShellFx::new(self));
         match placed {
             Ok(()) => {}
-            Err(Rejection::Refused(why, job)) => return Err((why, job)),
-            Err(Rejection::NoLane(job)) => {
-                let refusal = self.owned.borrow().no_lane_refusal(
-                    self.lanes.host.crash_backoff(),
+            Err(SubmitError::Refused(why, job)) => return Err((why, job)),
+            Err(SubmitError::NoLane(job)) => {
+                let refusal = self.core.borrow().no_lane_refusal(
+                    self.lanes.config.crash_backoff(),
                     self.run.stop.is_cancelled(),
                     monotonic_ns(),
                     self.index,
@@ -356,7 +356,7 @@ impl LaneHost {
         // on the way (atomic loads when there are none).
         let read = self.collect();
         if read > 0 {
-            self.counts().read_by_submit.add(read);
+            add_sole_writer(&self.counts().read_by_submit, read);
         }
         self.publish_load();
         Ok(())
@@ -368,7 +368,7 @@ impl LaneHost {
     /// here).
     pub(crate) fn running_long(&self) -> bool {
         let now = monotonic_ns();
-        let mut owned = self.owned.borrow_mut();
+        let mut owned = self.core.borrow_mut();
         let HostCore { lanes, ends, .. } = &mut *owned;
         lanes.iter_mut().zip(ends.iter_mut()).all(|(lane, end)| {
             let LaneWorker::Running { head, .. } = &mut lane.worker else {
@@ -387,7 +387,7 @@ impl LaneHost {
     }
 
     fn publish_load(&self) {
-        let load = self.owned.borrow().load();
+        let load = self.core.borrow().load();
         self.run.hosts[self.index].load.store(load, Relaxed);
     }
 
@@ -399,7 +399,7 @@ impl LaneHost {
         // Taken out, not borrowed, for the answering below: a collect that runs inside it finds
         // an empty buffer instead of a borrowed one.
         let mut done = self.completions.take();
-        read += self.owned.borrow_mut().collect(
+        read += self.core.borrow_mut().collect(
             &mut self.answer_bytes.borrow_mut(),
             depth,
             &mut done,
@@ -416,13 +416,13 @@ impl LaneHost {
     }
 
     fn in_flight(&self) -> bool {
-        self.owned.borrow().ends.iter().any(|e| e.in_flight() != 0)
+        self.core.borrow().ends.iter().any(|e| e.in_flight() != 0)
     }
 
     /// Kills the worker of any lane whose running handler is past the timeout.
     fn check_timeouts(&self) {
         let config = self.core_config();
-        self.owned
+        self.core
             .borrow_mut()
             .check_timeouts(monotonic_ns(), &config, &mut ShellFx::new(self));
     }
@@ -441,7 +441,7 @@ impl LaneHost {
     /// Runs `f` on this host's lane `i` and its channel end (the lane by its index, its
     /// identity, not by its place in `owned`); `None` when this host does not own lane `i`.
     fn with_lane<R>(&self, i: LaneIndex, f: impl FnOnce(&mut LocalLane, &mut LaneEnd) -> R) -> Option<R> {
-        let mut owned = self.owned.borrow_mut();
+        let mut owned = self.core.borrow_mut();
         let HostCore { lanes, ends, .. } = &mut *owned;
         let k = lanes.iter().position(|l| l.index == i)?;
         Some(f(&mut lanes[k], &mut ends[k]))
@@ -455,7 +455,7 @@ impl LaneHost {
     async fn worker_died(self: &Rc<Self>, dead: Arc<WorkerProcess>) {
         let (i, pid) = (dead.lane(), dead.pid());
         if self
-            .with_lane(i, |lane, _| lane.death_cause(dead.tag(), monotonic_ns()))
+            .with_lane(i, |lane, _| lane.death_cause(dead.id(), monotonic_ns()))
             .flatten()
             .is_none()
         {
@@ -470,8 +470,8 @@ impl LaneHost {
         let config = self.core_config();
         let mut fx = ShellFx::new(self);
         fx.dead_lived = Some(dead.opened_at().elapsed());
-        self.owned.borrow_mut().worker_exited(
-            dead.tag(),
+        self.core.borrow_mut().worker_exited(
+            dead.id(),
             &status,
             monotonic_ns(),
             self.run.stop.is_cancelled(),
@@ -487,7 +487,7 @@ impl LaneHost {
     /// crash-loops, so the poller does nothing for crash runs while every lane serves. It ends
     /// with the run, or once no lane loops.
     async fn watch_crash_loops(self: Rc<Self>) {
-        while let Some(next) = self.tend_crash_runs() {
+        while let Some(next) = self.check_crash_streaks() {
             tokio::select! {
                 biased;
                 () = self.stop.cancelled() => break,
@@ -500,20 +500,23 @@ impl LaneHost {
     /// Looks once at this host's crash runs: a lane that answered ends its run (logging it if it
     /// was alerted), a waiting lane whose wait is over forks, and a looping lane's alert is
     /// logged again when due. Returns how long until the next look, or `None` once no lane loops.
-    fn tend_crash_runs(&self) -> Option<Duration> {
+    fn check_crash_streaks(&self) -> Option<Duration> {
         let config = self.core_config();
         let now = monotonic_ns();
-        let next_ns = self.owned.borrow_mut().tend(now, &config, &mut ShellFx::new(self));
+        let next_ns = self
+            .core
+            .borrow_mut()
+            .check_crash_streaks(now, &config, &mut ShellFx::new(self));
         next_ns.map(|at| Duration::from_nanos(at.saturating_sub(now)))
     }
 
     /// Returns how the dead worker ended, as the template reaped it, waiting up to the host's
     /// `exit_status_wait` for the template's report.
     async fn exit_status(&self, i: LaneIndex, pid: Pid) -> WorkerExit {
-        let wait = self.lanes.host.exit_status_wait();
+        let wait = self.lanes.config.exit_status_wait();
         let deadline = Instant::now() + wait;
         loop {
-            self.lanes.read_template_reports();
+            self.lanes.read_fork_server_reports();
             if let Some(status) = self.lanes.exits.status_of(i, pid) {
                 return worker_exit(status);
             }
@@ -530,7 +533,7 @@ impl LaneHost {
     fn finish_respawns(&self, watch: &ProcessMonitor) {
         let config = self.core_config();
         let forking: Vec<LaneIndex> = self
-            .owned
+            .core
             .borrow()
             .lanes
             .iter()
@@ -560,7 +563,7 @@ impl LaneHost {
                     let worker = Arc::new(forked.claim());
                     *self.lanes.processes[i.0].lock() = Some(Arc::clone(&worker));
                     self.lanes.stats.respawns.fetch_add(1, Relaxed);
-                    let (tag, pid) = (worker.tag(), worker.pid());
+                    let (tag, pid) = (worker.id(), worker.pid());
                     match watch.add(worker) {
                         Ok(()) => Ok(tag),
                         Err(source) => Err(LaneLossError::ExitNotWatched { pid, source }),
@@ -568,13 +571,13 @@ impl LaneHost {
                 }
                 Err(e) => Err(LaneLossError::NotRespawned(e)),
             };
-            self.owned
+            self.core
                 .borrow_mut()
                 .forked(i, answer, &config, &mut ShellFx::new(self));
         }
-        self.owned
+        self.core
             .borrow_mut()
-            .look_at_starts(monotonic_ns, &config, &mut ShellFx::new(self));
+            .check_replacement_starts(monotonic_ns, &config, &mut ShellFx::new(self));
     }
 
     /// Records a failure that left `newly_broken` lanes without a worker for good, with `cause`
@@ -599,7 +602,7 @@ impl LaneHost {
 
     /// Handles a poller that failed while the run serves, after which nothing reads these lanes.
     /// This thread stops putting requests in them (it is no longer their host), the other threads
-    /// skip this host when they send (`HostLink::serving`); every lane is broken, its requests
+    /// skip this host when they send (`HostHandle::serving`); every lane is broken, its requests
     /// answered with the failure, and the run decides whether the server ends
     /// ([`RunHealth::failed`](super::health::RunHealth::failed)).
     fn fail(&self, failure: PollerError) {
@@ -616,13 +619,13 @@ impl LaneHost {
         });
         // A host's poller runs once, so this is the only cause.
         self.run.hosts[self.index].failure.get_or_init(|| Arc::clone(&down));
-        let lanes: Vec<LaneIndex> = self.owned.borrow().lanes.iter().map(|l| l.index).collect();
+        let lanes: Vec<LaneIndex> = self.core.borrow().lanes.iter().map(|l| l.index).collect();
         let why = Arc::new(LaneLossError::HostFailed(Arc::clone(&down)));
         let config = self.core_config();
         let newly = lanes
             .into_iter()
             .filter(|&i| {
-                self.owned
+                self.core
                     .borrow_mut()
                     .mark_broken(i, &why, &config, &mut ShellFx::new(self))
             })
@@ -639,19 +642,19 @@ impl LaneHost {
 
     /// Answers everything still waiting with 503, once the run has stopped.
     fn close(&self) {
-        self.owned.borrow_mut().close(&mut ShellFx::new(self));
+        self.core.borrow_mut().close(&mut ShellFx::new(self));
     }
 
     /// Says to every lane's worker that this host is awake.
     pub(crate) fn wake(&self) {
-        wake_all(&mut self.owned.borrow_mut().ends);
+        finish_wait(&mut self.core.borrow_mut().ends);
     }
 
     /// Starts the watch on this host's lanes' workers' exits.
     fn watch(&self) -> std::io::Result<ProcessMonitor> {
         let watch =
             ProcessMonitor::new().map_err(|e| std::io::Error::new(e.kind(), format!("the worker-exit watch: {e}")))?;
-        for lane in self.owned.borrow().lanes.iter() {
+        for lane in self.core.borrow().lanes.iter() {
             if let LaneWorker::Running { worker, .. } | LaneWorker::Overrun { worker, .. } = &lane.worker {
                 if let Some(process) = self.process_of(*worker) {
                     watch.add(process)?;
@@ -668,7 +671,7 @@ impl LaneHost {
             if self.stop.is_cancelled() {
                 return Ok(());
             }
-            self.count_answers();
+            self.count_responses();
             while let Some(job) = inbox.take() {
                 self.take_forwarded(job);
             }
@@ -688,10 +691,10 @@ impl LaneHost {
                 continue;
             }
             self.check_timeouts();
-            self.counts().sleeps.add(1);
+            add_sole_writer(&self.counts().sleeps, 1);
             let tick = if in_flight
                 || self
-                    .owned
+                    .core
                     .borrow()
                     .lanes
                     .iter()
@@ -711,7 +714,7 @@ impl LaneHost {
                     if self.hear_bells()? == 0 {
                         guard.clear_ready();
                     }
-                    self.counts().pipe_wakes.add(1);
+                    add_sole_writer(&self.counts().pipe_wakes, 1);
                 }
                 _ = self.notify.notified() => {}
                 job = inbox.next() => self.take_forwarded(job),
@@ -723,12 +726,16 @@ impl LaneHost {
 
     /// Adds the answers each lane's end read since the last round to the room its worker has for
     /// wake bytes; once a round, so fewer than 2^32 answers pass between two counts.
-    fn count_answers(&self) {
-        self.owned.borrow_mut().ends.iter_mut().for_each(LaneEnd::count_answers);
+    fn count_responses(&self) {
+        self.core
+            .borrow_mut()
+            .ends
+            .iter_mut()
+            .for_each(LaneEnd::count_responses);
     }
 
     /// Reads once each lane's wake pipe the queue says holds bytes, and counts the bytes against
-    /// the room its answers leave ([`HostEnd::hear_wakes`](mipyre_shm::channel::HostEnd::hear_wakes)). A lane whose worker is at fault is
+    /// the room its answers leave ([`RequesterEnd::record_wake_bytes`](mipyre_shm::channel::RequesterEnd::record_wake_bytes)). A lane whose worker is at fault is
     /// muted: its fault stays on its end, and the next collect kills the worker as for any
     /// other fault. Returns how many pipes held bytes.
     fn hear_bells(&self) -> Result<usize, PollerError> {
@@ -738,9 +745,9 @@ impl LaneHost {
             .rung(&mut rung)
             .map_err(|source| PollerError::BellsUnwatchable { source })?;
         for &k in &rung[..n] {
-            let lane = self.owned.borrow().lanes[k].index;
+            let lane = self.core.borrow().lanes[k].index;
             let drained = bell_drained(lane, drain_once(queue.bell(k)))?;
-            if self.owned.borrow_mut().ends[k].hear_wakes(drained.bytes).is_err() {
+            if self.core.borrow_mut().ends[k].record_wake_bytes(drained.bytes).is_err() {
                 queue
                     .mute(k)
                     .map_err(|source| PollerError::BellsUnwatchable { source })?;
@@ -757,7 +764,7 @@ impl LaneHost {
         if muted.is_empty() {
             return Ok(());
         }
-        let owned = self.owned.borrow();
+        let owned = self.core.borrow();
         let queue = self.bells.fd.get_ref();
         let mut i = 0;
         while i < muted.len() {
@@ -783,7 +790,7 @@ impl LaneHost {
     /// not; it is never forwarded again. One nobody waits for any more is dropped unrun.
     fn take_forwarded(&self, job: LaneJob) {
         if !runs_queued(job.reply.is_closed()) {
-            self.counts().unawaited_skips.add(1);
+            add_sole_writer(&self.counts().unawaited_skips, 1);
             return;
         }
         if let Err((failure, job)) = self.submit(job) {
@@ -793,37 +800,37 @@ impl LaneHost {
 
     /// Runs as the thread is about to park with no task ready. With requests in flight it spins
     /// on the lanes for up to the spin window, then says to every lane's worker that it sleeps
-    /// and looks once more ([`sleep_all`]): an answer published after that writes the wake pipe,
+    /// and looks once more ([`prepare_to_wait`]): an answer published after that writes the wake pipe,
     /// and one published before it is read now. An answer completes its request on this
     /// thread, and the runtime then runs it instead of parking.
     ///
     /// The spin only checks readiness ([`LaneHost::spin_on_lanes`]); [`LaneHost::collect`]
     /// reads the answers once, after it.
     pub(crate) fn spin_for_next_request(&self) {
-        self.counts().park_hooks.add(1);
+        add_sole_writer(&self.counts().park_hooks, 1);
         if !self.in_flight() {
             return;
         }
         self.wake();
-        let window = SpinWindow::until(monotonic_ns().saturating_add(self.lanes.host.spin_ns()));
+        let window = SpinWindow::until(monotonic_ns().saturating_add(self.lanes.config.spin_ns()));
         let spun = self.spin_on_lanes(window);
         let waits = &self.counts().waits;
-        waits.waits.add(1);
-        waits.spin_rounds.add(spun.rounds.into());
-        waits.parks.add(u64::from(!spun.ready));
+        add_sole_writer(&waits.waits, 1);
+        add_sole_writer(&waits.spin_rounds, spun.rounds.into());
+        add_sole_writer(&waits.parks, u64::from(!spun.ready));
         // Found or not, the thread may park after this hook: every end says the host sleeps
         // before it is read once more (the Dekker handshake with each worker's publish), so
         // either this read sees an answer or its worker sees the flag and writes the pipe.
-        let verdict = sleep_all(&mut self.owned.borrow_mut().ends);
-        if verdict == SleepVerdict::Collect {
+        let verdict = prepare_to_wait(&mut self.core.borrow_mut().ends);
+        if verdict == SleepDecision::Collect {
             let read = self.collect();
-            self.counts().read_by_spin.add(read);
+            add_sole_writer(&self.counts().read_by_spin, read);
         }
     }
 
     fn collect_in_poller(&self) -> u64 {
         let read = self.collect();
-        self.counts().read_by_poller.add(read);
+        add_sole_writer(&self.counts().read_by_poller, read);
         read
     }
 
@@ -832,8 +839,8 @@ impl LaneHost {
     /// wherever they are counted (`host::tests::spin_rounds_bench`).
     #[inline(never)]
     fn spin_on_lanes(&self, window: SpinWindow) -> SpinOutcome {
-        let owned = self.owned.borrow();
-        spin(window, monotonic_ns, || owned.ends.iter().any(LaneEnd::has_answers))
+        let owned = self.core.borrow();
+        spin(window, monotonic_ns, || owned.ends.iter().any(LaneEnd::has_responses))
     }
 
     /// Returns this host's counts, of which this host is the only writer.
@@ -871,7 +878,7 @@ impl HostEffects for ShellFx<'_> {
         self.host.lanes.take_attempt()
     }
 
-    fn kill(&mut self, worker: WorkerTag) {
+    fn kill(&mut self, worker: WorkerId) {
         self.host.kill(worker);
     }
 
@@ -880,7 +887,7 @@ impl HostEffects for ShellFx<'_> {
         let notify = Arc::clone(&self.host.notify);
         let task = tokio::task::spawn_blocking(move || {
             let forked = lanes
-                .spawn_worker(lane, attempt, FORK_ANSWER_TIMEOUT)
+                .spawn_worker(lane, attempt, FORK_REPLY_TIMEOUT)
                 .map(WorkerCandidate::new);
             notify.notify_one();
             forked
@@ -893,17 +900,17 @@ impl HostEffects for ShellFx<'_> {
         drop(self.host.forks.borrow_mut().remove(&lane));
     }
 
-    fn forget(&mut self, worker: WorkerTag) {
+    fn forget(&mut self, worker: WorkerId) {
         *self.host.lanes.processes[worker.lane.0].lock() = None;
     }
 
     #[inline]
     fn woke_worker(&mut self) {
-        self.host.counts().waits.wakes.add(1);
+        add_sole_writer(&self.host.counts().waits.wakes, 1);
     }
 
     fn skipped_unawaited(&mut self) {
-        self.host.counts().unawaited_skips.add(1);
+        add_sole_writer(&self.host.counts().unawaited_skips, 1);
     }
 
     #[inline]
@@ -911,7 +918,7 @@ impl HostEffects for ShellFx<'_> {
         answer_lane(reply, outcome);
     }
 
-    fn say(&mut self, notice: LaneNotice) {
+    fn report(&mut self, notice: LaneNotice) {
         let host = self.host;
         match notice {
             LaneNotice::WorkerDied { worker, cause, exit } => {

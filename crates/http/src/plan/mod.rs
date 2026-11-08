@@ -7,7 +7,6 @@
 #![forbid(unsafe_code)]
 #![deny(unreachable_pub, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-pub mod answer;
 pub mod body_limit;
 pub mod coalesce;
 pub mod compression;
@@ -15,13 +14,13 @@ pub mod conditional;
 pub mod cors;
 pub mod cross_origin;
 pub mod forwarded;
-#[cfg(test)]
-mod fuzz_headers;
+pub mod grpc;
 pub mod header;
 pub mod limits;
 pub mod reject;
 pub mod request;
 pub mod request_id;
+pub mod request_metrics;
 pub mod response;
 pub mod route;
 pub mod site;

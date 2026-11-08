@@ -292,21 +292,21 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
 
     #[derive(Default)]
-    struct WakeCount(AtomicUsize);
+    struct SpyWaker(AtomicUsize);
 
-    impl Wake for WakeCount {
+    impl Wake for SpyWaker {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
-    impl WakeCount {
+    impl SpyWaker {
         fn wakes(&self) -> usize {
             self.0.load(Ordering::SeqCst)
         }
     }
 
-    fn poll(wait: &mut RoomWait, count: &Arc<WakeCount>) -> Poll<Result<(), StreamEnd>> {
+    fn poll(wait: &mut RoomWait, count: &Arc<SpyWaker>) -> Poll<Result<(), StreamEnd>> {
         let waker = Waker::from(Arc::clone(count));
         wait.as_mut().poll(&mut Context::from_waker(&waker))
     }
@@ -327,7 +327,7 @@ mod tests {
         for _ in 0..STREAM_CHANNEL_CAP - 1 {
             stream.push(Bytes::from_static(b"x")).unwrap();
         }
-        let count = Arc::new(WakeCount::default());
+        let count = Arc::new(SpyWaker::default());
         assert_eq!(poll(&mut stream.room(), &count), Poll::Ready(Ok(())));
         assert_eq!(count.wakes(), 0);
     }
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn a_wait_on_a_full_stream_is_woken_once_when_the_client_takes_a_chunk() {
         let (stream, mut rx) = full_stream();
-        let count = Arc::new(WakeCount::default());
+        let count = Arc::new(SpyWaker::default());
         let mut wait = stream.room();
 
         assert_eq!(poll(&mut wait, &count), Poll::Pending);
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn a_wait_on_a_full_stream_wakes_with_the_client_gone_when_the_receiver_is_dropped() {
         let (stream, rx) = full_stream();
-        let count = Arc::new(WakeCount::default());
+        let count = Arc::new(SpyWaker::default());
         let mut wait = stream.room();
         assert_eq!(poll(&mut wait, &count), Poll::Pending);
 
@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn a_close_during_a_wait_wakes_it_with_closed_and_ends_the_response() {
         let (stream, mut rx) = full_stream();
-        let count = Arc::new(WakeCount::default());
+        let count = Arc::new(SpyWaker::default());
         let mut wait = stream.room();
         assert_eq!(poll(&mut wait, &count), Poll::Pending);
 
@@ -386,7 +386,7 @@ mod tests {
     fn a_wait_after_close_ends_at_its_first_poll_with_closed() {
         let (stream, _rx) = full_stream();
         stream.close();
-        let count = Arc::new(WakeCount::default());
+        let count = Arc::new(SpyWaker::default());
         assert_eq!(poll(&mut stream.room(), &count), Poll::Ready(Err(StreamEnd::Closed)));
         assert_eq!(count.wakes(), 0);
     }

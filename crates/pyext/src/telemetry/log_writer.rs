@@ -36,19 +36,19 @@ enum Message {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the log writer thread has stopped; lines logged before the flush may not have been written")]
-pub(crate) struct FenceError;
+pub(crate) struct FlushError;
 
 /// The fmt layer clones this for every event and writes one `Line` through it.
 #[derive(Clone)]
 pub(super) struct LogChannel {
     tx: Sender<Message>,
-    ledger: Arc<Ledger>,
+    ledger: Arc<LogChannelState>,
 }
 
 /// What the loggers and the writer thread of one queue both keep. It is one allocation so that
 /// cloning a channel for each event bumps one count.
 #[derive(Default)]
-struct Ledger {
+struct LogChannelState {
     fences: Fences,
     queue_full: AtomicU64,
     write_failed: AtomicU64,
@@ -95,14 +95,14 @@ impl Fences {
 
     /// Blocks until the writer thread has passed fence `ticket` or a later one, and fails once
     /// the thread has stopped.
-    fn wait(&self, ticket: u64) -> Result<(), FenceError> {
+    fn wait(&self, ticket: u64) -> Result<(), FlushError> {
         let mut state = self.state.lock();
         loop {
             if state.ticket >= ticket {
                 return Ok(());
             }
             if state.writer_stopped {
-                return Err(FenceError);
+                return Err(FlushError);
             }
             self.changed.wait(&mut state);
         }
@@ -121,7 +121,7 @@ impl LogQueue {
         LogQueue {
             channel: LogChannel {
                 tx,
-                ledger: Arc::new(Ledger::default()),
+                ledger: Arc::new(LogChannelState::default()),
             },
             rx,
         }
@@ -167,12 +167,12 @@ impl LogWriter {
     /// # Errors
     ///
     /// Fails when the thread had already stopped (it panicked on a line).
-    pub(super) fn stop(self) -> Result<(), FenceError> {
+    pub(super) fn stop(self) -> Result<(), FlushError> {
         let sent = self.tx.send(Message::Stop);
         let joined = self.thread.join();
         match (sent, joined) {
             (Ok(()), Ok(())) => Ok(()),
-            _ => Err(FenceError),
+            _ => Err(FlushError),
         }
     }
 }
@@ -184,7 +184,7 @@ pub(crate) const WRITER_THREAD: &str = "mipyre-log";
 /// that are waiting into one write. A batch that cannot be written is counted as dropped and the
 /// thread goes on with the next. However the thread ends, a panic included, a fence still
 /// waited on fails instead of waiting forever.
-fn write_out<W: Write>(rx: Receiver<Message>, mut out: W, ledger: &Ledger) {
+fn write_out<W: Write>(rx: Receiver<Message>, mut out: W, ledger: &LogChannelState) {
     /// Marks the writer stopped when the thread leaves, unwinding or not.
     struct Stopped<'a>(&'a Fences);
     impl Drop for Stopped<'_> {
@@ -281,7 +281,7 @@ struct DropNotices {
 impl DropNotices {
     /// Writes `batch` to `out`; a batch stderr refuses is counted as dropped and its error kept
     /// for the warning, since the log is the only place it could be reported.
-    fn write<W: Write>(&mut self, out: &mut W, batch: &mut Batch, ledger: &Ledger) {
+    fn write<W: Write>(&mut self, out: &mut W, batch: &mut Batch, ledger: &LogChannelState) {
         let lines = batch.lines;
         if let Err(error) = batch.write_to(out) {
             ledger.write_failed.fetch_add(lines, Ordering::Relaxed);
@@ -289,7 +289,7 @@ impl DropNotices {
         }
     }
 
-    fn warn(&mut self, ledger: &Ledger) {
+    fn warn(&mut self, ledger: &LogChannelState) {
         let now = mipyre_util::clock::now();
         let queue_full = ledger.queue_full.load(Ordering::Relaxed);
         if let Some(since) = self.queue_full.admit(queue_full, now) {
@@ -343,10 +343,10 @@ impl LogChannel {
     /// once the writer thread has stopped. Tickets only grow and one is drawn (`SeqCst`) after
     /// everything the caller logged before, so a later ticket passing means an earlier one's lines
     /// are out too, whichever fence reached the channel first.
-    pub(super) fn fence(&self) -> Result<(), FenceError> {
+    pub(super) fn fence(&self) -> Result<(), FlushError> {
         let ticket = self.ledger.fences.next.fetch_add(1, Ordering::SeqCst) + 1;
         // A full channel drops lines but never a fence, so this waits for room.
-        self.tx.send(Message::Fence(ticket)).map_err(|_| FenceError)?;
+        self.tx.send(Message::Fence(ticket)).map_err(|_| FlushError)?;
         self.ledger.fences.wait(ticket)
     }
 
@@ -394,9 +394,9 @@ mod tests {
     use super::*;
 
     #[derive(Clone, Default)]
-    struct Recorder(Arc<Mutex<Vec<u8>>>);
+    struct FakeStderr(Arc<Mutex<Vec<u8>>>);
 
-    impl Write for Recorder {
+    impl Write for FakeStderr {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.lock().extend_from_slice(buf);
             Ok(buf.len())
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn the_lines_before_a_fence_are_out_when_it_returns_and_it_is_not_written() {
-        let out = Recorder::default();
+        let out = FakeStderr::default();
         let queue = LogQueue::new();
         let _writer = queue.start_writer(out.clone()).unwrap();
         let mut channel = queue.channel().clone();
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn a_line_that_looks_like_anything_is_written_as_it_is() {
-        let out = Recorder::default();
+        let out = FakeStderr::default();
         let queue = LogQueue::new();
         let _writer = queue.start_writer(out.clone()).unwrap();
         let mut channel = queue.channel().clone();
@@ -448,8 +448,8 @@ mod tests {
     /// The writer panics on a line here, and afterwards a line fails too.
     #[test]
     fn a_stopped_writer_fails_the_fence() {
-        struct Broken;
-        impl Write for Broken {
+        struct PanickingStderr;
+        impl Write for PanickingStderr {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
                 panic!("the writer breaks");
             }
@@ -458,16 +458,16 @@ mod tests {
             }
         }
         let queue = LogQueue::new();
-        let LogWriter { thread, .. } = queue.start_writer(Broken).unwrap();
+        let LogWriter { thread, .. } = queue.start_writer(PanickingStderr).unwrap();
         let mut channel = queue.channel().clone();
         channel.write_all(b"x\n").unwrap();
         assert!(thread.join().is_err(), "the writer thread panicked on the line");
-        assert_eq!(channel.fence(), Err(FenceError));
+        assert_eq!(channel.fence(), Err(FlushError));
     }
 
     #[test]
     fn a_stopped_writer_wrote_every_line_before_the_stop_and_the_next_writes_the_rest() {
-        let out = Recorder::default();
+        let out = FakeStderr::default();
         let queue = LogQueue::new();
         let writer = queue.start_writer(out.clone()).unwrap();
         let mut channel = queue.channel().clone();
@@ -475,7 +475,7 @@ mod tests {
         writer.stop().unwrap();
         assert_eq!(&*out.0.lock(), b"before\n");
         // No thread writes now: a fence fails, and a line waits in the queue for the next writer.
-        assert_eq!(channel.fence(), Err(FenceError));
+        assert_eq!(channel.fence(), Err(FlushError));
         channel.write_all(b"between\n").unwrap();
         let _next = queue.start_writer(out.clone()).unwrap();
         channel.fence().unwrap();
@@ -484,8 +484,8 @@ mod tests {
 
     #[test]
     fn a_writer_that_already_stopped_fails_its_stop() {
-        struct Broken;
-        impl Write for Broken {
+        struct PanickingStderr;
+        impl Write for PanickingStderr {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
                 panic!("the writer breaks");
             }
@@ -494,9 +494,9 @@ mod tests {
             }
         }
         let queue = LogQueue::new();
-        let writer = queue.start_writer(Broken).unwrap();
+        let writer = queue.start_writer(PanickingStderr).unwrap();
         queue.channel().clone().write_all(b"x\n").unwrap();
-        assert_eq!(writer.stop(), Err(FenceError));
+        assert_eq!(writer.stop(), Err(FlushError));
     }
 
     #[test]
@@ -512,9 +512,9 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct Writes(Arc<Mutex<Vec<Vec<u8>>>>);
+    struct SpyStderr(Arc<Mutex<Vec<Vec<u8>>>>);
 
-    impl Write for Writes {
+    impl Write for SpyStderr {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.lock().push(buf.to_vec());
             Ok(buf.len())
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn the_lines_waiting_when_the_writer_wakes_go_out_in_one_write() {
-        let out = Writes::default();
+        let out = SpyStderr::default();
         let queue = LogQueue::new();
         let mut channel = queue.channel().clone();
         const LINES: usize = 1000;
@@ -545,7 +545,7 @@ mod tests {
 
     #[test]
     fn a_batch_past_its_size_is_written_without_waiting_for_the_queue_to_empty() {
-        let out = Writes::default();
+        let out = SpyStderr::default();
         let queue = LogQueue::new();
         let mut channel = queue.channel().clone();
         let mut line = vec![b'x'; 1023];
@@ -562,13 +562,13 @@ mod tests {
 
     /// Holds every write until the test opens it, and says when the writer is inside one.
     #[derive(Clone)]
-    struct Stuck {
+    struct BlockingStderr {
         entered: crossbeam_channel::Sender<()>,
         open: crossbeam_channel::Receiver<()>,
         lines: Arc<AtomicU64>,
     }
 
-    impl Write for Stuck {
+    impl Write for BlockingStderr {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             #[expect(clippy::let_underscore_must_use, reason = "the test may have stopped listening")]
             let _ = self.entered.try_send(());
@@ -591,7 +591,7 @@ mod tests {
         let (entered_tx, entered) = crossbeam_channel::bounded(1);
         let (open, open_rx) = crossbeam_channel::unbounded();
         let lines = Arc::new(AtomicU64::new(0));
-        let out = Stuck {
+        let out = BlockingStderr {
             entered: entered_tx,
             open: open_rx,
             lines: Arc::clone(&lines),
@@ -619,7 +619,7 @@ mod tests {
     #[derive(Clone)]
     struct PipeWithoutReader {
         refusals: Arc<AtomicU64>,
-        taken: Writes,
+        taken: SpyStderr,
     }
 
     impl Write for PipeWithoutReader {
@@ -639,7 +639,7 @@ mod tests {
     fn a_batch_stderr_refuses_is_counted_line_by_line_and_the_next_batch_is_written() {
         let out = PipeWithoutReader {
             refusals: Arc::new(AtomicU64::new(1)),
-            taken: Writes::default(),
+            taken: SpyStderr::default(),
         };
         let queue = LogQueue::new();
         let mut channel = queue.channel().clone();
@@ -665,14 +665,14 @@ mod tests {
 
     #[test]
     fn a_refused_batch_is_warned_of_with_stderrs_own_error() {
-        let ledger = Ledger::default();
+        let ledger = LogChannelState::default();
         let mut notices = DropNotices::default();
         let mut batch = Batch::default();
         batch.push(b"a\n");
         batch.push(b"b\n");
         let mut out = PipeWithoutReader {
             refusals: Arc::new(AtomicU64::new(1)),
-            taken: Writes::default(),
+            taken: SpyStderr::default(),
         };
         notices.write(&mut out, &mut batch, &ledger);
         assert_eq!(ledger.write_failed.load(Ordering::Relaxed), 2);
@@ -689,11 +689,11 @@ mod tests {
 
     #[test]
     fn a_written_batch_is_neither_counted_nor_warned_of() {
-        let ledger = Ledger::default();
+        let ledger = LogChannelState::default();
         let mut notices = DropNotices::default();
         let mut batch = Batch::default();
         batch.push(b"a\n");
-        notices.write(&mut Writes::default(), &mut batch, &ledger);
+        notices.write(&mut SpyStderr::default(), &mut batch, &ledger);
         assert_eq!(ledger.write_failed.load(Ordering::Relaxed), 0);
         let log = mipyre_runtime::testkit::captured_log(|| notices.warn(&ledger));
         assert!(log.is_empty(), "{log}");

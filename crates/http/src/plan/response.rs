@@ -407,7 +407,7 @@ mod tests {
     }
 
     const REQUEST_ID: RequestId = RequestId::Server(ServerRequestId {
-        process: 0x7f3c_0a5e_9b1d_4e2f,
+        process_seed: 0x7f3c_0a5e_9b1d_4e2f,
         number: 42,
     });
 

@@ -25,7 +25,7 @@ static TAKEN: AtomicBool = AtomicBool::new(false);
 /// # Errors
 ///
 /// Returns an error if a variable is malformed or a handed descriptor is not open.
-pub fn take_from_systemd() -> Result<Vec<std::net::TcpListener>, PassedError> {
+pub fn take_from_systemd() -> Result<Vec<std::net::TcpListener>, SocketActivationError> {
     let var = |name| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
     let count = handed_count(
         var("LISTEN_PID").as_deref(),
@@ -38,7 +38,7 @@ pub fn take_from_systemd() -> Result<Vec<std::net::TcpListener>, PassedError> {
     (0..count)
         .map(|index| {
             let fd = FIRST_HANDED_FD + i32::try_from(index).map_err(|_| too_many(count))?;
-            os::adopt_handed(fd).map_err(|source| PassedError::SystemCallFailed {
+            os::adopt_handed(fd).map_err(|source| SocketActivationError::SystemCallFailed {
                 index,
                 call: SocketCall::CheckOpen,
                 source,
@@ -47,19 +47,23 @@ pub fn take_from_systemd() -> Result<Vec<std::net::TcpListener>, PassedError> {
         .collect()
 }
 
-fn too_many(count: usize) -> PassedError {
-    PassedError::Environment {
+fn too_many(count: usize) -> SocketActivationError {
+    SocketActivationError::MalformedEnvironment {
         var: "LISTEN_FDS",
         value: count.to_string(),
         expected: "a count of descriptors this process can have",
     }
 }
 
-fn handed_count(listen_pid: Option<&str>, listen_fds: Option<&str>, own_pid: u32) -> Result<usize, PassedError> {
+fn handed_count(
+    listen_pid: Option<&str>,
+    listen_fds: Option<&str>,
+    own_pid: u32,
+) -> Result<usize, SocketActivationError> {
     let Some(pid) = listen_pid else {
         return Ok(0);
     };
-    let pid: u32 = pid.parse().map_err(|_| PassedError::Environment {
+    let pid: u32 = pid.parse().map_err(|_| SocketActivationError::MalformedEnvironment {
         var: "LISTEN_PID",
         value: pid.to_string(),
         expected: "a process id",
@@ -70,7 +74,7 @@ fn handed_count(listen_pid: Option<&str>, listen_fds: Option<&str>, own_pid: u32
     let Some(fds) = listen_fds else {
         return Ok(0);
     };
-    let count: usize = fds.parse().map_err(|_| PassedError::Environment {
+    let count: usize = fds.parse().map_err(|_| SocketActivationError::MalformedEnvironment {
         var: "LISTEN_FDS",
         value: fds.to_string(),
         expected: "a count of descriptors",
@@ -84,7 +88,7 @@ fn handed_count(listen_pid: Option<&str>, listen_fds: Option<&str>, own_pid: u32
 /// It is separate from [`ListenerError`](crate::tcp::listener::ListenerError) because that one
 /// names an address this process chose; `index` is the socket's position in the order handed in.
 #[derive(Debug, thiserror::Error)]
-pub enum PassedError {
+pub enum SocketActivationError {
     #[error(
         "passed socket {index} is not listening (by {}): a connection, or a socket never \
          put in listen() — a .socket unit with Accept=yes hands over one connection per \
@@ -97,7 +101,7 @@ pub enum PassedError {
     #[error("no listening socket was passed (LISTEN_FDS unset or 0): there is nothing to serve")]
     NoSockets,
     #[error("{var}={value:?} is not {expected}: the socket-activation environment is malformed")]
-    Environment {
+    MalformedEnvironment {
         var: &'static str,
         value: String,
         expected: &'static str,
@@ -138,9 +142,9 @@ impl std::fmt::Display for NonTcpSocket {
 /// Refuses `socket` unless it is an IP stream socket. It runs before any other check, because a
 /// Unix socket answers `SO_ACCEPTCONN` like a TCP one and then fails a later call with an errno
 /// that does not say why.
-fn require_tcp(socket: &std::net::TcpListener, index: usize) -> Result<(), PassedError> {
-    let failed = |call| move |source| PassedError::SystemCallFailed { index, call, source };
-    let not_tcp = |kind| Err(PassedError::NotTcp { index, kind });
+fn require_tcp(socket: &std::net::TcpListener, index: usize) -> Result<(), SocketActivationError> {
+    let failed = |call| move |source| SocketActivationError::SystemCallFailed { index, call, source };
+    let not_tcp = |kind| Err(SocketActivationError::NotTcp { index, kind });
     let sock = socket2::SockRef::from(socket);
     let local = sock.local_addr().map_err(failed(SocketCall::LocalAddr))?;
     if local.is_unix() {
@@ -163,7 +167,7 @@ fn require_tcp(socket: &std::net::TcpListener, index: usize) -> Result<(), Passe
 fn spread(
     sockets: Vec<(usize, Listener)>,
     copies: std::num::NonZeroUsize,
-) -> Result<Vec<Vec<(usize, Listener)>>, PassedError> {
+) -> Result<Vec<Vec<(usize, Listener)>>, SocketActivationError> {
     let mut loops: Vec<Vec<(usize, Listener)>> = (0..copies.get()).map(|_| Vec::new()).collect();
     let placed = socket_loops(sockets.len(), copies);
     for ((index, handed), SocketLoops { home, duplicates }) in sockets.into_iter().zip(placed) {
@@ -171,7 +175,7 @@ fn spread(
             let socket = handed
                 .socket
                 .try_clone()
-                .map_err(|source| PassedError::SystemCallFailed {
+                .map_err(|source| SocketActivationError::SystemCallFailed {
                     index,
                     call: SocketCall::TryClone,
                     source,
@@ -207,17 +211,21 @@ impl BoundListeners {
     /// on one fails. A handed-over
     /// connection (`Accept=yes`) is refused here, because it would fail every `accept()` while
     /// the accept loop only logs and backs off, and the server would look alive and serve nothing.
-    pub fn passed(sockets: Vec<std::net::TcpListener>, copies: std::num::NonZeroUsize) -> Result<Self, PassedError> {
+    pub fn passed(
+        sockets: Vec<std::net::TcpListener>,
+        copies: std::num::NonZeroUsize,
+    ) -> Result<Self, SocketActivationError> {
         if sockets.is_empty() {
-            return Err(PassedError::NoSockets);
+            return Err(SocketActivationError::NoSockets);
         }
         let mut groups: Vec<Vec<Listener>> = (0..copies.get()).map(|_| Vec::new()).collect();
         let mut by_addr: Vec<(std::net::SocketAddr, Vec<(usize, Listener)>)> = Vec::new();
         for (index, socket) in sockets.into_iter().enumerate() {
-            let failed = |call: SocketCall| move |source| PassedError::SystemCallFailed { index, call, source };
+            let failed =
+                |call: SocketCall| move |source| SocketActivationError::SystemCallFailed { index, call, source };
             require_tcp(&socket, index)?;
             if !os::is_listening(&socket).map_err(failed(SocketCall::CheckListening))? {
-                return Err(PassedError::NotListening { index });
+                return Err(SocketActivationError::NotListening { index });
             }
             // systemd hands the socket over blocking, and tokio's `from_std` catches that only
             // in debug builds; in release the first `accept()` with no client waiting would
@@ -311,18 +319,27 @@ mod tests {
     fn a_malformed_activation_variable_is_refused_with_its_value() {
         let err = handed_count(Some("seven"), Some("2"), 7).unwrap_err();
         assert!(
-            matches!(err, PassedError::Environment { var: "LISTEN_PID", .. }),
+            matches!(
+                err,
+                SocketActivationError::MalformedEnvironment { var: "LISTEN_PID", .. }
+            ),
             "{err}"
         );
         assert!(err.to_string().contains("\"seven\""), "{err}");
         let err = handed_count(Some("7"), Some("-1"), 7).unwrap_err();
         assert!(
-            matches!(err, PassedError::Environment { var: "LISTEN_FDS", .. }),
+            matches!(
+                err,
+                SocketActivationError::MalformedEnvironment { var: "LISTEN_FDS", .. }
+            ),
             "{err}"
         );
         let err = handed_count(Some("7"), Some(&u64::MAX.to_string()), 7).unwrap_err();
         assert!(
-            matches!(err, PassedError::Environment { var: "LISTEN_FDS", .. }),
+            matches!(
+                err,
+                SocketActivationError::MalformedEnvironment { var: "LISTEN_FDS", .. }
+            ),
             "{err}"
         );
     }
@@ -383,7 +400,10 @@ mod tests {
         )
         .err()
         .expect("a connection is not a listener");
-        assert!(matches!(err, PassedError::NotListening { index: 1 }), "{err:?}");
+        assert!(
+            matches!(err, SocketActivationError::NotListening { index: 1 }),
+            "{err:?}"
+        );
         assert!(err.to_string().contains("Accept=yes"), "{err}");
     }
 
@@ -395,7 +415,10 @@ mod tests {
         let err = BoundListeners::passed(vec![bound_only], two())
             .err()
             .expect("a socket never put in listen() is not a listener");
-        assert!(matches!(err, PassedError::NotListening { index: 0 }), "{err:?}");
+        assert!(
+            matches!(err, SocketActivationError::NotListening { index: 0 }),
+            "{err:?}"
+        );
         assert!(err.to_string().contains(os::LISTENING_QUERY), "{err}");
     }
 
@@ -427,7 +450,7 @@ mod tests {
         let err = BoundListeners::passed(Vec::new(), two())
             .err()
             .expect("nothing to serve");
-        assert!(matches!(err, PassedError::NoSockets), "{err:?}");
+        assert!(matches!(err, SocketActivationError::NoSockets), "{err:?}");
     }
 
     /// A `.socket` unit with `ListenStream=/path` hands over a Unix domain socket.
@@ -442,7 +465,7 @@ mod tests {
             .err()
             .expect("a Unix domain socket is not served");
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(matches!(err, PassedError::NotTcp { index: 0, .. }), "{err:?}");
+        assert!(matches!(err, SocketActivationError::NotTcp { index: 0, .. }), "{err:?}");
         assert!(err.to_string().contains("Unix domain socket"), "{err}");
     }
 
@@ -453,7 +476,7 @@ mod tests {
         let err = BoundListeners::passed(vec![handed], two())
             .err()
             .expect("a datagram socket is not served");
-        assert!(matches!(err, PassedError::NotTcp { index: 0, .. }), "{err:?}");
+        assert!(matches!(err, SocketActivationError::NotTcp { index: 0, .. }), "{err:?}");
         assert!(err.to_string().contains("not a stream socket"), "{err}");
     }
 

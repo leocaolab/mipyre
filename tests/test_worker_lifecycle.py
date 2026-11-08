@@ -295,7 +295,7 @@ def test_run_context_reports_a_missing_thread_state_as_a_value():
     error = returned.group(1)
     cases = re.search(r"enum " + error + r" \{(.*?)\n\}", code, re.S)
     assert cases, f"{error} is an enum in attach.rs"
-    assert "#[from] ThreadStateCreationFailure" in cases.group(1), cases.group(1)
+    assert "#[from] NewThreadStateError" in cases.group(1), cases.group(1)
 
 
 def test_conn_driver_renamed_and_interp_facade_gone():
@@ -338,8 +338,8 @@ def test_worker_api_passes_named_objects_not_tuples():
 
 def test_split_error_uses_thiserror():
     code = _code(RUNTIME / "pool" / "split.rs")
-    assert "impl std::fmt::Display for SplitError" not in code
-    assert "thiserror::Error)]\npub enum SplitError" in code
+    assert "impl std::fmt::Display for SplitWorkersError" not in code
+    assert "thiserror::Error)]\npub enum SplitWorkersError" in code
 
 
 def test_unit_tests_link_without_the_extension_module_feature():

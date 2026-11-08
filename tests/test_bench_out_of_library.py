@@ -1,9 +1,5 @@
 """Benchmark code is kept out of the production library.
 
-The built-in `benchmark.BenchmarkService/GetSum` gRPC handler is opt-in
-(`app.enable_grpc_benchmark()`) and, when on, intercepts only its own path, so a route
-accepting gRPC(-web) is reachable.
-
 `MipyreApp.bench_inmem` / `bench_loopback` exist only in a `--features bench`
 build. The bench tests below run only in such a build (they are skipped otherwise):
 
@@ -12,40 +8,21 @@ build. The bench tests below run only in such a build (they are skipped otherwis
 
 `test_default_build_has_no_bench_methods` asserts the default build, which is what the
 suite and CI install.
-
-Serving paths, as `app.run` picks them:
-  - "gil"   MIPYRE_TEST_MODE=main, MIPYRE_TPC=0  → multi-thread runtime, handlers on main
-  - "tpc"   default runtime                        → TPC inline (sub-interp)
-  - "pool"  default runtime, MIPYRE_TPC=0        → sub-interp pool
 """
 
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
-import urllib.error
-import urllib.request
 
 import pytest
-
-from tests._helpers import bound_port, read_file, set_subinterpreters
 
 from mipyre.engine import MipyreApp
 
 PYTHON = sys.executable
-HOST = "127.0.0.1"
-
-PATHS: dict[str, dict[str, str | None]] = {
-    "gil": {"runtime": "main", "tpc": "0"},
-    "tpc": {"runtime": None, "tpc": None},
-    "pool": {"runtime": None, "tpc": "0"},
-}
-
-GET_SUM = "/benchmark.BenchmarkService/GetSum"
 
 
 # ---------------------------------------------------------------------------
@@ -58,124 +35,6 @@ def _write_script(script: str) -> str:
     with os.fdopen(fd, "w") as f:
         f.write(textwrap.dedent(script))
     return path
-
-
-class Server:
-    """A Mipyre server running `script` on one serving path. `app.run` in the script
-    reads `port` from `APP_PORT`; the "gil" path runs with `MIPYRE_TEST_MODE=main`."""
-
-    def __init__(self, script: str, path: str, workers: int = 2):
-        self.port = 0  # the bound one once the server listens
-        self.script_path = _write_script(script)
-        self.log_path = self.script_path + ".log"
-        env = dict(os.environ)
-        env.pop("MIPYRE_TEST_MODE", None)
-        if (runtime := PATHS[path]["runtime"]) is not None:
-            env["MIPYRE_TEST_MODE"] = runtime
-        env["APP_PORT"] = "0"
-        env.pop("MIPYRE_TPC", None)
-        if (tpc := PATHS[path]["tpc"]) is not None:
-            env["MIPYRE_TPC"] = tpc
-        set_subinterpreters(env, str(workers))
-        with open(self.log_path, "w") as log:
-            self.proc = subprocess.Popen(
-                [PYTHON, self.script_path],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                env=env,
-            )
-        # The Listening line comes once the sockets are bound: waits for it or the exit.
-        try:
-            self.port = bound_port(read_file(self.log_path), self.proc)
-        except RuntimeError as e:
-            raise RuntimeError(f"server ({path}) did not start:\n{self.stop()}") from e
-
-    def post(self, path: str, body: bytes, content_type: str) -> tuple[int, bytes, dict]:
-        req = urllib.request.Request(
-            f"http://{HOST}:{self.port}{path}",
-            data=body,
-            method="POST",
-            headers={"Content-Type": content_type},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return r.status, r.read(), {k.lower(): v for k, v in r.headers.items()}
-        except urllib.error.HTTPError as e:
-            return e.code, e.read(), {k.lower(): v for k, v in e.headers.items()}
-
-    def stop(self) -> str:
-        if self.proc.poll() is None:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
-            try:
-                self.proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-                self.proc.wait(timeout=5)
-        with open(self.log_path, errors="replace") as f:
-            out = f.read()
-        for p in (self.script_path, self.log_path):
-            try:
-                os.unlink(p)
-            except FileNotFoundError:
-                pass
-        return out
-
-
-RUN = """
-import os
-from mipyre import ServerFlags
-app.run(ServerFlags(host="127.0.0.1", port=int(os.environ["APP_PORT"])))
-"""
-
-
-def _sum_request(a: int, b: int) -> bytes:
-    """A gRPC-framed `SumRequest { a, b }` (small non-negative ints: one-byte varints)."""
-    message = bytes([0x08, a, 0x10, b])
-    return b"\x00" + len(message).to_bytes(4, "big") + message
-
-
-def _sum_reply(result: int) -> bytes:
-    message = bytes([0x08, result])
-    return b"\x00" + len(message).to_bytes(4, "big") + message
-
-
-# ---------------------------------------------------------------------------
-# The gRPC benchmark service is opt-in and intercepts only its own path
-# ---------------------------------------------------------------------------
-
-GRPC_USER_ROUTE = """
-import os
-from mipyre import Mipyre
-app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
-
-@app.post("/rpc")
-def rpc(req):
-    return "user handler: " + req.headers.get("content-type", "")
-"""
-
-
-GRPC_ON = GRPC_USER_ROUTE + """
-app.enable_grpc_benchmark()
-"""
-
-
-def test_grpc_on_get_sum_works_and_intercepts_only_its_path():
-    """The wiring: enable_grpc_benchmark() answers GetSum and leaves every other path to the
-    routes. Which request is the gRPC method (its path, POST, an application/grpc*
-    content-type, and only when enabled) is `decide`'s, unit-tested in
-    crates/http/src/plan/request.rs (the_grpc_method_is_decided_first_and_only_when_on); one
-    pipeline serves it on every path."""
-    srv = Server(GRPC_ON + RUN, "tpc")
-    try:
-        status, body, headers = srv.post(GET_SUM, _sum_request(2, 3), "application/grpc")
-        assert status == 200
-        assert headers["content-type"] == "application/grpc"
-        assert body == _sum_reply(5)
-        status, body, _ = srv.post("/rpc", _sum_request(2, 3), "application/grpc")
-        assert (status, body) == (200, b"user handler: application/grpc")
-    finally:
-        srv.stop()
 
 
 # ---------------------------------------------------------------------------

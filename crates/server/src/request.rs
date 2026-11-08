@@ -11,8 +11,9 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::site::Site;
 use mipyre_http::io::body::ResponseBody;
+use mipyre_http::plan::response::HandlerResponse;
 use mipyre_http::plan::route::{HandlerCall, HandlerKind, RouteId, RuntimeChoice};
-use mipyre_runtime::exchange::{refuse, UnansweredError};
+use mipyre_runtime::exchange::{self, refuse, HandlerError, UnansweredError};
 use mipyre_runtime::{InterpreterPool, MainThreads};
 
 use super::on_main::run_on_main;
@@ -42,6 +43,15 @@ pub trait Backends {
         prepared: HandlerRequest,
         route: RouteId,
     ) -> impl Future<Output = Response<ResponseBody>> + 'a;
+
+    /// Runs the gRPC method `method` on `worker`, on the request's own thread, and returns its
+    /// answer unrendered.
+    fn call_unary_inline(
+        worker: &Self::Inline,
+        site: &Site,
+        method: RouteId,
+        request: exchange::Request,
+    ) -> Result<HandlerResponse, HandlerError>;
 
     fn main(&self) -> Option<&MainThreads>;
 
@@ -89,6 +99,7 @@ pub async fn handle_request<B: Backends>(
             Some(main) => run_on_main::<B>(site, main, prepared, target, handler).await,
             None => without_backend(site, prepared, RuntimeChoice::Main),
         },
+        HandlerCall::Grpc(method) => super::grpc::serve_grpc(&*server, prepared, method).await,
     };
     Ok(resp)
 }

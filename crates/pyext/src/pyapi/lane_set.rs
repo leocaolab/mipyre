@@ -96,7 +96,7 @@ impl PyLaneSet {
         let lanes = self.server("_setup_template")?;
         py.detach(|| lanes.setup_template(message)).map_err(|e| match e {
             TemplateSetupError::TooLong { .. } => PyValueError::new_err(e.to_string()),
-            TemplateSetupError::NoTemplate | TemplateSetupError::Send(_) => PyOSError::new_err(e.to_string()),
+            TemplateSetupError::NoForkServer | TemplateSetupError::Send(_) => PyOSError::new_err(e.to_string()),
         })
     }
 
@@ -107,13 +107,13 @@ impl PyLaneSet {
         let text = command_line.encode_text();
         py.detach(|| lanes.tell_template_run(&text)).map_err(|e| match e {
             TemplateRunError::CommandLineTooLong { .. } => PyValueError::new_err(e.to_string()),
-            TemplateRunError::NoTemplate | TemplateRunError::Send(_) => PyOSError::new_err(e.to_string()),
+            TemplateRunError::NoForkServer | TemplateRunError::Send(_) => PyOSError::new_err(e.to_string()),
         })
     }
 
     #[getter]
     fn workers(&self) -> PyResult<usize> {
-        Ok(self.server("workers")?.workers())
+        Ok(self.server("workers")?.lanes())
     }
 
     #[getter]
@@ -131,7 +131,7 @@ impl PyLaneSet {
         let lanes = self.server("_attach_template")?;
         // SAFETY: The caller hands over an fd it owns, from `socket.detach()`.
         let sock = unsafe { OwnedFd::from_raw_fd(fd) };
-        lanes.attach_template(pid, sock).map_err(|refused| {
+        lanes.attach_fork_server(pid, sock).map_err(|refused| {
             PyRuntimeError::new_err(format!("these lanes already have a template: pid {refused} is refused"))
         })
     }
@@ -172,15 +172,15 @@ fn stats_dict(py: Python<'_>, s: StatsSnapshot) -> PyResult<Bound<'_, PyDict>> {
     let events = s.host_events;
     d.set_item("host_sleeps", events.sleeps)?;
     d.set_item("pipe_wakes", events.pipe_wakes)?;
-    d.set_item("answers_by_submit", events.by_submit)?;
-    d.set_item("answers_by_spin", events.by_spin)?;
-    d.set_item("answers_by_poller", events.by_poller)?;
+    d.set_item("answers_by_submit", events.read_by_submit)?;
+    d.set_item("answers_by_spin", events.read_by_spin)?;
+    d.set_item("answers_by_poller", events.read_by_poller)?;
     d.set_item("park_hooks", events.park_hooks)?;
     d.set_item("overflow_forwards", events.overflow_forwards)?;
     d.set_item("spread_forwards", events.spread_forwards)?;
     d.set_item("unawaited_skips", events.unawaited_skips)?;
     d.set_item("host_failures", s.host_failures)?;
-    d.set_item("lanes_broken", s.lanes_broken)?;
+    d.set_item("lanes_broken", s.broken_lanes)?;
     d.set_item("fatal", s.fatal.map(|cause| cause.to_string()))?;
     Ok(d)
 }

@@ -2,76 +2,67 @@
 //!
 //! Run with
 //! `RUSTFLAGS="--cfg sync_model" cargo test -p mipyre_subinterp --lib --profile model --target-dir target/loom loom_model`.
-//! The thread state is a `loom::cell::UnsafeCell`, so Loom also fails any two host calls that
+//! The thread state is a `loom::cell::UnsafeCell`, so Loom also fails any two interpreter calls that
 //! are in "the GIL" at once. Every interleaving explored shows that an interruption aimed at a
-//! run never stays pending past that run's end or lands in the next run, that nothing touches
-//! the unit's thread state once its last end returned, and that an interruption which set its
-//! exception reports the run interrupted unless the slot moved on.
+//! unit never stays pending past that unit's end or lands in the next unit, that nothing touches
+//! the unit's thread state once its last end returned, and that an interruption reported set is
+//! reported by its unit's end.
 
 use std::sync::Arc;
 
 use loom::thread;
 
-use super::model_host::{end, new_slot, pending, thread_state_gone, ModelHost};
-use super::test_phase::phase_of_run;
-use super::{RunId, UnitPhase, UnitState};
+use super::model_interpreter::{begin, end, new_slot, pending, thread_state_gone, ModelInterpreter};
+use super::word::UnitId;
+use super::{Interruption, SlotInner};
 
-/// Spawns a thread that interrupts `run` and checks what it reports.
-fn interrupter(slot: &Arc<UnitState<ModelHost>>, run: RunId) -> thread::JoinHandle<()> {
+/// Spawns a thread that interrupts `unit` and returns what it reports.
+fn interrupter(slot: &Arc<SlotInner<ModelInterpreter>>, unit: UnitId) -> thread::JoinHandle<Interruption> {
     let slot = Arc::clone(slot);
-    thread::spawn(move || {
-        slot.interrupt(run, run).unwrap();
-        // An interruption of an ended run sets nothing, so only another run's state reported
-        // for this one is wrong.
-        if let Some(phase) = phase_of_run(&slot, run) {
-            assert!(
-                phase.was_interrupted() || phase.has_ended(),
-                "a run still running after its interruption returned reads not interrupted"
-            );
-        }
-    })
+    thread::spawn(move || slot.interrupt(unit, unit).unwrap())
 }
 
 #[test]
-fn a_stale_interruption_never_reaches_the_next_run() {
+fn a_stale_interruption_never_reaches_the_next_unit() {
     loom::model(|| {
         let slot = new_slot();
-        let (first, _) = slot.begin_run();
+        let first = begin(&slot);
         let interrupting = interrupter(&slot, first);
 
-        end(&slot, first);
-        assert_eq!(pending(&slot), None, "an interruption outlived the end of its run");
-        let (second, before) = slot.begin_run();
+        let first_interrupted = end(&slot, first, false);
+        assert_eq!(pending(&slot), None, "an interruption outlived the end of its unit");
+        let second = begin(&slot);
         assert_ne!(second, first);
-        assert!(UnitPhase::from_word(before).has_ended());
-        assert_eq!(pending(&slot), None, "an interruption of run 1 is pending in run 2");
-        end(&slot, second);
+        assert_eq!(pending(&slot), None, "an interruption of unit 1 is pending in unit 2");
+        assert!(!end(&slot, second, false), "unit 2 reports unit 1's interruption");
         thread_state_gone(&slot);
 
-        interrupting.join().unwrap();
+        let set = interrupting.join().unwrap() == Interruption::Set;
+        assert_eq!(set, first_interrupted, "a set interruption and the end disagree");
     });
 }
 
-/// The worker takes the interruption back mid-run, as a handler waiting outside bytecode does.
+/// The worker takes the interruption back mid-unit, as a handler waiting outside bytecode does.
 #[test]
 fn a_take_back_and_an_end_leave_nothing_pending() {
     loom::model(|| {
         let slot = new_slot();
-        let (run, _) = slot.begin_run();
-        let interrupting = interrupter(&slot, run);
+        let unit = begin(&slot);
+        let interrupting = interrupter(&slot, unit);
 
-        let gil = slot.host.gil.take();
-        let was_pending = slot.host.with_thread(gil, |state| state.pending.is_some());
+        let gil = slot.interpreter.gil.take();
+        let was_pending = slot.interpreter.with_thread(gil, |state| state.pending.is_some());
         let taken = slot.take_interruption(gil);
         assert_eq!(taken, was_pending, "the take-back disagrees with what was pending");
-        assert_eq!(slot.host.with_thread(gil, |state| state.pending), None);
-        slot.host.gil.give();
+        assert_eq!(slot.interpreter.with_thread(gil, |state| state.pending), None);
+        slot.interpreter.gil.give();
 
-        end(&slot, run);
-        assert_eq!(pending(&slot), None, "an interruption outlived the end of its run");
+        let interrupted = end(&slot, unit, taken);
+        assert_eq!(pending(&slot), None, "an interruption outlived the end of its unit");
         thread_state_gone(&slot);
 
-        interrupting.join().unwrap();
+        let set = interrupting.join().unwrap() == Interruption::Set;
+        assert_eq!(set, interrupted, "a set interruption and the end disagree");
     });
 }
 
@@ -83,15 +74,15 @@ fn an_end_waits_for_every_interruption_in_flight() {
     model.preemption_bound = Some(4);
     model.check(|| {
         let slot = new_slot();
-        let (run, _) = slot.begin_run();
-        let one = interrupter(&slot, run);
-        let two = interrupter(&slot, run);
+        let unit = begin(&slot);
+        let one = interrupter(&slot, unit);
+        let two = interrupter(&slot, unit);
 
-        end(&slot, run);
+        let interrupted = end(&slot, unit, false);
         assert_eq!(pending(&slot), None);
         thread_state_gone(&slot);
 
-        one.join().unwrap();
-        two.join().unwrap();
+        let set = [one.join().unwrap(), two.join().unwrap()].contains(&Interruption::Set);
+        assert_eq!(set, interrupted, "a set interruption and the end disagree");
     });
 }

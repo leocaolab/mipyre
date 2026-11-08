@@ -10,13 +10,13 @@
 mod support;
 
 use std::future::Ready;
+use std::marker::PhantomData;
 use std::mem::{size_of, size_of_val};
 
 use mipyre_core::ReplyWait;
 use mipyre_http::plan::limits::RequestBudget;
-use mipyre_microbench::Must;
 
-use support::{through_timeout, through_wait, Body, ReadyBackend, SecondPollBackend};
+use support::{through_timeout, through_wait, Body, SecondPollRun, StubBackend};
 
 #[test]
 fn the_wait_is_no_larger_than_tokio_timeout() {
@@ -25,15 +25,27 @@ fn the_wait_is_no_larger_than_tokio_timeout() {
 
 #[test]
 fn a_request_future_awaiting_through_the_core_is_no_larger_than_today() {
-    let budget = RequestBudget::from_secs(1.0).must("1 s is a budget");
+    let budget = RequestBudget::from_secs(1.0).expect("1 s is a budget");
     for (core, today) in [
         (
-            size_of_val(&through_wait(&ReadyBackend, [0; 8], budget)),
-            size_of_val(&through_timeout(&ReadyBackend, [0; 8], budget)),
+            size_of_val(&through_wait(&StubBackend::<Ready<Body>>(PhantomData), [0; 8], budget)),
+            size_of_val(&through_timeout(
+                &StubBackend::<Ready<Body>>(PhantomData),
+                [0; 8],
+                budget,
+            )),
         ),
         (
-            size_of_val(&through_wait(&SecondPollBackend, [0; 8], budget)),
-            size_of_val(&through_timeout(&SecondPollBackend, [0; 8], budget)),
+            size_of_val(&through_wait(
+                &StubBackend::<SecondPollRun>(PhantomData),
+                [0; 8],
+                budget,
+            )),
+            size_of_val(&through_timeout(
+                &StubBackend::<SecondPollRun>(PhantomData),
+                [0; 8],
+                budget,
+            )),
         ),
     ] {
         assert!(

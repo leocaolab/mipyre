@@ -5,7 +5,6 @@
 //! one process never see each other's requests.
 
 use std::os::fd::RawFd;
-use std::sync::Arc;
 
 use crate::sync::Mutex;
 use pyo3::exceptions::{PyBaseException, PyException as PyExceptionType, PyRuntimeError};
@@ -14,14 +13,10 @@ use pyo3::prelude::*;
 use super::engine_queue::{send_answer, EngineInbox, EngineReply, TaskPlace};
 use super::hook_chain::worker_response;
 use super::main_call::main_reply;
-use super::worker::async_engine::{EngineRoutes, EngineWebSockets};
+use super::worker::async_engine::EngineRoutes;
 use super::worker_app;
 use crate::exchange::error::{refuse, HandlerError, ReplyHolder, RequestStage, ResponseError, UnansweredError};
-use crate::exchange::loop_wait::{LoopMailbox, LoopWaits};
 use crate::exchange::request::Request;
-use crate::exchange::{HandlerEnds, PyException, WebSocket};
-use crate::pool::answer_if_awaited;
-use crate::websocket::{ConnectionHeld, HooksAnswer, WsConnection};
 
 mod guard;
 use guard::worker_api_function;
@@ -301,18 +296,10 @@ fn registered_routes(py: Python<'_>) -> PyResult<worker_app::WorkerRoutes<'_>> {
 }
 
 /// Returns what the worker's async engine serves: its app's handlers, indexed like main's route
-/// table, its hooks, and its WebSocket handlers when `connections` is where main hands it
-/// connections.
-pub(crate) fn worker_engine_routes(
-    py: Python<'_>,
-    connections: Option<Arc<LoopMailbox<WsConnection>>>,
-) -> PyResult<EngineRoutes> {
+/// table, and its hooks.
+pub(crate) fn worker_engine_routes(py: Python<'_>) -> PyResult<EngineRoutes> {
     let routes = registered_routes(py)?;
     let unbind = |hooks: Vec<Bound<'_, PyAny>>| hooks.into_iter().map(Bound::unbind).collect();
-    let websockets = connections.map(|connections| EngineWebSockets {
-        handlers: routes.websockets.iter().map(|h| h.clone().map(Bound::unbind)).collect(),
-        connections,
-    });
     Ok(EngineRoutes {
         before: unbind(routes.before_hooks),
         after: unbind(routes.after_hooks),
@@ -322,131 +309,7 @@ pub(crate) fn worker_engine_routes(
             .map(|r| r.handler.map(Bound::unbind))
             .collect(),
         streams: false,
-        websockets,
     })
-}
-
-/// Is one engine's end of its connections, as the engine's Python sees it; dropping it stops the
-/// engine taking more.
-#[pyclass(frozen, module = "mipyre.engine", name = "_ConnectionInbox")]
-pub struct ConnectionInbox(pub(crate) Arc<LoopMailbox<WsConnection>>);
-
-#[pymethods]
-impl ConnectionInbox {
-    /// Returns the fd the engine's loop waits on: readable when connections were handed to it.
-    #[getter]
-    fn doorbell(&self) -> std::os::fd::RawFd {
-        self.0.doorbell()
-    }
-
-    /// Takes the connections handed so far, each as a job.
-    fn take(&self, py: Python<'_>) -> PyResult<Vec<WsJob>> {
-        let taken = self.0.take()?;
-        Ok(taken
-            .into_iter()
-            .filter_map(|connection| WsJob::new(py, connection))
-            .collect())
-    }
-}
-
-impl Drop for ConnectionInbox {
-    fn drop(&mut self) {
-        drop(self.0.close());
-    }
-}
-
-/// One connection as the engine's task runs it: its hooks answer the upgrade, then its handler
-/// gets the connection. Dropping it ends the connection's hold on the server's slot.
-#[pyclass(frozen, module = "mipyre.engine", name = "_WsJob")]
-pub struct WsJob {
-    route: usize,
-    #[pyo3(get)]
-    request: Py<Request>,
-    label: RequestLabel,
-    /// Holds the connection's queues and the hooks' answer until the hooks have run.
-    upgrade: Mutex<Option<(HandlerEnds, HooksAnswer)>>,
-    _held: ConnectionHeld,
-}
-
-impl WsJob {
-    /// Returns `None` when the request cannot be made, after answering the upgrade with why.
-    fn new(py: Python<'_>, connection: WsConnection) -> Option<Self> {
-        let WsConnection {
-            route,
-            request,
-            ends,
-            hooks_answer,
-            ended,
-        } = connection;
-        let label = request.label();
-        match Py::new(py, request) {
-            Ok(request) => Some(WsJob {
-                route: route.index(),
-                request,
-                label,
-                upgrade: Mutex::new(Some((ends, hooks_answer))),
-                _held: ended,
-            }),
-            Err(e) => {
-                let error = HandlerError::python(py, RequestStage::Setup, &e).log(&label);
-                answer_if_awaited(hooks_answer, Err(error));
-                None
-            }
-        }
-    }
-
-    fn take_upgrade(&self) -> PyResult<(HandlerEnds, HooksAnswer)> {
-        self.upgrade
-            .lock()
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("this WebSocket upgrade was already answered"))
-    }
-}
-
-#[pymethods]
-impl WsJob {
-    #[getter]
-    fn route(&self) -> usize {
-        self.route
-    }
-
-    /// Sends the 101 and returns the connection, or `None` when the handshake already gave up
-    /// waiting (its request budget), when no 101 was sent.
-    fn accept(&self, py: Python<'_>, waits: Py<LoopWaits>) -> PyResult<Option<WebSocket>> {
-        let (ends, hooks_answer) = self.take_upgrade()?;
-        if hooks_answer.send(Ok(None)).is_err() {
-            return Ok(None);
-        }
-        Ok(Some(WebSocket::new(ends, self.request.clone_ref(py), waits)))
-    }
-
-    /// Answers the upgrade with what a `before_request` hook returned.
-    fn refuse(&self, value: Bound<'_, PyAny>) -> PyResult<()> {
-        let (_, hooks_answer) = self.take_upgrade()?;
-        let answer = worker_response(value).map_err(|e| HandlerError::from(e).log(&self.label));
-        answer_if_awaited(hooks_answer, answer.map(Some));
-        Ok(())
-    }
-
-    /// Answers the upgrade with the exception a `before_request` hook raised.
-    fn fail(&self, exception: Bound<'_, PyAny>) -> PyResult<()> {
-        let (_, hooks_answer) = self.take_upgrade()?;
-        let py = exception.py();
-        let error = HandlerError::python(py, RequestStage::BeforeHook, &PyErr::from_value(exception)).log(&self.label);
-        answer_if_awaited(hooks_answer, Err(error));
-        Ok(())
-    }
-
-    /// Logs the exception the handler raised on the upgraded connection, which has no response
-    /// left to carry it.
-    fn raised(&self, exception: Bound<'_, PyAny>) {
-        let py = exception.py();
-        let exception = PyException::capture(py, &PyErr::from_value(exception));
-        let label = &self.label;
-        tracing::error!(target: "mipyre::handler", request_id = %label.id,
-            method = label.method.as_str(), path = label.uri.path(), error = %exception,
-            traceback = exception.traceback(), "WebSocket handler raised");
-    }
 }
 
 #[cfg(test)]
@@ -464,7 +327,7 @@ mod tests {
     fn a_worker_engine_without_an_app_fails_its_start() {
         Python::initialize();
         mipyre_subinterp::attach::with_main(|py| {
-            let Err(e) = worker_engine_routes(py, None) else {
+            let Err(e) = worker_engine_routes(py) else {
                 panic!("the main interpreter has no worker app");
             };
             assert!(e.to_string().contains("has no app"), "{e}");

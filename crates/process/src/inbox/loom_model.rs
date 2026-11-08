@@ -21,7 +21,7 @@ fn a_send_racing_the_close_leaves_nothing_in_the_inbox() {
         let sender = thread::spawn({
             let inbox = Arc::clone(&inbox);
             let item = Arc::clone(&item);
-            move || drop(inbox.send(item))
+            move || drop(inbox.try_send(item))
         });
         inbox.close();
         sender.join().unwrap();

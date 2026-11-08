@@ -1,6 +1,5 @@
 //! Runs Python handlers: sub-interpreter workers and their pool, the main interpreter's threads, a
-//! WebSocket connection's task on an async engine,
-//! a process lane's worker (`lane_worker`: handlers in worker processes, `runtime="process"`), and
+//! WebSocket connection's calls, a process lane's worker (`lane_worker`: handlers in worker processes, `runtime="process"`), and
 //! the hook chain around each call.
 
 mod declaration;
@@ -39,19 +38,19 @@ pub use self::main_gil::MAIN_GIL;
 pub use self::main_threads::{MainSizes, MainThreadHandles, MainThreads};
 pub(crate) use self::pool::answer_if_awaited;
 pub use self::pool::{
-    pools_at_abandon_limit, split_workers_for_routes, workers_abandoned, AbandonedWorker, InterpreterPool, PoolError,
-    PoolJob, PoolThreads, RouteKinds, WorkerCounts,
+    pools_at_abandon_limit, split_workers_for_routes, workers_abandoned, AbandonedWorker, InterpreterPool, PoolCall,
+    PoolError, PoolJob, PoolThreads, RouteKinds, WorkerCounts,
 };
 pub(crate) use self::request_context::in_reused_context;
 pub use self::rules::{copy_rules, Handler, Routes};
 pub use self::shared_map::{map_for_new, AppStore, StateValue};
 pub use self::start::{start_here, StartError, StartGate, StartHandle, ThreadResident};
-pub use self::websocket::{NoLiveEngine, WsConnection, WsEngines};
+pub use self::websocket::{WsEvent, WsSession, WsUpgradeAnswer};
 pub use self::worker::program::{app_file, CommandLine, MissingAppFileError, WorkerProgram};
 pub use self::worker::start::{WorkerException, WorkerRecipe};
 pub use self::worker::sync_runner::{Retirement, SyncRunner};
 pub use self::worker::{SubInterpreterWorker, WorkerIndex};
-pub use self::worker_api::{_worker_fail, _worker_send, _worker_take, _worker_to_response, ConnectionInbox, WsJob};
+pub use self::worker_api::{_worker_fail, _worker_send, _worker_take, _worker_to_response};
 pub use self::worker_app::{
     _routers_to_load, _set_routers_to_load, record_worker_app, AppRoute, AppWebSocket, EngineModule,
     ScriptRegistrations,

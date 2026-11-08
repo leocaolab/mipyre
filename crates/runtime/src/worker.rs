@@ -86,7 +86,6 @@ impl<R: RequestRunner> SubInterpreterWorker<R> {
     /// thread state current on this thread aborts the process.
     pub fn create(worker: WorkerIndex, spec: &WorkerSpec<'_>) -> Result<Self, WorkerStartError> {
         SubInterpreter::create_on_this_thread(
-            worker.to_string(),
             |source| WorkerStartError::CreationFailed { worker, source },
             |py| match start::prepare::<R>(py, worker, spec) {
                 Ok(runner) => Ok(Held { worker, runner }),
@@ -102,10 +101,6 @@ impl<R: RequestRunner> SubInterpreterWorker<R> {
 
     pub(crate) fn worker_id(&self) -> WorkerIndex {
         self.index
-    }
-
-    pub fn end_on_own_thread(self) {
-        self.interp.end_on_own_thread()
     }
 
     fn with_gil<T>(&mut self, f: impl for<'py> FnOnce(&mut R, Python<'py>) -> T) -> std::thread::Result<T> {

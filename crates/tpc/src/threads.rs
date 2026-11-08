@@ -75,7 +75,7 @@ pub struct AffinityOutcome {
 /// and returns what happened; only the caller knows what an unpinned thread means and how to say
 /// so.
 pub fn pin_and_raise_qos(core: Option<CoreId>) -> AffinityOutcome {
-    place_with(&HostOs, core)
+    place_with(&SystemCalls, core)
 }
 
 fn place_with(os: &impl ThreadOs, core: Option<CoreId>) -> AffinityOutcome {
@@ -113,7 +113,7 @@ where
     H: ThreadHooks + Clone,
     Fut: Future<Output = Result<(), E>>,
 {
-    serve_with(&HostOs, affinity, blocking_stack, hooks, stop, teardown, serve)
+    serve_with(&SystemCalls, affinity, blocking_stack, hooks, stop, teardown, serve)
 }
 
 /// Serves as [`serve_on_this_thread`] does, building the runtime through `os`.
@@ -209,10 +209,10 @@ trait ThreadOs {
     fn build_runtime(&self, builder: &mut RuntimeBuilder) -> std::io::Result<Runtime>;
 }
 
-/// Makes the host's real calls.
-struct HostOs;
+/// Makes the real system calls.
+struct SystemCalls;
 
-impl ThreadOs for HostOs {
+impl ThreadOs for SystemCalls {
     fn pin(&self, core: Option<CoreId>) -> Result<(), mipyre_cpu::PinError> {
         try_pin_current(core)
     }
@@ -676,7 +676,7 @@ pub struct ThreadResults<T, E> {
     /// Every failure, in thread order.
     pub failures: Vec<ThreadFailure<E>>,
     /// The threads, ended or not, that left something running past the join, in thread order.
-    pub left_running: Vec<ThreadLeftover>,
+    pub left_running: Vec<StrayThread>,
 }
 
 pub struct ThreadFailure<E> {
@@ -687,13 +687,13 @@ pub struct ThreadFailure<E> {
 /// A thread that left something running when its run was joined, which keeps running as the
 /// process goes on.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ThreadLeftover {
+pub struct StrayThread {
     pub thread: String,
-    pub what: Leftover,
+    pub what: StrayWork,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Leftover {
+pub enum StrayWork {
     /// The thread itself was still running at the deadline.
     Thread,
     /// The thread ended, but its runtime's shutdown left this many blocking-pool threads running:
@@ -719,9 +719,9 @@ impl<T, E> ThreadResults<T, E> {
             let outcome = match joined {
                 Ok(outcome) => outcome,
                 Err(ThreadJoinError::StillRunning) => {
-                    results.left_running.push(ThreadLeftover {
+                    results.left_running.push(StrayThread {
                         thread,
-                        what: Leftover::Thread,
+                        what: StrayWork::Thread,
                     });
                     continue;
                 }
@@ -729,9 +729,9 @@ impl<T, E> ThreadResults<T, E> {
                 Err(ThreadJoinError::Panicked(payload)) => Err(ThreadError::Panicked(payload)),
             };
             if let Some(calls) = pool_threads {
-                results.left_running.push(ThreadLeftover {
+                results.left_running.push(StrayThread {
                     thread: thread.clone(),
-                    what: Leftover::BlockingCalls(calls),
+                    what: StrayWork::BlockingCalls(calls),
                 });
             }
             match outcome {
@@ -927,12 +927,12 @@ mod tests {
 
     /// Counts the serve hooks it is called with; copies share the counts, so the test keeps one.
     #[derive(Clone, Default)]
-    struct HookRecorder {
+    struct SpyHooks {
         before_serve: Arc<AtomicUsize>,
         after_serve: Arc<AtomicUsize>,
     }
 
-    impl ThreadHooks for HookRecorder {
+    impl ThreadHooks for SpyHooks {
         fn before_serve(&self) {
             self.before_serve.fetch_add(1, Ordering::SeqCst);
         }
@@ -944,12 +944,12 @@ mod tests {
     /// Which payload was dropped on which thread.
     type Drops = Arc<TestMutex<Vec<(usize, std::thread::ThreadId)>>>;
 
-    struct DropWitness {
+    struct SpyPayload {
         value: usize,
         drops: Drops,
     }
 
-    impl Drop for DropWitness {
+    impl Drop for SpyPayload {
         fn drop(&mut self) {
             self.drops
                 .lock()
@@ -958,13 +958,13 @@ mod tests {
         }
     }
 
-    fn witnesses(values: &[usize]) -> (Vec<(DropWitness, Option<CoreId>)>, Drops) {
+    fn witnesses(values: &[usize]) -> (Vec<(SpyPayload, Option<CoreId>)>, Drops) {
         let drops = Arc::new(TestMutex::new(Vec::new()));
         let payloads = values
             .iter()
             .map(|&value| {
                 (
-                    DropWitness {
+                    SpyPayload {
                         value,
                         drops: Arc::clone(&drops),
                     },
@@ -1066,9 +1066,9 @@ mod tests {
 
     /// Starts every thread on the OS except the one at the given index, whose spawn fails as an
     /// OS refusal does.
-    struct RefuseAt(usize);
+    struct StubSpawner(usize);
 
-    impl Spawner for RefuseAt {
+    impl Spawner for StubSpawner {
         fn spawn<R: Send + 'static>(
             &mut self,
             index: usize,
@@ -1104,7 +1104,7 @@ mod tests {
         )
     }
 
-    /// Serves on this thread, unpinned, with the host's real calls.
+    /// Serves on this thread, unpinned, with the real system calls.
     fn serve_here<Fut>(
         stop: &ThreadStop<()>,
         limit: Duration,
@@ -1116,7 +1116,7 @@ mod tests {
         serve_on_this_thread(
             pin_and_raise_qos(None),
             BLOCKING_STACK,
-            HookRecorder::default(),
+            SpyHooks::default(),
             stop,
             move || limit,
             serve,
@@ -1135,16 +1135,22 @@ mod tests {
             let stop = own_stop("t");
             let finished = Arc::new(AtomicUsize::new(0));
             let done = Arc::clone(&finished);
-            let served = serve_test(&HostOs, HookRecorder::default(), &stop, Duration::ZERO, || async move {
-                drop(tokio::task::spawn_blocking(move || {
-                    entered.send(()).unwrap();
-                    released.recv().unwrap();
-                    done.fetch_add(1, Ordering::SeqCst);
-                    ended.send(()).unwrap();
-                }));
-                in_pool.recv().expect("the call started");
-                Ok(())
-            });
+            let served = serve_test(
+                &SystemCalls,
+                SpyHooks::default(),
+                &stop,
+                Duration::ZERO,
+                || async move {
+                    drop(tokio::task::spawn_blocking(move || {
+                        entered.send(()).unwrap();
+                        released.recv().unwrap();
+                        done.fetch_add(1, Ordering::SeqCst);
+                        ended.send(()).unwrap();
+                    }));
+                    in_pool.recv().expect("the call started");
+                    Ok(())
+                },
+            );
             assert!(served.is_ok(), "{:?}", served.err());
             assert_eq!(
                 left_on_pool(&stop),
@@ -1158,17 +1164,17 @@ mod tests {
         });
     }
 
-    /// The steps of one thread's setup in order, written by both [`StepOs`] and [`StepLog`].
+    /// The steps of one thread's setup in order, written by both [`SpyOs`] and [`OrderSpyHooks`].
     type Steps = Arc<TestMutex<Vec<&'static str>>>;
 
     /// Records each OS call and fails the build when `fail_build` is set, because tokio's own
     /// build cannot be made to fail on demand.
-    struct StepOs {
+    struct SpyOs {
         steps: Steps,
         fail_build: bool,
     }
 
-    impl ThreadOs for StepOs {
+    impl ThreadOs for SpyOs {
         fn pin(&self, _core: Option<CoreId>) -> Result<(), mipyre_cpu::PinError> {
             self.steps.lock().unwrap().push("pin");
             Ok(())
@@ -1187,9 +1193,9 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct StepLog(Steps);
+    struct OrderSpyHooks(Steps);
 
-    impl ThreadHooks for StepLog {
+    impl ThreadHooks for OrderSpyHooks {
         fn before_serve(&self) {
             self.0.lock().unwrap().push("before_serve");
         }
@@ -1202,13 +1208,13 @@ mod tests {
     #[test]
     fn the_thread_is_pinned_before_its_runtime_is_built() {
         let steps = Steps::default();
-        let os = StepOs {
+        let os = SpyOs {
             steps: Arc::clone(&steps),
             fail_build: false,
         };
         let served = serve_test(
             &os,
-            StepLog(Arc::clone(&steps)),
+            OrderSpyHooks(Arc::clone(&steps)),
             &own_stop("t"),
             Duration::ZERO,
             || async { Ok(()) },
@@ -1221,7 +1227,7 @@ mod tests {
     #[test]
     fn a_runtime_that_is_not_built_calls_no_serve_hook() {
         let steps = Steps::default();
-        let os = StepOs {
+        let os = SpyOs {
             steps: Arc::clone(&steps),
             fail_build: true,
         };
@@ -1229,7 +1235,7 @@ mod tests {
         let ran = Arc::clone(&served);
         let result = serve_test(
             &os,
-            StepLog(Arc::clone(&steps)),
+            OrderSpyHooks(Arc::clone(&steps)),
             &own_stop("t"),
             Duration::ZERO,
             || async move {
@@ -1265,7 +1271,7 @@ mod tests {
             let outcome: Result<(), ThreadError<BodyError>> = serve_on_this_thread(
                 affinity,
                 BLOCKING_STACK,
-                HookRecorder::default(),
+                SpyHooks::default(),
                 &own_stop("t"),
                 || Duration::ZERO,
                 || async move {
@@ -1287,9 +1293,9 @@ mod tests {
     #[test]
     fn a_panicking_serve_still_pairs_before_and_after_serve() {
         within_10s(|| {
-            let hooks = HookRecorder::default();
+            let hooks = SpyHooks::default();
             let stop = own_stop("t");
-            let served = serve_test(&HostOs, hooks.clone(), &stop, Duration::ZERO, || async {
+            let served = serve_test(&SystemCalls, hooks.clone(), &stop, Duration::ZERO, || async {
                 if std::hint::black_box(true) {
                     panic!("injected panic in serve");
                 }
@@ -1306,9 +1312,9 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct ParkSignal(Gate);
+    struct ParkSpyHooks(Gate);
 
-    impl ThreadHooks for ParkSignal {
+    impl ThreadHooks for ParkSpyHooks {
         fn on_park(&self) {
             self.0.open();
         }
@@ -1322,9 +1328,9 @@ mod tests {
         let stop = CancellationToken::new();
         let parked = Gate::default();
         let token = stop.clone();
-        let hooks = ParkSignal(parked.clone());
+        let hooks = ParkSpyHooks(parked.clone());
         let thread = std::thread::spawn(move || {
-            serve_test(&HostOs, hooks, &own_stop("idle"), Duration::ZERO, || async move {
+            serve_test(&SystemCalls, hooks, &own_stop("idle"), Duration::ZERO, || async move {
                 crate::LocalStop::follow(&token).stopped().await;
                 Ok(())
             })
@@ -1428,9 +1434,9 @@ mod tests {
         assert!(stopped_first, "the join returned before the stop");
         assert_eq!(
             joined.left_running,
-            [ThreadLeftover {
+            [StrayThread {
                 thread: "serving-0".into(),
-                what: Leftover::Thread
+                what: StrayWork::Thread
             }]
         );
     }
@@ -1483,9 +1489,9 @@ mod tests {
         release.open();
         assert_eq!(
             joined.left_running,
-            [ThreadLeftover {
+            [StrayThread {
                 thread: "late-group-0".into(),
-                what: Leftover::Thread
+                what: StrayWork::Thread
             }]
         );
     }
@@ -1598,7 +1604,7 @@ mod tests {
             vec![((), None), ((), None)],
             1 << 20,
             &run,
-            &mut RefuseAt(1),
+            &mut StubSpawner(1),
             |_slot, (), own| -> Result<(), ThreadError<BodyError>> {
                 block_until_cancelled(&own.token());
                 body(Err(BodyError::AlsoNotServed))
@@ -1722,13 +1728,13 @@ mod tests {
         assert_eq!(
             results.left_running,
             [
-                ThreadLeftover {
+                StrayThread {
                     thread: "b".into(),
-                    what: Leftover::BlockingCalls(NonZeroUsize::new(3).unwrap())
+                    what: StrayWork::BlockingCalls(NonZeroUsize::new(3).unwrap())
                 },
-                ThreadLeftover {
+                StrayThread {
                     thread: "d".into(),
-                    what: Leftover::Thread
+                    what: StrayWork::Thread
                 },
             ]
         );
@@ -1868,7 +1874,7 @@ mod tests {
             payloads,
             1 << 20,
             &run,
-            &mut RefuseAt(2),
+            &mut StubSpawner(2),
             |_slot, payload, stop| -> Result<usize, ThreadError<BodyError>> {
                 block_until_cancelled(&stop.token());
                 Ok(payload.value)
@@ -1910,7 +1916,7 @@ mod tests {
             vec![(0usize, None), (1, None)],
             1 << 20,
             &run,
-            &mut RefuseAt(1),
+            &mut StubSpawner(1),
             move |_slot, payload, _stop| -> Result<usize, ThreadError<BodyError>> {
                 held.wait();
                 Ok(payload)
@@ -1957,9 +1963,9 @@ mod tests {
         release.open();
         assert_eq!(
             joined.left_running,
-            [ThreadLeftover {
+            [StrayThread {
                 thread: "x-1".into(),
-                what: Leftover::Thread
+                what: StrayWork::Thread
             }]
         );
         assert_eq!(joined.failures[0].thread, "x-0");
@@ -1990,9 +1996,9 @@ mod tests {
         release.open();
         assert_eq!(
             joined.left_running,
-            [ThreadLeftover {
+            [StrayThread {
                 thread: "slow-0".into(),
-                what: Leftover::Thread
+                what: StrayWork::Thread
             }]
         );
         assert!(joined.ended.is_empty());
@@ -2075,9 +2081,9 @@ mod tests {
         assert_eq!(run.cause(), failed("stuck-0"));
         assert_eq!(
             joined.left_running,
-            [ThreadLeftover {
+            [StrayThread {
                 thread: "stuck-0".into(),
-                what: Leftover::BlockingCalls(NonZeroUsize::MIN)
+                what: StrayWork::BlockingCalls(NonZeroUsize::MIN)
             }]
         );
         assert!(
@@ -2099,9 +2105,9 @@ mod tests {
         assert!(joined.failures.is_empty());
         assert_eq!(
             joined.left_running,
-            [ThreadLeftover {
+            [StrayThread {
                 thread: "kept-0".into(),
-                what: Leftover::BlockingCalls(NonZeroUsize::MIN)
+                what: StrayWork::BlockingCalls(NonZeroUsize::MIN)
             }]
         );
         assert!(!joined.is_clean(), "not a clean end");
@@ -2190,9 +2196,9 @@ mod tests {
         assert!(matches!(&joined.failures[0].error, ThreadError::Panicked(payload) if payload == "serve panicked"));
         assert_eq!(
             joined.left_running,
-            [ThreadLeftover {
+            [StrayThread {
                 thread: "panics-0".into(),
-                what: Leftover::BlockingCalls(NonZeroUsize::MIN)
+                what: StrayWork::BlockingCalls(NonZeroUsize::MIN)
             }]
         );
     }
@@ -2218,10 +2224,16 @@ mod tests {
         let hooks = PanicsBeforeServe::default();
         let served = Arc::new(AtomicUsize::new(0));
         let ran = Arc::clone(&served);
-        let outcome = serve_test(&HostOs, hooks.clone(), &own_stop("t"), Duration::ZERO, || async move {
-            ran.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
+        let outcome = serve_test(
+            &SystemCalls,
+            hooks.clone(),
+            &own_stop("t"),
+            Duration::ZERO,
+            || async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
         assert_eq!(
             (
                 hooks.before_serve.load(Ordering::SeqCst),
@@ -2278,12 +2290,18 @@ mod tests {
 
     #[test]
     fn an_after_serve_panic_after_a_panicking_serve_is_said_beside_it() {
-        let served = serve_test(&HostOs, AfterServePanic, &own_stop("t"), Duration::ZERO, || async {
-            if std::hint::black_box(true) {
-                panic!("serve panicked");
-            }
-            Ok(())
-        });
+        let served = serve_test(
+            &SystemCalls,
+            AfterServePanic,
+            &own_stop("t"),
+            Duration::ZERO,
+            || async {
+                if std::hint::black_box(true) {
+                    panic!("serve panicked");
+                }
+                Ok(())
+            },
+        );
         assert!(matches!(&served, Err(ThreadError::Panicked(payload))
             if payload == "serve panicked; after_serve panicked too: after_serve panicked"));
     }

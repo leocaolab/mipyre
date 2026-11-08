@@ -56,7 +56,7 @@ pub enum TlsError {
     #[error("rustls refuses the key: {0}")]
     KeyRefused(rustls::Error),
     #[error("TLS config error: {0}")]
-    RejectedByRustls(#[from] rustls::Error),
+    ProtocolVersionsRefused(#[from] rustls::Error),
     /// The system's random source failed.
     #[error("make the session-ticket key: {0}")]
     TicketKeyNotGenerated(rustls::Error),
@@ -88,7 +88,7 @@ impl TlsError {
             TlsError::Unreadable { what, .. } | TlsError::NotPem { what, .. } => Some(*what),
             TlsError::NoCertificate(_) => Some(PemFile::Certificate),
             TlsError::NoKey(_) | TlsError::KeyMismatch { .. } | TlsError::KeyRefused(_) => Some(PemFile::PrivateKey),
-            TlsError::RejectedByRustls(_) | TlsError::TicketKeyNotGenerated(_) => None,
+            TlsError::ProtocolVersionsRefused(_) | TlsError::TicketKeyNotGenerated(_) => None,
         }
     }
 }
@@ -220,7 +220,7 @@ where
     match handshake(acceptor, stream).await {
         Ok(stream) => Some(stream),
         Err(e) => {
-            let warn = events::degrade(TlsEvent::HandshakeFailed);
+            let warn = events::count_and_admit(TlsEvent::HandshakeFailed);
             tracing::debug!(error = %e, "TLS handshake failed");
             if let Some(held) = warn {
                 tracing::warn!(error = %e, held, "TLS handshake failed");

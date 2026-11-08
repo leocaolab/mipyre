@@ -279,6 +279,10 @@ fn ask_table(table: &Table, method: &str, path: &str) -> Answer {
             HandlerCall::Worker(id, kind) => (id.index(), HandlerPlace::Worker(kind)),
             HandlerCall::Main(target, handler) => (*table.handler(target), HandlerPlace::Main(handler)),
             HandlerCall::Lane(id) => (id.index(), HandlerPlace::Lane),
+            HandlerCall::Grpc(id) => panic!(
+                "resolve answered gRPC method #{}, which no HTTP router holds",
+                id.index()
+            ),
         };
         Resolution {
             route,
@@ -332,9 +336,10 @@ fn run(ops: &[Op]) -> Result<(), TestCaseError> {
             Op::WebSocket(template) => {
                 let rendered = template.render();
                 let index = table.handlers().count();
-                let got = registration(table.add_websocket(&rendered, index, WsPlace::Main), |e| {
-                    matches!(e, WsRouteError::MisreadPath { .. })
-                });
+                let got = registration(
+                    table.add_websocket(&rendered, super::ws_test_handlers::only(index), WsPlace::Main),
+                    |e| matches!(e, WsRouteError::MisreadPath { .. }),
+                );
                 prop_assert_eq!(got, model.add_websocket(template), "websocket {}", rendered);
             }
             Op::Ask { method, path } => {

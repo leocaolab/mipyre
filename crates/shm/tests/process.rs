@@ -1,5 +1,5 @@
-//! Runs the channel between real processes, as the lanes do: the test process is the host, and the peer is a forked
-//! child that maps the channel from the fd the host made, so every system call is the real one. The peer is not
+//! Runs the channel between real processes, as the lanes do: the test process is the caller, and the peer is a forked
+//! child that maps the channel from the fd the caller made, so every system call is the real one. The peer is not
 //! trusted: it dies at any point, writes anything anywhere in the channel, and forks children of its own.
 //!
 //! A forked child runs only its body and ends with `_exit`: it never returns into the test harness, and a panic in it
@@ -20,13 +20,13 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use mipyre_shm::adapter::doorbell::{
-    drain_once, open_host_doorbell, DrainOutcome, FutexDoorbell, HostBell, HostBellOutcome, PipeDoorbell,
+    drain_once, open_requester_doorbell, DrainOutcome, FutexDoorbell, PipeDoorbell, RequesterBell, RequesterBellOutcome,
 };
 use mipyre_shm::adapter::mapped::MappedMemory;
 use mipyre_shm::adapter::parker::FutexParker;
 use mipyre_shm::channel::{
-    sleep_all, wake_all, Attempt, Channel, DeadPeerAnswer, HeapMemory, HostEnd, PeerEnd, PeerFault, SleepVerdict,
-    StartOutcome, Wait, NOTE_BYTES,
+    finish_wait, prepare_to_wait, Attempt, Channel, DeadPeerResponse, HeapMemory, PeerEnd, PeerFault, RequesterEnd,
+    SleepDecision, StartOutcome, WaitOutcome, NOTE_BYTES,
 };
 use mipyre_shm::plan::geometry::{Geometry, SlotBytes};
 use mipyre_shm::plan::ring::{RingDepth, Seq};
@@ -34,25 +34,25 @@ use mipyre_shm::plan::spin_window::SpinWindow;
 
 /// The status a forked child ends with when its body panicked.
 const CHILD_PANICKED: i32 = 101;
-/// A peer sleeps a minute per slice, so a wake that never came shows as the host's wait running out.
+/// A peer sleeps a minute per slice, so a wake that never came shows as the caller's wait running out.
 const PEER_SLICE_NS: u64 = 60_000_000_000;
-/// How long the host waits for its wake pipe before it calls the wake lost; far below [`PEER_SLICE_NS`].
+/// How long the caller waits for its wake pipe before it calls the wake lost; far below [`PEER_SLICE_NS`].
 const HOST_WAIT_MS: i32 = 20_000;
 /// The peer parks as soon as it finds no request, so every wait goes through the OS.
 const NO_SPIN: SpinWindow = SpinWindow::until(0);
 
-type Host = HostEnd<MappedMemory, FutexDoorbell>;
+type Requester = RequesterEnd<MappedMemory, FutexDoorbell>;
 type Peer = PeerEnd<MappedMemory, PipeDoorbell, FutexParker>;
 
 fn geometry(depth: u32) -> Geometry {
     Geometry::new(RingDepth::new(depth).unwrap(), SlotBytes::new(256).unwrap()).unwrap()
 }
 
-/// One channel the test made as a lane's host does, and the two fds its peers are handed.
+/// One channel the test made as the server does for a lane, and the two fds its peers are handed.
 struct Lane {
     geometry: Geometry,
-    host: Host,
-    bell: HostBell,
+    caller: Requester,
+    bell: RequesterBell,
     shm: OwnedFd,
     bell_write: OwnedFd,
 }
@@ -61,11 +61,11 @@ impl Lane {
     fn new(depth: u32) -> Self {
         let geometry = geometry(depth);
         let (memory, shm) = MappedMemory::create(&geometry).unwrap();
-        let (bell, bell_write) = open_host_doorbell().unwrap();
-        let host = HostEnd::new(Arc::new(Channel::new(memory)), FutexDoorbell);
+        let (bell, bell_write) = open_requester_doorbell().unwrap();
+        let caller = RequesterEnd::new(Arc::new(Channel::new(memory)), FutexDoorbell);
         Lane {
             geometry,
-            host,
+            caller,
             bell,
             shm,
             bell_write,
@@ -83,7 +83,7 @@ impl Lane {
 
     fn send(&mut self, seq: u32) {
         let mut slot = self
-            .host
+            .caller
             .request_slot()
             .expect("the test sends only while the ring has room");
         assert_eq!(slot.seq(), Seq::new(seq));
@@ -91,19 +91,19 @@ impl Lane {
         slot.publish().unwrap_or_else(|never| match never {});
     }
 
-    /// Returns the next answer the peer publishes, sleeping on the wake pipe as the host does whenever none is
+    /// Returns the next answer the peer publishes, sleeping on the wake pipe as the caller does whenever none is
     /// there.
     fn next_answer(&mut self) -> (Seq, BytesMut) {
         let mut message = BytesMut::new();
         loop {
-            if let Some(seq) = self.host.answers().unwrap().take_next(&mut message).unwrap() {
+            if let Some(seq) = self.caller.responses().unwrap().take_next(&mut message).unwrap() {
                 return (seq, message);
             }
-            if sleep_all(std::slice::from_mut(&mut self.host)) == SleepVerdict::Park {
+            if prepare_to_wait(std::slice::from_mut(&mut self.caller)) == SleepDecision::Park {
                 wait_for_ring(&self.bell);
                 drain_once(&self.bell).unwrap();
             }
-            wake_all(std::slice::from_mut(&mut self.host));
+            finish_wait(std::slice::from_mut(&mut self.caller));
         }
     }
 }
@@ -141,8 +141,8 @@ enum Death {
 fn echo(peer: &mut Peer, death: Option<Death>, last: u32) -> i32 {
     loop {
         let request = match peer.wait_for_request(NO_SPIN, now_ns, PEER_SLICE_NS) {
-            Ok(Wait::Request(request)) => request,
-            Ok(Wait::SliceOver) => continue,
+            Ok(WaitOutcome::Request(request)) => request,
+            Ok(WaitOutcome::SliceOver) => continue,
             Err(refused) => panic!("the peer's wait was refused: {refused}"),
         };
         let seq = request.seq().get();
@@ -150,7 +150,7 @@ fn echo(peer: &mut Peer, death: Option<Death>, last: u32) -> i32 {
             die();
         }
         let message = request.bytes().unwrap().to_vec();
-        let rung = request.answer(|w| {
+        let rung = request.respond(|w| {
             if matches!(death, Some(Death::MidAnswer(at)) if at == seq) {
                 w.put(&message[..message.len() / 2]).unwrap();
                 die();
@@ -158,9 +158,9 @@ fn echo(peer: &mut Peer, death: Option<Death>, last: u32) -> i32 {
             w.put(&message).unwrap();
         });
         match rung {
-            Ok(Some(HostBellOutcome::HostGone)) => return 0,
+            Ok(Some(RequesterBellOutcome::RequesterGone)) => return 0,
             Ok(_) => {}
-            Err(broken) => panic!("the host's wake pipe broke: {broken}"),
+            Err(broken) => panic!("the caller's wake pipe broke: {broken}"),
         }
         if matches!(death, Some(Death::AfterAnswering(at)) if at == seq) {
             die();
@@ -195,12 +195,12 @@ fn fork_child(body: impl FnOnce() -> i32) -> libc::pid_t {
 
 /// How a child ended.
 #[derive(Debug, PartialEq, Eq)]
-enum End {
+enum ChildExit {
     Exited(i32),
     Killed(i32),
 }
 
-fn wait_end(pid: libc::pid_t) -> End {
+fn wait_end(pid: libc::pid_t) -> ChildExit {
     let mut status = 0;
     // SAFETY: `status` is a writable int and `pid` is this process's child.
     assert_eq!(
@@ -210,9 +210,9 @@ fn wait_end(pid: libc::pid_t) -> End {
         std::io::Error::last_os_error()
     );
     if libc::WIFSIGNALED(status) {
-        End::Killed(libc::WTERMSIG(status))
+        ChildExit::Killed(libc::WTERMSIG(status))
     } else {
-        End::Exited(libc::WEXITSTATUS(status))
+        ChildExit::Exited(libc::WEXITSTATUS(status))
     }
 }
 
@@ -221,8 +221,8 @@ fn kill(pid: libc::pid_t) {
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
 }
 
-/// Waits until the peer has written into the host's wake pipe; one that never does fails the test.
-fn wait_for_ring(bell: &HostBell) {
+/// Waits until the peer has written into the caller's wake pipe; one that never does fails the test.
+fn wait_for_ring(bell: &RequesterBell) {
     let mut watched = libc::pollfd {
         fd: bell.as_raw_fd(),
         events: libc::POLLIN,
@@ -233,13 +233,13 @@ fn wait_for_ring(bell: &HostBell) {
     assert_eq!(
         ready,
         1,
-        "the peer never rang the host's wake pipe: {}",
+        "the peer never rang the caller's wake pipe: {}",
         std::io::Error::last_os_error()
     );
 }
 
-/// Each doorbell is proved once on its own before the bulk: the host is asleep before the peer answers, so the peer
-/// must ring the pipe; the peer is asleep before the host publishes, so the host must wake its futex. A ring lost
+/// Each doorbell is proved once on its own before the bulk: the caller is asleep before the peer answers, so the peer
+/// must ring the pipe; the peer is asleep before the caller publishes, so the caller must wake its futex. A ring lost
 /// either way leaves the waiting side asleep past [`HOST_WAIT_MS`].
 #[test]
 fn a_forked_peer_answers_through_a_mapped_channel() {
@@ -247,13 +247,16 @@ fn a_forked_peer_answers_through_a_mapped_channel() {
     let mut lane = Lane::new(4);
     let peer = lane.fork_peer(|peer| echo(peer, None, REQUESTS - 1));
 
-    assert_eq!(sleep_all(std::slice::from_mut(&mut lane.host)), SleepVerdict::Park);
+    assert_eq!(
+        prepare_to_wait(std::slice::from_mut(&mut lane.caller)),
+        SleepDecision::Park
+    );
     lane.send(0);
     wait_for_ring(&lane.bell);
-    wake_all(std::slice::from_mut(&mut lane.host));
+    finish_wait(std::slice::from_mut(&mut lane.caller));
     assert_eq!(lane.next_answer(), (Seq::new(0), BytesMut::from(&request(0)[..])));
 
-    while lane.host.channel().peer_waits().parks == 0 {
+    while lane.caller.channel().peer_waits().parks == 0 {
         std::thread::yield_now();
     }
     lane.send(1);
@@ -261,7 +264,7 @@ fn a_forked_peer_answers_through_a_mapped_channel() {
 
     let (mut sent, mut answered) = (2, 2);
     while answered < REQUESTS {
-        while sent < REQUESTS && lane.host.window().has_room(lane.geometry.depth()) {
+        while sent < REQUESTS && lane.caller.window().has_room(lane.geometry.depth()) {
             lane.send(sent);
             sent += 1;
         }
@@ -269,11 +272,11 @@ fn a_forked_peer_answers_through_a_mapped_channel() {
         assert_eq!((seq, &message[..]), (Seq::new(answered), &request(answered)[..]));
         answered += 1;
     }
-    let waits = lane.host.channel().peer_waits();
+    let waits = lane.caller.channel().peer_waits();
     assert!(waits.parks > 0 && waits.wakes > 0, "{waits:?}");
 
     drop(lane);
-    assert_eq!(wait_end(peer), End::Exited(0));
+    assert_eq!(wait_end(peer), ChildExit::Exited(0));
 }
 
 /// A child forked by either end has no mapping at the channel's address, so its first read there is a fault; the
@@ -290,9 +293,9 @@ fn a_child_of_either_end_cannot_touch_the_mapping() {
     };
 
     assert_eq!(
-        wait_end(reads(lane.host.channel())),
-        End::Killed(libc::SIGSEGV),
-        "a child of the host"
+        wait_end(reads(lane.caller.channel())),
+        ChildExit::Killed(libc::SIGSEGV),
+        "a child of the caller"
     );
     let peer = fork_child(|| {
         let mapped = Channel::new(MappedMemory::attach(&lane.geometry, lane.shm.as_fd()).unwrap());
@@ -306,11 +309,11 @@ fn a_child_of_either_end_cannot_touch_the_mapping() {
             0
         });
         match (wait_end(child), wait_end(control)) {
-            (End::Killed(libc::SIGSEGV), End::Exited(0)) => 0,
+            (ChildExit::Killed(libc::SIGSEGV), ChildExit::Exited(0)) => 0,
             ends => panic!("the peer's children ended {ends:?}"),
         }
     });
-    assert_eq!(wait_end(peer), End::Exited(0), "a child of the peer");
+    assert_eq!(wait_end(peer), ChildExit::Exited(0), "a child of the peer");
 }
 
 /// A peer that dies on purpose at each place in its work leaves the window split where it died: the answers it
@@ -324,10 +327,10 @@ fn a_peer_that_dies_anywhere_leaves_its_answers_and_no_request_for_the_next() {
             lane.send(seq);
         }
         let peer = lane.fork_peer(|peer| echo(peer, Some(death), 5));
-        assert_eq!(wait_end(peer), End::Killed(libc::SIGKILL), "{death:?}");
+        assert_eq!(wait_end(peer), ChildExit::Killed(libc::SIGKILL), "{death:?}");
 
         let mut answered = Vec::new();
-        let split = lane.host.take_over(&mut answered).unwrap();
+        let split = lane.caller.take_over(&mut answered).unwrap();
         let (published, running) = match death {
             Death::AfterTaking(at) | Death::MidAnswer(at) => (at, Some(Seq::new(at))),
             Death::AfterAnswering(at) => (at + 1, None),
@@ -336,11 +339,11 @@ fn a_peer_that_dies_anywhere_leaves_its_answers_and_no_request_for_the_next() {
         assert_eq!(split.running(), running, "{death:?}");
         let untaken = published + u32::from(running.is_some());
         assert_eq!(
-            (split.handed().start(), split.handed().end()),
+            (split.untaken().start(), split.untaken().end()),
             (Seq::new(untaken), Seq::new(6)),
             "{death:?}"
         );
-        assert_eq!(lane.host.in_flight(), 0, "{death:?}");
+        assert_eq!(lane.caller.in_flight(), 0, "{death:?}");
 
         let replacement = lane.fork_peer(|peer| echo(peer, None, 6));
         lane.send(6);
@@ -350,12 +353,12 @@ fn a_peer_that_dies_anywhere_leaves_its_answers_and_no_request_for_the_next() {
             "{death:?}"
         );
         drop(lane);
-        assert_eq!(wait_end(replacement), End::Exited(0));
+        assert_eq!(wait_end(replacement), ChildExit::Exited(0));
     }
 }
 
-fn echoed(seq: u32) -> DeadPeerAnswer {
-    DeadPeerAnswer {
+fn echoed(seq: u32) -> DeadPeerResponse {
+    DeadPeerResponse {
         seq: Seq::new(seq),
         message: Ok(request(seq).into()),
     }
@@ -376,22 +379,22 @@ fn a_peer_killed_at_any_moment_loses_no_request_and_answers_none_twice() {
     let mut next_kill = kills.next();
 
     while read < REQUESTS {
-        while sent < REQUESTS && lane.host.window().has_room(lane.geometry.depth()) {
+        while sent < REQUESTS && lane.caller.window().has_room(lane.geometry.depth()) {
             lane.send(sent);
             sent += 1;
         }
         if next_kill.is_some_and(|at| read >= at) {
             next_kill = kills.next();
             kill(peer);
-            assert_eq!(wait_end(peer), End::Killed(libc::SIGKILL));
+            assert_eq!(wait_end(peer), ChildExit::Killed(libc::SIGKILL));
             let mut answered = Vec::new();
-            let split = lane.host.take_over(&mut answered).unwrap();
+            let split = lane.caller.take_over(&mut answered).unwrap();
             for answer in answered {
                 assert_eq!(answer, echoed(answer.seq.get()));
                 times_answered[answer.seq.get() as usize] += 1;
             }
-            given_up += u32::from(split.running().is_some()) + split.handed().len();
-            read = split.handed().end().get();
+            given_up += u32::from(split.running().is_some()) + split.untaken().len();
+            read = split.untaken().end().get();
             peer = lane.fork_peer(|peer| echo(peer, None, REQUESTS - 1));
             continue;
         }
@@ -404,7 +407,7 @@ fn a_peer_killed_at_any_moment_loses_no_request_and_answers_none_twice() {
     assert!(times_answered.iter().all(|&n| n <= 1), "an answer came twice");
     assert_eq!(times_answered.iter().filter(|&&n| n == 0).count() as u32, given_up);
     drop(lane);
-    assert_eq!(wait_end(peer), End::Exited(0));
+    assert_eq!(wait_end(peer), ChildExit::Exited(0));
 }
 
 /// Writes `writes` words of garbage into the channel's memory: small numbers near the ring's counters, the largest
@@ -437,19 +440,19 @@ fn scribble(shm: &OwnedFd, total_bytes: usize, seed: u64, writes: u32) {
             1 => u32::MAX - (next() % 4) as u32,
             _ => next() as u32,
         };
-        // SAFETY: `at` is a word inside the mapping; the host reads these words only as atomics or by copying.
+        // SAFETY: `at` is a word inside the mapping; the caller reads these words only as atomics or by copying.
         unsafe { base.cast::<u32>().add(at).write_volatile(value) };
     }
 }
 
-/// Exercises every way the host reads the channel, while the peer may be writing garbage into it, and checks that
-/// nothing it believed is out of the host's own bounds.
+/// Exercises every way the caller reads the channel, while the peer may be writing garbage into it, and checks that
+/// nothing it believed is out of the caller's own bounds.
 fn read_everything(lane: &mut Lane, fault: &mut Option<PeerFault>) {
     let max = lane.geometry.max_message() as usize;
     let mut message = BytesMut::new();
-    match lane.host.answers() {
+    match lane.caller.responses() {
         Ok(mut ready) => {
-            assert_eq!(*fault, None, "a fault the host kept was forgotten");
+            assert_eq!(*fault, None, "a fault the caller kept was forgotten");
             loop {
                 message.clear();
                 match ready.take_next(&mut message) {
@@ -464,30 +467,30 @@ fn read_everything(lane: &mut Lane, fault: &mut Option<PeerFault>) {
         }
         Err(found) => assert!(fault.is_none_or(|kept| kept == found), "{fault:?} then {found:?}"),
     }
-    if let Err(found) = lane.host.answers() {
+    if let Err(found) = lane.caller.responses() {
         *fault = Some(found);
     }
-    let window = lane.host.window();
-    if let Ok(Some(running)) = lane.host.running() {
+    let window = lane.caller.window();
+    if let Ok(Some(running)) = lane.caller.running() {
         assert!(
             running.since(window.read()) < window.in_flight(),
             "{running} outside {window:?}"
         );
     }
-    std::hint::black_box(lane.host.has_news());
-    if let Ok(Some(StartOutcome::Failed(note))) = lane.host.start_report(Attempt::new(1)) {
+    std::hint::black_box(lane.caller.has_responses_or_fault());
+    if let Ok(Some(StartOutcome::Failed(note))) = lane.caller.start_report(Attempt::new(1)) {
         assert!(note.len() <= NOTE_BYTES as usize);
     }
-    std::hint::black_box(sleep_all(std::slice::from_mut(&mut lane.host)));
-    wake_all(std::slice::from_mut(&mut lane.host));
-    if lane.host.request_slot().is_some() {
+    std::hint::black_box(prepare_to_wait(std::slice::from_mut(&mut lane.caller)));
+    finish_wait(std::slice::from_mut(&mut lane.caller));
+    if lane.caller.request_slot().is_some() {
         assert_eq!(*fault, None, "a peer at fault was sent a request");
     }
-    let window = lane.host.window();
+    let window = lane.caller.window();
     assert!(window.in_flight() <= lane.geometry.depth().get(), "{window:?}");
 }
 
-/// A peer that writes garbage anywhere in the channel, while the host reads it and after, never makes the host read
+/// A peer that writes garbage anywhere in the channel, while the caller reads it and after, never makes the caller read
 /// past its own bounds, forget a fault it found, or misplace a request when it takes over; and once it is dead, no
 /// request it could have rewritten reaches the next peer, which is served as on a clean channel.
 #[test]
@@ -522,15 +525,15 @@ fn a_peer_writing_garbage_anywhere_cannot_crash_mislead_or_outlive_itself() {
         }
         read_everything(&mut lane, &mut fault);
 
-        let before = lane.host.window();
+        let before = lane.caller.window();
         let mut answered = Vec::new();
-        match lane.host.take_over(&mut answered) {
+        match lane.caller.take_over(&mut answered) {
             Ok(split) => {
                 assert_eq!(
-                    (split.answered().start(), split.handed().end()),
+                    (split.responded().start(), split.untaken().end()),
                     (before.read(), before.sent())
                 );
-                assert_eq!(answered.len() as u32, split.answered().len());
+                assert_eq!(answered.len() as u32, split.responded().len());
                 assert!(answered
                     .iter()
                     .all(|a| a.message.as_ref().is_ok_and(|m| m.len() <= total)));
@@ -538,7 +541,7 @@ fn a_peer_writing_garbage_anywhere_cannot_crash_mislead_or_outlive_itself() {
             Err(dead) => assert_eq!(dead.abandoned, before.outstanding()),
         }
 
-        assert_eq!(lane.host.in_flight(), 0, "seed {seed}");
+        assert_eq!(lane.caller.in_flight(), 0, "seed {seed}");
         let next = before.sent().get();
         let peer = lane.fork_peer(|peer| echo(peer, None, next + 7));
         for seq in next..next + 8 {
@@ -550,14 +553,14 @@ fn a_peer_writing_garbage_anywhere_cannot_crash_mislead_or_outlive_itself() {
             );
         }
         drop(lane);
-        assert_eq!(wait_end(peer), End::Exited(0), "seed {seed}");
+        assert_eq!(wait_end(peer), ChildExit::Exited(0), "seed {seed}");
     }
 }
 
-/// A peer that keeps writing into the host's wake pipe cannot hold the host in a read: each drain reads once.
+/// A peer that keeps writing into the caller's wake pipe cannot hold the caller in a read: each drain reads once.
 #[test]
-fn a_peer_flooding_the_wake_pipe_cannot_hold_the_host_in_a_read() {
-    let (bell, bell_write) = open_host_doorbell().unwrap();
+fn a_peer_flooding_the_wake_pipe_cannot_hold_the_caller_in_a_read() {
+    let (bell, bell_write) = open_requester_doorbell().unwrap();
     let flooder = fork_child(|| loop {
         // A full pipe answers EAGAIN, which a flooder ignores; a reader gone ends it.
         if rustix::io::write(&bell_write, &[1u8; 4096]) == Err(rustix::io::Errno::PIPE) {
@@ -573,5 +576,5 @@ fn a_peer_flooding_the_wake_pipe_cannot_hold_the_host_in_a_read() {
     }
     assert!(more_left > 0);
     kill(flooder);
-    assert_eq!(wait_end(flooder), End::Killed(libc::SIGKILL));
+    assert_eq!(wait_end(flooder), ChildExit::Killed(libc::SIGKILL));
 }

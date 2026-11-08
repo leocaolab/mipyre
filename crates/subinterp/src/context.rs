@@ -16,7 +16,7 @@
 //!
 //! A context is entered once:
 //!
-//! ```compile_fail
+//! ```compile_fail,E0382
 //! # use mipyre_subinterp::context::PyContext;
 //! # fn unit(py: pyo3::Python<'_>) -> pyo3::PyResult<()> {
 //! let ctx = PyContext::new(py)?;
@@ -28,7 +28,7 @@
 //!
 //! A suspended entry can't be left (or used) until it is entered again:
 //!
-//! ```compile_fail
+//! ```compile_fail,E0382
 //! # use mipyre_subinterp::context::PyContext;
 //! # fn unit(py: pyo3::Python<'_>) -> pyo3::PyResult<()> {
 //! let entry = PyContext::new(py)?.enter();
@@ -214,22 +214,19 @@ fn exit(ctx: &Bound<'_, PyAny>) -> PyResult<()> {
 }
 
 impl Drop for ContextEntry<'_> {
-    /// Runs only on a panic, since every step that ends an entry skips it, and logs the error
-    /// because no caller can take it.
+    /// Runs only on a panic, since every step that ends an entry skips it, and hands the error
+    /// to `sys.unraisablehook`, the app's place for errors no caller can take, as CPython does
+    /// for an exception in `__del__`.
     fn drop(&mut self) {
         if let Err(err) = exit(&self.0) {
-            tracing::error!(
-                error = %err,
-                "leaving a unit's contextvars.Context failed: code in it entered a context it \
-                 did not exit"
-            );
+            err.write_unraisable(self.0.py(), Some(&self.0));
         }
     }
 }
 
 /// How an object is awaited, read from its type's C slots in two compares without a Python call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AwaitSlot {
+pub enum AwaitKind {
     /// The object's type is exactly the native coroutine type.
     Coroutine,
     /// The type has `am_await`, as a Future or a Cython coroutine does.
@@ -238,9 +235,9 @@ pub enum AwaitSlot {
 }
 
 #[inline]
-pub fn await_slot(obj: &Bound<'_, PyAny>) -> AwaitSlot {
+pub fn await_kind(obj: &Bound<'_, PyAny>) -> AwaitKind {
     if is_coroutine(obj) {
-        return AwaitSlot::Coroutine;
+        return AwaitKind::Coroutine;
     }
     let ptr = obj.as_ptr();
     // SAFETY: `ptr` is borrowed from a live `obj`, its type is never NULL, and `tp_as_async` is
@@ -250,9 +247,9 @@ pub fn await_slot(obj: &Bound<'_, PyAny>) -> AwaitSlot {
         !slots.is_null() && (*slots).am_await.is_some()
     };
     if awaitable {
-        AwaitSlot::Awaitable
+        AwaitKind::Awaitable
     } else {
-        AwaitSlot::Plain
+        AwaitKind::Plain
     }
 }
 

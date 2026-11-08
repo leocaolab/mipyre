@@ -52,7 +52,7 @@ pub enum PollPhase {
 }
 
 /// Says what a write does: when [`Self::drain_first`], the kept bytes go out first so order holds,
-/// then [`Self::action`] runs. Only [`write()`] makes one, so a [`WriteAction::Keep`] is always under
+/// then [`Self::action`] runs. Only [`decide_write()`] makes one, so a [`WriteAction::Keep`] is always under
 /// [`COALESCE_LIMIT`]. `drain_first` sits beside the action rather than in its variants because
 /// the call site then tests one register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub struct ConnectionFacts {
 /// reading it into locals, because splitting it by `kept` or passing `conn` by value measured
 /// more instructions at the call site.
 #[inline]
-pub fn write(conn: &ConnectionFacts, kept: usize, draining: bool, bufs: &[IoSlice<'_>]) -> WriteDecision {
+pub fn decide_write(conn: &ConnectionFacts, kept: usize, draining: bool, bufs: &[IoSlice<'_>]) -> WriteDecision {
     let ConnectionFacts {
         protocol,
         poll,
@@ -216,7 +216,7 @@ mod tests {
 
     fn http1(kept: usize, draining: bool, n: usize) -> WriteDecision {
         let buf = vec![0; n];
-        write(&BATCHING, kept, draining, &[IoSlice::new(&buf)])
+        decide_write(&BATCHING, kept, draining, &[IoSlice::new(&buf)])
     }
 
     fn alone() -> WriteDecision {
@@ -269,7 +269,7 @@ mod tests {
     fn a_vectored_write_counts_all_its_slices() {
         let (a, b) = (vec![0; COALESCE_LIMIT / 2], vec![0; COALESCE_LIMIT / 2 + 1]);
         assert_eq!(
-            write(&BATCHING, 0, false, &[IoSlice::new(&a), IoSlice::new(&b)]),
+            decide_write(&BATCHING, 0, false, &[IoSlice::new(&a), IoSlice::new(&b)]),
             direct(false)
         );
     }
@@ -298,7 +298,10 @@ mod tests {
             protocol: Protocol::Sniffing(PartialPreface(3)),
             ..BATCHING
         };
-        assert_eq!(write(&sniffing, 0, false, &[IoSlice::new(&buf)]), keep(false, 10));
+        assert_eq!(
+            decide_write(&sniffing, 0, false, &[IoSlice::new(&buf)]),
+            keep(false, 10)
+        );
     }
 
     /// HTTP/2 passes through, after what was kept while the preface was being sniffed.
@@ -315,9 +318,9 @@ mod tests {
             input_unread: false,
             ..BATCHING
         };
-        assert_eq!(write(&h2, 5, false, &[IoSlice::new(&buf[..10])]), pass(true));
-        assert_eq!(write(&h2, 0, false, &[IoSlice::new(&buf)]), pass(false));
-        assert_eq!(write(&h2, 5, true, &[IoSlice::new(&buf)]), pass(true));
+        assert_eq!(decide_write(&h2, 5, false, &[IoSlice::new(&buf[..10])]), pass(true));
+        assert_eq!(decide_write(&h2, 0, false, &[IoSlice::new(&buf)]), pass(false));
+        assert_eq!(decide_write(&h2, 5, true, &[IoSlice::new(&buf)]), pass(true));
     }
 
     /// A response with nothing kept before it and no request unread after it is the only one
@@ -330,17 +333,21 @@ mod tests {
             input_unread: false,
             ..BATCHING
         };
-        assert_eq!(write(&read_pending, 0, false, &one), alone());
+        assert_eq!(decide_write(&read_pending, 0, false, &one), alone());
         let outside = ConnectionFacts {
             poll: PollPhase::Outside,
             ..BATCHING
         };
         assert_eq!(
-            write(&outside, 0, false, &one),
+            decide_write(&outside, 0, false, &one),
             alone(),
             "outside a poll a flush always writes anyway"
         );
-        assert_eq!(write(&BATCHING, 0, false, &one), keep(false, 100), "a pipelined batch");
+        assert_eq!(
+            decide_write(&BATCHING, 0, false, &one),
+            keep(false, 100),
+            "a pipelined batch"
+        );
     }
 
     /// Bytes kept or under way go first, so a response behind them is kept to go with them.
@@ -352,8 +359,8 @@ mod tests {
             input_unread: false,
             ..BATCHING
         };
-        assert_eq!(write(&behind, 1, false, &one), keep(false, 100));
-        assert_eq!(write(&behind, 0, true, &one), keep(true, 100));
+        assert_eq!(decide_write(&behind, 1, false, &one), keep(false, 100));
+        assert_eq!(decide_write(&behind, 0, true, &one), keep(true, 100));
     }
 
     /// An inner IO that writes one slice per call would split a multi-slice response into a write
@@ -367,13 +374,13 @@ mod tests {
             ..BATCHING
         };
         let two = [IoSlice::new(&head), IoSlice::new(&body)];
-        assert_eq!(write(&scalar, 0, false, &two), keep(false, 30));
-        assert_eq!(write(&scalar, 0, false, &[IoSlice::new(&head)]), alone());
+        assert_eq!(decide_write(&scalar, 0, false, &two), keep(false, 30));
+        assert_eq!(decide_write(&scalar, 0, false, &[IoSlice::new(&head)]), alone());
         let vectored = ConnectionFacts {
             vectored: true,
             ..scalar
         };
-        assert_eq!(write(&vectored, 0, false, &two), alone());
+        assert_eq!(decide_write(&vectored, 0, false, &two), alone());
     }
 
     #[test]
@@ -475,7 +482,7 @@ mod proofs {
     fn a_kept_write_counts_every_slice_and_is_under_the_limit() {
         let (slices, count) = any_slices();
         let bufs = &slices[..count];
-        let decision = write(&any_connection(), kani::any(), kani::any(), bufs);
+        let decision = decide_write(&any_connection(), kani::any(), kani::any(), bufs);
         if let WriteAction::Keep { total } = decision.action() {
             let sum: usize = bufs.iter().map(|b| b.len()).sum();
             assert!(sum < COALESCE_LIMIT);
@@ -489,7 +496,7 @@ mod proofs {
     fn a_kept_write_that_drains_nothing_first_fits_beside_what_is_kept() {
         let (slices, count) = any_slices();
         let kept: usize = kani::any();
-        let decision = write(&any_connection(), kept, kani::any(), &slices[..count]);
+        let decision = decide_write(&any_connection(), kept, kani::any(), &slices[..count]);
         if let WriteAction::Keep { total } = decision.action() {
             if !decision.drain_first() {
                 let together = kept.checked_add(total as usize);
@@ -504,7 +511,7 @@ mod proofs {
         let (slices, count) = any_slices();
         let conn = any_connection();
         let (kept, draining): (usize, bool) = (kani::any(), kani::any());
-        let decision = write(&conn, kept, draining, &slices[..count]);
+        let decision = decide_write(&conn, kept, draining, &slices[..count]);
         assert_eq!(decision.action() == WriteAction::Pass, conn.protocol == Protocol::Http2);
         if conn.protocol == Protocol::Http2 {
             assert_eq!(decision.drain_first(), draining || kept > 0);

@@ -269,7 +269,7 @@ fn mount_on(root: &Path, copies: Copies, budget: &Arc<CacheBudget>) -> StaticMou
     StaticMount {
         rule: StaticMountRule::new("/static", copies).unwrap(),
         cache: Arc::new(cache),
-        held: Arc::new(HeldBytes::new()),
+        in_flight: Arc::new(BytesInFlight::new()),
     }
 }
 
@@ -527,7 +527,11 @@ fn a_file_sent_from_disk_answers_as_the_kept_file_does() {
         "HEAD's Content-Length"
     );
     assert_eq!(&body_of(&rt, sent_answer)[..], &bytes[..]);
-    assert_eq!(sent.held.get(), 0, "every chunk was handed back once the body was read");
+    assert_eq!(
+        sent.in_flight.get(),
+        0,
+        "every chunk was handed back once the body was read"
+    );
 
     let etag = kept_answer.headers()[ETAG].to_str().unwrap().to_owned();
     let revalidated = serve_asking(
@@ -752,7 +756,7 @@ fn slow_clients_of_an_unkept_file_hold_a_bounded_number_of_bytes() {
             clients.push(client);
         }
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        let held = mount.held.get();
+        let held = mount.in_flight.get();
         drop(clients);
         held
     });

@@ -1,5 +1,5 @@
 //! Holds the channel to what it promises about a peer it does not trust: every value the peer can write in
-//! the header, at each edge of what the host believes, through a real shared mapping the test writes as the peer
+//! the header, at each edge of what the caller believes, through a real shared mapping the test writes as the peer
 //! does; the ring's wrap at 2^32 at every depth; a peer that drops requests unanswered; a dead peer's
 //! leftovers and the next attempt; and memory the OS will not give.
 //!
@@ -15,7 +15,7 @@
 )]
 
 use std::convert::Infallible;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,25 +24,31 @@ use bytes::BytesMut;
 use mipyre_shm::adapter::doorbell::FutexDoorbell;
 use mipyre_shm::adapter::mapped::{AttachError, MappedMemory};
 use mipyre_shm::adapter::parker::FutexParker;
-use mipyre_shm::channel::{Attempt, Channel, HeapMemory, HostEnd, PeerEnd, PeerFault, StartOutcome, Wait, NOTE_BYTES};
+use mipyre_shm::channel::{
+    Attempt, Channel, HeapMemory, PeerEnd, PeerFault, RequesterEnd, StartOutcome, WaitOutcome, NOTE_BYTES,
+};
 use mipyre_shm::plan::geometry::{Geometry, SlotBytes, HEADER_PAGE};
-use mipyre_shm::plan::ring::{count_ready_answers, exit_split, running, PeerCounterError, RingDepth, Seq, Window};
+use mipyre_shm::plan::ring::{
+    count_ready_responses, exit_split, running, PeerCounterError, RingDepth, RingWindow, Seq,
+};
 use mipyre_shm::plan::slot_len::SlotLengthError;
 use mipyre_shm::plan::spin_window::SpinWindow;
 use mipyre_shm::plan::start::StartReportError;
-use mipyre_shm::protocol::doorbell::{AtomicU32, Doorbell, Parker};
+use mipyre_shm::protocol::doorbell::{AtomicU32, Parker};
 use mipyre_shm::Syscall;
 
-/// A peer's doorbell to a host that never sleeps in these tests.
-struct NoBell;
+#[path = "support/peer_view.rs"]
+#[expect(
+    dead_code,
+    reason = "these tests write the peer's words, never a run of message bytes"
+)]
+mod peer_view;
 
-impl Doorbell for NoBell {
-    type Outcome = ();
-    type Error = Infallible;
-    fn ring(&self, _: &AtomicU32) -> Result<(), Infallible> {
-        Ok(())
-    }
-}
+#[path = "support/stub_doorbell.rs"]
+mod stub_doorbell;
+
+use peer_view::PeerView;
+use stub_doorbell::StubDoorbell;
 
 /// The peer parks as soon as it finds no request.
 const NO_SPIN: SpinWindow = SpinWindow::until(0);
@@ -65,69 +71,17 @@ mod at {
 const READY: u32 = 1;
 const FAILED: u32 = 2;
 
-type Host = HostEnd<MappedMemory, FutexDoorbell>;
-type Peer = PeerEnd<MappedMemory, NoBell, FutexParker>;
+type Requester = RequesterEnd<MappedMemory, FutexDoorbell>;
+type Peer = PeerEnd<MappedMemory, StubDoorbell, FutexParker>;
 
 fn geometry(depth: u32, slot_bytes: usize) -> Geometry {
     Geometry::new(RingDepth::new(depth).unwrap(), SlotBytes::new(slot_bytes).unwrap()).unwrap()
 }
 
-/// A second shared mapping of the channel's object, through which the test writes as the peer does.
-struct PeerView {
-    base: *mut u8,
-    len: usize,
-}
-
-impl PeerView {
-    fn new(shm: &OwnedFd, len: usize) -> Self {
-        // SAFETY: a new shared mapping of the whole object at an address the kernel picks.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                shm.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(base, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
-        PeerView { base: base.cast(), len }
-    }
-
-    fn put_u32(&self, at: usize, value: u32) {
-        assert!(at.is_multiple_of(4) && at + 4 <= self.len);
-        // SAFETY: an aligned word inside the mapping; the host reads it only as an atomic.
-        unsafe { self.base.add(at).cast::<u32>().write_volatile(value) };
-    }
-
-    fn u32_at(&self, at: usize) -> u32 {
-        assert!(at.is_multiple_of(4) && at + 4 <= self.len);
-        // SAFETY: as in `put_u32`.
-        unsafe { self.base.add(at).cast::<u32>().read_volatile() }
-    }
-
-    fn put_u64(&self, at: usize, value: u64) {
-        assert!(at.is_multiple_of(8) && at + 8 <= self.len);
-        // SAFETY: as in `put_u32`, a word of 8 bytes.
-        unsafe { self.base.add(at).cast::<u64>().write_volatile(value) };
-    }
-}
-
-// SAFETY: the view is a range of shared addresses read and written only by volatile word accesses, from any thread.
-unsafe impl Send for PeerView {}
-
-impl Drop for PeerView {
-    fn drop(&mut self) {
-        // SAFETY: the whole of the mapping `new` made.
-        unsafe { libc::munmap(self.base.cast(), self.len) };
-    }
-}
-
-/// One channel in a mapping, its host's end, and a view to write into it as the peer.
+/// One channel in a mapping, its caller's end, and a view to write into it as the peer.
 struct Rig {
     geometry: Geometry,
-    host: Host,
+    caller: Requester,
     shm: OwnedFd,
     view: PeerView,
 }
@@ -136,11 +90,11 @@ impl Rig {
     fn new(depth: u32) -> Self {
         let geometry = geometry(depth, 64);
         let (memory, shm) = MappedMemory::create(&geometry).unwrap();
-        let host = HostEnd::new(Arc::new(Channel::new(memory)), FutexDoorbell);
+        let caller = RequesterEnd::new(Arc::new(Channel::new(memory)), FutexDoorbell);
         let view = PeerView::new(&shm, geometry.total_bytes());
         let mut rig = Rig {
             geometry,
-            host,
+            caller,
             shm,
             view,
         };
@@ -150,47 +104,47 @@ impl Rig {
 
     /// Fails the test unless the offsets in [`at`] are where the channel writes its words.
     fn check_offsets(&mut self) {
-        self.host.begin_attempt(Attempt::new(0xA77E));
+        self.caller.begin_attempt(Attempt::new(0xA77E));
         assert_eq!(self.view.u32_at(at::ATTEMPT), 0xA77E, "attempt");
         self.view.put_u32(at::NOTE_LEN, 3);
         self.view.put_u32(at::STATE, FAILED);
         assert_eq!(
-            self.host
+            self.caller
                 .start_report(Attempt::new(0xA77E))
                 .unwrap()
                 .map(|o| matches!(o, StartOutcome::Failed(n) if n.len() == 3)),
             Some(true)
         );
-        self.host.begin_attempt(Attempt::new(0));
+        self.caller.begin_attempt(Attempt::new(0));
         self.view.put_u64(at::WAITS, 11);
         self.view.put_u64(at::WAITS + 24, 7);
-        let waits = self.host.channel().peer_waits();
+        let waits = self.caller.channel().peer_waits();
         assert_eq!((waits.waits, waits.wakes), (11, 7), "peer waits");
         self.view.put_u64(at::WAITS, 0);
         self.view.put_u64(at::WAITS + 24, 0);
-        mipyre_shm::channel::sleep_all(std::slice::from_mut(&mut self.host));
-        assert_eq!(self.view.u32_at(at::HOST_SLEEPING), 1, "host_sleeping");
-        mipyre_shm::channel::wake_all(std::slice::from_mut(&mut self.host));
-        assert_eq!(self.view.u32_at(at::HOST_SLEEPING), 0, "host_sleeping");
+        mipyre_shm::channel::prepare_to_wait(std::slice::from_mut(&mut self.caller));
+        assert_eq!(self.view.u32_at(at::HOST_SLEEPING), 1, "requester_sleeping");
+        mipyre_shm::channel::finish_wait(std::slice::from_mut(&mut self.caller));
+        assert_eq!(self.view.u32_at(at::HOST_SLEEPING), 0, "requester_sleeping");
     }
 
     fn peer(&self) -> Peer {
         let memory = MappedMemory::attach(&self.geometry, self.shm.as_fd()).unwrap();
-        PeerEnd::new(Arc::new(Channel::new(memory)), NoBell, FutexParker)
+        PeerEnd::new(Arc::new(Channel::new(memory)), StubDoorbell, FutexParker)
     }
 
     fn send(&mut self, n: u32) {
         for _ in 0..n {
-            let mut slot = self.host.request_slot().expect("the ring has room");
+            let mut slot = self.caller.request_slot().expect("the ring has room");
             let seq = slot.seq();
             slot.write(|w| w.put(&seq.get().to_le_bytes())).unwrap();
             slot.publish().unwrap_or_else(|never| match never {});
         }
     }
 
-    /// Takes every answer ready, as the host does.
+    /// Takes every answer ready, as the caller does.
     fn take_all(&mut self) -> Result<Vec<(Seq, Vec<u8>)>, PeerFault> {
-        let mut ready = self.host.answers()?;
+        let mut ready = self.caller.responses()?;
         let mut out = Vec::new();
         loop {
             let mut buf = BytesMut::new();
@@ -216,19 +170,19 @@ impl Rig {
             "taken, resp_head"
         );
         assert_eq!(rig.take_all().unwrap().len(), 2);
-        assert_eq!(rig.host.window(), Window::new(Seq::new(2), Seq::new(6)));
+        assert_eq!(rig.caller.window(), RingWindow::new(Seq::new(2), Seq::new(6)));
         rig
     }
 }
 
 /// Takes the next request, which must be there, and answers it with its own bytes.
 fn echo(peer: &mut Peer) -> Seq {
-    let Ok(Wait::Request(request)) = peer.wait_for_request(NO_SPIN, || 0, 1) else {
+    let Ok(WaitOutcome::Request(request)) = peer.wait_for_request(NO_SPIN, || 0, 1) else {
         panic!("a request was published");
     };
     let (seq, bytes) = (request.seq(), request.bytes().unwrap().to_vec());
     request
-        .answer(|w| w.put(&bytes).unwrap())
+        .respond(|w| w.put(&bytes).unwrap())
         .unwrap_or_else(|never| match never {});
     seq
 }
@@ -267,9 +221,9 @@ fn every_depth_keeps_the_requests_in_flight_in_distinct_slots_across_the_wrap() 
         let g = Geometry::new(depth, SlotBytes::new(8).unwrap()).unwrap();
         let read = Seq::new(u32::MAX - depth.get() / 2);
         let sent = read.after(depth.get());
-        let w = Window::new(read, sent);
+        let w = RingWindow::new(read, sent);
         assert!(
-            !w.has_room(depth) && Window::new(read, sent.after(u32::MAX)).has_room(depth),
+            !w.has_room(depth) && RingWindow::new(read, sent.after(u32::MAX)).has_room(depth),
             "depth {}",
             depth.get()
         );
@@ -285,9 +239,9 @@ fn every_depth_keeps_the_requests_in_flight_in_distinct_slots_across_the_wrap() 
         let mut taken = std::collections::HashSet::new();
         for &k in &ks {
             let seq = read.after(k);
-            let (req, ans) = (g.request_slot(seq).get(), g.answer_slot(seq).get());
+            let (req, ans) = (g.request_offset(seq).get(), g.response_offset(seq).get());
             assert!(
-                req >= HEADER_PAGE && req + 8 <= g.answer_slot(Seq::new(0)).get(),
+                req >= HEADER_PAGE && req + 8 <= g.response_offset(Seq::new(0)).get(),
                 "depth {} seq {seq}",
                 depth.get()
             );
@@ -297,16 +251,16 @@ fn every_depth_keeps_the_requests_in_flight_in_distinct_slots_across_the_wrap() 
                 "depth {}: seq {seq} shares a slot",
                 depth.get()
             );
-            assert_eq!(count_ready_answers(&w, seq), Ok(k), "depth {}", depth.get());
+            assert_eq!(count_ready_responses(&w, seq), Ok(k), "depth {}", depth.get());
         }
-        assert_eq!(count_ready_answers(&w, sent), Ok(depth.get()));
+        assert_eq!(count_ready_responses(&w, sent), Ok(depth.get()));
         assert!(
-            count_ready_answers(&w, sent.after(1)).is_err(),
+            count_ready_responses(&w, sent.after(1)).is_err(),
             "one past what was sent, depth {}",
             depth.get()
         );
         assert!(
-            count_ready_answers(&w, read.after(u32::MAX)).is_err(),
+            count_ready_responses(&w, read.after(u32::MAX)).is_err(),
             "one behind what was read, depth {}",
             depth.get()
         );
@@ -318,12 +272,12 @@ fn every_depth_keeps_the_requests_in_flight_in_distinct_slots_across_the_wrap() 
         );
         assert!(running(&w, read, sent.after(1)).is_err());
         assert!(exit_split(&w, read, read.after(1))
-            .is_ok_and(|s| s.running() == Some(read) && s.handed().len() == depth.get() - 1));
+            .is_ok_and(|s| s.running() == Some(read) && s.untaken().len() == depth.get() - 1));
     }
 }
 
 /// The two counters a live peer writes, at every value from two behind what was read to two past what was sent:
-/// the host believes exactly `read ≤ published ≤ taken ≤ sent`, keeps anything else as the peer's fault with the
+/// the caller believes exactly `read ≤ published ≤ taken ≤ sent`, keeps anything else as the peer's fault with the
 /// value it read, and from then on reads nothing of the peer's and sends it nothing.
 #[test]
 fn a_live_peers_counters_at_each_edge_are_believed_or_kept_as_its_fault() {
@@ -335,11 +289,11 @@ fn a_live_peers_counters_at_each_edge_are_believed_or_kept_as_its_fault() {
             rig.view.put_u32(at::TAKEN, taken);
             let believed = (read..=sent).contains(&published) && (published..=sent).contains(&taken);
             let case = format!("published {published}, taken {taken}");
-            match rig.host.running() {
+            match rig.caller.running() {
                 Ok(run) => {
                     assert!(believed, "{case}: believed");
                     assert_eq!(run, (taken != published).then_some(Seq::new(published)), "{case}");
-                    assert!(rig.host.request_slot().is_some(), "{case}");
+                    assert!(rig.caller.request_slot().is_some(), "{case}");
                 }
                 Err(fault) => {
                     assert!(!believed, "{case}: refused {fault:?}");
@@ -355,19 +309,19 @@ fn a_live_peers_counters_at_each_edge_are_believed_or_kept_as_its_fault() {
                     assert!(said, "{case}: the fault says what was read: {e}");
                     rig.view.put_u32(at::RESP_HEAD, sent);
                     rig.view.put_u32(at::TAKEN, sent);
-                    assert_eq!(rig.host.answers().err(), Some(fault), "{case}: the fault is kept");
+                    assert_eq!(rig.caller.responses().err(), Some(fault), "{case}: the fault is kept");
                     assert!(
-                        rig.host.request_slot().is_none(),
+                        rig.caller.request_slot().is_none(),
                         "{case}: a peer at fault is sent nothing"
                     );
-                    assert!(!rig.host.has_answers(), "{case}");
+                    assert!(!rig.caller.has_responses(), "{case}");
                 }
             }
         }
     }
 }
 
-/// A dead peer's two counters at every value around the window: the host splits the window by them exactly when a
+/// A dead peer's two counters at every value around the window: the caller splits the window by them exactly when a
 /// standing peer could have left them, else gives up every request sent; either way the next peer takes only what is
 /// sent after.
 #[test]
@@ -383,7 +337,7 @@ fn a_dead_peers_counters_at_each_edge_split_the_window_or_give_it_up() {
             let split_ok =
                 (read..=sent).contains(&published) && (taken == published || (taken == published + 1 && taken <= sent));
             let mut answered = Vec::new();
-            match rig.host.take_over(&mut answered) {
+            match rig.caller.take_over(&mut answered) {
                 Ok(split) => {
                     assert!(split_ok, "{case}: split");
                     assert_eq!(answered.len() as u32, published - read, "{case}");
@@ -393,7 +347,7 @@ fn a_dead_peers_counters_at_each_edge_split_the_window_or_give_it_up() {
                         "{case}"
                     );
                     assert_eq!(
-                        (split.handed().start().get(), split.handed().end().get()),
+                        (split.untaken().start().get(), split.untaken().end().get()),
                         (taken.max(published), sent),
                         "{case}"
                     );
@@ -408,7 +362,7 @@ fn a_dead_peers_counters_at_each_edge_split_the_window_or_give_it_up() {
                     assert!(answered.is_empty(), "{case}");
                 }
             }
-            assert_eq!(rig.host.in_flight(), 0, "{case}");
+            assert_eq!(rig.caller.in_flight(), 0, "{case}");
             assert_eq!(
                 (
                     rig.view.u32_at(at::REQ_HEAD),
@@ -420,7 +374,7 @@ fn a_dead_peers_counters_at_each_edge_split_the_window_or_give_it_up() {
             );
             let mut next = rig.peer();
             assert!(
-                matches!(next.wait_for_request(NO_SPIN, || 0, 1), Ok(Wait::SliceOver)),
+                matches!(next.wait_for_request(NO_SPIN, || 0, 1), Ok(WaitOutcome::SliceOver)),
                 "{case}: the next peer takes nothing old"
             );
             rig.send(1);
@@ -434,7 +388,7 @@ fn a_dead_peers_counters_at_each_edge_split_the_window_or_give_it_up() {
     }
 }
 
-/// A slot's length word at each edge of the slot's room, in both rings: the host takes an answer up to the room and
+/// A slot's length word at each edge of the slot's room, in both rings: the caller takes an answer up to the room and
 /// keeps one past it as the fault, with the value; the peer refuses a request past it with the value.
 #[test]
 fn a_slot_length_at_each_edge_is_taken_or_refused_with_its_value() {
@@ -443,9 +397,9 @@ fn a_slot_length_at_each_edge_is_taken_or_refused_with_its_value() {
         let mut rig = Rig::window_2_6();
         let mut peer = rig.peer();
         echo(&mut peer);
-        rig.view.put_u32(rig.geometry.answer_slot(Seq::new(2)).get(), len);
+        rig.view.put_u32(rig.geometry.response_offset(Seq::new(2)).get(), len);
         let mut buf = BytesMut::new();
-        let taken = rig.host.answers().unwrap().take_next(&mut buf);
+        let taken = rig.caller.responses().unwrap().take_next(&mut buf);
         if len <= max {
             assert_eq!(
                 (taken, buf.len()),
@@ -461,8 +415,8 @@ fn a_slot_length_at_each_edge_is_taken_or_refused_with_its_value() {
             assert!(buf.is_empty(), "answer of {len}: nothing copied");
         }
 
-        rig.view.put_u32(rig.geometry.request_slot(Seq::new(3)).get(), len);
-        let Ok(Wait::Request(request)) = peer.wait_for_request(NO_SPIN, || 0, 1) else {
+        rig.view.put_u32(rig.geometry.request_offset(Seq::new(3)).get(), len);
+        let Ok(WaitOutcome::Request(request)) = peer.wait_for_request(NO_SPIN, || 0, 1) else {
             panic!("request 3 was sent")
         };
         match request.bytes() {
@@ -485,26 +439,26 @@ fn a_start_report_is_the_attempts_own_and_its_note_is_held_to_its_area() {
     rig.view.put_u32(at::ATTEMPT, next.get());
     rig.view.put_u32(at::STATE, READY);
     rig.view.put_u32(at::NOTE_LEN, u32::MAX);
-    rig.host.begin_attempt(next);
+    rig.caller.begin_attempt(next);
     assert_eq!(
-        rig.host.start_report(next),
+        rig.caller.start_report(next),
         Ok(None),
         "the dead peer's report is cleared"
     );
     let peer = rig.peer();
     peer.report_ready(Attempt::new(1)).unwrap();
     assert_eq!(
-        rig.host.start_report(next),
+        rig.caller.start_report(next),
         Ok(None),
         "a peer of another attempt writes nothing"
     );
     peer.report_ready(next).unwrap();
-    assert_eq!(rig.host.start_report(next), Ok(Some(StartOutcome::Ready)));
+    assert_eq!(rig.caller.start_report(next), Ok(Some(StartOutcome::Ready)));
 
     for len in [0, 1, NOTE_BYTES - 1, NOTE_BYTES, NOTE_BYTES + 1, u32::MAX] {
         rig.view.put_u32(at::NOTE_LEN, len);
         rig.view.put_u32(at::STATE, FAILED);
-        match rig.host.start_report(next) {
+        match rig.caller.start_report(next) {
             Ok(Some(StartOutcome::Failed(note))) => {
                 assert!(len <= NOTE_BYTES && note.len() == len as usize, "note of {len}")
             }
@@ -516,13 +470,16 @@ fn a_start_report_is_the_attempts_own_and_its_note_is_held_to_its_area() {
     }
     for state in [3, 0x100, u32::MAX] {
         rig.view.put_u32(at::STATE, state);
-        assert_eq!(rig.host.start_report(next), Err(StartReportError::UnknownState(state)));
+        assert_eq!(
+            rig.caller.start_report(next),
+            Err(StartReportError::UnknownState(state))
+        );
     }
 }
 
-/// A dead peer that left every word of the header it can write set wrong (its sleep flag down, the host's up, the
-/// host's own `req_head` ahead, its wait counts at the top) does not stop the next peer, in another thread on real
-/// futex sleeps of a minute per slice, from being woken by the host's publish and answering.
+/// A dead peer that left every word of the header it can write set wrong (its sleep flag down, the caller's up, the
+/// caller's own `req_head` ahead, its wait counts at the top) does not stop the next peer, in another thread on real
+/// futex sleeps of a minute per slice, from being woken by the caller's publish and answering.
 ///
 /// The limit is 20 s: no step here waits on a clock except the peer's minute-long sleep slices, so a lost wake shows
 /// as the limit passing, and a working round trip takes microseconds.
@@ -535,7 +492,7 @@ fn a_dead_peers_leftover_flags_do_not_cost_the_next_peer_its_wake() {
     for k in 0..4 {
         rig.view.put_u64(at::WAITS + 8 * k, u64::MAX);
     }
-    rig.host.take_over(&mut Vec::new()).unwrap();
+    rig.caller.take_over(&mut Vec::new()).unwrap();
     let mut next = rig.peer();
     let (parked_tx, parked_rx) = mpsc::channel();
     let view_parks = PeerView::new(&rig.shm, rig.geometry.total_bytes());
@@ -545,14 +502,14 @@ fn a_dead_peers_leftover_flags_do_not_cost_the_next_peer_its_wake() {
             parked_tx.send(()).unwrap();
             loop {
                 match next.wait_for_request(NO_SPIN, || 0, 60_000_000_000) {
-                    Ok(Wait::Request(request)) => {
+                    Ok(WaitOutcome::Request(request)) => {
                         let (seq, bytes) = (request.seq(), request.bytes().unwrap().to_vec());
                         request
-                            .answer(|w| w.put(&bytes).unwrap())
+                            .respond(|w| w.put(&bytes).unwrap())
                             .unwrap_or_else(|never| match never {});
                         return seq;
                     }
-                    Ok(Wait::SliceOver) => continue,
+                    Ok(WaitOutcome::SliceOver) => continue,
                     Err(e) => panic!("the peer's sleep was refused: {e}"),
                 }
             }
@@ -566,7 +523,7 @@ fn a_dead_peers_leftover_flags_do_not_cost_the_next_peer_its_wake() {
     });
     rig.send(1);
     let mut rig = within(Duration::from_secs(20), "the answer of the woken peer", move || {
-        while !rig.host.has_answers() {
+        while !rig.caller.has_responses() {
             std::thread::yield_now();
         }
         rig
@@ -576,13 +533,13 @@ fn a_dead_peers_leftover_flags_do_not_cost_the_next_peer_its_wake() {
 }
 
 /// A request the peer drops unanswered is taken again, by the same peer: across a thousand requests on two threads,
-/// each one dropped once before it is answered, every answer reaches the host once, in order, with its own bytes.
+/// each one dropped once before it is answered, every answer reaches the caller once, in order, with its own bytes.
 ///
 /// The limit is 20 s: neither side waits on a clock (the peer's parker yields), so only a lost request ends there.
 #[test]
 fn a_request_dropped_unanswered_is_taken_again_and_answered_once() {
-    struct Yield;
-    impl Parker for Yield {
+    struct StubParker;
+    impl Parker for StubParker {
         type Error = Infallible;
         fn park(&self, _: &AtomicU32, _: u32, _: u64) -> Result<(), Infallible> {
             std::thread::yield_now();
@@ -591,8 +548,8 @@ fn a_request_dropped_unanswered_is_taken_again_and_answered_once() {
     }
     const REQUESTS: u32 = 1000;
     let channel = Arc::new(Channel::new(HeapMemory::new(&geometry(4, 64))));
-    let mut host = HostEnd::new(Arc::clone(&channel), FutexDoorbell);
-    let mut peer = PeerEnd::new(channel, NoBell, Yield);
+    let mut caller = RequesterEnd::new(Arc::clone(&channel), FutexDoorbell);
+    let mut peer = PeerEnd::new(channel, StubDoorbell, StubParker);
     within(
         Duration::from_secs(20),
         "a thousand requests each dropped once",
@@ -602,7 +559,7 @@ fn a_request_dropped_unanswered_is_taken_again_and_answered_once() {
                     let mut dropped = None;
                     let mut answered = 0;
                     while answered < REQUESTS {
-                        let Ok(Wait::Request(request)) = peer.wait_for_request(NO_SPIN, || 0, 1) else {
+                        let Ok(WaitOutcome::Request(request)) = peer.wait_for_request(NO_SPIN, || 0, 1) else {
                             continue;
                         };
                         let seq = request.seq();
@@ -613,7 +570,7 @@ fn a_request_dropped_unanswered_is_taken_again_and_answered_once() {
                         }
                         let bytes = request.bytes().unwrap().to_vec();
                         request
-                            .answer(|w| w.put(&bytes).unwrap())
+                            .respond(|w| w.put(&bytes).unwrap())
                             .unwrap_or_else(|never| match never {});
                         answered += 1;
                     }
@@ -621,12 +578,12 @@ fn a_request_dropped_unanswered_is_taken_again_and_answered_once() {
                 let (mut sent, mut read) = (0u32, 0u32);
                 while read < REQUESTS {
                     while sent < REQUESTS {
-                        let Some(mut slot) = host.request_slot() else { break };
+                        let Some(mut slot) = caller.request_slot() else { break };
                         slot.write(|w| w.put(&sent.to_le_bytes())).unwrap();
                         slot.publish().unwrap_or_else(|never| match never {});
                         sent += 1;
                     }
-                    let mut ready = host.answers().unwrap();
+                    let mut ready = caller.responses().unwrap();
                     let mut buf = BytesMut::new();
                     while let Some(seq) = ready.take_next(&mut buf).unwrap() {
                         assert_eq!((seq, &buf[..]), (Seq::new(read), &read.to_le_bytes()[..]));

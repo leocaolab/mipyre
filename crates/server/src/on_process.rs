@@ -53,13 +53,13 @@ async fn run(
     label: &RequestLabel,
 ) -> hyper::Response<ResponseBody> {
     let accept_encoding = AcceptEncoding::of(&head, site.rules.settings.compression.as_ref());
-    match answer(site, lanes, head, body, route).await {
+    match dispatch_to_lanes(site, lanes, head, body, route).await {
         Ok(data) => http_response(Ok(data), &accept_encoding, &site.counters).await,
         Err(error) => fail(error, label, &site.counters),
     }
 }
 
-async fn answer(
+async fn dispatch_to_lanes(
     site: &Site,
     lanes: &ServerLanes,
     head: RequestHead,
@@ -186,7 +186,7 @@ mod tests {
 
         let malformed = || {
             LaneRequestError::Malformed(LaneDecodeError::UnknownTag {
-                field: TaggedField::AnswerKind,
+                field: TaggedField::ResponseKind,
                 tag: 9,
             })
         };

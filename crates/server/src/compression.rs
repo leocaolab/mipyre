@@ -15,7 +15,7 @@ use mipyre_http::plan::response::HandlerResponse;
 /// Bytes of buffers one thread keeps for reuse; a buffer that would take its pool past this
 /// is dropped instead, so the pools' memory is bounded (per serving thread).
 const POOL_MAX_BYTES_PER_THREAD: usize = 4 << 20;
-const POOL_SLOTS_PER_THREAD: usize = 8;
+const POOL_MAX_BUFFERS_PER_THREAD: usize = 8;
 
 /// Recycled output buffers, per thread. A TPC thread compresses and sends its own
 /// responses, so a buffer goes back to the thread that used it: no lock every core takes
@@ -43,7 +43,7 @@ impl BufferPool {
 
     fn give(&mut self, mut buf: Vec<u8>) {
         let cap = buf.capacity();
-        if self.bufs.len() < POOL_SLOTS_PER_THREAD && self.bytes() + cap <= POOL_MAX_BYTES_PER_THREAD {
+        if self.bufs.len() < POOL_MAX_BUFFERS_PER_THREAD && self.bytes() + cap <= POOL_MAX_BYTES_PER_THREAD {
             buf.clear();
             self.bufs.push(buf);
         }
@@ -86,7 +86,7 @@ fn run(body: &[u8], codec: Codec) -> Option<Bytes> {
             .try_with(|stream| stream.borrow_mut().encode(body, level, &mut buf))
             // The thread is exiting and its stream is already destroyed.
             .unwrap_or_else(|_| GzipStream::default().encode(body, level, &mut buf)),
-        Codec::Brotli(quality) => compression::brotli(body, quality, &mut buf),
+        Codec::Brotli(quality) => compression::encode_brotli(body, quality, &mut buf),
     };
     let buf = PooledBuffer(buf);
     match encoded {

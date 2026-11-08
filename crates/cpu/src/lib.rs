@@ -11,10 +11,10 @@ mod plan;
 
 pub use core_affinity::CoreId;
 pub use os::{
-    elevate_thread_qos_macos, read_cpu_quota, try_pin_current, CapacityFileError, CpuListFileError, CpuReadError,
-    FileError, HostCpus, PinError, PinFault, PinOrder, PinOrderError, QuotaReadError, TopologyReadError,
+    elevate_thread_qos_macos, read_cpu_quota, try_pin_current, AvailableCpus, CapacityFileError, CpuListFileError,
+    FileError, PinError, PinErrorKind, PinOrder, PinOrderError, ReadCpusError, ReadQuotaError, ReadTopologyError,
 };
-pub use plan::{CpuMaxError, CpuMaxFault, CpuOrder, Cpus, PerfValueError, Quota, MAX_CPUS};
+pub use plan::{CpuMaxErrorKind, CpuOrder, Cpus, ParseCpuMaxError, PerfValueError, Quota, MAX_CPUS};
 
 /// Holds a value on its own cache line, so one core's writes do not invalidate another's copy.
 /// 128 bytes covers Apple silicon's 128-byte lines and x86's 64-byte lines, which it fetches in

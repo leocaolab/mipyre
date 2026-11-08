@@ -8,7 +8,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use super::keyed_log_throttle::{HeldLines, KeyedLogThrottle};
+use super::keyed_log_throttle::{KeyedLogThrottle, SuppressedLines};
 use crate::io::os;
 use crate::plan::compression::{Coding, CodingSet};
 use crate::plan::static_plan::{choose_precompressed, Copies};
@@ -298,13 +298,13 @@ fn skip_copy(path: &Path, error: &StaticError) {
     }
     degraded::count(StaticDegradation::PrecompressedFallback);
     match TWIN_THROTTLE.admit(path, clock::now()) {
-        Some(HeldLines::OfKey(held)) => tracing::warn!(
+        Some(SuppressedLines::OfKey(held)) => tracing::warn!(
             error = %error,
             held,
             path = %path.display(),
             "pre-compressed twin not served; answering with the original"
         ),
-        Some(HeldLines::OfUnrememberedKeys(held)) => tracing::warn!(
+        Some(SuppressedLines::OfUnrememberedKeys(held)) => tracing::warn!(
             error = %error,
             held_among_other_paths = held,
             path = %path.display(),

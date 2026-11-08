@@ -128,12 +128,6 @@ backtrace = { version = "0.3", optional = true }
 
 [dev-dependencies]
 mipyre_runtime = { path = "../runtime", features = ["testkit"] }
-proptest = "1"
-# The fuzz target of the NUMERIC decoder (src/db/numeric/fuzz.rs): `cargo test` replays its committed corpus,
-# `cargo bolero test` mutates it under libFuzzer.
-# Exactly 0.13.4: from 0.13.5 on its derive crate pins indexmap to =2.11.2, which would move the workspace's
-# shipping indexmap (h2, sqlx) back from 2.14.
-bolero = "=0.13.4"
 tokio = { version = "1", features = ["test-util"] }
 
 [lints]

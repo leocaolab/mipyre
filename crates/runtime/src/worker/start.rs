@@ -10,7 +10,7 @@ use pyo3::exceptions::{PyImportError, PyModuleNotFoundError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyModule};
 
-use super::exec::{bundled, exec_in, new_module, ExecFailure, ExtensionLoader, PythonSource, ScriptFailure};
+use super::exec::{bundled, exec_in, new_module, ExecFailure, ExtensionLoader, PythonSource, ScriptDiagnosis};
 use super::program::WorkerProgram;
 use super::{RequestRunner, WorkerIndex};
 use crate::exchange::error::PyException;
@@ -79,14 +79,14 @@ pub enum WorkerStartError {
     #[error(
         "worker {worker}: {} raised while the worker started: {raised}{}",
         .file.display(),
-        .failure.as_ref().map(ToString::to_string).unwrap_or_default()
+        .diagnosis.as_ref().map(ToString::to_string).unwrap_or_default()
     )]
     ScriptRaised {
         worker: WorkerIndex,
         file: Box<Path>,
         raised: StartException,
         /// It is boxed because the explanation text would make every start error large.
-        failure: Option<Box<ScriptFailure>>,
+        diagnosis: Option<Box<ScriptDiagnosis>>,
     },
     #[error("worker {worker}: {step} failed: {raised}")]
     SetupRaised {
@@ -139,12 +139,12 @@ impl WorkerStartError {
     }
 
     fn exec(py: Python<'_>, worker: WorkerIndex, file: &Path, error: ExecFailure) -> Self {
-        let ExecFailure { raised, failure } = error;
+        let ExecFailure { raised, diagnosis } = error;
         WorkerStartError::ScriptRaised {
             worker,
             file: file.into(),
             raised: StartException::capture(py, &raised),
-            failure: failure.map(Box::new),
+            diagnosis: diagnosis.map(Box::new),
         }
     }
 

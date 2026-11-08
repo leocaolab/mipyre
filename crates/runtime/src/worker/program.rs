@@ -235,7 +235,7 @@ enum CommandLineError {
     #[error("flag {flag}: unknown kind {kind:?} (the kinds are str, int, float, bool, choice, strs)")]
     UnknownKind { flag: String, kind: String },
     #[error("flag {flag}: kind {kind} takes choices only when it is choice, and then at least one; got {choices:?}")]
-    Choices {
+    MisfitChoices {
         flag: String,
         kind: String,
         choices: Option<Vec<String>>,
@@ -267,7 +267,7 @@ fn value_error(e: CommandLineError) -> PyErr {
 
 impl FlagKind {
     fn new(flag: &str, word: &str, choices: Option<Vec<String>>) -> Result<FlagKind, CommandLineError> {
-        let refused = |choices| CommandLineError::Choices {
+        let refused = |choices| CommandLineError::MisfitChoices {
             flag: flag.to_owned(),
             kind: word.to_owned(),
             choices,

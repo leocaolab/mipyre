@@ -60,12 +60,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "assoc"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -188,99 +182,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
-]
-
-[[package]]
-name = "bolero"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ff44d278fc0062c95327087ed96b3d256906d1d8f579e534a3de8d6b386913a"
-dependencies = [
- "bolero-afl",
- "bolero-engine",
- "bolero-generator",
- "bolero-honggfuzz",
- "bolero-kani",
- "bolero-libfuzzer",
- "cfg-if",
- "rand 0.9.4",
-]
-
-[[package]]
-name = "bolero-afl"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9bf4cbd0bacf9356d3c7e5d9d088480f2076ba3c595c15ee9a6a378cdd7b297"
-dependencies = [
- "bolero-engine",
- "cc",
-]
-
-[[package]]
-name = "bolero-engine"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dca199170a7c92c669c1019f9219a316b66bcdcfa4b36cac5a460a4c1a851aba"
-dependencies = [
- "anyhow",
- "bolero-generator",
- "lazy_static",
- "pretty-hex",
- "rand 0.9.4",
- "rand_xoshiro",
-]
-
-[[package]]
-name = "bolero-generator"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98a5782f2650f80d533f58ec339c6dce4cc5428f9c2755894f98156f52af81f2"
-dependencies = [
- "bolero-generator-derive",
- "either",
- "getrandom 0.3.4",
- "rand_core 0.9.5",
- "rand_xoshiro",
-]
-
-[[package]]
-name = "bolero-generator-derive"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a21a3b022507b9edd2050caf370d945e398c1a7c8455531220fa3968c45d29e"
-dependencies = [
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "bolero-honggfuzz"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a118ef27295eddefadc6a99728ee698d1b18d2e80dc4777d21bee3385096ffd"
-dependencies = [
- "bolero-engine",
-]
-
-[[package]]
-name = "bolero-kani"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "852ea5784a9f3e68bfd302ca80b8b863bce140593eb5770fee6ab110899c28fc"
-dependencies = [
- "bolero-engine",
-]
-
-[[package]]
-name = "bolero-libfuzzer"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "858dc57c11725c52662501fa79fdbc6f7050339a05ca1bf1e587add0fed40d62"
-dependencies = [
- "bolero-engine",
- "cc",
 ]
 
 [[package]]
@@ -1379,30 +1280,27 @@ dependencies = [
 
 [[package]]
 name = "mipyre_core"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "mipyre_http",
- "mipyre_microbench",
  "pin-project-lite",
  "tokio",
 ]
 
 [[package]]
 name = "mipyre_cpu"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "core_affinity",
  "libc",
- "mipyre_microbench",
  "proptest",
 ]
 
 [[package]]
 name = "mipyre_http"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "atomic-waker",
- "bolero",
  "brotli",
  "bytes",
  "dashmap",
@@ -1415,8 +1313,6 @@ dependencies = [
  "libc",
  "loom",
  "matchit",
- "mimalloc",
- "mipyre_microbench",
  "mipyre_transport",
  "mipyre_util",
  "notify",
@@ -1432,16 +1328,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "mipyre_microbench"
-version = "3.0.1"
-
-[[package]]
 name = "mipyre_pg"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "futures-util",
  "mipyre_util",
  "parking_lot",
+ "proptest",
  "sqlx",
  "thiserror",
  "tokio",
@@ -1450,9 +1343,8 @@ dependencies = [
 
 [[package]]
 name = "mipyre_process"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
- "bolero",
  "bytes",
  "crossbeam-queue",
  "futures-util",
@@ -1479,10 +1371,9 @@ dependencies = [
 
 [[package]]
 name = "mipyre_pyext"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "backtrace",
- "bolero",
  "bytes",
  "crossbeam-channel",
  "futures-util",
@@ -1505,7 +1396,6 @@ dependencies = [
  "mipyre_transport",
  "mipyre_util",
  "parking_lot",
- "proptest",
  "pyo3",
  "pythonize",
  "quanta",
@@ -1524,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "mipyre_runtime"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -1551,15 +1441,17 @@ dependencies = [
  "rustix",
  "serde_json",
  "shuttle",
+ "slab",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
 ]
 
 [[package]]
 name = "mipyre_server"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "bytes",
  "core_affinity",
@@ -1602,14 +1494,12 @@ dependencies = [
 
 [[package]]
 name = "mipyre_shm"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
- "bolero",
  "bytes",
  "libc",
  "loom",
  "mipyre_cpu",
- "mipyre_microbench",
  "proptest",
  "rustix",
  "shuttle",
@@ -1618,26 +1508,23 @@ dependencies = [
 
 [[package]]
 name = "mipyre_subinterp"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "loom",
  "mipyre_cpu",
- "mipyre_microbench",
  "parking_lot",
  "pyo3",
  "shuttle",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
 name = "mipyre_tpc"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "futures-util",
  "loom",
  "mipyre_cpu",
- "mipyre_microbench",
  "mipyre_util",
  "thiserror",
  "tokio",
@@ -1647,11 +1534,10 @@ dependencies = [
 
 [[package]]
 name = "mipyre_transport"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
  "libc",
  "mio",
- "mipyre_microbench",
  "mipyre_util",
  "pin-project-lite",
  "rcgen",
@@ -1667,9 +1553,8 @@ dependencies = [
 
 [[package]]
 name = "mipyre_util"
-version = "3.0.1"
+version = "4.0.0"
 dependencies = [
- "mipyre_microbench",
  "proptest",
 ]
 
@@ -1857,22 +1742,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
-]
-
-[[package]]
-name = "pretty-hex"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a65843dfefbafd3c879c683306959a6de478443ffe9c9adf02f5976432402d7"
-
-[[package]]
-name = "proc-macro-crate"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b00f26d3400549137f92511a46ac1cd8ce37cb5598a96d382381458b992a5d24"
-dependencies = [
- "toml_datetime 0.6.3",
- "toml_edit",
 ]
 
 [[package]]
@@ -2949,17 +2818,11 @@ dependencies = [
  "indexmap",
  "serde_core",
  "serde_spanned",
- "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_datetime",
  "toml_parser",
  "toml_writer",
  "winnow 0.7.15",
 ]
-
-[[package]]
-name = "toml_datetime"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cda73e2f1397b1262d6dfdcef8aafae14d1de7748d66822d3bfeeb6d03e5e4b"
 
 [[package]]
 name = "toml_datetime"
@@ -2968,17 +2831,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
 dependencies = [
  "serde_core",
-]
-
-[[package]]
-name = "toml_edit"
-version = "0.20.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "396e4d48bbb2b7554c944bde63101b5ae446cff6ec4a24227428f15eb72ef338"
-dependencies = [
- "indexmap",
- "toml_datetime 0.6.3",
- "winnow 0.5.40",
 ]
 
 [[package]]
@@ -3489,15 +3341,6 @@ name = "windows_x86_64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
-
-[[package]]
-name = "winnow"
-version = "0.5.40"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f593a95398737aeed53e489c785df13f3618e41dbcd6718c6addbf1395aa6876"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "winnow"

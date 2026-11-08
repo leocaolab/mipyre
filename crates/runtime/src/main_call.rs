@@ -118,19 +118,19 @@ pub(crate) fn call_handler_with_hooks<M>(
     rules: &SiteRules<Py<PyAny>, M>,
     spare: &mut SpareContext,
     target: HandlerTarget,
-    sky_req: Request,
+    request: Request,
 ) -> Result<HandlerReply, ErrorRecord> {
     let gil = &super::MAIN_GIL;
     gil.queued();
     let gil_wait_start = std::time::Instant::now();
 
-    let label = sky_req.label();
+    let label = request.label();
 
     mipyre_subinterp::attach::with_main(|py| {
         gil.acquired(gil_wait_start.elapsed().as_micros() as u64);
         let hold_start = std::time::Instant::now();
 
-        let result = catch_panic(|| in_reused_context(py, spare, |rc| run_with_hooks(py, rc, rules, target, sky_req)));
+        let result = catch_panic(|| in_reused_context(py, spare, |rc| run_with_hooks(py, rc, rules, target, request)));
 
         gil.released(hold_start.elapsed().as_micros() as u64);
         result.map_err(|e| e.log(&label))
@@ -142,11 +142,11 @@ pub(crate) fn run_with_hooks<'py, M>(
     rc: &mut RequestContext<'py>,
     rules: &SiteRules<Py<PyAny>, M>,
     target: HandlerTarget,
-    sky_req: Request,
+    request: Request,
 ) -> Result<HandlerReply, HandlerError> {
     let routes = &rules.routes;
     let mut chain = main_chain(py, rc);
-    let req = Bound::new(py, sky_req).map_err(|e| HandlerError::python(py, RequestStage::Setup, &e))?;
+    let req = Bound::new(py, request).map_err(|e| HandlerError::python(py, RequestStage::Setup, &e))?;
 
     if let Some(short_circuit) = chain.before(routes.before_hooks(), &req)? {
         return Ok(HandlerReply::Response(short_circuit));

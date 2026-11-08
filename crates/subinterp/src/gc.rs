@@ -4,7 +4,7 @@ use std::num::NonZeroU64;
 use std::str::FromStr;
 use std::time::Duration;
 
-/// The GC mode named by `MIPYRE_GC_MODE`.
+/// How a worker's collections are triggered, by its name in configuration.
 ///
 /// `count` is predictable but can pause during a burst; `idle` puts the pause in a lull and
 /// needs the per-thread-listener TPC topology; under `off`, `gc.disable()` still runs at
@@ -28,17 +28,17 @@ impl std::fmt::Display for GcMode {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0:?} is not a GC mode (expected \"count\", \"idle\" or \"off\")")]
-pub struct UnknownGcMode(pub String);
+pub struct ParseGcModeError(pub String);
 
 impl FromStr for GcMode {
-    type Err = UnknownGcMode;
+    type Err = ParseGcModeError;
 
-    fn from_str(raw: &str) -> Result<Self, UnknownGcMode> {
+    fn from_str(raw: &str) -> Result<Self, ParseGcModeError> {
         match raw {
             "count" => Ok(GcMode::Count),
             "idle" => Ok(GcMode::Idle),
             "off" => Ok(GcMode::Off),
-            other => Err(UnknownGcMode(other.to_string())),
+            other => Err(ParseGcModeError(other.to_string())),
         }
     }
 }
@@ -87,7 +87,15 @@ pub struct GcSchedule {
     count: GcCount,
     in_lulls: bool,
     /// Kept in every mode so that `after_unit` stores without a branch; read only in idle mode.
-    lull: Lull,
+    tick_state: GcTickState,
+}
+
+/// A schedule's next state, and whether a collection is due at the event that led to it.
+#[must_use = "the schedule moves to `next`; dropping it loses the event"]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GcStep {
+    pub next: GcSchedule,
+    pub due: bool,
 }
 
 impl GcSchedule {
@@ -100,28 +108,45 @@ impl GcSchedule {
         GcSchedule {
             count: GcCount::new(every),
             in_lulls,
-            lull: Lull::Collected,
+            tick_state: GcTickState::Collected,
         }
     }
 
-    /// Counts a finished unit and returns whether a collection is now due.
+    /// Counts a finished unit, and says whether a collection is now due.
     #[inline]
-    pub fn after_unit(&mut self) -> bool {
-        self.lull = Lull::Ran;
-        self.count.count_due()
+    pub fn after_unit(self) -> GcStep {
+        let count = self.count.after_unit();
+        GcStep {
+            next: GcSchedule {
+                count,
+                tick_state: GcTickState::Ran,
+                ..self
+            },
+            due: count.due(),
+        }
     }
 
-    /// Returns whether a collection is due because units ran since the last one and none since
-    /// the previous tick; it is never due in count and off modes.
-    pub fn on_idle_tick(&mut self) -> bool {
-        self.in_lulls && self.lull.on_tick()
+    /// Says whether a collection is due because units ran since the last one and none since the
+    /// previous tick; it is never due in count and off modes.
+    pub fn on_idle_tick(self) -> GcStep {
+        if !self.in_lulls {
+            return GcStep { next: self, due: false };
+        }
+        let (tick_state, due) = self.tick_state.on_tick();
+        GcStep {
+            next: GcSchedule { tick_state, ..self },
+            due,
+        }
     }
 
     /// Books a collection that returned, so both triggers start again.
     #[inline]
-    pub fn collected(&mut self) {
-        self.count.collected();
-        self.lull = Lull::Collected;
+    pub fn collected(self) -> GcSchedule {
+        GcSchedule {
+            count: self.count.collected(),
+            tick_state: GcTickState::Collected,
+            ..self
+        }
     }
 }
 
@@ -139,41 +164,39 @@ impl GcCount {
     }
 
     #[inline]
-    fn count_due(&mut self) -> bool {
+    fn after_unit(self) -> GcCount {
         // Branch-free because it runs after every unit; without a threshold `ran < 0` never holds.
         let every = self.every.map_or(0, NonZeroU64::get);
-        self.ran += u64::from(self.ran < every);
-        self.due()
+        GcCount {
+            ran: self.ran + u64::from(self.ran < every),
+            ..self
+        }
     }
 
-    fn due(&self) -> bool {
+    fn due(self) -> bool {
         self.every.is_some_and(|every| self.ran >= every.get())
     }
 
-    fn collected(&mut self) {
-        self.ran = 0;
+    fn collected(self) -> GcCount {
+        GcCount { ran: 0, ..self }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Lull {
+enum GcTickState {
     Collected,
     Ran,
     /// Units ran since the last collection and none since the previous tick.
     Quiet,
 }
 
-impl Lull {
-    /// Returns whether to collect at this tick; a quiet worker stays quiet, so a collection
-    /// that failed is due again at the next tick.
-    fn on_tick(&mut self) -> bool {
-        match *self {
-            Lull::Collected => false,
-            Lull::Ran => {
-                *self = Lull::Quiet;
-                false
-            }
-            Lull::Quiet => true,
+impl GcTickState {
+    /// Returns the GC state after this tick and whether to collect at it; a quiet worker stays quiet,
+    /// so a collection that failed is due again at the next tick.
+    fn on_tick(self) -> (GcTickState, bool) {
+        match self {
+            GcTickState::Collected => (GcTickState::Collected, false),
+            GcTickState::Ran | GcTickState::Quiet => (GcTickState::Quiet, self == GcTickState::Quiet),
         }
     }
 }
@@ -187,11 +210,7 @@ mod tests {
     }
 
     fn counted(every: u64, units: u64) -> GcCount {
-        let mut count = GcCount::new(NonZeroU64::new(every));
-        for _ in 0..units {
-            count.count_due();
-        }
-        count
+        (0..units).fold(GcCount::new(NonZeroU64::new(every)), |count, _| count.after_unit())
     }
 
     #[test]
@@ -216,8 +235,20 @@ mod tests {
 
     fn ran(policy: GcPolicy, units: u64) -> (GcSchedule, Vec<bool>) {
         let mut schedule = GcSchedule::new(policy);
-        let due = (0..units).map(|_| schedule.after_unit()).collect();
+        let due = (0..units).map(|_| unit(&mut schedule)).collect();
         (schedule, due)
+    }
+
+    fn unit(schedule: &mut GcSchedule) -> bool {
+        let step = schedule.after_unit();
+        *schedule = step.next;
+        step.due
+    }
+
+    fn tick(schedule: &mut GcSchedule) -> bool {
+        let step = schedule.on_idle_tick();
+        *schedule = step.next;
+        step.due
     }
 
     #[test]
@@ -229,50 +260,40 @@ mod tests {
 
     #[test]
     fn a_collection_that_returned_starts_the_count_again() {
-        let (mut schedule, _) = ran(count(3), 3);
-        schedule.collected();
+        let (schedule, _) = ran(count(3), 3);
+        let mut schedule = schedule.collected();
         assert_eq!(schedule, GcSchedule::new(count(3)));
-        assert!(!schedule.after_unit());
-        assert!(!schedule.after_unit());
-        assert!(schedule.after_unit());
+        assert!(!unit(&mut schedule));
+        assert!(!unit(&mut schedule));
+        assert!(unit(&mut schedule));
     }
 
     #[test]
     fn a_due_collection_that_is_not_booked_stays_due() {
         let (mut schedule, _) = ran(idle(every(3)), 3);
-        assert!(schedule.after_unit());
-        assert!(schedule.after_unit(), "and at the unit after that");
-        assert!(!schedule.on_idle_tick(), "units ran since the previous tick");
-        assert!(schedule.on_idle_tick(), "quiet, and still uncollected");
+        assert!(unit(&mut schedule));
+        assert!(unit(&mut schedule), "and at the unit after that");
+        assert!(!tick(&mut schedule), "units ran since the previous tick");
+        assert!(tick(&mut schedule), "quiet, and still uncollected");
     }
 
     #[test]
     fn a_lull_collects_after_a_quiet_tick() {
-        let mut lull = Lull::Collected;
-        assert!(!lull.on_tick());
-        lull = Lull::Ran;
-        assert!(!lull.on_tick());
-        assert!(lull.on_tick());
-        assert!(lull.on_tick());
-        lull = Lull::Collected;
-        assert!(!lull.on_tick());
-        lull = Lull::Ran;
-        assert!(!lull.on_tick());
-        lull = Lull::Ran;
-        assert!(!lull.on_tick());
-        assert!(lull.on_tick());
+        assert_eq!(GcTickState::Collected.on_tick(), (GcTickState::Collected, false));
+        assert_eq!(GcTickState::Ran.on_tick(), (GcTickState::Quiet, false));
+        assert_eq!(GcTickState::Quiet.on_tick(), (GcTickState::Quiet, true));
     }
 
     fn due(schedule: &mut GcSchedule, event: Event) -> bool {
         match event {
-            Event::Request => schedule.after_unit(),
-            Event::Tick => schedule.on_idle_tick(),
+            Event::Request => unit(schedule),
+            Event::Tick => tick(schedule),
         }
     }
 
     fn settle(schedule: &mut GcSchedule, outcome: Outcome) {
         if outcome == Outcome::Returned {
-            schedule.collected();
+            *schedule = schedule.collected();
         }
     }
 
@@ -477,9 +498,10 @@ mod proofs {
 
     #[kani::proof]
     fn a_unit_keeps_the_count_within_its_threshold_and_is_due_exactly_at_it() {
-        let mut count = any_reachable_count();
-        let before = count.ran;
-        let due = count.count_due();
+        let before = any_reachable_count();
+        let count = before.after_unit();
+        let due = count.due();
+        let before = before.ran;
         match count.every.map(NonZeroU64::get) {
             Some(every) => {
                 assert_eq!(count.ran, if before < every { before + 1 } else { every });
@@ -494,9 +516,8 @@ mod proofs {
 
     #[kani::proof]
     fn a_collection_starts_the_count_again() {
-        let mut count = any_reachable_count();
-        count.collected();
-        assert_eq!(count, GcCount::new(count.every));
+        let count = any_reachable_count();
+        assert_eq!(count.collected(), GcCount::new(count.every));
     }
 
     fn any_policy() -> GcPolicy {
@@ -525,20 +546,21 @@ mod proofs {
         let mut schedule = GcSchedule::new(policy);
         let (mut since_collect, mut since_tick) = (0u64, 0u64);
         for _ in 0..STEPS {
-            let due = if kani::any() {
+            let step = if kani::any() {
                 since_collect += 1;
                 since_tick += 1;
-                let due = schedule.after_unit();
-                assert_eq!(due, threshold.is_some_and(|t| since_collect >= t.get()));
-                due
+                let step = schedule.after_unit();
+                assert_eq!(step.due, threshold.is_some_and(|t| since_collect >= t.get()));
+                step
             } else {
-                let due = schedule.on_idle_tick();
-                assert_eq!(due, lulls && since_collect > 0 && since_tick == 0);
+                let step = schedule.on_idle_tick();
+                assert_eq!(step.due, lulls && since_collect > 0 && since_tick == 0);
                 since_tick = 0;
-                due
+                step
             };
-            if due && kani::any() {
-                schedule.collected();
+            schedule = step.next;
+            if step.due && kani::any() {
+                schedule = schedule.collected();
                 since_collect = 0;
             }
         }

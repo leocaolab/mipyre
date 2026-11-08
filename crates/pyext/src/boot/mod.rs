@@ -21,4 +21,4 @@ pub(crate) use self::serve_exception::{listener_exception, passed_exception};
 pub(crate) use self::settings::{
     cli_option, env_variable, CodeCall, Deployment, EntryPoint, Flag, FlagScope, ServerFlagValues, ServerFlags, FLAGS,
 };
-pub(crate) use self::topology::{InterpreterMode, ServerLayout, Topology};
+pub(crate) use self::topology::{check_websockets, InterpreterMode, ServerLayout, Topology};

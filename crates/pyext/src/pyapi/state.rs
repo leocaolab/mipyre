@@ -18,7 +18,7 @@ fn text<'py>(py: Python<'py>, key: &str, value: &StateValue) -> PyResult<Bound<'
 }
 
 /// Refuses access from a process-lane worker, a process apart from the server's state.
-fn guard() -> PyResult<()> {
+fn refuse_in_worker_process() -> PyResult<()> {
     mipyre_process::refuse_in_lane_worker("app.state (SharedState)")
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
@@ -46,7 +46,7 @@ impl AppStateView {
     }
 
     fn set(&self, key: String, value: String) -> PyResult<()> {
-        guard()?;
+        refuse_in_worker_process()?;
         self.store.insert(key, StateValue::Text(value));
         Ok(())
     }
@@ -60,7 +60,7 @@ impl AppStateView {
         key: &str,
         default: Option<Bound<'py, PyString>>,
     ) -> PyResult<Option<Bound<'py, PyString>>> {
-        guard()?;
+        refuse_in_worker_process()?;
         match self.store.get(key) {
             Some(v) => text(py, key, v.value()).map(Some),
             None => Ok(default),
@@ -68,37 +68,37 @@ impl AppStateView {
     }
 
     fn set_bytes(&self, key: String, value: Vec<u8>) -> PyResult<()> {
-        guard()?;
+        refuse_in_worker_process()?;
         self.store.insert(key, StateValue::Bytes(value));
         Ok(())
     }
 
     fn get_bytes<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        guard()?;
+        refuse_in_worker_process()?;
         Ok(self.store.get(key).map(|v| PyBytes::new(py, v.value().as_bytes())))
     }
 
     /// Delete `key` and return whether it existed.
     fn delete(&self, key: &str) -> PyResult<bool> {
-        guard()?;
+        refuse_in_worker_process()?;
         Ok(self.store.remove(key).is_some())
     }
 
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        guard()?;
+        refuse_in_worker_process()?;
         PyList::new(py, self.store.iter().map(|e| PyString::new(py, e.key())))
     }
 
     /// Return all string values; a value that is not UTF-8 raises `TypeError` naming its key.
     fn values<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyString>>> {
-        guard()?;
+        refuse_in_worker_process()?;
         self.store.iter().map(|e| text(py, e.key(), e.value())).collect()
     }
 
     /// Return all `(key, value)` pairs; a value that is not UTF-8 raises `TypeError` naming
     /// its key.
     fn items<'py>(&self, py: Python<'py>) -> PyResult<Vec<(Bound<'py, PyString>, Bound<'py, PyString>)>> {
-        guard()?;
+        refuse_in_worker_process()?;
         self.store
             .iter()
             .map(|e| Ok((PyString::new(py, e.key()), text(py, e.key(), e.value())?)))
@@ -106,13 +106,13 @@ impl AppStateView {
     }
 
     fn __len__(&self) -> PyResult<usize> {
-        guard()?;
+        refuse_in_worker_process()?;
         Ok(self.store.len())
     }
 
     /// Return whether `key` exists, even when its value is not UTF-8.
     fn __contains__(&self, key: &str) -> PyResult<bool> {
-        guard()?;
+        refuse_in_worker_process()?;
         Ok(self.store.contains_key(key))
     }
 
@@ -123,7 +123,7 @@ impl AppStateView {
     /// Return the string value of `key`; an absent key raises `KeyError` and a value that is
     /// not UTF-8 raises `TypeError`.
     fn __getitem__<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyString>> {
-        guard()?;
+        refuse_in_worker_process()?;
         match self.store.get(key) {
             None => Err(pyo3::exceptions::PyKeyError::new_err(key.to_string())),
             Some(v) => text(py, key, v.value()),
@@ -144,7 +144,7 @@ impl AppStateView {
     /// An existing value that is not an integer raises `TypeError` rather than being reset,
     /// because it may be someone else's data; overflow raises `OverflowError`.
     fn incr(&self, key: String, amount: i64) -> PyResult<i64> {
-        guard()?;
+        refuse_in_worker_process()?;
         let mut entry = self
             .store
             .entry(key.clone())

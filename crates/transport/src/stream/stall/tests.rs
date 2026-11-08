@@ -7,19 +7,19 @@ use std::task::Waker;
 
 /// Answers each write from the script, where `None` is `Pending`; once the script runs out,
 /// every write is `Pending`.
-struct Socket {
+struct StubSocket {
     script: VecDeque<Option<usize>>,
     calls: usize,
 }
 
-fn socket(script: &[Option<usize>]) -> Socket {
-    Socket {
+fn socket(script: &[Option<usize>]) -> StubSocket {
+    StubSocket {
         script: script.iter().copied().collect(),
         calls: 0,
     }
 }
 
-impl AsyncWrite for Socket {
+impl AsyncWrite for StubSocket {
     fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.calls += 1;
         match self.script.pop_front().flatten() {
@@ -38,14 +38,14 @@ impl AsyncWrite for Socket {
 const LIMIT: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_millis(1);
 
-fn write(io: &mut WriteStall<Socket>) -> Poll<io::Result<usize>> {
+fn write(io: &mut TimeoutStream<StubSocket>) -> Poll<io::Result<usize>> {
     let mut cx = Context::from_waker(Waker::noop());
     Pin::new(io).poll_write(&mut cx, b"response")
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_write_blocked_for_the_limit_fails_with_timed_out() {
-    let mut io = WriteStall::new(socket(&[]), LIMIT);
+    let mut io = TimeoutStream::new(socket(&[]), LIMIT);
     assert!(write(&mut io).is_pending());
     tokio::time::advance(LIMIT - TICK).await;
     assert!(write(&mut io).is_pending(), "not yet at the limit");
@@ -58,7 +58,7 @@ async fn a_write_blocked_for_the_limit_fails_with_timed_out() {
 
 #[tokio::test(start_paused = true)]
 async fn progress_restarts_the_budget() {
-    let mut io = WriteStall::new(socket(&[None, None, Some(3), None, None]), LIMIT);
+    let mut io = TimeoutStream::new(socket(&[None, None, Some(3), None, None]), LIMIT);
     assert!(write(&mut io).is_pending());
     tokio::time::advance(LIMIT - TICK).await;
     assert!(write(&mut io).is_pending());
@@ -73,7 +73,7 @@ async fn progress_restarts_the_budget() {
 
 #[tokio::test(start_paused = true)]
 async fn a_flush_that_moves_nothing_does_not_restart_a_blocked_write() {
-    let mut io = WriteStall::new(socket(&[]), LIMIT);
+    let mut io = TimeoutStream::new(socket(&[]), LIMIT);
     let mut cx = Context::from_waker(Waker::noop());
     assert!(write(&mut io).is_pending());
     tokio::time::advance(LIMIT - TICK).await;
@@ -87,7 +87,7 @@ async fn a_flush_that_moves_nothing_does_not_restart_a_blocked_write() {
 
 #[tokio::test(start_paused = true)]
 async fn a_zero_byte_write_is_not_progress() {
-    let mut io = WriteStall::new(socket(&[None, Some(0), None]), LIMIT);
+    let mut io = TimeoutStream::new(socket(&[None, Some(0), None]), LIMIT);
     assert!(write(&mut io).is_pending());
     assert!(matches!(write(&mut io), Poll::Ready(Ok(0))));
     tokio::time::advance(LIMIT).await;
@@ -99,7 +99,7 @@ async fn a_zero_byte_write_is_not_progress() {
 
 #[tokio::test(start_paused = true)]
 async fn after_a_stall_the_stream_fails_every_write_without_trying_the_socket() {
-    let mut io = WriteStall::new(socket(&[]), LIMIT);
+    let mut io = TimeoutStream::new(socket(&[]), LIMIT);
     let counted = events::total(StreamEvent::WriteStalled);
     assert!(write(&mut io).is_pending());
     tokio::time::advance(LIMIT).await;
@@ -120,7 +120,7 @@ async fn after_a_stall_the_stream_fails_every_write_without_trying_the_socket() 
     assert_eq!(io.inner.calls, calls, "a stalled stream is not written to again");
 }
 
-impl AsyncRead for Socket {
+impl AsyncRead for StubSocket {
     fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Poll::Pending
     }

@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::io::static_files::{FileBody, FileSendError};
-use crate::plan::body_limit::{BodySizeLimit, TooLarge};
+use crate::plan::body_limit::{BodySizeLimit, LengthLimitError};
 use crate::plan::limits::{BodyTimeAllowance, Limits, RequestBudget};
 
 /// A whole body is kept unboxed, so the common buffered response costs no allocation of its own.
@@ -95,8 +95,8 @@ pub enum BodyReadError {
     ConnectionLost(#[source] Arc<hyper::Error>),
 }
 
-impl From<TooLarge> for BodyReadError {
-    fn from(_: TooLarge) -> Self {
+impl From<LengthLimitError> for BodyReadError {
+    fn from(_: LengthLimitError) -> Self {
         BodyReadError::TooLarge
     }
 }
@@ -358,7 +358,7 @@ pub fn body_channel() -> (BodySender, BodyReceiver) {
 
 #[derive(Debug, PartialEq, Eq)]
 enum HandoffError {
-    Deadline,
+    Timeout,
     ClosedReceiver,
 }
 
@@ -382,7 +382,7 @@ pub async fn stream_body_feeder<B>(
     let last = match feed(body, &tx, max_size, time, handler_wait.get()).await {
         Ok(Ok(())) => BodyMessage::End,
         Ok(Err(reject)) => BodyMessage::Rejected(reject),
-        Err(HandoffError::Deadline) => BodyMessage::Unread(handler_wait.get()),
+        Err(HandoffError::Timeout) => BodyMessage::Unread(handler_wait.get()),
         Err(HandoffError::ClosedReceiver) => return,
     };
     last_slot.send(last);
@@ -465,7 +465,7 @@ async fn hand(
     tokio::select! {
         biased;
         sent = tx.send(msg) => sent.map_err(|_| HandoffError::ClosedReceiver)?,
-        () = timer => return Err(HandoffError::Deadline),
+        () = timer => return Err(HandoffError::Timeout),
     }
     Ok(Some(waiting.elapsed()))
 }
@@ -516,7 +516,7 @@ mod tests {
             Duration::from_secs(5),
             hand(&tx, BodyMessage::End, timer.as_mut(), Duration::from_millis(50)),
         );
-        assert!(matches!(gave_up.await, Ok(Err(HandoffError::Deadline))));
+        assert!(matches!(gave_up.await, Ok(Err(HandoffError::Timeout))));
         assert_eq!(Instant::now(), deadline);
     }
 
@@ -592,16 +592,16 @@ mod tests {
 
     /// Yields its frames, then ends, or waits forever when `stall` is set; `hint` stands for a
     /// `Content-Length` header.
-    struct Scripted {
+    struct StubBody {
         frames: std::collections::VecDeque<hyper::body::Frame<Bytes>>,
         hint: Option<u64>,
         stall: bool,
         polled: usize,
     }
 
-    impl Scripted {
+    impl StubBody {
         fn new(frames: &[&'static [u8]], hint: Option<u64>) -> Self {
-            Scripted {
+            StubBody {
                 frames: frames
                     .iter()
                     .map(|f| hyper::body::Frame::data(Bytes::from_static(f)))
@@ -613,14 +613,14 @@ mod tests {
         }
 
         fn stalled(hint: Option<u64>) -> Self {
-            Scripted {
+            StubBody {
                 stall: true,
-                ..Scripted::new(&[], hint)
+                ..StubBody::new(&[], hint)
             }
         }
     }
 
-    impl hyper::body::Body for Scripted {
+    impl hyper::body::Body for StubBody {
         type Data = Bytes;
         type Error = hyper::Error;
         fn poll_frame(
@@ -640,12 +640,12 @@ mod tests {
         }
     }
 
-    struct Recording {
+    struct SpyGate {
         asked: Vec<usize>,
         limit: usize,
     }
 
-    impl BodyGate for Recording {
+    impl BodyGate for SpyGate {
         type Error = BodyReadError;
         fn admit(&mut self, committed: usize) -> Result<(), BodyReadError> {
             self.asked.push(committed);
@@ -659,7 +659,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_body_announced_over_the_cap_is_refused_before_it_is_read() {
         let started = Instant::now();
-        let mut body = Scripted::stalled(Some(2048));
+        let mut body = StubBody::stalled(Some(2048));
         let read = collect_within(
             &mut body,
             &mut OpenGate,
@@ -673,10 +673,10 @@ mod tests {
 
     #[tokio::test]
     async fn frames_that_add_up_past_the_cap_are_refused() {
-        let body = Scripted::new(&[b"0123456789", b"0123456789", b"0"], None);
+        let body = StubBody::new(&[b"0123456789", b"0123456789", b"0"], None);
         let read = collect_within(body, &mut OpenGate, &limits(20, absolute(Duration::from_secs(30)))).await;
         assert!(matches!(read, Err(BodyReadError::TooLarge)), "{read:?}");
-        let body = Scripted::new(&[b"0123456789", b"0123456789"], None);
+        let body = StubBody::new(&[b"0123456789", b"0123456789"], None);
         let read = collect_within(body, &mut OpenGate, &limits(20, absolute(Duration::from_secs(30)))).await;
         assert_eq!(read.unwrap().len(), 20, "exactly the cap is allowed");
     }
@@ -685,8 +685,8 @@ mod tests {
     #[tokio::test]
     async fn an_announced_size_does_not_buy_a_buffer_of_that_size() {
         const ANNOUNCED: u64 = 10 << 20;
-        let body = Scripted::new(&[b"a", b"b"], Some(ANNOUNCED));
-        let mut gate = Recording {
+        let body = StubBody::new(&[b"a", b"b"], Some(ANNOUNCED));
+        let mut gate = SpyGate {
             asked: Vec::new(),
             limit: usize::MAX,
         };
@@ -697,8 +697,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_gate_refusal_stops_the_read_before_the_frame_is_taken() {
-        let body = Scripted::new(&[b"0123", b"4567", b"89"], None);
-        let mut gate = Recording {
+        let body = StubBody::new(&[b"0123", b"4567", b"89"], None);
+        let mut gate = SpyGate {
             asked: Vec::new(),
             limit: 8,
         };
@@ -709,8 +709,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_body_in_several_frames_is_joined_in_order() {
-        let body = Scripted::new(&[b"he", b"ll", b"o"], Some(5));
-        let mut gate = Recording {
+        let body = StubBody::new(&[b"he", b"ll", b"o"], Some(5));
+        let mut gate = SpyGate {
             asked: Vec::new(),
             limit: usize::MAX,
         };
@@ -747,7 +747,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_streamed_body_announced_over_the_cap_is_refused_before_a_chunk() {
         let (tx, mut rx) = body_channel();
-        let body = Scripted::new(&[b"0123"], Some(2048));
+        let body = StubBody::new(&[b"0123"], Some(2048));
         stream_body_feeder(
             body,
             tx,
@@ -763,8 +763,8 @@ mod tests {
         assert!(rx.recv().await.is_none());
     }
 
-    fn chunks_then(n: usize, tail: Option<hyper::body::Frame<Bytes>>, stall: bool) -> Scripted {
-        let mut body = Scripted::new(&[], None);
+    fn chunks_then(n: usize, tail: Option<hyper::body::Frame<Bytes>>, stall: bool) -> StubBody {
+        let mut body = StubBody::new(&[], None);
         body.frames = (0..n)
             .map(|_| hyper::body::Frame::data(Bytes::from_static(b"x")))
             .chain(tail)
@@ -865,12 +865,12 @@ mod tests {
         assert!(matches!(last, Some(BodyMessage::Unread(b)) if b == budget), "{last:?}");
     }
 
-    struct ThenIncoming {
+    struct StubPrefixedBody {
         first: std::collections::VecDeque<Bytes>,
         rest: Incoming,
     }
 
-    impl hyper::body::Body for ThenIncoming {
+    impl hyper::body::Body for StubPrefixedBody {
         type Data = Bytes;
         type Error = hyper::Error;
         fn poll_frame(
@@ -898,7 +898,7 @@ mod tests {
             let handed = handed.lock().unwrap().take();
             async move {
                 if let Some((tx, fed)) = handed {
-                    let body = ThenIncoming {
+                    let body = StubPrefixedBody {
                         first: (0..CHUNKS_IN_FLIGHT).map(|_| Bytes::from_static(b"x")).collect(),
                         rest: req.into_body(),
                     };
@@ -1333,7 +1333,7 @@ mod tests {
         const NONE: &[u8] = b"";
         async fn read(frames: &[&'static [u8]]) -> Result<Bytes, BodyReadError> {
             collect_within(
-                Scripted::new(frames, None),
+                StubBody::new(frames, None),
                 &mut OpenGate,
                 &limits(1024, absolute(Duration::from_secs(30))),
             )
@@ -1351,11 +1351,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_frame_is_not_put_to_the_gate() {
-        let mut gate = Recording {
+        let mut gate = SpyGate {
             asked: Vec::new(),
             limit: usize::MAX,
         };
-        let body = Scripted::new(&[b"abc", b""], None);
+        let body = StubBody::new(&[b"abc", b""], None);
         let read = collect_within(body, &mut gate, &limits(1024, absolute(Duration::from_secs(30)))).await;
         assert_eq!(read.expect("the body was read").into_bytes(), b"abc"[..]);
         assert_eq!(gate.asked, [3]);
@@ -1364,7 +1364,7 @@ mod tests {
     #[tokio::test]
     async fn a_streamed_body_hands_on_no_empty_chunk() {
         let (tx, mut rx) = body_channel();
-        let body = Scripted::new(&[b"", b"x", b"", b"x", b""], None);
+        let body = StubBody::new(&[b"", b"x", b"", b"x", b""], None);
         stream_body_feeder(
             body,
             tx,
@@ -1441,12 +1441,12 @@ mod tests {
     }
 
     /// Keeps a second handle on each data frame it hands over.
-    struct FrameTap<B> {
+    struct SpyBody<B> {
         body: B,
         frames: Vec<Bytes>,
     }
 
-    impl<B: hyper::body::Body<Data = Bytes> + Unpin> hyper::body::Body for FrameTap<B> {
+    impl<B: hyper::body::Body<Data = Bytes> + Unpin> hyper::body::Body for SpyBody<B> {
         type Data = Bytes;
         type Error = B::Error;
         fn poll_frame(
@@ -1470,7 +1470,7 @@ mod tests {
     #[tokio::test]
     async fn an_h2_body_ended_by_an_empty_frame_is_read_uncopied() {
         let (frames, read) = read_h2_body(|body| async move {
-            let mut tap = FrameTap {
+            let mut tap = SpyBody {
                 body,
                 frames: Vec::new(),
             };

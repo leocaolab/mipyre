@@ -5,12 +5,8 @@ from mipyre import Mipyre, ServerFlags
 app = Mipyre()
 
 @app.websocket("/echo")
-async def echo(ws):
-    async for msg in ws:
-        if isinstance(msg, bytes):
-            await ws.send_bytes(msg)
-        else:
-            await ws.send(f"echo: {msg}")
+def echo(ws, msg):
+    return msg if isinstance(msg, bytes) else f"echo: {msg}"
 
 @app.get("/")
 def index(req):

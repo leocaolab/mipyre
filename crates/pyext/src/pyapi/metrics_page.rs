@@ -43,7 +43,7 @@ impl MetricsPage {
             body: PyBytes::new(py, page.as_bytes()).into_any().unbind(),
             status: StatusCode::OK,
             content_type: Some(HeaderValue::from_static(exposition::CONTENT_TYPE)),
-            header_type: None,
+            content_type_header: None,
             headers: Default::default(),
             validation_errors: None,
         }

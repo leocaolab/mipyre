@@ -6,6 +6,7 @@
 pub mod body_stream;
 pub mod cookie;
 pub mod error;
+pub mod grpc_error;
 pub mod http_exception;
 pub mod json;
 pub(crate) mod loop_wait;
@@ -22,12 +23,10 @@ pub(crate) use self::error::catch_panic;
 pub use self::error::{
     refuse, Capacity, ErrorRecord, HandlerError, PyException, ReplyHolder, RequestStage, UnansweredError,
 };
+pub use self::grpc_error::GrpcError;
 pub use self::http_exception::HttpException;
 pub use self::json::{loads, require_json};
-pub use self::loop_wait::LoopWaits;
 pub use self::request::{Request, RequestBody, RequestHeaders};
 pub use self::response::{Response, VALIDATION_DETAIL_LIMIT};
 pub use self::stream::{HandlerReply, ResponseStream, StreamReply};
-pub use self::websocket::{
-    connection_channels, ConnectionEnds, HandlerEnds, QueueEntry, QueueSender, WebSocket, WebSocketMessage,
-};
+pub use self::websocket::{publish, Outbox, Taken, WebSocket, WsClose, WsMessage};

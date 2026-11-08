@@ -1,5 +1,5 @@
 //! Throttles a log line that repeats while its condition lasts to one per period, counting the
-//! lines held back.
+//! lines suppressed.
 //!
 //! The caller hands in `now` as the time since a fixed origin, so a throttle never reads a clock.
 //! [`LogThrottle`] is the lock-free form for one condition; [`ThrottleState`] is the same rule as
@@ -41,7 +41,7 @@ impl ThrottlePeriod {
 pub struct LogThrottle {
     period: ThrottlePeriod,
     open_at: AtomicU64,
-    held: AtomicU64,
+    suppressed: AtomicU64,
 }
 
 impl LogThrottle {
@@ -49,29 +49,29 @@ impl LogThrottle {
         LogThrottle {
             period: ThrottlePeriod::new(period),
             open_at: AtomicU64::new(0),
-            held: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
         }
     }
 
-    /// Returns how many lines were held back since the last logged one when this line should be
-    /// logged, and `None` when it is held back.
+    /// Returns how many lines were suppressed since the last logged one when this line should be
+    /// logged, and `None` when it is suppressed.
     ///
     /// A line another thread holds back while this one goes out may be counted in this line
-    /// rather than the next: every held line is counted once, but at a period's edge one can land
+    /// rather than the next: every suppressed line is counted once, but at a period's edge one can land
     /// a line early.
     pub fn admit(&self, now: Duration) -> Option<u64> {
         let now = nanos(now);
         let mut open = self.open_at.load(Ordering::Acquire);
         loop {
             let Some(next) = reopens_at(open, now, self.period.nanos) else {
-                self.held.fetch_add(1, Ordering::Relaxed);
+                self.suppressed.fetch_add(1, Ordering::Relaxed);
                 return None;
             };
             match self
                 .open_at
                 .compare_exchange_weak(open, next, Ordering::AcqRel, Ordering::Acquire)
             {
-                Ok(_) => return Some(self.held.swap(0, Ordering::Relaxed)),
+                Ok(_) => return Some(self.suppressed.swap(0, Ordering::Relaxed)),
                 Err(current) => open = current,
             }
         }
@@ -83,16 +83,19 @@ impl LogThrottle {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ThrottleState {
     open_at: u64,
-    held: u64,
+    suppressed: u64,
 }
 
 impl ThrottleState {
     pub const fn new() -> Self {
-        ThrottleState { open_at: 0, held: 0 }
+        ThrottleState {
+            open_at: 0,
+            suppressed: 0,
+        }
     }
 
-    /// Returns how many lines were held back since the last logged one when this line should be
-    /// logged, and `None` when it is held back.
+    /// Returns how many lines were suppressed since the last logged one when this line should be
+    /// logged, and `None` when it is suppressed.
     pub fn admit(&mut self, now: Duration, period: ThrottlePeriod) -> Option<u64> {
         self.admit_at(nanos(now), period.nanos)
     }
@@ -101,10 +104,10 @@ impl ThrottleState {
         match reopens_at(self.open_at, at, period_ns) {
             Some(next) => {
                 self.open_at = next;
-                Some(std::mem::take(&mut self.held))
+                Some(std::mem::take(&mut self.suppressed))
             }
             None => {
-                self.held = self.held.saturating_add(1);
+                self.suppressed = self.suppressed.saturating_add(1);
                 None
             }
         }
@@ -115,15 +118,15 @@ impl ThrottleState {
         nanos(now) >= self.open_at
     }
 
-    /// Returns the lines held back that no line has carried out yet.
-    pub fn held(&self) -> u64 {
-        self.held
+    /// Returns the lines suppressed that no line has carried out yet.
+    pub fn suppressed(&self) -> u64 {
+        self.suppressed
     }
 
-    /// Counts `lines` held back elsewhere into the next line that goes out, as when the condition
-    /// they were held for is merged into this one.
-    pub fn add_held(&mut self, lines: u64) {
-        self.held = self.held.saturating_add(lines);
+    /// Counts `lines` suppressed elsewhere into the next line that goes out, as when the condition
+    /// they were suppressed for is merged into this one.
+    pub fn add_suppressed(&mut self, lines: u64) {
+        self.suppressed = self.suppressed.saturating_add(lines);
     }
 }
 
@@ -135,21 +138,21 @@ mod proofs {
     use super::*;
 
     /// Proves that a throttle lets a line out exactly when its period is over, that the line
-    /// carries every line held since the last one, and that the next period starts at the line.
+    /// carries every line suppressed since the last one, and that the next period starts at the line.
     #[kani::proof]
     fn a_throttle_lets_a_line_out_once_its_period_is_over_with_every_held_line() {
-        let (open_at, held, at, period_ns): (u64, u64, u64, u64) = kani::any();
-        kani::assume(held < u64::MAX);
-        let mut throttle = ThrottleState { open_at, held };
+        let (open_at, suppressed, at, period_ns): (u64, u64, u64, u64) = kani::any();
+        kani::assume(suppressed < u64::MAX);
+        let mut throttle = ThrottleState { open_at, suppressed };
         match throttle.admit_at(at, period_ns) {
             Some(carried) => {
                 assert!(at >= open_at);
-                assert_eq!(carried, held);
+                assert_eq!(carried, suppressed);
                 assert_eq!(
                     throttle,
                     ThrottleState {
                         open_at: at.saturating_add(period_ns),
-                        held: 0
+                        suppressed: 0
                     }
                 );
                 assert!(throttle.open_at >= open_at);
@@ -160,7 +163,7 @@ mod proofs {
                     throttle,
                     ThrottleState {
                         open_at,
-                        held: held + 1
+                        suppressed: suppressed + 1
                     }
                 );
             }

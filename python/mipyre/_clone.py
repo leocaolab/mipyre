@@ -24,24 +24,41 @@ def ensure_private_dir(path: str) -> None:
     """Create `path` private to this user, or check that an existing one is.
 
     Code is loaded from under it, so a directory another user can write to would let them plant
-    code that runs in this server.
+    code that runs in this server. Every level this call creates is made 0700 whatever the umask,
+    because a caller may later ask for any of them as a private directory of its own; levels that
+    already existed are left as they are.
     """
+    missing = []
+    level = os.path.abspath(path)
+    while not os.path.lexists(level):
+        missing.append(level)
+        level = os.path.dirname(level)
     try:
-        os.makedirs(path, mode=0o700, exist_ok=True)
+        for level in reversed(missing):
+            try:
+                os.mkdir(level, 0o700)
+            except FileExistsError:
+                continue
+            os.chmod(level, 0o700)
         st = os.lstat(path)
     except OSError as e:
         raise PrivateCopyError(f"making the private directory {path} failed: {e}") from e
-    if not stat.S_ISDIR(st.st_mode):
-        raise PrivateCopyError(f"{path} is not a directory (a symlink?); refusing to load code from it")
-    if st.st_uid != os.getuid():
-        raise PrivateCopyError(
-            f"{path} is owned by uid {st.st_uid}, not this user ({os.getuid()}); refusing to load code from it"
+    refused = _refusal(path, st.st_mode, st.st_uid, os.getuid())
+    if refused is not None:
+        raise refused
+
+
+def _refusal(path: str, mode: int, owner: int, uid: int) -> PrivateCopyError | None:
+    """Return why the existing `path` of this `mode` and `owner` cannot hold code, or None if it can."""
+    if not stat.S_ISDIR(mode):
+        return PrivateCopyError(f"{path} is not a directory (a symlink?); refusing to load code from it")
+    if owner != uid:
+        return PrivateCopyError(f"{path} is owned by uid {owner}, not this user ({uid}); refusing to load code from it")
+    if mode & 0o022:
+        return PrivateCopyError(
+            f"{path} is writable by other users (mode {stat.S_IMODE(mode):o}); refusing to load code from it. chmod go-w it."
         )
-    if st.st_mode & 0o022:
-        raise PrivateCopyError(
-            f"{path} is writable by other users (mode {stat.S_IMODE(st.st_mode):o}); "
-            "refusing to load code from it. chmod go-w it."
-        )
+    return None
 
 
 def claim_name(root: str, name: str) -> int | None:

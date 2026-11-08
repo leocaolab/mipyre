@@ -1,6 +1,6 @@
 //! Reads a start report: what the peer of one start attempt says came of it.
 //!
-//! The host clears the report before each attempt; the peer of that attempt writes `state` once, and on a failure
+//! The caller clears the report before each attempt; the peer of that attempt writes `state` once, and on a failure
 //! first the length of the note it left (its traceback).
 
 use super::slot_len::{decode_len, SlotLengthError};

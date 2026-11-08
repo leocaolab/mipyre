@@ -10,24 +10,24 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use super::fork_server::{fork_failed, ForkError, ForkServer, FORK_REPLY_TIMEOUT};
 use super::health::{self, CrashLoopWait, RunHealth};
 use super::host::{HostError, LaneHost, LaneRunError, LaneRunEvent};
-use super::host_config::HostConfig;
-use super::inbox::{Inbox, InboxRefusal};
-use super::lane_failure::{fault_said, LaneIndex, WorkerExit};
+use super::inbox::{Inbox, TrySendError};
+use super::lane_config::LaneConfig;
+use super::lane_failure::{fault_source, LaneIndex, WorkerExit};
 use super::monitor::worker_exit;
 use super::pid::Pid;
 use super::poller::{enter_idle, resume_from_idle};
 use super::route::{answer_lane, LaneJob, LaneRequestError};
 use super::stats::{sum_waits, HostCounts, Stats};
 use super::template::ExitReports;
-use super::template_host::{fork_failed, ForkError, Template, FORK_ANSWER_TIMEOUT};
 use super::worker_process::WorkerProcess;
 use crate::sync::{AtomicU32, AtomicUsize, Mutex, Ordering::*, RwLock};
 use mipyre_cpu::CacheLine;
-use mipyre_shm::adapter::doorbell::{drain_once, open_host_doorbell, FutexDoorbell, HostBell};
+use mipyre_shm::adapter::doorbell::{drain_once, open_requester_doorbell, FutexDoorbell, RequesterBell};
 use mipyre_shm::adapter::mapped::MappedMemory;
-use mipyre_shm::channel::{Attempt, Channel, HostEnd, PeerFault, StartOutcome, WaitTotals};
+use mipyre_shm::channel::{Attempt, Channel, PeerFault, RequesterEnd, StartOutcome, Waits};
 use mipyre_shm::plan::geometry::Geometry;
 use mipyre_shm::plan::start::StartReportError;
 use mipyre_shm::SyscallError;
@@ -35,11 +35,11 @@ use mipyre_tpc::{OsThread, ShutdownDeadline, ThreadJoinError};
 use tokio_util::sync::CancellationToken;
 
 /// The host's end of one lane's channel: the shared mapping, and a futex to wake the worker with.
-pub(super) type LaneEnd = HostEnd<MappedMemory, FutexDoorbell>;
+pub(super) type LaneEnd = RequesterEnd<MappedMemory, FutexDoorbell>;
 
 /// Why a server run's lanes could not start.
 #[derive(Debug, thiserror::Error)]
-pub enum LaneStartError {
+pub enum StartRunError {
     #[error(
         "the process lanes are already serving another server of this app; a second server \
          with runtime='process' routes needs its own app"
@@ -48,7 +48,7 @@ pub enum LaneStartError {
     /// The template could not prepare (with start="fork" the app failed to import, or it is
     /// not single-threaded) and said why before it ended; the fork request for `lane` met it.
     #[error("the process-lane template could not start workers (met by the fork request for lane {lane}):\n{failure}")]
-    TemplateFailed { lane: LaneIndex, failure: String },
+    ForkServerFailed { lane: LaneIndex, failure: String },
     /// The run's channel for `lane` (its shared memory) could not be made.
     #[error("making the shared memory of lane {lane}: {source}")]
     Channel { lane: LaneIndex, source: SyscallError },
@@ -86,7 +86,7 @@ pub enum LaneStartError {
     BellUnreadable { lane: LaneIndex, source: SyscallError },
     #[error(
         "the process worker of lane {lane} (pid {pid}) corrupted the lane as it started: {}",
-        fault_said(fault)
+        fault_source(fault)
     )]
     WorkerFault {
         lane: LaneIndex,
@@ -121,7 +121,7 @@ pub(crate) enum RunPhase {
 
 /// What one server run shares between its hosts.
 pub(crate) struct RunState {
-    pub(crate) hosts: Vec<HostLink>,
+    pub(crate) hosts: Vec<HostHandle>,
     /// The run's channel of each lane, read only for how its worker waited.
     pub(crate) channels: Vec<Arc<Channel<MappedMemory>>>,
     pub(crate) stop: CancellationToken,
@@ -168,7 +168,7 @@ pub(crate) struct RunLane {
 /// reports readable for good: once the template and the workers are gone, the host's poller would
 /// wake for it on every round.
 pub(crate) struct RunBell {
-    pub(crate) bell: HostBell,
+    pub(crate) bell: RequesterBell,
     pub(crate) write: OwnedFd,
 }
 
@@ -177,10 +177,10 @@ pub(crate) struct RunBell {
 pub struct ServerLanes {
     lanes: usize,
     pub(crate) geometry: Geometry,
-    pub(crate) host: HostConfig,
+    pub(crate) config: LaneConfig,
     /// Holds each lane's current worker; written by whoever forks it, kills it or sees it die.
     pub(crate) processes: Vec<Mutex<Option<Arc<WorkerProcess>>>>,
-    pub(crate) template: OnceLock<Template>,
+    pub(crate) fork_server: OnceLock<ForkServer>,
     /// The wait statuses the template reported, filled by whoever reads its socket.
     pub(super) exits: ExitReports,
     pub(crate) run: RwLock<RunPhase>,
@@ -200,7 +200,7 @@ pub struct ServerLanes {
     pub(crate) host_counts: Vec<CacheLine<HostCounts>>,
     /// How the workers of the runs that ended waited for requests; each run's channels count
     /// only that run.
-    pub(crate) ended_peer_waits: Mutex<WaitTotals>,
+    pub(crate) ended_worker_waits: Mutex<Waits>,
     /// Holds, per lane, why it crash-loops while it does; its host writes it and the server's
     /// metrics read it.
     pub(crate) crash_loops: Vec<Mutex<Option<String>>>,
@@ -211,7 +211,7 @@ pub struct ServerLanes {
 fn run_of(
     lanes: Vec<RunLane>,
     hosts: usize,
-    config: &HostConfig,
+    config: &LaneConfig,
     tell_run: Box<dyn Fn(LaneRunEvent) + Send + Sync>,
 ) -> RunState {
     let channels = lanes.iter().map(|lane| Arc::clone(lane.end.channel())).collect();
@@ -223,10 +223,10 @@ fn run_of(
         .into_iter()
         .filter_map(|lanes| {
             let capacity = config.inbox_capacity(NonZeroUsize::new(lanes.len())?);
-            Some(HostLink {
+            Some(HostHandle {
                 inbox: Inbox::new(capacity),
                 usable_lanes: AtomicUsize::new(lanes.len()),
-                start: Mutex::new(Some(lanes)),
+                lanes: Mutex::new(Some(lanes)),
                 load: AtomicUsize::new(0),
                 failure: OnceLock::new(),
                 crash_wait: Mutex::new(None),
@@ -247,10 +247,10 @@ fn host_of(lane: LaneIndex, hosts: usize) -> usize {
 }
 
 /// What other threads hold of one host: where to send it a request, and how busy it is.
-pub(crate) struct HostLink {
+pub(crate) struct HostHandle {
     pub(crate) inbox: Inbox<LaneJob>,
     /// The host's lanes, which it takes when it starts.
-    pub(crate) start: Mutex<Option<Vec<RunLane>>>,
+    pub(crate) lanes: Mutex<Option<Vec<RunLane>>>,
     /// Requests in its lanes and queued behind them, as the host last published it (read by
     /// other threads to decide whether to spread a request).
     pub(crate) load: AtomicUsize,
@@ -267,7 +267,7 @@ pub(crate) struct HostLink {
     pub(crate) crash_wait: Mutex<Option<CrashLoopWait>>,
 }
 
-impl HostLink {
+impl HostHandle {
     pub(crate) fn serving(&self) -> bool {
         self.failure.get().is_none() && self.usable_lanes.load(Relaxed) > 0 && !self.inbox.is_closed()
     }
@@ -279,13 +279,13 @@ impl HostLink {
         reason = "a job the inbox no longer takes comes back by value, to go elsewhere"
     )]
     pub(crate) fn send(&self, job: LaneJob) -> Result<(), LaneJob> {
-        match self.inbox.send(job) {
+        match self.inbox.try_send(job) {
             Ok(()) => Ok(()),
-            Err(InboxRefusal::Full(job)) => {
+            Err(TrySendError::Full(job)) => {
                 answer_lane(job.reply, Err(LaneRequestError::Rejected(health::lanes_full())));
                 Ok(())
             }
-            Err(InboxRefusal::Closed(job)) => Err(job),
+            Err(TrySendError::Closed(job)) => Err(job),
         }
     }
 }
@@ -294,7 +294,7 @@ impl HostLink {
 /// failure is returned (so no host is still starting when the caller stops the run), and the
 /// first host that could not start fails the start with its own cause. The caller then stops
 /// the run, which stops the hosts that did start.
-fn hosts_started(reports: impl IntoIterator<Item = Result<(), LaneStartError>>) -> Result<(), LaneStartError> {
+fn hosts_started(reports: impl IntoIterator<Item = Result<(), StartRunError>>) -> Result<(), StartRunError> {
     let reports: Vec<_> = reports.into_iter().collect();
     reports.into_iter().collect()
 }
@@ -315,7 +315,7 @@ struct WorkerStartSnapshot {
 enum StartWait {
     Ready,
     Waiting,
-    Failed(LaneStartError),
+    Failed(StartRunError),
 }
 
 /// One look at the worker `pid` of lane `lane` while the start waits for it (until
@@ -333,9 +333,9 @@ fn starting_worker(
         Ok(Some(StartOutcome::Ready)) => return StartWait::Ready,
         Ok(Some(StartOutcome::Failed(note))) => {
             let failure = String::from_utf8_lossy(&note).into_owned();
-            return StartWait::Failed(LaneStartError::WorkerStart { lane, pid, failure });
+            return StartWait::Failed(StartRunError::WorkerStart { lane, pid, failure });
         }
-        Err(source) => return StartWait::Failed(LaneStartError::WorkerReportUnreadable { lane, pid, source }),
+        Err(source) => return StartWait::Failed(StartRunError::WorkerReportUnreadable { lane, pid, source }),
         Ok(None) => {}
     }
     let exit = match (look.reaped, look.gone_since) {
@@ -346,10 +346,10 @@ fn starting_worker(
         (None, _) => None,
     };
     if let Some(exit) = exit {
-        return StartWait::Failed(LaneStartError::DiedBeforeReady { lane, pid, exit });
+        return StartWait::Failed(StartRunError::DiedBeforeReady { lane, pid, exit });
     }
     if look.now > deadline {
-        return StartWait::Failed(LaneStartError::NotReady { lane, pid });
+        return StartWait::Failed(StartRunError::NotReady { lane, pid });
     }
     StartWait::Waiting
 }
@@ -456,28 +456,28 @@ fn join_hosts(threads: Vec<OsThread<()>>, deadline: &ShutdownDeadline) -> Vec<St
 
 impl ServerLanes {
     /// Creates the server's `lanes` lanes, each run's channels laid out by `geometry`.
-    pub(crate) fn create(lanes: NonZeroUsize, geometry: Geometry, host: HostConfig) -> Self {
+    pub(crate) fn create(lanes: NonZeroUsize, geometry: Geometry, config: LaneConfig) -> Self {
         let n = lanes.get();
         ServerLanes {
             lanes: n,
             geometry,
-            host,
+            config,
             processes: (0..n).map(|_| Mutex::new(None)).collect(),
-            template: OnceLock::new(),
+            fork_server: OnceLock::new(),
             exits: ExitReports::new(n),
             run: RwLock::new(RunPhase::Idle),
             dedicated: Mutex::new(Vec::new()),
             attempts: AtomicU32::new(0),
-            health: Mutex::new(RunHealth::new(n, host.on_failure())),
+            health: Mutex::new(RunHealth::new(n, config.on_failure())),
             first_failure: Mutex::new(None),
             stats: Stats::default(),
             host_counts: (0..n).map(|_| CacheLine(HostCounts::default())).collect(),
-            ended_peer_waits: Mutex::new(WaitTotals::default()),
+            ended_worker_waits: Mutex::new(Waits::default()),
             crash_loops: (0..n).map(|_| Mutex::new(None)).collect(),
         }
     }
 
-    pub fn workers(&self) -> usize {
+    pub fn lanes(&self) -> usize {
         self.lanes
     }
 
@@ -492,20 +492,20 @@ impl ServerLanes {
         self: &Arc<Self>,
         hosting: HostKind,
         tell_run: Box<dyn Fn(LaneRunEvent) + Send + Sync>,
-    ) -> Result<(), LaneStartError> {
+    ) -> Result<(), StartRunError> {
         {
             let mut phase = self.run.write();
             if !matches!(*phase, RunPhase::Idle) {
-                return Err(LaneStartError::AlreadyServing);
+                return Err(StartRunError::AlreadyServing);
             }
             *phase = RunPhase::Starting;
         }
-        let n = self.workers();
-        *self.health.lock() = RunHealth::new(n, self.host.on_failure());
+        let n = self.lanes();
+        *self.health.lock() = RunHealth::new(n, self.config.on_failure());
         *self.first_failure.lock() = None;
-        let template = self.template.get().ok_or(LaneStartError::Fork {
+        let template = self.fork_server.get().ok_or(StartRunError::Fork {
             lane: LaneIndex(0),
-            source: ForkError::NoTemplate,
+            source: ForkError::NoForkServer,
         })?;
         let hosts = match hosting {
             HostKind::Tpc { threads } => n.min(threads.max(1)),
@@ -526,7 +526,7 @@ impl ServerLanes {
             let attempt = self.take_attempt();
             lane.end.begin_attempt(attempt);
             let worker = Arc::new(
-                self.spawn_worker(i, attempt, FORK_ANSWER_TIMEOUT)
+                self.spawn_worker(i, attempt, FORK_REPLY_TIMEOUT)
                     .map_err(|fork| fork_failed(i, fork))?,
             );
             *self.processes[i.0].lock() = Some(Arc::clone(&worker));
@@ -545,7 +545,7 @@ impl ServerLanes {
                         .build()
                 })
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(LaneStartError::Runtime)?,
+                .map_err(StartRunError::Runtime)?,
             HostKind::Tpc { .. } => Vec::new(),
         };
         self.serve(lanes, hosts, tell_run);
@@ -563,7 +563,7 @@ impl ServerLanes {
                             local.block_on(&rt, async move {
                                 let (report, host) = match LaneHost::start(&lanes, h) {
                                     Ok(host) => (Ok(()), host),
-                                    Err(source) => (Err(LaneStartError::HostStart { host: h, source }), None),
+                                    Err(source) => (Err(StartRunError::HostStart { host: h, source }), None),
                                 };
                                 // Unheard only when start_run gave up first (a later host
                                 // thread could not be spawned); its caller stops the run.
@@ -582,7 +582,7 @@ impl ServerLanes {
                             });
                         },
                     )
-                    .map_err(|source| LaneStartError::HostThread { host: h, source })?;
+                    .map_err(|source| StartRunError::HostThread { host: h, source })?;
                     threads.push(spawned);
                 }
             }
@@ -597,18 +597,18 @@ impl ServerLanes {
     /// the template reports, or the look's decision could change with time.
     fn wait_until_ready(
         &self,
-        template: &Template,
+        template: &ForkServer,
         lanes: &mut [RunLane],
         spawned: &[(Arc<WorkerProcess>, Attempt)],
-    ) -> Result<(), LaneStartError> {
-        let deadline = Instant::now() + self.host.worker_start_timeout();
-        let watch = super::os::ExitWatch::new().map_err(LaneStartError::StartWatch)?;
+    ) -> Result<(), StartRunError> {
+        let deadline = Instant::now() + self.config.worker_start_timeout();
+        let watch = super::os::ExitWatch::new().map_err(StartRunError::StartWatch)?;
         let mut gone = vec![None; spawned.len()];
         for (k, (worker, _)) in spawned.iter().enumerate() {
             if watch
                 .add(worker.handle(), worker.pid().into(), k as u64)
-                .map_err(LaneStartError::StartWatch)?
-                == super::os::Registration::Gone
+                .map_err(StartRunError::StartWatch)?
+                == super::os::ExitWatchStatus::AlreadyExited
             {
                 worker.record_exit();
                 gone[k] = Some(Instant::now());
@@ -616,7 +616,7 @@ impl ServerLanes {
         }
         // Nothing else talks to the template while a run starts: the hosts, which fork
         // replacements and read its reports, are not up yet.
-        let mut link = template.link.lock();
+        let mut link = template.connection.lock();
         for (k, (lane, (worker, attempt))) in lanes.iter_mut().zip(spawned).enumerate() {
             let (i, pid) = (lane.index, worker.pid());
             loop {
@@ -624,7 +624,7 @@ impl ServerLanes {
                 // Read in the order the worker and the template write: a worker writes its start
                 // report before it ends, and is reaped after. So what ended it is looked at
                 // first, and a report it left is never missed.
-                see_exits(&watch, spawned, &mut gone, now).map_err(LaneStartError::StartWatch)?;
+                see_exits(&watch, spawned, &mut gone, now).map_err(StartRunError::StartWatch)?;
                 template.take_ready(&mut link, &self.exits);
                 let look = WorkerStartSnapshot {
                     report: lane.end.start_report(*attempt),
@@ -632,23 +632,23 @@ impl ServerLanes {
                     gone_since: gone[k],
                     now,
                 };
-                match starting_worker(i, pid, look, deadline, self.host.exit_status_wait()) {
+                match starting_worker(i, pid, look, deadline, self.config.exit_status_wait()) {
                     StartWait::Ready => break,
                     StartWait::Waiting => {}
                     StartWait::Failed(e) => return Err(e),
                 }
-                let by = look_again_by(gone[k], deadline, self.host.exit_status_wait());
+                let by = look_again_by(gone[k], deadline, self.config.exit_status_wait());
                 let bell = lane.bell.bell.as_fd();
                 let slept = match link.ended() {
                     None => sleep_until_readable([bell, watch.as_fd(), link.socket()], by),
                     Some(_) => sleep_until_readable([bell, watch.as_fd()], by),
                 };
-                slept.map_err(|errno| LaneStartError::StartWatch(errno.into()))?;
+                slept.map_err(|errno| StartRunError::StartWatch(errno.into()))?;
                 let drained =
-                    drain_once(&lane.bell.bell).map_err(|source| LaneStartError::BellUnreadable { lane: i, source })?;
+                    drain_once(&lane.bell.bell).map_err(|source| StartRunError::BellUnreadable { lane: i, source })?;
                 lane.end
-                    .hear_wakes(drained.bytes)
-                    .map_err(|fault| LaneStartError::WorkerFault { lane: i, pid, fault })?;
+                    .record_wake_bytes(drained.bytes)
+                    .map_err(|fault| StartRunError::WorkerFault { lane: i, pid, fault })?;
             }
         }
         Ok(())
@@ -661,24 +661,24 @@ impl ServerLanes {
         hosts: usize,
         tell_run: Box<dyn Fn(LaneRunEvent) + Send + Sync>,
     ) -> Arc<RunState> {
-        let run = Arc::new(run_of(lanes, hosts, &self.host, tell_run));
+        let run = Arc::new(run_of(lanes, hosts, &self.config, tell_run));
         *self.run.write() = RunPhase::Serving(Arc::clone(&run));
         run
     }
 
     /// Makes this run's channel and wake pipe for every lane: the host's part of each, and each
     /// one's shared memory object, which goes to the lane's workers.
-    fn open_lanes(&self) -> Result<(Vec<RunLane>, Vec<OwnedFd>), LaneStartError> {
-        let n = self.workers();
+    fn open_lanes(&self) -> Result<(Vec<RunLane>, Vec<OwnedFd>), StartRunError> {
+        let n = self.lanes();
         let (mut lanes, mut fds) = (Vec::with_capacity(n), Vec::with_capacity(n));
         for i in 0..n {
             let lane = LaneIndex(i);
             let (memory, shm) =
-                MappedMemory::create(&self.geometry).map_err(|source| LaneStartError::Channel { lane, source })?;
-            let (bell, write) = open_host_doorbell().map_err(|source| LaneStartError::Bell { lane, source })?;
+                MappedMemory::create(&self.geometry).map_err(|source| StartRunError::Channel { lane, source })?;
+            let (bell, write) = open_requester_doorbell().map_err(|source| StartRunError::Bell { lane, source })?;
             lanes.push(RunLane {
                 index: lane,
-                end: HostEnd::new(Arc::new(Channel::new(memory)), FutexDoorbell),
+                end: RequesterEnd::new(Arc::new(Channel::new(memory)), FutexDoorbell),
                 bell: RunBell { bell, write },
             });
             fds.push(shm);
@@ -698,7 +698,7 @@ impl ServerLanes {
             RunPhase::Starting => {}
             RunPhase::Serving(run) => {
                 run.stop.cancel();
-                let mut ended = self.ended_peer_waits.lock();
+                let mut ended = self.ended_worker_waits.lock();
                 *ended = sum_waits(std::iter::once(*ended).chain(run.channels.iter().map(|c| c.peer_waits())));
             }
         }
@@ -721,7 +721,7 @@ impl ServerLanes {
         attempt: Attempt,
         within: Duration,
     ) -> Result<WorkerProcess, ForkError> {
-        let template = self.template.get().ok_or(ForkError::NoTemplate)?;
+        let template = self.fork_server.get().ok_or(ForkError::NoForkServer)?;
         let forked = template.fork(i, attempt, within, &self.exits);
         if let Err(ForkError::TimedOut { .. }) = forked {
             self.watch_late_answers(template);
@@ -732,8 +732,8 @@ impl ServerLanes {
     /// Starts the thread that reads the template's late answers, unless one already waits for
     /// them. Without it a late worker would wait on its lane until somebody next read the socket
     /// (the next fork, the next run's start, the next exit status).
-    fn watch_late_answers(self: &Arc<Self>, template: &Template) {
-        let mut link = template.link.lock();
+    fn watch_late_answers(self: &Arc<Self>, template: &ForkServer) {
+        let mut link = template.connection.lock();
         if !link.start_watch() {
             return;
         }
@@ -758,7 +758,7 @@ impl ServerLanes {
     /// connection ended. It reads only when no fork exchange holds the socket, and an exchange
     /// holds it until its own answer came or it gave up, so every answer it reads is a late one.
     fn read_late_answers(&self, sock: &OwnedFd) {
-        let Some(template) = self.template.get() else {
+        let Some(template) = self.fork_server.get() else {
             tracing::error!(
                 target: "mipyre::server",
                 "the template's late fork answers are watched with no template attached"
@@ -767,14 +767,14 @@ impl ServerLanes {
         };
         loop {
             {
-                let mut link = template.link.lock();
+                let mut link = template.connection.lock();
                 template.take_ready(&mut link, &self.exits);
                 if link.end_watch() {
                     return;
                 }
             }
             if let Err(errno) = wait_readable(sock.as_fd()) {
-                template.link.lock().drop_watch();
+                template.connection.lock().drop_watch();
                 tracing::warn!(
                     target: "mipyre::server",
                     %errno,
@@ -798,7 +798,7 @@ pub(crate) mod tests {
         lanes: &ServerLanes,
         hosts: usize,
         tell_run: Box<dyn Fn(LaneRunEvent) + Send + Sync>,
-    ) -> Result<(Arc<RunState>, Vec<OwnedFd>), LaneStartError> {
+    ) -> Result<(Arc<RunState>, Vec<OwnedFd>), StartRunError> {
         let (run_lanes, fds) = lanes.open_lanes()?;
         Ok((lanes.serve(run_lanes, hosts, tell_run), fds))
     }
@@ -842,7 +842,7 @@ pub(crate) mod tests {
             ..look_at(t)
         };
         match starting_worker(LaneIndex(1), pid, failed, deadline, STATUS_WAIT) {
-            StartWait::Failed(LaneStartError::WorkerStart {
+            StartWait::Failed(StartRunError::WorkerStart {
                 lane: LaneIndex(1),
                 pid: p,
                 failure,
@@ -858,7 +858,7 @@ pub(crate) mod tests {
         };
         assert!(matches!(
             starting_worker(LaneIndex(1), pid, unreadable, deadline, STATUS_WAIT),
-            StartWait::Failed(LaneStartError::WorkerReportUnreadable {
+            StartWait::Failed(StartRunError::WorkerReportUnreadable {
                 source: StartReportError::UnknownState(3),
                 ..
             })
@@ -884,7 +884,7 @@ pub(crate) mod tests {
                 ..look_at(t)
             };
             match starting_worker(LaneIndex(2), pid, ended, deadline, STATUS_WAIT) {
-                StartWait::Failed(LaneStartError::DiedBeforeReady {
+                StartWait::Failed(StartRunError::DiedBeforeReady {
                     lane: LaneIndex(2),
                     pid: p,
                     exit,
@@ -919,7 +919,7 @@ pub(crate) mod tests {
             deadline,
             STATUS_WAIT,
         ) {
-            StartWait::Failed(LaneStartError::DiedBeforeReady {
+            StartWait::Failed(StartRunError::DiedBeforeReady {
                 exit: WorkerExit::Unreported(waited),
                 ..
             }) => assert_eq!(waited, STATUS_WAIT),
@@ -939,7 +939,7 @@ pub(crate) mod tests {
         ));
         assert!(matches!(
             starting_worker(LaneIndex(0), pid, look_at(deadline + Duration::from_nanos(1)), deadline, STATUS_WAIT),
-            StartWait::Failed(LaneStartError::NotReady { lane: LaneIndex(0), pid: p }) if p == pid
+            StartWait::Failed(StartRunError::NotReady { lane: LaneIndex(0), pid: p }) if p == pid
         ));
     }
 
@@ -965,7 +965,7 @@ pub(crate) mod tests {
     fn a_run_start_hears_every_host_and_fails_with_the_one_that_could_not_start() {
         let reports = [
             Ok(()),
-            Err(LaneStartError::HostStart {
+            Err(StartRunError::HostStart {
                 host: 1,
                 source: std::io::Error::other("the worker-exit watch: EMFILE"),
             }),
@@ -975,7 +975,7 @@ pub(crate) mod tests {
         let result = hosts_started(reports.into_iter().inspect(|_| heard += 1));
         assert_eq!(heard, 3, "every host is heard before the start fails");
         match result {
-            Err(LaneStartError::HostStart { host: 1, source }) => {
+            Err(StartRunError::HostStart { host: 1, source }) => {
                 assert_eq!(source.to_string(), "the worker-exit watch: EMFILE");
             }
             other => panic!("expected host 1's start failure, got {other:?}"),

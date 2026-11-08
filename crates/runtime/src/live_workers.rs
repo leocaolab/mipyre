@@ -204,9 +204,9 @@ mod tests {
 
     /// The losses a `tell_loss` was told, in order.
     #[derive(Clone, Default)]
-    struct Told(Arc<Mutex<Vec<WorkerKindLoss>>>);
+    struct LossSpy(Arc<Mutex<Vec<WorkerKindLoss>>>);
 
-    impl Told {
+    impl LossSpy {
         fn tell(&self) -> Arc<dyn Fn(WorkerKindLoss) + Send + Sync> {
             let told = self.clone();
             Arc::new(move |loss| told.0.lock().expect("no test thread panicked").push(loss))
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn the_last_worker_of_a_kind_tells_the_loss_with_the_first_cause() {
-        let told = Told::default();
+        let told = LossSpy::default();
         let counters = Arc::new(WorkerCounters::new());
         let (_, lives) = LiveWorkers::new(WorkerKind::TpcThread, 2, told.tell(), &counters);
         let mut lives = lives.into_iter();
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn a_worker_stopped_by_the_server_is_no_longer_serving_and_did_not_die() {
-        let told = Told::default();
+        let told = LossSpy::default();
         let counters = Arc::new(WorkerCounters::new());
         let (_, lives) = LiveWorkers::new(WorkerKind::PoolSync, 3, told.tell(), &counters);
         assert_eq!(lives.len(), 3, "one life per worker");
@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn a_worker_that_stops_on_its_own_is_counted_as_died_and_no_longer_serving() {
-        let told = Told::default();
+        let told = LossSpy::default();
         let counters = Arc::new(WorkerCounters::new());
         let (_, lives) = LiveWorkers::new(WorkerKind::PoolSync, 2, told.tell(), &counters);
         let mut lives = lives.into_iter();
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn each_kind_tells_its_own_loss_with_its_own_first_cause() {
-        let told = Told::default();
+        let told = LossSpy::default();
         let counters = Arc::new(WorkerCounters::new());
         let (_, sync) = LiveWorkers::new(WorkerKind::PoolSync, 1, told.tell(), &counters);
         let (_, r#async) = LiveWorkers::new(WorkerKind::PoolAsync, 1, told.tell(), &counters);

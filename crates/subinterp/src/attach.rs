@@ -8,8 +8,8 @@
 //! bound to a sub-interpreter. A value holding such objects may pass through that thread only
 //! if its last owner drops it on main, attached.
 
-use crate::finalization::FINALIZATION;
-use crate::ThreadStateCreationFailure;
+use crate::finalization::{RegisterHookError, FINALIZATION};
+use crate::NewThreadStateError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::InterpreterHandle;
@@ -22,7 +22,8 @@ pub fn on_main(py: Python<'_>) -> bool {
 /// Runs `f` attached to the main interpreter.
 ///
 /// A thread with no thread state keeps one main thread state for its whole life, so a pool
-/// thread does not create and destroy one per call.
+/// thread does not create and destroy one per call; one that cannot keep it attaches with a
+/// thread state per call.
 ///
 /// # Panics
 ///
@@ -33,17 +34,44 @@ where
 {
     let main = InterpreterHandle::main();
     if InterpreterHandle::bound().is_none() {
-        // During thread-local teardown the slot may be gone, and creation fails when out of
-        // memory; either way `with_interpreter` attaches with a thread state for this call only.
-        match THREAD_MAIN_TSTATE.try_with(|slot| slot.ensure(main)) {
-            Ok(Ok(())) | Err(_) => {}
-            Ok(Err(e)) => tracing::warn!(
-                "this thread keeps no main-interpreter thread state ({e}); attaching with a \
-                 thread state per call instead"
-            ),
+        // [arc:intentional-handle] reason: a thread state per call is correct, only slower, and
+        // each cause reaches its owner elsewhere: every creation returns a refused hook
+        // (`NewInterpreterError::HookRefused`), a thread state that cannot be made fails the
+        // per-call attach too, and an ending thread has no other way.
+        match keep_main_thread_state(main) {
+            Ok(())
+            | Err(MainThreadStateError::ThreadEnding)
+            | Err(MainThreadStateError::NoThreadState(NewThreadStateError))
+            | Err(MainThreadStateError::HookRefused(_)) => {}
         }
     }
     with_interpreter(main, f)
+}
+
+/// How a thread attaches to the interpreter it asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachPath<I> {
+    /// The thread has no thread state: one is made for this call.
+    Temporary,
+    /// The thread is bound to the interpreter asked for: its own thread state is re-attached.
+    Bound,
+    /// Another thread state is current on top of the thread's own, such as a sub-interpreter's
+    /// init or handler running here; `PyGILState_Ensure` would restore the thread's own on top of
+    /// it, which CPython treats as fatal without saying why.
+    OtherCurrent,
+    /// The thread is bound to a different interpreter, this one.
+    BoundElsewhere(I),
+}
+
+/// Decides how a thread attaches to `wanted`, from whether a thread state other than its own is
+/// current and which interpreter it is bound to.
+fn route<I: PartialEq>(other_current: bool, bound: Option<I>, wanted: I) -> AttachPath<I> {
+    match bound {
+        _ if other_current => AttachPath::OtherCurrent,
+        None => AttachPath::Temporary,
+        Some(bound) if bound == wanted => AttachPath::Bound,
+        Some(bound) => AttachPath::BoundElsewhere(bound),
+    }
 }
 
 /// Runs `f` attached to `interp`, from any thread.
@@ -63,28 +91,24 @@ where
     // A TPC thread may have kept its worker's thread state current between requests.
     crate::detach_for_idle();
     // SAFETY: This is always safe to call and returns null when the thread has no thread state.
-    let bound = unsafe { ffi::PyGILState_GetThisThreadState() };
+    let own = unsafe { ffi::PyGILState_GetThisThreadState() };
     // SAFETY: This is always safe to call and returns null when no thread state is current.
     let current = unsafe { ffi::PyThreadState_GetUnchecked() };
-    // `PyGILState_Ensure` would restore the bound thread state on top of another current one,
-    // which CPython treats as fatal without saying why.
-    assert!(
-        current.is_null() || current == bound,
-        "with_interpreter(interpreter {}) while another thread state is current on this thread \
-         (a sub-interpreter's init or handler running on it); attach from a thread that has \
-         none",
-        interp.id(),
-    );
-    let Some(bound_interp) = InterpreterHandle::bound() else {
-        return interp.attach(f);
-    };
-    assert!(
-        bound_interp == interp,
-        "with_interpreter(interpreter {}) on a thread bound to interpreter {}",
-        interp.id(),
-        bound_interp.id(),
-    );
-    Python::attach(f)
+    match route(!current.is_null() && current != own, InterpreterHandle::bound(), interp) {
+        AttachPath::Temporary => interp.attach(f),
+        AttachPath::Bound => Python::attach(f),
+        AttachPath::OtherCurrent => panic!(
+            "with_interpreter(interpreter {}) while another thread state is current on this \
+             thread (a sub-interpreter's init or handler running on it); attach from a thread \
+             that has none",
+            interp.id(),
+        ),
+        AttachPath::BoundElsewhere(bound) => panic!(
+            "with_interpreter(interpreter {}) on a thread bound to interpreter {}",
+            interp.id(),
+            bound.id(),
+        ),
+    }
 }
 
 struct MainThreadState(std::cell::Cell<Option<std::ptr::NonNull<ffi::PyThreadState>>>);
@@ -94,18 +118,27 @@ thread_local! {
         const { MainThreadState(std::cell::Cell::new(None)) };
 }
 
-/// Says why a thread attaches with a thread state per call instead of keeping one.
+/// Why a thread attaches with a thread state per call instead of keeping one.
 #[derive(Debug, thiserror::Error)]
 enum MainThreadStateError {
     #[error(transparent)]
-    NoThreadState(#[from] ThreadStateCreationFailure),
-    #[error("could not register the finalization hook: {0}")]
-    FinalizationHookRefused(String),
+    NoThreadState(#[from] NewThreadStateError),
+    #[error(transparent)]
+    HookRefused(#[from] RegisterHookError),
+    #[error("the thread is ending: its thread-locals are being destroyed")]
+    ThreadEnding,
+}
+
+/// Makes the calling thread keep a main thread state unless it has one; the thread must have
+/// no thread state, so the new one becomes the one `PyGILState_Ensure` re-attaches.
+fn keep_main_thread_state(main: InterpreterHandle) -> Result<(), MainThreadStateError> {
+    THREAD_MAIN_TSTATE
+        .try_with(|slot| slot.ensure(main))
+        .map_err(|_| MainThreadStateError::ThreadEnding)?
 }
 
 impl MainThreadState {
-    /// Creates this thread's main thread state unless it has one; the thread must have no thread
-    /// state, so the new one becomes the one `PyGILState_Ensure` re-attaches.
+    /// Creates this thread's main thread state unless it has one.
     ///
     /// The finalization hook is armed first, so that every kept thread state is deleted at
     /// thread exit only before `Py_Finalize` frees it, even in a process with no sub-interpreter.
@@ -114,14 +147,10 @@ impl MainThreadState {
             return Ok(());
         }
         if !FINALIZATION.armed() {
-            main.try_attach(|py| {
-                FINALIZATION.arm(py).map_err(|e| {
-                    MainThreadStateError::FinalizationHookRefused(format!("{}: {}", e.get_type(py), e.value(py)))
-                })
-            })
-            .ok_or(ThreadStateCreationFailure)??;
+            main.try_attach(|py| FINALIZATION.arm(py))
+                .ok_or(NewThreadStateError)??;
         }
-        let tstate = main.new_thread_state().ok_or(ThreadStateCreationFailure)?;
+        let tstate = main.new_thread_state().ok_or(NewThreadStateError)?;
         self.0.set(Some(tstate));
         Ok(())
     }
@@ -138,7 +167,7 @@ impl Drop for MainThreadState {
         let Some(tstate) = self.0.get() else {
             return;
         };
-        let Some(_not_finalizing) = FINALIZATION.not_begun() else {
+        let Some(_not_finalizing) = FINALIZATION.try_hold() else {
             return;
         };
         let tstate = tstate.as_ptr();
@@ -200,12 +229,11 @@ mod tests {
         crate::python_thread("left-behind-worker".into())
             .spawn(move || {
                 let mut worker = SubInterpreter::<Interp>::create_on_this_thread::<NewInterpreterError>(
-                    "left-behind".into(),
                     std::convert::identity,
                     |py| Ok(Interp(InterpreterHandle::current(py))),
                 )
                 .expect("a sub-interpreter on its serving thread");
-                let interp = worker.held().0;
+                let interp = worker.attachment().0;
                 let count =
                     |worker: &mut SubInterpreter<Interp>| worker.with_gil(|_, py| thread_states(py)).expect("no panic");
                 let before = count(&mut worker);
@@ -229,7 +257,7 @@ mod tests {
                     counted.wait();
                     after
                 });
-                worker.end_on_own_thread();
+                drop(worker);
                 after as isize - before as isize
             })
             .expect("spawn the worker thread")
@@ -258,6 +286,16 @@ mod tests {
                 ffi::PyThreadState_DeleteCurrent();
             }
         }
+    }
+
+    #[test]
+    fn a_thread_attaches_by_whether_it_is_bound_and_to_what() {
+        assert_eq!(route(false, None, 1), AttachPath::Temporary);
+        assert_eq!(route(false, Some(1), 1), AttachPath::Bound);
+        assert_eq!(route(false, Some(2), 1), AttachPath::BoundElsewhere(2));
+        assert_eq!(route(true, None, 1), AttachPath::OtherCurrent);
+        assert_eq!(route(true, Some(1), 1), AttachPath::OtherCurrent);
+        assert_eq!(route(true, Some(2), 1), AttachPath::OtherCurrent);
     }
 
     #[test]

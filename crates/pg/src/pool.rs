@@ -143,7 +143,7 @@ fn differs<T: PartialEq + Copy>(asked: Option<T>, existing: T) -> Option<(T, T)>
 /// What a run opens: one pool per DSN, in the order the DSNs were first asked for, and the
 /// size of its runtime.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RunPlan {
+pub(crate) struct PoolPlan {
     pub(crate) threads: NonZeroUsize,
     pub(crate) pools: Vec<PoolSettings>,
 }
@@ -157,7 +157,10 @@ pub(crate) struct RunPlan {
 /// # Errors
 ///
 /// Returns every conflict, each naming its DSN (password masked).
-pub(crate) fn plan_run(requests: &[&PoolRequest], default_threads: NonZeroUsize) -> Result<RunPlan, Vec<PoolConflict>> {
+pub(crate) fn plan_pools(
+    requests: &[&PoolRequest],
+    default_threads: NonZeroUsize,
+) -> Result<PoolPlan, Vec<PoolConflict>> {
     let threads = requests
         .iter()
         .find_map(|r| r.runtime_threads)
@@ -190,7 +193,7 @@ pub(crate) fn plan_run(requests: &[&PoolRequest], default_threads: NonZeroUsize)
         }
     }
     if conflicts.is_empty() {
-        Ok(RunPlan { threads, pools })
+        Ok(PoolPlan { threads, pools })
     } else {
         Err(conflicts)
     }
@@ -374,7 +377,7 @@ mod tests {
         let first = request("postgres://a", None, Some(5));
         let later = request("postgres://a", None, Some(5));
         let other = request("postgres://b", Some(3), None);
-        let plan = plan_run(&[&first, &later, &other], two()).unwrap();
+        let plan = plan_pools(&[&first, &later, &other], two()).unwrap();
         assert_eq!(plan.threads, two());
         assert_eq!(plan.pools, vec![first.settings(), other.settings()]);
     }
@@ -384,7 +387,7 @@ mod tests {
         let first = request("postgres://u:secret@h/a", Some(2), None);
         let more = request("postgres://u:secret@h/a", Some(3), Some(5));
         let fine = request("postgres://u:secret@h/a", Some(2), None);
-        let conflicts = plan_run(&[&first, &more, &fine, &more], two()).unwrap_err();
+        let conflicts = plan_pools(&[&first, &more, &fine, &more], two()).unwrap_err();
         let lines: Vec<String> = conflicts.iter().map(ToString::to_string).collect();
         assert_eq!(
             lines,
@@ -402,7 +405,7 @@ mod tests {
         a.runtime_threads = Some(two());
         let mut b = request("postgres://b", None, None);
         b.runtime_threads = two().checked_add(1);
-        let conflicts = plan_run(&[&a, &b], NonZeroUsize::MIN).unwrap_err();
+        let conflicts = plan_pools(&[&a, &b], NonZeroUsize::MIN).unwrap_err();
         assert!(matches!(
             conflicts.as_slice(),
             [PoolConflict {
@@ -411,9 +414,9 @@ mod tests {
             }]
         ));
         b.runtime_threads = None;
-        assert_eq!(plan_run(&[&a, &b], NonZeroUsize::MIN).unwrap().threads, two());
+        assert_eq!(plan_pools(&[&a, &b], NonZeroUsize::MIN).unwrap().threads, two());
         assert_eq!(
-            plan_run(&[&b], two()).unwrap().threads,
+            plan_pools(&[&b], two()).unwrap().threads,
             two(),
             "nobody named it: the default"
         );

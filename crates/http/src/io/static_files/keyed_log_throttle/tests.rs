@@ -19,17 +19,17 @@ fn capacity(n: usize) -> NonZeroUsize {
 #[test]
 fn a_keys_logged_line_carries_its_held_count() {
     let mut throttles: PerKeyThrottles<String> = PerKeyThrottles::new(PERIOD, capacity(8));
-    assert_eq!(throttles.admit("a", at(0)), Some(HeldLines::OfKey(0)));
+    assert_eq!(throttles.admit("a", at(0)), Some(SuppressedLines::OfKey(0)));
     assert_eq!(throttles.admit("a", at(1)), None);
     assert_eq!(throttles.admit("a", just_before(60)), None);
     assert_eq!(
         throttles.admit("a", at(60)),
-        Some(HeldLines::OfKey(2)),
+        Some(SuppressedLines::OfKey(2)),
         "both held lines are counted in the next one"
     );
     assert_eq!(
         throttles.admit("a", at(120)),
-        Some(HeldLines::OfKey(0)),
+        Some(SuppressedLines::OfKey(0)),
         "and only once"
     );
 }
@@ -76,12 +76,12 @@ fn a_new_key_takes_the_place_of_one_whose_period_is_over() {
     assert!(throttles.admit(&2, at(10)).is_some());
     assert_eq!(
         throttles.admit(&3, just_before(60)),
-        Some(HeldLines::OfUnrememberedKeys(0)),
+        Some(SuppressedLines::OfUnrememberedKeys(0)),
         "no place yet: the overflow line"
     );
     assert_eq!(
         throttles.admit(&3, at(60)),
-        Some(HeldLines::OfKey(0)),
+        Some(SuppressedLines::OfKey(0)),
         "3 takes 1's place"
     );
     assert!(throttles.admit(&3, at(61)).is_none(), "and is remembered");
@@ -91,28 +91,33 @@ fn a_new_key_takes_the_place_of_one_whose_period_is_over() {
 #[test]
 fn a_forgotten_keys_held_lines_go_out_with_the_next_overflow_line() {
     let mut throttles: PerKeyThrottles<String> = PerKeyThrottles::new(PERIOD, capacity(1));
-    assert_eq!(throttles.admit("a", at(0)), Some(HeldLines::OfKey(0)));
+    assert_eq!(throttles.admit("a", at(0)), Some(SuppressedLines::OfKey(0)));
     assert_eq!(throttles.admit("a", at(1)), None);
     assert_eq!(
         throttles.admit("b", at(60)),
-        Some(HeldLines::OfKey(0)),
+        Some(SuppressedLines::OfKey(0)),
         "b takes the place of a, whose period is over"
     );
     assert_eq!(
         throttles.admit("c", at(61)),
-        Some(HeldLines::OfUnrememberedKeys(1)),
+        Some(SuppressedLines::OfUnrememberedKeys(1)),
         "the line a held is not lost with a's place"
     );
 }
 
 /// Returns the held lines a `PerKeyThrottles` still keeps, which no line has carried out yet.
 fn residual<K: Hash + Eq>(throttles: &PerKeyThrottles<K>) -> u64 {
-    throttles.remembered.values().map(|e| e.throttle.held()).sum::<u64>() + throttles.unremembered.held()
+    throttles
+        .remembered
+        .values()
+        .map(|e| e.throttle.suppressed())
+        .sum::<u64>()
+        + throttles.unremembered.suppressed()
 }
 
-fn carried(held: HeldLines) -> u64 {
+fn carried(held: SuppressedLines) -> u64 {
     match held {
-        HeldLines::OfKey(n) | HeldLines::OfUnrememberedKeys(n) => n,
+        SuppressedLines::OfKey(n) | SuppressedLines::OfUnrememberedKeys(n) => n,
     }
 }
 
@@ -124,7 +129,7 @@ proptest! {
         period_ns in 1u64..100,
     ) {
         let mut throttles: PerKeyThrottles<u8> = PerKeyThrottles::new(Duration::from_nanos(period_ns), capacity(capacity_n));
-        let decided: Vec<Option<HeldLines>> = calls.iter().map(|(key, at)| throttles.admit(key, Duration::from_nanos(*at))).collect();
+        let decided: Vec<Option<SuppressedLines>> = calls.iter().map(|(key, at)| throttles.admit(key, Duration::from_nanos(*at))).collect();
         let held = decided.iter().filter(|d| d.is_none()).count() as u64;
         let reported: u64 = decided.iter().flatten().map(|h| carried(*h)).sum();
         prop_assert_eq!(reported + residual(&throttles), held);
@@ -142,7 +147,7 @@ proptest! {
     ) {
         let mut throttles: PerKeyThrottles<u8> = PerKeyThrottles::new(Duration::from_nanos(period_ns), capacity(capacity_n));
         let mut now = 0u64;
-        let mut lines: Vec<(u64, u8, HeldLines)> = Vec::new();
+        let mut lines: Vec<(u64, u8, SuppressedLines)> = Vec::new();
         for (key, step) in &calls {
             now += step;
             if let Some(held) = throttles.admit(key, Duration::from_nanos(now)) {
@@ -156,7 +161,7 @@ proptest! {
         for key in 0u8..9 {
             let own: Vec<u64> = lines
                 .iter()
-                .filter(|(_, k, held)| *k == key && matches!(held, HeldLines::OfKey(_)))
+                .filter(|(_, k, held)| *k == key && matches!(held, SuppressedLines::OfKey(_)))
                 .map(|(t, _, _)| *t)
                 .collect();
             for pair in own.windows(2) {
@@ -167,7 +172,7 @@ proptest! {
 }
 
 /// Reads the doc of `PerKeyThrottles` plainly: a list in the order keys were last seen.
-struct KeyList {
+struct PerKeyThrottlesModel {
     period_ns: u64,
     capacity: usize,
     /// Holds each key with when its period is over and its held lines, least recently seen first.
@@ -175,8 +180,8 @@ struct KeyList {
     unremembered: (u64, u64),
 }
 
-impl KeyList {
-    fn admit(&mut self, key: u8, at: u64) -> Option<HeldLines> {
+impl PerKeyThrottlesModel {
+    fn admit(&mut self, key: u8, at: u64) -> Option<SuppressedLines> {
         let open_at = at.saturating_add(self.period_ns);
         if let Some(i) = self.keys.iter().position(|k| k.0 == key) {
             let (_, over_at, held) = self.keys.remove(i);
@@ -186,7 +191,7 @@ impl KeyList {
                 ((key, over_at, held + 1), None)
             };
             self.keys.push(entry);
-            return admitted.map(HeldLines::OfKey);
+            return admitted.map(SuppressedLines::OfKey);
         }
         if self.keys.len() >= self.capacity {
             match self.keys.iter().position(|k| at >= k.1) {
@@ -194,7 +199,7 @@ impl KeyList {
                 None if at >= self.unremembered.0 => {
                     let held = std::mem::take(&mut self.unremembered.1);
                     self.unremembered.0 = open_at;
-                    return Some(HeldLines::OfUnrememberedKeys(held));
+                    return Some(SuppressedLines::OfUnrememberedKeys(held));
                 }
                 None => {
                     self.unremembered.1 += 1;
@@ -203,7 +208,7 @@ impl KeyList {
             }
         }
         self.keys.push((key, open_at, 0));
-        Some(HeldLines::OfKey(0))
+        Some(SuppressedLines::OfKey(0))
     }
 }
 
@@ -215,7 +220,7 @@ proptest! {
         period_ns in 0u64..100,
     ) {
         let mut throttles: PerKeyThrottles<u8> = PerKeyThrottles::new(Duration::from_nanos(period_ns), capacity(capacity_n));
-        let mut listed = KeyList { period_ns, capacity: capacity_n, keys: Vec::new(), unremembered: (0, 0) };
+        let mut listed = PerKeyThrottlesModel { period_ns, capacity: capacity_n, keys: Vec::new(), unremembered: (0, 0) };
         for (key, at) in &calls {
             prop_assert_eq!(throttles.admit(key, Duration::from_nanos(*at)), listed.admit(*key, *at), "key {} at {}", key, at);
         }

@@ -34,10 +34,10 @@ use crate::plan::static_plan::{
 };
 pub use cache::{CacheBudget, MountWatch, DEFAULT_CACHE_BUDGET_BYTES};
 use cache::{MissGeneration, MountCache};
-use keyed_log_throttle::{HeldLines, KeyedLogThrottle};
+use keyed_log_throttle::{KeyedLogThrottle, SuppressedLines};
 use mipyre_util::clock;
 use read::{file_name, FileSet};
-use send::{Digest, Fingerprint, HeldBytes};
+use send::{BytesInFlight, Digest, Fingerprint};
 pub use send::{FileBody, FileSendError};
 
 /// Larger files are refused with 413, because a file the cache keeps is read whole into memory,
@@ -67,7 +67,7 @@ impl CanonicalDir {
 pub struct StaticMount {
     rule: StaticMountRule,
     cache: Arc<MountCache>,
-    held: Arc<HeldBytes>,
+    in_flight: Arc<BytesInFlight>,
 }
 
 impl AsRef<StaticMountRule> for StaticMount {
@@ -97,7 +97,7 @@ impl StaticMount {
         Ok(Self {
             rule,
             cache: Arc::new(MountCache::new(configured, root)),
-            held: Arc::new(HeldBytes::new()),
+            in_flight: Arc::new(BytesInFlight::new()),
         })
     }
 
@@ -130,13 +130,13 @@ impl StaticMount {
     /// Counts the bytes this clone's answers send from disk apart from every other clone's; a
     /// server calls it on its copy of each mount, so what one server holds is its own.
     pub fn count_own_sends(&mut self) {
-        self.held = Arc::new(HeldBytes::new());
+        self.in_flight = Arc::new(BytesInFlight::new());
     }
 
     /// Returns how many bytes this mount's answers sent from disk hold, read and not yet written
     /// out.
     pub fn bytes_in_flight(&self) -> u64 {
-        self.held.get()
+        self.in_flight.get()
     }
 }
 
@@ -146,7 +146,7 @@ impl StaticMount {
     /// Opens `key` under the mount's root, picks the representation `accept_encoding` asks for
     /// and fingerprints it on the calling thread, without the cache, and answers `request`.
     #[doc(hidden)]
-    pub fn answer_from_disk_here(
+    pub fn respond_from_disk_here(
         &self,
         key: &[u8],
         accept_encoding: Option<&str>,
@@ -161,7 +161,7 @@ impl StaticMount {
             opened.into_disk(accept_encoding)
         };
         match opened() {
-            Ok(file) => file.map(|file| file.respond(request, &self.held)),
+            Ok(file) => file.map(|file| file.respond(request, &self.in_flight)),
             Err(error) => Some(error_response(error.status())),
         }
     }
@@ -226,8 +226,8 @@ impl StaticError {
             }
             // EACCES on a contained file means the deployment is wrong, so it stays a warning.
             Self::PermissionDenied { path, .. } => match PERMISSION_THROTTLE.admit(path.as_path(), clock::now()) {
-                Some(HeldLines::OfKey(held)) => tracing::warn!(error = %self, held, "static file refused"),
-                Some(HeldLines::OfUnrememberedKeys(held)) => {
+                Some(SuppressedLines::OfKey(held)) => tracing::warn!(error = %self, held, "static file refused"),
+                Some(SuppressedLines::OfUnrememberedKeys(held)) => {
                     tracing::warn!(error = %self, held_among_other_paths = held, "static file refused")
                 }
                 None => tracing::debug!(error = %self, "static file refused"),
@@ -365,7 +365,7 @@ struct DiskRepresentation {
 }
 
 impl DiskRepresentation {
-    fn respond(self, request: &HeaderMap, held: &Arc<HeldBytes>) -> Response<ResponseBody> {
+    fn respond(self, request: &HeaderMap, in_flight: &Arc<BytesInFlight>) -> Response<ResponseBody> {
         let Self {
             head,
             file,
@@ -374,7 +374,13 @@ impl DiskRepresentation {
         } = self;
         head.respond(request, || match fingerprint.len {
             0 => ResponseBody::empty(),
-            len => ResponseBody::File(FileBody::new(file, path, len, fingerprint.digest, Arc::clone(held))),
+            len => ResponseBody::File(FileBody::new(
+                file,
+                path,
+                len,
+                fingerprint.digest,
+                Arc::clone(in_flight),
+            )),
         })
     }
 }
@@ -554,7 +560,7 @@ pub async fn try_static_file(lookups: StaticLookups<'_, '_, StaticMount>) -> Opt
     clippy::large_enum_variant,
     reason = "moved once per miss, out of the blocking pool: boxing would add an allocation to every miss"
 )]
-enum AnswerSource {
+enum StaticFileSource {
     Memory(Arc<StaticFile>),
     Disk(DiskRepresentation),
 }
@@ -583,9 +589,9 @@ async fn serve(lookup: StaticLookup<'_, '_, StaticMount>) -> Result<Option<Respo
             return Ok(None);
         };
         if let Some(kept) = read_and_keep(&loader, key, ticket, name, &opened)? {
-            return Ok(Some(AnswerSource::Memory(kept)));
+            return Ok(Some(StaticFileSource::Memory(kept)));
         }
-        Ok::<_, StaticError>(opened.into_disk(accepted.as_deref())?.map(AnswerSource::Disk))
+        Ok::<_, StaticError>(opened.into_disk(accepted.as_deref())?.map(StaticFileSource::Disk))
     })
     .await
     .map_err(|source| StaticError::Unfinished {
@@ -593,8 +599,8 @@ async fn serve(lookup: StaticLookup<'_, '_, StaticMount>) -> Result<Option<Respo
         source,
     })??;
     Ok(source.map(|source| match source {
-        AnswerSource::Memory(file) => file.respond(accept_encoding, request),
-        AnswerSource::Disk(file) => file.respond(request, &mount.held),
+        StaticFileSource::Memory(file) => file.respond(accept_encoding, request),
+        StaticFileSource::Disk(file) => file.respond(request, &mount.in_flight),
     }))
 }
 
@@ -616,8 +622,8 @@ fn read_and_keep(
     let Some(ticket) = ticket else {
         return Ok(None);
     };
-    if let Some(held) = cache.held(opened.resolved()) {
-        return Ok(cache.keep_held(key, ticket, requested, held));
+    if let Some(held) = cache.cached_file(opened.resolved()) {
+        return Ok(cache.keep_cached(key, ticket, requested, held));
     }
     let Some(reserved) = cache.reserve(opened.len()) else {
         return Ok(None);

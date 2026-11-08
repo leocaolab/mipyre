@@ -1,6 +1,6 @@
 [package]
 name = "mipyre_pg"
-description = "A server run's Postgres pools, one per DSN, on a mipyre-db tokio runtime of their own, and the handles code holds to them; no Python"
+description = "A server run's Postgres pools, one per DSN, on a mipyre-db tokio runtime of their own, the handles code holds to them, and the NUMERIC wire format as decimal text; no Python"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"
+
+[dev-dependencies]
+# The NUMERIC codec's property tests (src/numeric.rs).
+proptest = "1"
 
 [lints]
 workspace = true

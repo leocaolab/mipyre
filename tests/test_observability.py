@@ -337,9 +337,8 @@ def test_metrics_counts_a_websocket_upgrade_past_the_cap():
     app.max_websocket_connections = 1
 
     @app.websocket("/echo")
-    async def echo(ws):
-        while (msg := await ws.recv()) is not None:
-            await ws.send(msg)
+    def echo(ws, msg):
+        return msg
 
     with TestClient(app) as c:
         before = c.get("/metrics").text

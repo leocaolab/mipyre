@@ -25,7 +25,7 @@ const DISCARD_CHUNK: usize = 4096;
 
 /// Says how a server closes a stream it is done with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Close {
+pub enum CloseStyle {
     /// Nothing the peer may still send matters, or no one waits for an answer.
     Now,
     /// The peer may still be sending a request the server answered before reading it whole, so

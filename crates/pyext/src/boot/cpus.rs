@@ -2,7 +2,7 @@
 
 use std::num::NonZeroUsize;
 
-use mipyre_cpu::{CpuReadError, Cpus, HostCpus, PinOrder, PinOrderError, Quota, QuotaReadError};
+use mipyre_cpu::{AvailableCpus, Cpus, PinOrder, PinOrderError, Quota, ReadCpusError, ReadQuotaError};
 
 /// Holds the CPU counts a server is sized from, where its TPC threads would be pinned, and why
 /// the counts are a fallback when they are.
@@ -17,10 +17,10 @@ pub(crate) struct ServerCpus {
 #[derive(Debug)]
 pub(crate) enum CpuCountFallback {
     /// The CPU counts could not be read; the logical count, or one CPU, stands in.
-    Cpus(CpuReadError),
+    Cpus(ReadCpusError),
     /// The cgroup CPU quota could not be read; the affinity mask alone sizes the server.
-    Quota(QuotaReadError),
-    Both(CpuReadError, QuotaReadError),
+    Quota(ReadQuotaError),
+    Both(ReadCpusError, ReadQuotaError),
 }
 
 impl ServerCpus {
@@ -28,8 +28,8 @@ impl ServerCpus {
     /// left unread by a failed pin-order read are said with that read's error, which only
     /// `pin_order` holds.
     pub(crate) fn fallback_reason(&self) -> Option<String> {
-        let cpus = |e: &CpuReadError| match (e, self.pin_order.as_ref().err()) {
-            (CpuReadError::Cores { .. }, Some(source)) => format!("{e}: {source}"),
+        let cpus = |e: &ReadCpusError| match (e, self.pin_order.as_ref().err()) {
+            (ReadCpusError::PinOrderFailed { .. }, Some(source)) => format!("{e}: {source}"),
             _ => e.to_string(),
         };
         self.fallback.as_ref().map(|fallback| match fallback {
@@ -44,7 +44,7 @@ impl ServerCpus {
 /// because a count only sizes defaults that `threads` and `subinterpreters` can override.
 pub(crate) fn host_cpus() -> ServerCpus {
     let (quota, quota_error) = cpu_quota();
-    let HostCpus { cpus, pin_order } = HostCpus::read(quota);
+    let AvailableCpus { cpus, pin_order } = AvailableCpus::read(quota);
     let (cpus, cpus_error) = sizing_cpus(cpus, &pin_order);
     let fallback = match (cpus_error, quota_error) {
         (None, None) => None,
@@ -61,12 +61,12 @@ pub(crate) fn host_cpus() -> ServerCpus {
 
 /// Reads this process's cgroup CPU quota; one that cannot be read is logged and treated as no
 /// quota, and its error is handed back for the fallback reason.
-fn cpu_quota() -> (Quota, Option<QuotaReadError>) {
+fn cpu_quota() -> (Quota, Option<ReadQuotaError>) {
     match mipyre_cpu::read_cpu_quota() {
         Ok(quota) => (quota, None),
         Err(e) => {
             tracing::warn!(target: "mipyre::server", error = %e,
-                error_type = "QuotaReadError",
+                error_type = "ReadQuotaError",
                 "could not read the CPU quota; sizing from the affinity mask alone");
             (Quota::Unlimited, Some(e))
         }
@@ -76,32 +76,32 @@ fn cpu_quota() -> (Quota, Option<QuotaReadError>) {
 /// Returns the CPUs [`sizing`] picks and, when they are a fallback, the read failure, logged
 /// here. Cores left unread by a failed pin-order read are logged with that read's error.
 fn sizing_cpus(
-    read: Result<Cpus, CpuReadError>,
+    read: Result<Cpus, ReadCpusError>,
     pin_order: &Result<PinOrder, PinOrderError>,
-) -> (Cpus, Option<CpuReadError>) {
+) -> (Cpus, Option<ReadCpusError>) {
     let (cpus, fallback) = sizing(read);
     match &fallback {
         None => {}
-        Some(e @ CpuReadError::Cores { .. }) => {
+        Some(e @ ReadCpusError::PinOrderFailed { .. }) => {
             let source = pin_order.as_ref().err();
             tracing::warn!(target: "mipyre::server", error = %e,
                 source = source.map(tracing::field::display),
-                error_type = "CpuReadError::Cores",
+                error_type = "ReadCpusError::PinOrderFailed",
                 "sizing the physical-core defaults from the logical CPU count");
         }
-        Some(e @ CpuReadError::CoreCount { .. }) => {
+        Some(e @ ReadCpusError::CoreCountFailed { .. }) => {
             tracing::warn!(target: "mipyre::server", error = %e,
-                error_type = "CpuReadError::CoreCount",
+                error_type = "ReadCpusError::CoreCountFailed",
                 "sizing the physical-core defaults from the logical CPU count");
         }
-        Some(e @ CpuReadError::CoresNotCountedHere { .. }) => {
+        Some(e @ ReadCpusError::CoresNotCountedHere { .. }) => {
             tracing::info!(target: "mipyre::server", error = %e,
-                error_type = "CpuReadError::CoresNotCountedHere",
+                error_type = "ReadCpusError::CoresNotCountedHere",
                 "sizing the physical-core defaults from the logical CPU count");
         }
-        Some(e @ CpuReadError::Logical(_)) => {
+        Some(e @ ReadCpusError::Logical(_)) => {
             tracing::warn!(target: "mipyre::server", error = %e,
-                error_type = "CpuReadError::Logical", "sizing for one CPU");
+                error_type = "ReadCpusError::Logical", "sizing for one CPU");
         }
     }
     (cpus, fallback)
@@ -109,15 +109,15 @@ fn sizing_cpus(
 
 /// Returns the CPUs to size from and, when they are a fallback, the read failure they stand in
 /// for: the logical count replaces unread cores, and one CPU replaces an unread logical count.
-fn sizing(read: Result<Cpus, CpuReadError>) -> (Cpus, Option<CpuReadError>) {
+fn sizing(read: Result<Cpus, ReadCpusError>) -> (Cpus, Option<ReadCpusError>) {
     match read {
         Ok(cpus) => (cpus, None),
         Err(
-            e @ (CpuReadError::Cores { logical }
-            | CpuReadError::CoreCount { logical, .. }
-            | CpuReadError::CoresNotCountedHere { logical }),
+            e @ (ReadCpusError::PinOrderFailed { logical }
+            | ReadCpusError::CoreCountFailed { logical, .. }
+            | ReadCpusError::CoresNotCountedHere { logical }),
         ) => (Cpus::new(logical, logical), Some(e)),
-        Err(e @ CpuReadError::Logical(_)) => (Cpus::new(NonZeroUsize::MIN, NonZeroUsize::MIN), Some(e)),
+        Err(e @ ReadCpusError::Logical(_)) => (Cpus::new(NonZeroUsize::MIN, NonZeroUsize::MIN), Some(e)),
     }
 }
 
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn cores_this_platform_does_not_count_size_from_the_logical_count_and_say_why() {
-        let (cpus, fallback) = sizing(Err(CpuReadError::CoresNotCountedHere { logical: n(8) }));
+        let (cpus, fallback) = sizing(Err(ReadCpusError::CoresNotCountedHere { logical: n(8) }));
         assert_eq!((cpus.logical(), cpus.physical()), (n(8), n(8)));
         let reason = fallback.expect("a fallback says why").to_string();
         assert!(reason.contains("does not count physical cores"), "{reason}");
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn unread_cores_size_from_the_logical_count_and_say_why() {
-        let (cpus, fallback) = sizing(Err(CpuReadError::Cores { logical: n(8) }));
+        let (cpus, fallback) = sizing(Err(ReadCpusError::PinOrderFailed { logical: n(8) }));
         assert_eq!((cpus.logical(), cpus.physical()), (n(8), n(8)));
         let reason = fallback.expect("a fallback says why").to_string();
         assert!(reason.contains("8 logical CPUs"), "{reason}");
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn an_unread_logical_count_sizes_for_one_cpu_and_says_why() {
-        let (cpus, fallback) = sizing(Err(CpuReadError::Logical(std::io::Error::other("no /proc here"))));
+        let (cpus, fallback) = sizing(Err(ReadCpusError::Logical(std::io::Error::other("no /proc here"))));
         assert_eq!((cpus.logical(), cpus.physical()), (n(1), n(1)));
         let reason = fallback.expect("a fallback says why").to_string();
         assert!(reason.contains("no /proc here"), "{reason}");
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn a_fallback_says_which_read_failed_with_the_pin_order_read_behind_unread_cores() {
-        let (sized, error) = sizing(Err(CpuReadError::Cores { logical: n(8) }));
+        let (sized, error) = sizing(Err(ReadCpusError::PinOrderFailed { logical: n(8) }));
         let cpus = ServerCpus {
             cpus: sized,
             pin_order: unread_topology(),
@@ -200,8 +200,8 @@ mod tests {
             cpus: sized,
             pin_order: Ok(PinOrder::Unsupported),
             fallback: Some(CpuCountFallback::Both(
-                CpuReadError::Logical(std::io::Error::other("no parallelism")),
-                mipyre_cpu::QuotaReadError::NotCgroupV2 {
+                ReadCpusError::Logical(std::io::Error::other("no parallelism")),
+                mipyre_cpu::ReadQuotaError::NotCgroupV2 {
                     text: "1:name=systemd:/".into(),
                 },
             )),
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn a_cpu_sizing_fallback_warns_with_its_error_type() {
         let logical = NonZeroUsize::new(6).unwrap();
-        let cores = CpuReadError::Cores { logical };
+        let cores = ReadCpusError::PinOrderFailed { logical };
         let unread = Err(mipyre_cpu::PinOrderError::Topology(mipyre_cpu::CpuListFileError::Os(
             mipyre_cpu::FileError {
                 path: "no siblings file".into(),
@@ -226,11 +226,14 @@ mod tests {
         let mut sized = None;
         let log = mipyre_runtime::testkit::captured_log(|| sized = Some(sizing_cpus(Err(cores), &unread).0));
         let line = log.lines().find(|l| l.contains("no siblings file")).expect(&log);
-        assert!(line.contains("\"error_type\":\"CpuReadError::Cores\""), "{line}");
+        assert!(
+            line.contains("\"error_type\":\"ReadCpusError::PinOrderFailed\""),
+            "{line}"
+        );
         let sized = sized.unwrap();
         assert_eq!((sized.logical(), sized.physical()), (logical, logical));
 
-        let counted = CpuReadError::CoreCount {
+        let counted = ReadCpusError::CoreCountFailed {
             logical,
             source: std::io::Error::other("no sysctl answer"),
         };
@@ -239,17 +242,20 @@ mod tests {
             sized = Some(sizing_cpus(Err(counted), &Ok(PinOrder::Unsupported)).0)
         });
         let line = log.lines().find(|l| l.contains("no sysctl answer")).expect(&log);
-        assert!(line.contains("\"error_type\":\"CpuReadError::CoreCount\""), "{line}");
+        assert!(
+            line.contains("\"error_type\":\"ReadCpusError::CoreCountFailed\""),
+            "{line}"
+        );
         let sized = sized.unwrap();
         assert_eq!((sized.logical(), sized.physical()), (logical, logical));
 
-        let unknown = CpuReadError::Logical(std::io::Error::other("no parallelism"));
+        let unknown = ReadCpusError::Logical(std::io::Error::other("no parallelism"));
         let mut sized = None;
         let log = mipyre_runtime::testkit::captured_log(|| {
             sized = Some(sizing_cpus(Err(unknown), &Ok(PinOrder::Unsupported)).0)
         });
         let line = log.lines().find(|l| l.contains("no parallelism")).expect(&log);
-        assert!(line.contains("\"error_type\":\"CpuReadError::Logical\""), "{line}");
+        assert!(line.contains("\"error_type\":\"ReadCpusError::Logical\""), "{line}");
         let sized = sized.unwrap();
         assert_eq!(
             (sized.logical(), sized.physical()),

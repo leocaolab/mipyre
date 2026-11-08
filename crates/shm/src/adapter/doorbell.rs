@@ -1,5 +1,5 @@
-//! Rings each side's doorbell: a futex wake for the peer, and for the host a byte into a pipe whose read end the
-//! host's reactor watches, since the host's thread sleeps in its reactor and not on a word.
+//! Rings each side's doorbell: a futex wake for the peer, and for the caller a byte into a pipe whose read end the
+//! caller's reactor watches, since the caller's thread sleeps in its reactor and not on a word.
 
 use std::convert::Infallible;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -23,7 +23,7 @@ impl Doorbell for FutexDoorbell {
     }
 }
 
-/// Wakes the host: the peer's write end of the host's wake pipe.
+/// Wakes the caller: the peer's write end of the caller's wake pipe.
 pub struct PipeDoorbell {
     fd: OwnedFd,
 }
@@ -34,20 +34,20 @@ impl PipeDoorbell {
     }
 }
 
-/// What a byte into the host's wake pipe found.
+/// What a byte into the caller's wake pipe found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HostBellOutcome {
-    /// The byte is in the pipe, or the pipe is full and wakes the host already.
+pub enum RequesterBellOutcome {
+    /// The byte is in the pipe, or the pipe is full and wakes the caller already.
     Rung,
-    /// No one holds the read end: the host is gone.
-    HostGone,
+    /// No one holds the read end: the caller is gone.
+    RequesterGone,
 }
 
 impl Doorbell for PipeDoorbell {
-    type Outcome = HostBellOutcome;
+    type Outcome = RequesterBellOutcome;
     type Error = SyscallError;
 
-    fn ring(&self, _: &AtomicU32) -> Result<HostBellOutcome, SyscallError> {
+    fn ring(&self, _: &AtomicU32) -> Result<RequesterBellOutcome, SyscallError> {
         bell_outcome(os::write_byte(self.fd.as_fd())).map_err(|errno| SyscallError {
             call: Syscall::Write,
             errno,
@@ -55,63 +55,63 @@ impl Doorbell for PipeDoorbell {
     }
 }
 
-/// Sorts what writing the wake byte returned: a byte written or a full pipe rang, EPIPE found the host gone, and any
+/// Sorts what writing the wake byte returned: a byte written or a full pipe rang, EPIPE found the caller gone, and any
 /// other errno is the pipe's.
-pub fn bell_outcome(written: Result<usize, Errno>) -> Result<HostBellOutcome, Errno> {
+pub fn bell_outcome(written: Result<usize, Errno>) -> Result<RequesterBellOutcome, Errno> {
     match written {
-        Ok(_) | Err(Errno::AGAIN) => Ok(HostBellOutcome::Rung),
-        Err(Errno::PIPE) => Ok(HostBellOutcome::HostGone),
+        Ok(_) | Err(Errno::AGAIN) => Ok(RequesterBellOutcome::Rung),
+        Err(Errno::PIPE) => Ok(RequesterBellOutcome::RequesterGone),
         Err(errno) => Err(errno),
     }
 }
 
-/// The host's end of its wake pipe, which the host registers in its own reactor.
-pub struct HostBell {
+/// The caller's end of its wake pipe, which the caller registers in its own reactor.
+pub struct RequesterBell {
     fd: OwnedFd,
 }
 
-impl AsFd for HostBell {
+impl AsFd for RequesterBell {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
 }
 
-impl AsRawFd for HostBell {
+impl AsRawFd for RequesterBell {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
 
-/// Opens a host wake pipe: the host's read end and the write end for the peer. Both are nonblocking and
+/// Opens a caller wake pipe: the caller's read end and the write end for the peer. Both are nonblocking and
 /// close-on-exec; the fd travels to the peer by `SCM_RIGHTS`, which needs no inheritable fd.
-pub fn open_host_doorbell() -> Result<(HostBell, OwnedFd), SyscallError> {
+pub fn open_requester_doorbell() -> Result<(RequesterBell, OwnedFd), SyscallError> {
     let (read, write) = os::pipe()?;
-    Ok((HostBell { fd: read }, write))
+    Ok((RequesterBell { fd: read }, write))
 }
 
-/// What one read of the host's wake pipe left in it.
+/// What one read of the caller's wake pipe left in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrainOutcome {
     Empty,
     MoreLeft,
 }
 
-/// One read of the host's wake pipe: the bytes it took, each a wake some peer wrote, and what it left.
+/// One read of the caller's wake pipe: the bytes it took, each a wake some peer wrote, and what it left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Drain {
+pub struct WakeRead {
     pub bytes: usize,
     pub outcome: DrainOutcome,
 }
 
 const BELL_READ_BYTES: usize = 256;
 
-/// Reads the host's wake pipe once, so a peer that keeps writing cannot hold the host's thread in a loop: whatever
+/// Reads the caller's wake pipe once, so a peer that keeps writing cannot hold the caller's thread in a loop: whatever
 /// it leaves is read on a later round.
 ///
 /// # Errors
 ///
 /// When the pipe cannot be read; reading it again would fail the same way.
-pub fn drain_once(bell: &HostBell) -> Result<Drain, SyscallError> {
+pub fn drain_once(bell: &RequesterBell) -> Result<WakeRead, SyscallError> {
     let mut buf = [0u8; BELL_READ_BYTES];
     drain_outcome(os::read(bell.as_fd(), &mut buf), BELL_READ_BYTES).map_err(|errno| SyscallError {
         call: Syscall::Read,
@@ -121,23 +121,23 @@ pub fn drain_once(bell: &HostBell) -> Result<Drain, SyscallError> {
 
 /// Says what a read of a wake pipe into a buffer of `cap` bytes took and whether the pipe may hold more after it
 /// returned `read`. A full read or an interrupted one may have left bytes; a short read, end of file and EAGAIN leave
-/// none. Any other errno is the pipe's and goes back to the caller, which alone can decide what a host whose wake pipe
-/// cannot be read does.
-pub fn drain_outcome(read: Result<usize, Errno>, cap: usize) -> Result<Drain, Errno> {
+/// none. Any other errno is the pipe's and goes back to whoever read the pipe, which alone can decide what a caller whose
+/// wake pipe cannot be read does.
+pub fn drain_outcome(read: Result<usize, Errno>, cap: usize) -> Result<WakeRead, Errno> {
     match read {
-        Ok(n) if n == cap => Ok(Drain {
+        Ok(n) if n == cap => Ok(WakeRead {
             bytes: n,
             outcome: DrainOutcome::MoreLeft,
         }),
-        Err(Errno::INTR) => Ok(Drain {
+        Err(Errno::INTR) => Ok(WakeRead {
             bytes: 0,
             outcome: DrainOutcome::MoreLeft,
         }),
-        Ok(n) => Ok(Drain {
+        Ok(n) => Ok(WakeRead {
             bytes: n,
             outcome: DrainOutcome::Empty,
         }),
-        Err(Errno::AGAIN) => Ok(Drain {
+        Err(Errno::AGAIN) => Ok(WakeRead {
             bytes: 0,
             outcome: DrainOutcome::Empty,
         }),
@@ -150,10 +150,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_byte_written_or_a_full_pipe_rings_a_gone_reader_is_the_host_gone_and_the_rest_fails() {
-        assert_eq!(bell_outcome(Ok(1)), Ok(HostBellOutcome::Rung));
-        assert_eq!(bell_outcome(Err(Errno::AGAIN)), Ok(HostBellOutcome::Rung));
-        assert_eq!(bell_outcome(Err(Errno::PIPE)), Ok(HostBellOutcome::HostGone));
+    fn a_byte_written_or_a_full_pipe_rings_a_gone_reader_is_the_caller_gone_and_the_rest_fails() {
+        assert_eq!(bell_outcome(Ok(1)), Ok(RequesterBellOutcome::Rung));
+        assert_eq!(bell_outcome(Err(Errno::AGAIN)), Ok(RequesterBellOutcome::Rung));
+        assert_eq!(bell_outcome(Err(Errno::PIPE)), Ok(RequesterBellOutcome::RequesterGone));
         assert_eq!(bell_outcome(Err(Errno::BADF)), Err(Errno::BADF));
     }
 
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn a_wake_read_says_more_is_left_only_when_it_filled_the_buffer_or_was_interrupted() {
         let cap = BELL_READ_BYTES;
-        let drain = |bytes, outcome| Ok(Drain { bytes, outcome });
+        let drain = |bytes, outcome| Ok(WakeRead { bytes, outcome });
         assert_eq!(drain_outcome(Ok(cap), cap), drain(cap, DrainOutcome::MoreLeft));
         assert_eq!(drain_outcome(Ok(cap - 1), cap), drain(cap - 1, DrainOutcome::Empty));
         assert_eq!(drain_outcome(Ok(0), cap), drain(0, DrainOutcome::Empty));
@@ -179,8 +179,8 @@ mod tests {
         use super::super::*;
 
         #[test]
-        fn both_ends_of_a_host_doorbell_are_close_on_exec() {
-            let (bell, write) = open_host_doorbell().unwrap();
+        fn both_ends_of_a_caller_doorbell_are_close_on_exec() {
+            let (bell, write) = open_requester_doorbell().unwrap();
             for end in [bell.as_fd(), write.as_fd()] {
                 assert!(rustix::io::fcntl_getfd(end)
                     .unwrap()
@@ -190,10 +190,10 @@ mod tests {
 
         #[test]
         fn an_empty_doorbell_drains_empty_and_a_full_one_still_rings() {
-            let (bell, write) = open_host_doorbell().unwrap();
+            let (bell, write) = open_requester_doorbell().unwrap();
             assert_eq!(
                 drain_once(&bell),
-                Ok(Drain {
+                Ok(WakeRead {
                     bytes: 0,
                     outcome: DrainOutcome::Empty
                 })
@@ -203,10 +203,10 @@ mod tests {
             while rustix::io::write(&ringer.fd, &[1u8; 4096]).is_ok() {}
             while os::write_byte(ringer.fd.as_fd()).is_ok() {}
             assert_eq!(os::write_byte(ringer.fd.as_fd()), Err(Errno::AGAIN));
-            assert_eq!(ringer.ring(&word), Ok(HostBellOutcome::Rung));
+            assert_eq!(ringer.ring(&word), Ok(RequesterBellOutcome::Rung));
             assert_eq!(
                 drain_once(&bell),
-                Ok(Drain {
+                Ok(WakeRead {
                     bytes: BELL_READ_BYTES,
                     outcome: DrainOutcome::MoreLeft
                 })
@@ -214,12 +214,12 @@ mod tests {
         }
 
         #[test]
-        fn a_doorbell_whose_host_closed_its_end_finds_the_host_gone() {
-            let (bell, write) = open_host_doorbell().unwrap();
+        fn a_doorbell_whose_caller_closed_its_end_finds_the_caller_gone() {
+            let (bell, write) = open_requester_doorbell().unwrap();
             drop(bell);
             assert_eq!(
                 PipeDoorbell::new(write).ring(&AtomicU32::new(0)),
-                Ok(HostBellOutcome::HostGone)
+                Ok(RequesterBellOutcome::RequesterGone)
             );
         }
 
@@ -227,7 +227,7 @@ mod tests {
         /// however much the peer wrote.
         #[test]
         fn a_drain_reads_once_however_much_was_written() {
-            let (bell, write) = open_host_doorbell().unwrap();
+            let (bell, write) = open_requester_doorbell().unwrap();
             assert_eq!(
                 rustix::io::write(&write, &[1u8; 3 * BELL_READ_BYTES]),
                 Ok(3 * BELL_READ_BYTES)
@@ -235,7 +235,7 @@ mod tests {
             for _ in 0..3 {
                 assert_eq!(
                     drain_once(&bell),
-                    Ok(Drain {
+                    Ok(WakeRead {
                         bytes: BELL_READ_BYTES,
                         outcome: DrainOutcome::MoreLeft
                     })
@@ -243,7 +243,7 @@ mod tests {
             }
             assert_eq!(
                 drain_once(&bell),
-                Ok(Drain {
+                Ok(WakeRead {
                     bytes: 0,
                     outcome: DrainOutcome::Empty
                 })
@@ -251,7 +251,7 @@ mod tests {
             drop(write);
             assert_eq!(
                 drain_once(&bell),
-                Ok(Drain {
+                Ok(WakeRead {
                     bytes: 0,
                     outcome: DrainOutcome::Empty
                 })
@@ -260,8 +260,8 @@ mod tests {
 
         #[test]
         fn a_doorbell_end_that_cannot_be_read_returns_the_read_and_its_errno() {
-            let (_bell, write) = open_host_doorbell().unwrap();
-            let not_a_bell = HostBell { fd: write };
+            let (_bell, write) = open_requester_doorbell().unwrap();
+            let not_a_bell = RequesterBell { fd: write };
             assert_eq!(
                 drain_once(&not_a_bell),
                 Err(SyscallError {

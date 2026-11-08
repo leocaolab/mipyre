@@ -35,7 +35,7 @@ impl SqlQuery {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum QueryMethod {
     /// `fetch_one`, `fetch_all`, `fetch_scalar` or `execute`, whose answer comes back whole.
-    Answer(FetchMode),
+    Fetch(FetchMode),
     /// `fetch_iter`, whose rows come back one at a time through a `PgCursor`.
     Cursor,
 }
@@ -43,7 +43,7 @@ pub(super) enum QueryMethod {
 impl std::fmt::Display for QueryMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Answer(fetch) => fetch.name(),
+            Self::Fetch(fetch) => fetch.name(),
             Self::Cursor => "fetch_iter",
         })
     }
@@ -84,21 +84,21 @@ pub(super) async fn bind(
     // Postgres always describes parameter types; without them nothing can be encoded.
     let declared = match prepared.parameters() {
         Some(Either::Left(types)) => types,
-        Some(Either::Right(count)) => return Err(DbError::Undescribed { op, count: Some(count) }),
-        None => return Err(DbError::Undescribed { op, count: None }),
+        Some(Either::Right(count)) => return Err(DbError::ParamTypesUndescribed { op, count: Some(count) }),
+        None => return Err(DbError::ParamTypesUndescribed { op, count: None }),
     };
     let args = param::encode_args(declared, params)?;
     Ok(sqlx::query_with(sql, args))
 }
 
-pub(super) enum QueryAnswer {
+pub(super) enum FetchResult {
     Row(Option<PgRow>),
     Rows(Vec<PgRow>),
     Scalar(PgRow),
     Affected(u64),
 }
 
-impl QueryAnswer {
+impl FetchResult {
     pub(super) fn into_py(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(match self {
             Self::Row(Some(row)) => cell::row_to_dict(py, &row)?.into_any(),
@@ -116,19 +116,19 @@ impl QueryAnswer {
     }
 }
 
-pub(super) async fn run(pool: sqlx::PgPool, stmt: SqlQuery, fetch: FetchMode) -> Result<QueryAnswer, DbError> {
-    let op = QueryMethod::Answer(fetch);
+pub(super) async fn run(pool: sqlx::PgPool, stmt: SqlQuery, fetch: FetchMode) -> Result<FetchResult, DbError> {
+    let op = QueryMethod::Fetch(fetch);
     let query_error = |source| DbError::QueryFailed { op, source };
     let mut conn = pool.acquire().await.map_err(query_error)?;
     let query = bind(&mut conn, op, stmt.sql, stmt.params).await?;
     match fetch {
-        FetchMode::One => query.fetch_optional(&mut *conn).await.map(QueryAnswer::Row),
-        FetchMode::All => query.fetch_all(&mut *conn).await.map(QueryAnswer::Rows),
-        FetchMode::Scalar => query.fetch_one(&mut *conn).await.map(QueryAnswer::Scalar),
+        FetchMode::One => query.fetch_optional(&mut *conn).await.map(FetchResult::Row),
+        FetchMode::All => query.fetch_all(&mut *conn).await.map(FetchResult::Rows),
+        FetchMode::Scalar => query.fetch_one(&mut *conn).await.map(FetchResult::Scalar),
         FetchMode::Execute => query
             .execute(&mut *conn)
             .await
-            .map(|done| QueryAnswer::Affected(done.rows_affected())),
+            .map(|done| FetchResult::Affected(done.rows_affected())),
     }
     .map_err(query_error)
 }

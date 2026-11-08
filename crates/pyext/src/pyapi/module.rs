@@ -145,9 +145,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mipyre_runtime::exchange::SameSite>()?;
     m.add_class::<mipyre_runtime::exchange::RequestHeaders>()?;
     m.add_class::<mipyre_runtime::exchange::WebSocket>()?;
-    m.add_class::<mipyre_runtime::exchange::LoopWaits>()?;
-    m.add_class::<mipyre_runtime::ConnectionInbox>()?;
-    m.add_class::<mipyre_runtime::WsJob>()?;
+    m.add_function(pyo3::wrap_pyfunction!(publish, m)?)?;
     m.add_class::<crate::pyapi::state::AppStateView>()?;
     m.add_class::<mipyre_runtime::exchange::ResponseStream>()?;
     m.add_class::<mipyre_runtime::exchange::BodyStream>()?;
@@ -158,6 +156,7 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<mipyre_runtime::exchange::PyBodyReadError>(),
     )?;
     m.add_class::<mipyre_runtime::exchange::HttpException>()?;
+    m.add_class::<mipyre_runtime::exchange::GrpcError>()?;
     crate::db::register(m)?;
     m.add_class::<crate::pyapi::config::Metrics>()?;
     m.add_class::<crate::pyapi::config::RunMetrics>()?;
@@ -195,4 +194,10 @@ fn engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "fault_injection")]
     m.add_function(pyo3::wrap_pyfunction!(_fault_panic, m)?)?;
     Ok(())
+}
+
+/// Sends `msg` (`str` or `bytes`) to every WebSocket connection subscribed to `topic`.
+#[pyfunction]
+fn publish(topic: &str, msg: &Bound<'_, PyAny>) -> PyResult<()> {
+    mipyre_runtime::exchange::publish(topic, msg)
 }

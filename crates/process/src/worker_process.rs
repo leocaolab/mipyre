@@ -9,18 +9,18 @@
 
 use std::time::Instant;
 
-use super::core::WorkerTag;
+use super::core::WorkerId;
+use super::fork_server::ForkError;
 use super::lane_failure::LaneIndex;
 use super::os::ProcessHandle;
 use super::pid::Pid;
-use super::template_host::ForkError;
 
 /// The process a lane's worker runs in. Made only by [`WorkerProcess::open`], which checks the
 /// template is its parent: holding one means the process was the template's worker.
 #[derive(Debug)]
 pub(super) struct WorkerProcess {
     /// Its lane, start attempt and pid.
-    tag: WorkerTag,
+    id: WorkerId,
     /// When the server took the process as its lane's worker, right after the fork answered.
     opened_at: Instant,
     /// What the server signals it by and watches its exit through.
@@ -28,7 +28,7 @@ pub(super) struct WorkerProcess {
 }
 
 impl WorkerProcess {
-    /// Takes `pid`, which `template` answered to the fork request `tag`, once the kernel says
+    /// Takes `pid`, which `template` answered to the fork request `id`, once the kernel says
     /// `template` is its parent. A pid with no process names nothing a signal could hit: it is a
     /// worker that already ended and was reaped, and is taken, its death then seen as any
     /// worker's is.
@@ -40,12 +40,12 @@ impl WorkerProcess {
     ///
     /// # Errors
     ///
-    /// [`ForkError::NotTemplateChild`] for a process the template did not start,
+    /// [`ForkError::NotForkServerChild`] for a process the template did not start,
     /// [`ForkError::ParentUnread`] when the kernel's record cannot be read, and
     /// [`ForkError::PidfdUnopened`] when the process has no pidfd (Linux; it is killed then: a
     /// worker left running would serve its lane unseen).
-    pub(super) fn open(template: Pid, tag: WorkerTag) -> Result<Self, ForkError> {
-        let pid = tag.pid;
+    pub(super) fn open(template: Pid, id: WorkerId) -> Result<Self, ForkError> {
+        let pid = id.pid;
         let handle = match ProcessHandle::open(pid.into()) {
             Ok(handle) => handle,
             Err(errno) => {
@@ -65,23 +65,23 @@ impl WorkerProcess {
             handle.record_exit();
         }
         Ok(WorkerProcess {
-            tag,
+            id,
             opened_at: Instant::now(),
             handle,
         })
     }
 
     pub(super) fn lane(&self) -> LaneIndex {
-        self.tag.lane
+        self.id.lane
     }
 
     /// The worker this process is, as the host's decisions name it.
-    pub(super) fn tag(&self) -> WorkerTag {
-        self.tag
+    pub(super) fn id(&self) -> WorkerId {
+        self.id
     }
 
     pub(super) fn pid(&self) -> Pid {
-        self.tag.pid
+        self.id.pid
     }
 
     pub(super) fn opened_at(&self) -> Instant {
@@ -100,7 +100,7 @@ impl WorkerProcess {
 
     /// Sends the process SIGKILL; one known to be gone is left alone.
     pub(super) fn kill(&self) {
-        refused_kill(self.tag.pid, self.handle.kill(self.tag.pid.into()));
+        refused_kill(self.id.pid, self.handle.kill(self.id.pid.into()));
     }
 }
 
@@ -117,7 +117,7 @@ fn check_parent(template: Pid, pid: Pid) -> Result<Option<i32>, ForkError> {
 /// kill could hit, and is taken.
 fn template_child(template: Pid, pid: Pid, parent: Option<i32>) -> Result<Pid, ForkError> {
     match parent {
-        Some(parent) if parent != template.as_raw() => Err(ForkError::NotTemplateChild { template, pid, parent }),
+        Some(parent) if parent != template.as_raw() => Err(ForkError::NotForkServerChild { template, pid, parent }),
         Some(_) | None => Ok(pid),
     }
 }
@@ -160,7 +160,7 @@ mod tests {
         assert_eq!(template_child(template, pid, None).ok(), Some(pid));
         assert!(matches!(
             template_child(template, pid, Some(101)),
-            Err(ForkError::NotTemplateChild { parent: 101, pid: p, template: t }) if p == pid && t == template
+            Err(ForkError::NotForkServerChild { parent: 101, pid: p, template: t }) if p == pid && t == template
         ));
     }
 }

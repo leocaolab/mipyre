@@ -24,17 +24,17 @@ use std::task::{Context, Poll};
 use super::*;
 use crate::core::{publish, refused_start, runs_queued, Replacement};
 use crate::health::{CrashBackoff, FailurePolicy};
-use crate::host_config::tests::with_crash_backoff;
-use crate::host_config::HostConfig;
+use crate::lane_config::tests::with_crash_backoff;
+use crate::lane_config::LaneConfig;
 use crate::lane_failure::{LaneDecodeError, LaneUnansweredError};
 use crate::lane_set::{lane_geometry, MIN_SLOT_BYTES};
 use crate::route::LaneRun;
 use crate::run::tests::serve_unforked;
-use crate::run::{HostKind, LaneStartError};
+use crate::run::{HostKind, StartRunError};
 use crate::sync::AtomicU64;
 use crate::template::tests::report_frame;
 use crate::template::{send_attached, send_with_fds, transfer_all, CommandBody, TransferError, MAX_FRAME_BYTES};
-use crate::template::{LinkEnd, TemplateCommand, TemplateReport};
+use crate::template::{DisconnectCause, ForkServerCommand, ForkServerReport};
 use crate::wire::{self, LaneRequest};
 use mipyre_core::HandoffBackend;
 use mipyre_cpu::CacheLine;
@@ -42,11 +42,11 @@ use mipyre_http::io::request_head::RequestHead;
 use mipyre_http::plan::request_id::{ClientRequestId, RequestId};
 use mipyre_http::plan::route::RouteKey;
 use mipyre_shm::adapter::doorbell::FutexDoorbell;
-use mipyre_shm::adapter::doorbell::{Drain, DrainOutcome};
-use mipyre_shm::adapter::doorbell::{HostBellOutcome, PipeDoorbell};
+use mipyre_shm::adapter::doorbell::{DrainOutcome, WakeRead};
+use mipyre_shm::adapter::doorbell::{PipeDoorbell, RequesterBellOutcome};
 use mipyre_shm::adapter::mapped::MappedMemory;
-use mipyre_shm::channel::{Channel, HostEnd, SlotRoomError};
-use mipyre_shm::channel::{PeerEnd, SlotWriter, Wait};
+use mipyre_shm::channel::{Channel, RequesterEnd, SlotRoomError};
+use mipyre_shm::channel::{PeerEnd, SlotWriter, WaitOutcome};
 use mipyre_shm::plan::geometry::Geometry;
 use mipyre_shm::plan::ring::{PeerCounterError, Seq};
 use mipyre_shm::plan::wakes::WakeFloodError;
@@ -61,7 +61,7 @@ impl LaneHost {
     /// it takes no more, and the run is told ([`LaneHost::carry_out`]).
     fn break_lane(&self, i: LaneIndex, why: LaneLossError) {
         let config = self.core_config();
-        self.owned
+        self.core
             .borrow_mut()
             .break_lane(i, why, &config, &mut ShellFx::new(self));
     }
@@ -76,8 +76,8 @@ fn this_process() -> Pid {
 }
 
 /// Names the worker of lane `i` at `pid`, as a start attempt of its own.
-fn tag(i: usize, pid: Pid) -> WorkerTag {
-    WorkerTag {
+fn tag(i: usize, pid: Pid) -> WorkerId {
+    WorkerId {
         lane: LaneIndex(i),
         attempt: Attempt::new(pid.as_raw() as u32),
         pid,
@@ -118,12 +118,12 @@ fn lanes_with(workers: usize, on_failure: FailurePolicy) -> Arc<ServerLanes> {
 /// behind them.
 fn lanes_queueing(workers: usize, queue_per_worker: usize, on_failure: FailurePolicy) -> Arc<ServerLanes> {
     lanes_configured(workers, |geometry| {
-        host_config(geometry, Duration::from_secs(5), queue_per_worker, on_failure)
+        lane_config(geometry, Duration::from_secs(5), queue_per_worker, on_failure)
     })
 }
 
 /// Creates [`lanes`] whose hosts run as `configure` makes them for the lanes' geometry.
-fn lanes_configured(workers: usize, configure: impl FnOnce(&Geometry) -> HostConfig) -> Arc<ServerLanes> {
+fn lanes_configured(workers: usize, configure: impl FnOnce(&Geometry) -> LaneConfig) -> Arc<ServerLanes> {
     let geometry = lane_geometry(DEPTH, MIN_SLOT_BYTES).unwrap();
     let host = configure(&geometry);
     let lanes = std::num::NonZeroUsize::new(workers).expect("a test asks for at least one lane");
@@ -131,13 +131,13 @@ fn lanes_configured(workers: usize, configure: impl FnOnce(&Geometry) -> HostCon
 }
 
 /// Makes a host config as the server does, with no spin.
-fn host_config(
+fn lane_config(
     geometry: &Geometry,
     timeout: Duration,
     queue_per_worker: usize,
     on_failure: FailurePolicy,
-) -> HostConfig {
-    HostConfig::new(geometry, timeout, queue_per_worker, Duration::ZERO, on_failure).unwrap()
+) -> LaneConfig {
+    LaneConfig::new(geometry, timeout, queue_per_worker, Duration::ZERO, on_failure).unwrap()
 }
 
 /// Puts the lanes in a run that serves them with `hosts` hosts, as `start_run` does once its
@@ -151,14 +151,14 @@ fn serve(lanes: &ServerLanes, hosts: usize) -> (Arc<RunState>, Vec<OwnedFd>) {
 /// What a test's server run heard from its lanes: whether they told it to stop, and the worker
 /// deaths they told it of.
 #[derive(Default)]
-struct HeardRun {
+struct SpyRun {
     stopped: CancellationToken,
     deaths: AtomicU64,
 }
 
 /// Serves the lanes as [`serve`] does, with a run that keeps what the lanes tell it.
-fn serve_heard(lanes: &ServerLanes, hosts: usize) -> (Arc<RunState>, Arc<HeardRun>, Vec<OwnedFd>) {
-    let heard = Arc::new(HeardRun::default());
+fn serve_heard(lanes: &ServerLanes, hosts: usize) -> (Arc<RunState>, Arc<SpyRun>, Vec<OwnedFd>) {
+    let heard = Arc::new(SpyRun::default());
     let told = Arc::clone(&heard);
     let tell_run = Box::new(move |event| match event {
         LaneRunEvent::WorkerDied => {
@@ -171,9 +171,9 @@ fn serve_heard(lanes: &ServerLanes, hosts: usize) -> (Arc<RunState>, Arc<HeardRu
 }
 
 /// Rings nothing: the test drives the host by hand, so a host that said it sleeps is read anyway.
-struct NoBell;
+struct StubDoorbell;
 
-impl Doorbell for NoBell {
+impl Doorbell for StubDoorbell {
     type Outcome = ();
     type Error = Infallible;
     fn ring(&self, _: &ShmWord) -> Result<(), Infallible> {
@@ -182,9 +182,9 @@ impl Doorbell for NoBell {
 }
 
 /// Sleeps not at all, so a wait for a request no host sent ends at once.
-struct NoSleep;
+struct StubParker;
 
-impl Parker for NoSleep {
+impl Parker for StubParker {
     type Error = Infallible;
     fn park(&self, _: &ShmWord, _: u32, _: u64) -> Result<(), Infallible> {
         Ok(())
@@ -192,11 +192,11 @@ impl Parker for NoSleep {
 }
 
 /// A lane's worker as the test plays it.
-type TestPeer = PeerEnd<MappedMemory, NoBell, NoSleep>;
+type WorkerEnd = PeerEnd<MappedMemory, StubDoorbell, StubParker>;
 
 /// Returns lane `i`'s worker in `run`, starting where the last one left the lane.
-fn peer(run: &RunState, i: usize) -> TestPeer {
-    PeerEnd::new(Arc::clone(&run.channels[i]), NoBell, NoSleep)
+fn peer(run: &RunState, i: usize) -> WorkerEnd {
+    PeerEnd::new(Arc::clone(&run.channels[i]), StubDoorbell, StubParker)
 }
 
 /// Maps lane `i`'s channel on its own from its fds, as a worker's C extension could reach it, to
@@ -206,13 +206,13 @@ fn raw(fds: &[OwnedFd], i: usize, geometry: Geometry) -> RawChannel {
 }
 
 /// Takes the next request `peer` was sent and answers it with what `fill` writes.
-fn answer_with(peer: &mut TestPeer, fill: impl FnOnce(&mut SlotWriter<'_>)) {
+fn answer_with(peer: &mut WorkerEnd, fill: impl FnOnce(&mut SlotWriter<'_>)) {
     let request = match peer.wait_for_request(SpinWindow::until(0), || 0, 1) {
-        Ok(Wait::Request(request)) => request,
-        Ok(Wait::SliceOver) => panic!("the host sent the worker no request"),
+        Ok(WaitOutcome::Request(request)) => request,
+        Ok(WaitOutcome::SliceOver) => panic!("the host sent the worker no request"),
         Err(never) => match never {},
     };
-    request.answer(fill).unwrap_or_else(|never| match never {});
+    request.respond(fill).unwrap_or_else(|never| match never {});
 }
 
 /// A lane's channel mapped by the test on its own: the words a worker writes, at the places
@@ -275,13 +275,13 @@ impl Drop for RawChannel {
 
 /// Returns host `host`'s load on lane `k` of its own: requests in its slots and queued.
 fn load_of(host: &LaneHost, k: usize) -> usize {
-    let owned = host.owned.borrow();
+    let owned = host.core.borrow();
     owned.lanes[k].load(&owned.ends[k])
 }
 
 /// Returns where host `host`'s lane `k` of its own stands on its ring: (read, sent).
 fn window_of(host: &LaneHost, k: usize) -> (u32, u32) {
-    let w = host.owned.borrow().ends[k].window();
+    let w = host.core.borrow().ends[k].window();
     (w.read().get(), w.sent().get())
 }
 
@@ -361,7 +361,7 @@ fn a_broken_lane_is_skipped_while_another_lane_of_its_host_serves() {
             }
             answers.push(answer);
         }
-        let owned = host.owned.borrow();
+        let owned = host.core.borrow();
         assert_eq!(owned.lanes[0].load(&owned.ends[0]), 0, "the broken lane took a request");
         assert_eq!(owned.lanes[1].load(&owned.ends[1]), 2);
     });
@@ -562,9 +562,9 @@ fn only_the_start_refused_status_is_a_refused_start() {
 fn a_run_with_no_template_fails_its_start_with_the_typed_fork_error() {
     let lanes = lanes(1);
     match lanes.start_run(HostKind::Dedicated, Box::new(|_| {})) {
-        Err(LaneStartError::Fork {
+        Err(StartRunError::Fork {
             lane: LaneIndex(0),
-            source: ForkError::NoTemplate,
+            source: ForkError::NoForkServer,
         }) => {}
         other => panic!("expected the lane's fork error, got {other:?}"),
     }
@@ -620,8 +620,8 @@ fn a_death_for_a_lane_not_owned_or_a_stale_worker_changes_nothing() {
         host.worker_died(ended_worker(0, 0)).await;
         assert_eq!(lanes.stats.deaths.load(Relaxed), 0);
         assert!(matches!(
-            &host.owned.borrow().lanes[0].worker,
-            LaneWorker::Running { worker: running, .. } if *running == worker.tag()
+            &host.core.borrow().lanes[0].worker,
+            LaneWorker::Running { worker: running, .. } if *running == worker.id()
         ));
         host.shutdown().await;
     });
@@ -648,8 +648,8 @@ fn a_failed_respawn_breaks_the_lane_with_the_typed_fork_error() {
         // The broken lane is the only lane, so the server is told to stop: wait for that.
         heard.stopped.cancelled().await;
         assert!(matches!(
-            host.owned.borrow().lanes[0].broken_why(),
-            Some(LaneLossError::NotRespawned(ForkError::NoTemplate))
+            host.core.borrow().lanes[0].broken_why(),
+            Some(LaneLossError::NotRespawned(ForkError::NoForkServer))
         ));
         run.stop.cancel();
         host.stopped().await;
@@ -675,7 +675,7 @@ const LONG_WAITS: CrashBackoff = CrashBackoff {
 fn lanes_backing_off(workers: usize, backoff: CrashBackoff) -> Arc<ServerLanes> {
     lanes_configured(workers, |geometry| {
         with_crash_backoff(
-            host_config(geometry, Duration::from_secs(5), DEPTH as usize, FailurePolicy::Isolate),
+            lane_config(geometry, Duration::from_secs(5), DEPTH as usize, FailurePolicy::Isolate),
             backoff,
         )
     })
@@ -687,7 +687,7 @@ async fn crash(host: &Rc<LaneHost>, i: usize, n: i32) {
     let worker = ended_worker(i, n);
     host.with_lane(LaneIndex(i), |lane, _| {
         lane.worker = LaneWorker::Running {
-            worker: worker.tag(),
+            worker: worker.id(),
             starting: None,
             head: None,
         }
@@ -737,7 +737,7 @@ fn a_lane_crashing_three_times_in_a_row_waits_and_the_other_lane_serves() {
         crash(&host, 0, 4001).await;
         crash(&host, 0, 4002).await;
         assert!(
-            matches!(host.owned.borrow().lanes[0].worker, LaneWorker::Forking { .. }),
+            matches!(host.core.borrow().lanes[0].worker, LaneWorker::Forking { .. }),
             "the second crash forks at once"
         );
         assert_eq!(run.hosts[0].usable_lanes.load(Relaxed), 2);
@@ -748,7 +748,7 @@ fn a_lane_crashing_three_times_in_a_row_waits_and_the_other_lane_serves() {
         }
         assert_eq!(load_of(&host, 0), 1);
         crash(&host, 0, 4003).await;
-        assert!(host.owned.borrow().lanes[0].waiting());
+        assert!(host.core.borrow().lanes[0].in_crash_wait());
         assert_eq!(run.hosts[0].usable_lanes.load(Relaxed), 1);
         match held_answer.try_recv() {
             Ok(Err(LaneRequestError::Rejected(LaneUnansweredError::WorkerDiedBeforeTaking {
@@ -887,11 +887,11 @@ fn bench_requests_on_host(requests: u64) {
 /// The stand-in worker's part of a bench request: takes the request the host published and
 /// encodes `answer` into its answer slot, as a worker does.
 #[inline(never)]
-fn stand_in_answers(peer: &mut TestPeer, answer: &HandlerResponse) {
-    let Ok(Wait::Request(request)) = peer.wait_for_request(SpinWindow::until(0), || 0, 1) else {
+fn stand_in_answers(peer: &mut WorkerEnd, answer: &HandlerResponse) {
+    let Ok(WaitOutcome::Request(request)) = peer.wait_for_request(SpinWindow::until(0), || 0, 1) else {
         panic!("the host published a request");
     };
-    let answered = request.answer(|w| wire::encode_response(w, answer).expect("the answer fits"));
+    let answered = request.respond(|w| wire::encode_handler_response(w, answer).expect("the answer fits"));
     std::hint::black_box(answered.is_ok());
 }
 
@@ -985,7 +985,7 @@ fn ok_answer(w: &mut SlotWriter<'_>) {
         http::header::HeaderValue::from_static("text/plain"),
         mipyre_http::plan::response::HeaderLines::new(),
     ));
-    wire::encode_answer(w, &ok).expect("a short answer fits");
+    wire::encode_response(w, &ok).expect("a short answer fits");
 }
 
 /// A request bigger than a slot is answered 413 without taking a slot or a place in the queue,
@@ -1069,7 +1069,7 @@ fn a_malformed_answer_fails_its_request_and_frees_its_slot() {
             answers.push(answer);
         }
         assert!(
-            host.owned.borrow().lanes[0].queued.is_empty(),
+            host.core.borrow().lanes[0].queued.is_empty(),
             "a slot is still held by the bad answer"
         );
         assert_eq!(window_of(host, 0).1, 1 + DEPTH);
@@ -1102,7 +1102,7 @@ fn a_dead_worker_gives_up_the_request_it_ran_and_those_it_never_took() {
         let mut untaken = publish_into(&host, 0);
         // The worker takes the first request, and dies running it.
         let mut taker = peer(&run, 0);
-        let Ok(Wait::Request(request)) = taker.wait_for_request(SpinWindow::until(0), || 0, 1) else {
+        let Ok(WaitOutcome::Request(request)) = taker.wait_for_request(SpinWindow::until(0), || 0, 1) else {
             panic!("the host published a request");
         };
         drop(request);
@@ -1127,7 +1127,7 @@ fn a_dead_worker_gives_up_the_request_it_ran_and_those_it_never_took() {
         assert!(
             matches!(
                 next.wait_for_request(SpinWindow::until(0), || 0, 1),
-                Ok(Wait::SliceOver)
+                Ok(WaitOutcome::SliceOver)
             ),
             "the next worker was handed a request its predecessor could have rewritten"
         );
@@ -1140,7 +1140,7 @@ fn a_dead_worker_gives_up_the_request_it_ran_and_those_it_never_took() {
 #[test]
 fn a_hosts_inbox_holds_as_many_as_its_lanes() {
     let lanes = lanes(1);
-    let config = &lanes.host;
+    let config = &lanes.config;
     let n = |k: usize| std::num::NonZeroUsize::new(k).unwrap();
     assert_eq!(config.inbox_capacity(n(1)), n(DEPTH as usize));
     assert_eq!(config.inbox_capacity(n(2)), n(2 * DEPTH as usize));
@@ -1204,7 +1204,7 @@ fn breaking_a_lane_answers_every_request_it_holds_lane_lost() {
             answers.push(answer);
         }
         assert_eq!(
-            host.owned.borrow().lanes[0].queued.len(),
+            host.core.borrow().lanes[0].queued.len(),
             1,
             "one request queued behind the slots"
         );
@@ -1220,8 +1220,8 @@ fn breaking_a_lane_answers_every_request_it_holds_lane_lost() {
                 other => panic!("request {n}: expected LaneLost, got {other:?}"),
             }
         }
-        let owned = host.owned.borrow();
-        assert!(owned.lanes[0].waiting.iter().all(Option::is_none));
+        let owned = host.core.borrow();
+        assert!(owned.lanes[0].waiters.iter().all(Option::is_none));
         assert!(owned.lanes[0].queued.is_empty());
     });
 }
@@ -1248,7 +1248,7 @@ fn a_queued_request_nobody_waits_for_is_not_put_in_the_ring() {
             }
             answers.push(answer);
         }
-        assert_eq!(host.owned.borrow().lanes[0].queued.len(), 2);
+        assert_eq!(host.core.borrow().lanes[0].queued.len(), 2);
         let awaited = answers.pop().expect("the last request is queued");
         let unawaited = answers.pop().expect("the one before it is queued too");
         drop(unawaited);
@@ -1256,7 +1256,7 @@ fn a_queued_request_nobody_waits_for_is_not_put_in_the_ring() {
         answer_with(&mut worker, ok_answer);
         host.collect();
 
-        assert!(host.owned.borrow().lanes[0].queued.is_empty());
+        assert!(host.core.borrow().lanes[0].queued.is_empty());
         assert_eq!(window_of(host, 0).1, DEPTH + 1, "only the awaited request was sent");
         assert_eq!(lanes.host_events_total().unawaited_skips, 1);
         drop(awaited);
@@ -1357,7 +1357,7 @@ fn lane_logic_bench() {
         for seq in 0..n {
             let (job, mut answer) = job();
             assert!(host.submit(job).is_ok(), "the lane takes request {seq}");
-            let Ok(Wait::Request(request)) = worker.wait_for_request(SpinWindow::until(0), || 0, 1) else {
+            let Ok(WaitOutcome::Request(request)) = worker.wait_for_request(SpinWindow::until(0), || 0, 1) else {
                 panic!("request {seq} was published");
             };
             let view = request.bytes();
@@ -1368,7 +1368,7 @@ fn lane_logic_bench() {
             assert!(req.is_ok(), "request {seq} decodes");
             drop(req);
             drop(view);
-            let fits = request.answer(|w| assert!(wire::encode_answer(w, &response).is_ok(), "answer {seq} fits"));
+            let fits = request.respond(|w| assert!(wire::encode_response(w, &response).is_ok(), "answer {seq} fits"));
             assert!(fits.is_ok());
             host.collect();
             assert!(matches!(answer.try_recv(), Ok(Ok(_))), "request {seq} answered");
@@ -1419,7 +1419,7 @@ fn a_wake_pipe_that_cannot_be_waited_on_fails_the_host_with_the_os_error() {
 /// Returns the write end of lane `k`'s wake pipe, of the host that takes `host`'s share of the
 /// run, as every worker of the lane is handed it.
 fn bell_write(run: &RunState, host: usize, k: usize) -> OwnedFd {
-    run.hosts[host].start.lock().as_ref().expect("no host took its share")[k]
+    run.hosts[host].lanes.lock().as_ref().expect("no host took its share")[k]
         .bell
         .write
         .try_clone()
@@ -1440,13 +1440,13 @@ fn a_host_of_two_lanes_wakes_on_either_lanes_pipe() {
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
         let host = LaneHost::start(&lanes, 0).unwrap().expect("a host");
-        assert_eq!(host.owned.borrow().lanes.len(), 2);
+        assert_eq!(host.core.borrow().lanes.len(), 2);
         for (k, write) in writes.into_iter().enumerate() {
             // The poller runs to its wait, with nothing in flight.
             tokio::task::yield_now().await;
             let before = lanes.host_events_total().pipe_wakes;
             let rung = PipeDoorbell::new(write).ring(&ShmWord::new(0));
-            assert_eq!(rung.ok(), Some(HostBellOutcome::Rung));
+            assert_eq!(rung.ok(), Some(RequesterBellOutcome::Rung));
             tokio::time::timeout(Duration::from_secs(10), async {
                 while lanes.host_events_total().pipe_wakes == before {
                     tokio::task::yield_now().await;
@@ -1466,11 +1466,11 @@ fn a_host_of_two_lanes_wakes_on_either_lanes_pipe() {
 #[test]
 fn a_wake_pipe_whose_read_fails_fails_the_host_with_the_error() {
     for drain in [
-        Drain {
+        WakeRead {
             bytes: 3,
             outcome: DrainOutcome::Empty,
         },
-        Drain {
+        WakeRead {
             bytes: 256,
             outcome: DrainOutcome::MoreLeft,
         },
@@ -1655,8 +1655,8 @@ fn the_setup_arrives_whole_with_its_fds_over_a_socket_pair() {
 /// Runs `n` calls of one part of a request's lane work on fixed input: building the request
 /// (`job`), the host's encode of it into a slot (`encode_request`), the worker's decode of it from
 /// its slot (`decode_request`), the worker's encode of [`bench_answer`] into a slot
-/// (`encode_answer`; a request slot's writer, the same `SlotWriter` an answer's is) and the host's
-/// decode of the answer it copied out (`decode_answer`). The difference of the `LANE_PART_N`=2N
+/// (`encode_response`; a request slot's writer, the same `SlotWriter` an answer's is) and the host's
+/// decode of the answer it copied out (`decode_response`). The difference of the `LANE_PART_N`=2N
 /// and =N runs divided by N tells the parts of `bench_on_host` apart. Run as a test without
 /// `LANE_PART`, it runs each part 16 times.
 #[test]
@@ -1676,23 +1676,26 @@ fn lane_parts_bench() {
     };
     let geometry = lane_geometry(DEPTH, MIN_SLOT_BYTES).unwrap();
     let channel = Arc::new(Channel::new(MappedMemory::create(&geometry).unwrap().0));
-    let mut host = HostEnd::new(Arc::clone(&channel), NoBell);
-    let mut peer = PeerEnd::new(channel, NoBell, NoSleep);
+    let mut host = RequesterEnd::new(Arc::clone(&channel), StubDoorbell);
+    let mut peer = PeerEnd::new(channel, StubDoorbell, StubParker);
     let answer = bench_answer();
     let (request, _reply) = job();
     // Request 0 goes round once: the worker holds it, and the host keeps a copy of its answer.
     let mut slot = host.request_slot().expect("an empty ring has room");
     slot.write(|w| wire::encode_request(w, &request.request)).unwrap();
     slot.publish().unwrap_or_else(|never| match never {});
-    let Ok(Wait::Request(taken)) = peer.wait_for_request(SpinWindow::until(0), || 0, 1) else {
+    let Ok(WaitOutcome::Request(taken)) = peer.wait_for_request(SpinWindow::until(0), || 0, 1) else {
         panic!("request 0 was published");
     };
     let mut copied = BytesMut::new();
     {
-        let mut ready = host.answers().unwrap();
+        let mut ready = host.responses().unwrap();
         assert_eq!(ready.take_next(&mut copied), Ok(None));
     }
-    let answer_bytes = wire::tests::written(MIN_SLOT_BYTES - 8, |w| wire::encode_response(w, &answer).unwrap()).1;
+    let answer_bytes = wire::tests::written(MIN_SLOT_BYTES - 8, |w| {
+        wire::encode_handler_response(w, &answer).unwrap()
+    })
+    .1;
     // The slot request 1 will take: written into, never published.
     let mut slot = host.request_slot().expect("a ring of two has room for a second");
     for part in parts {
@@ -1710,11 +1713,11 @@ fn lane_parts_bench() {
                     std::hint::black_box(wire::decode_request(&bytes).unwrap());
                 }
                 "encode_answer" => {
-                    slot.write(|w| wire::encode_response(w, std::hint::black_box(&answer)))
+                    slot.write(|w| wire::encode_handler_response(w, std::hint::black_box(&answer)))
                         .unwrap();
                 }
                 "decode_answer" => {
-                    std::hint::black_box(wire::decode_answer(std::hint::black_box(&answer_bytes).clone()).unwrap());
+                    std::hint::black_box(wire::decode_response(std::hint::black_box(&answer_bytes).clone()).unwrap());
                 }
                 other => {
                     panic!("LANE_PART={other}: job, encode_request, decode_request, encode_answer or decode_answer")
@@ -1757,7 +1760,7 @@ fn a_start_failure_left_by_an_earlier_worker_breaks_a_ready_replacement() {
                 attempt,
             });
             lane.worker = LaneWorker::Running {
-                worker: replacement.tag(),
+                worker: replacement.id(),
                 starting,
                 head: None,
             }
@@ -1765,7 +1768,7 @@ fn a_start_failure_left_by_an_earlier_worker_breaks_a_ready_replacement() {
         .unwrap();
         let watch = ProcessMonitor::new().unwrap();
         host.finish_respawns(&watch);
-        let owned = host.owned.borrow();
+        let owned = host.core.borrow();
         let state = owned.lanes[0].broken_why().map(ToString::to_string);
         assert!(
             state.is_none(),
@@ -1799,7 +1802,7 @@ fn a_replacement_that_reports_a_failed_start_breaks_its_lane_with_its_traceback(
                 attempt,
             });
             lane.worker = LaneWorker::Running {
-                worker: ended_worker(0, 4243).tag(),
+                worker: ended_worker(0, 4243).id(),
                 starting,
                 head: None,
             };
@@ -1808,7 +1811,7 @@ fn a_replacement_that_reports_a_failed_start_breaks_its_lane_with_its_traceback(
         peer(&run, 0).report_failed(attempt, b"Traceback: ImportError");
         host.finish_respawns(&ProcessMonitor::new().unwrap());
         assert!(matches!(
-            host.owned.borrow().lanes[0].broken_why(),
+            host.core.borrow().lanes[0].broken_why(),
             Some(LaneLossError::ReplacementNotStarted { failure }) if failure == "Traceback: ImportError"
         ));
     });
@@ -1830,7 +1833,7 @@ fn a_worker_that_refused_its_start_breaks_its_lane() {
         let worker = ended_worker(0, 4244);
         host.with_lane(LaneIndex(0), |lane, _| {
             lane.worker = LaneWorker::Running {
-                worker: worker.tag(),
+                worker: worker.id(),
                 starting: None,
                 head: None,
             }
@@ -1839,7 +1842,7 @@ fn a_worker_that_refused_its_start_breaks_its_lane() {
         host.lanes.exits.record(LaneIndex(0), worker.pid(), START_REFUSED << 8);
         host.worker_died(worker).await;
         assert!(matches!(
-            host.owned.borrow().lanes[0].broken_why(),
+            host.core.borrow().lanes[0].broken_why(),
             Some(LaneLossError::StartRefused { .. })
         ));
         assert_eq!(lanes.broken_lanes(), 1);
@@ -1888,18 +1891,18 @@ fn the_server_kills_whatever_pid_the_template_names() {
     let victim_pid = victim.id() as i32;
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     lanes
-        .attach_template(Pid::new(1).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(1).unwrap(), OwnedFd::from(ours))
         .unwrap();
     let answering = std::thread::spawn(move || {
         let (lane, attempt) = read_fork_request(&mut theirs);
         theirs.write_all(&fork_answer_bytes(lane, attempt, victim_pid)).unwrap();
         theirs
     });
-    let answer = lanes.spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_ANSWER_TIMEOUT);
+    let answer = lanes.spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_REPLY_TIMEOUT);
     let _theirs = answering.join().unwrap();
     let refused = matches!(
         &answer,
-        Err(ForkError::NotTemplateChild { pid, parent, .. })
+        Err(ForkError::NotForkServerChild { pid, parent, .. })
             if pid.as_raw() == victim_pid && *parent == std::process::id() as i32
     );
     if let Ok(worker) = answer {
@@ -1931,7 +1934,7 @@ fn the_server_takes_the_pid_of_a_child_of_the_template() {
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     // The test process plays the template: it started `child`.
     lanes
-        .attach_template(Pid::new(std::process::id() as i32).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(std::process::id() as i32).unwrap(), OwnedFd::from(ours))
         .unwrap();
     let answering = std::thread::spawn(move || {
         let (lane, attempt) = read_fork_request(&mut theirs);
@@ -1939,7 +1942,7 @@ fn the_server_takes_the_pid_of_a_child_of_the_template() {
         theirs
     });
     let answer = lanes
-        .spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_ANSWER_TIMEOUT)
+        .spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_REPLY_TIMEOUT)
         .map(|w| w.pid().as_raw())
         .map_err(|e| e.to_string());
     let _theirs = answering.join().unwrap();
@@ -1965,7 +1968,7 @@ fn read_fork_request(theirs: &mut std::os::unix::net::UnixStream) -> (u32, u32) 
 /// A fork answer as the template writes it (`report_frame` in template.py): the request's lane
 /// and attempt, then the pid it started.
 fn fork_answer_bytes(lane: u32, attempt: u32, pid: i32) -> Vec<u8> {
-    report_frame(&TemplateReport::Forked {
+    report_frame(&ForkServerReport::Forked {
         lane: LaneIndex(lane as usize),
         attempt: Attempt::new(attempt),
         result: Ok(Pid::new(pid).unwrap()),
@@ -1979,7 +1982,7 @@ fn a_template_that_never_answers_holds_the_fork_exchange_until_it_closes() {
     let lanes = lanes(1);
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     lanes
-        .attach_template(Pid::new(1).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(1).unwrap(), OwnedFd::from(ours))
         .unwrap();
     let (read_tx, read_rx) = std::sync::mpsc::channel();
     let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
@@ -2023,7 +2026,7 @@ fn a_late_fork_answer_is_read_before_the_next_request_gets_its_own(late_lane: u3
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     // The test process plays the template: it starts both children.
     lanes
-        .attach_template(Pid::new(std::process::id() as i32).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(std::process::id() as i32).unwrap(), OwnedFd::from(ours))
         .unwrap();
     let within = Duration::from_millis(1);
     let mut late = std::process::Command::new("sleep").arg("30").spawn().unwrap();
@@ -2045,7 +2048,7 @@ fn a_late_fork_answer_is_read_before_the_next_request_gets_its_own(late_lane: u3
         (lane, attempt, theirs)
     });
     let next = lanes
-        .spawn_worker(LaneIndex(next_lane as usize), lanes.take_attempt(), FORK_ANSWER_TIMEOUT)
+        .spawn_worker(LaneIndex(next_lane as usize), lanes.take_attempt(), FORK_REPLY_TIMEOUT)
         .map(|w| w.pid().as_raw());
     let (lane, next_attempt, _theirs) = answering.join().unwrap();
     assert_eq!(lane, next_lane);
@@ -2080,7 +2083,7 @@ fn a_late_fork_answer_kills_its_worker_with_no_later_read() {
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     // The test process plays the template: it starts the child.
     lanes
-        .attach_template(Pid::new(std::process::id() as i32).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(std::process::id() as i32).unwrap(), OwnedFd::from(ours))
         .unwrap();
     let mut late = std::process::Command::new("sleep").arg("30").spawn().unwrap();
 
@@ -2128,7 +2131,7 @@ fn the_server_reads_the_reports_the_template_writes() {
         let lane = || LaneIndex(golden_u32(case, "lane") as usize);
         let pid = |field| Pid::new(golden_i32(case, field)).unwrap();
         let expected = match case["kind"].as_str().unwrap() {
-            "forked" => TemplateReport::Forked {
+            "forked" => ForkServerReport::Forked {
                 lane: lane(),
                 attempt: Attempt::new(golden_u32(case, "attempt")),
                 result: match case.get("errno") {
@@ -2136,13 +2139,13 @@ fn the_server_reads_the_reports_the_template_writes() {
                     None => Ok(pid("pid")),
                 },
             },
-            "exited" => TemplateReport::Exited {
+            "exited" => ForkServerReport::Exited {
                 lane: lane(),
                 pid: pid("pid"),
                 status: golden_i32(case, "status"),
             },
-            "import_failed" => TemplateReport::ImportFailed(case["traceback"].as_str().unwrap().into()),
-            "lane_fds_missing" => TemplateReport::LaneFdsMissing {
+            "import_failed" => ForkServerReport::ImportFailed(case["traceback"].as_str().unwrap().into()),
+            "lane_fds_missing" => ForkServerReport::LaneFdsMissing {
                 lane: lane(),
                 got: golden_u32(case, "got"),
             },
@@ -2150,7 +2153,7 @@ fn the_server_reads_the_reports_the_template_writes() {
         };
         let bytes = golden_bytes(case);
         assert_eq!(
-            crate::template::decode_template_report(&bytes, 8),
+            crate::template::decode_report(&bytes, 8),
             Ok(Some((expected, bytes.len()))),
             "{}",
             case["what"]
@@ -2168,19 +2171,19 @@ fn the_server_writes_the_commands_the_template_reads() {
         let command = match case["kind"].as_str().unwrap() {
             "setup" => {
                 body = case["json"].as_str().unwrap().as_bytes().to_vec();
-                TemplateCommand::Setup(CommandBody::new(&body).unwrap())
+                ForkServerCommand::Setup(CommandBody::new(&body).unwrap())
             }
-            "lane" => TemplateCommand::Lane {
+            "lane" => ForkServerCommand::Lane {
                 lane: lane(),
                 fds: [shm.as_fd(), wake.as_fd()],
             },
-            "start" => TemplateCommand::Start {
+            "start" => ForkServerCommand::Start {
                 lane: lane(),
                 attempt: Attempt::new(golden_u32(case, "attempt")),
             },
             "run" => {
                 body = case["json"].as_str().unwrap().as_bytes().to_vec();
-                TemplateCommand::Run(CommandBody::new(&body).unwrap())
+                ForkServerCommand::CommandLine(CommandBody::new(&body).unwrap())
             }
             other => panic!("a command kind the server has no variant for: {other}"),
         };
@@ -2196,18 +2199,18 @@ fn a_template_that_closes_inside_a_frame_fails_this_fork_and_the_next() {
     let lanes = lanes(1);
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     lanes
-        .attach_template(Pid::new(1).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(1).unwrap(), OwnedFd::from(ours))
         .unwrap();
     let template = std::thread::spawn(move || {
         let (lane, attempt) = read_fork_request(&mut theirs);
         let answer = fork_answer_bytes(lane, attempt, 4242);
         theirs.write_all(&answer[..answer.len() / 2]).unwrap();
     });
-    let first = lanes.spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_ANSWER_TIMEOUT);
+    let first = lanes.spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_REPLY_TIMEOUT);
     template.join().unwrap();
-    assert!(matches!(first, Err(ForkError::TemplateClosed { .. })), "{first:?}");
-    let second = lanes.spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_ANSWER_TIMEOUT);
-    assert!(matches!(second, Err(ForkError::TemplateClosed { .. })), "{second:?}");
+    assert!(matches!(first, Err(ForkError::ForkServerClosed { .. })), "{first:?}");
+    let second = lanes.spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_REPLY_TIMEOUT);
+    assert!(matches!(second, Err(ForkError::ForkServerClosed { .. })), "{second:?}");
 }
 
 /// Bytes that are no frame end the connection: the fork fails with the frame error and the
@@ -2218,7 +2221,7 @@ fn a_frame_with_an_unknown_tag_fails_the_fork_with_its_first_bytes() {
     let lanes = lanes(1);
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     lanes
-        .attach_template(Pid::new(1).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(1).unwrap(), OwnedFd::from(ours))
         .unwrap();
     let bad = [1u8, 0, 0, 0, 99];
     let template = std::thread::spawn(move || {
@@ -2226,13 +2229,13 @@ fn a_frame_with_an_unknown_tag_fails_the_fork_with_its_first_bytes() {
         theirs.write_all(&bad).unwrap();
         theirs
     });
-    let fork = lanes.spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_ANSWER_TIMEOUT);
+    let fork = lanes.spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_REPLY_TIMEOUT);
     let _theirs = template.join().unwrap();
     match fork {
         Err(ForkError::ProtocolViolated {
             end:
-                LinkEnd::BadFrame {
-                    error: crate::template::TemplateFrameError::UnknownTag(99),
+                DisconnectCause::BadFrame {
+                    error: crate::template::DecodeReportError::UnknownTag(99),
                     prefix,
                 },
             ..
@@ -2249,21 +2252,21 @@ fn a_frame_past_the_length_limit_fails_the_fork_from_its_header() {
     let lanes = lanes(1);
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     lanes
-        .attach_template(Pid::new(1).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(1).unwrap(), OwnedFd::from(ours))
         .unwrap();
     let template = std::thread::spawn(move || {
         read_fork_request(&mut theirs);
         theirs.write_all(&(MAX_FRAME_BYTES + 1).to_le_bytes()).unwrap();
         theirs
     });
-    let fork = lanes.spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_ANSWER_TIMEOUT);
+    let fork = lanes.spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_REPLY_TIMEOUT);
     let _theirs = template.join().unwrap();
     assert!(
         matches!(
             fork,
             Err(ForkError::ProtocolViolated {
-                end: LinkEnd::BadFrame {
-                    error: crate::template::TemplateFrameError::TooLong { .. },
+                end: DisconnectCause::BadFrame {
+                    error: crate::template::DecodeReportError::TooLong { .. },
                     ..
                 },
                 ..
@@ -2283,12 +2286,12 @@ fn an_exit_report_before_the_fork_answer_is_kept_and_the_fork_gets_its_worker() 
     let child_pid = child.id() as i32;
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     lanes
-        .attach_template(Pid::new(std::process::id() as i32).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(std::process::id() as i32).unwrap(), OwnedFd::from(ours))
         .unwrap();
     let dead = Pid::new(777).unwrap();
     let template = std::thread::spawn(move || {
         let (lane, attempt) = read_fork_request(&mut theirs);
-        let exited = report_frame(&TemplateReport::Exited {
+        let exited = report_frame(&ForkServerReport::Exited {
             lane: LaneIndex(1),
             pid: dead,
             status: 9,
@@ -2298,7 +2301,7 @@ fn an_exit_report_before_the_fork_answer_is_kept_and_the_fork_gets_its_worker() 
         theirs
     });
     let fork = lanes
-        .spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_ANSWER_TIMEOUT)
+        .spawn_worker(LaneIndex(0), lanes.take_attempt(), FORK_REPLY_TIMEOUT)
         .map(|w| w.pid().as_raw())
         .map_err(|e| e.to_string());
     let _theirs = template.join().unwrap();
@@ -2323,13 +2326,13 @@ fn a_host_reads_an_exit_status_while_a_fork_holds_the_socket() {
     let lanes = lanes(1);
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     lanes
-        .attach_template(Pid::new(1).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(1).unwrap(), OwnedFd::from(ours))
         .unwrap();
     let dead = Pid::new(777).unwrap();
     let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
     let template = std::thread::spawn(move || {
         read_fork_request(&mut theirs);
-        let exited = report_frame(&TemplateReport::Exited {
+        let exited = report_frame(&ForkServerReport::Exited {
             lane: LaneIndex(0),
             pid: dead,
             status: 9 << 8,
@@ -2344,7 +2347,7 @@ fn a_host_reads_an_exit_status_while_a_fork_holds_the_socket() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let fork = std::thread::spawn(move || {
         done_tx
-            .send(forking.spawn_worker(LaneIndex(0), forking.take_attempt(), FORK_ANSWER_TIMEOUT))
+            .send(forking.spawn_worker(LaneIndex(0), forking.take_attempt(), FORK_REPLY_TIMEOUT))
             .unwrap()
     });
     let (_run, _fds) = serve(&lanes, 1);
@@ -2377,16 +2380,16 @@ fn a_lane_frame_short_of_its_fds_fails_the_start() {
     let lanes = lanes(1);
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     lanes
-        .attach_template(Pid::new(1).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(1).unwrap(), OwnedFd::from(ours))
         .unwrap();
-    let missing = report_frame(&TemplateReport::LaneFdsMissing {
+    let missing = report_frame(&ForkServerReport::LaneFdsMissing {
         lane: LaneIndex(0),
         got: 1,
     });
     theirs.write_all(&missing).unwrap();
     drop(theirs);
     match lanes.start_run(HostKind::Dedicated, Box::new(|_| {})) {
-        Err(LaneStartError::LaneFds {
+        Err(StartRunError::LaneFds {
             lane: LaneIndex(0),
             got: 1,
             want: 2,
@@ -2404,13 +2407,13 @@ fn a_template_import_failure_fails_the_start_with_its_traceback() {
     let lanes = lanes(1);
     let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     lanes
-        .attach_template(Pid::new(1).unwrap(), OwnedFd::from(ours))
+        .attach_fork_server(Pid::new(1).unwrap(), OwnedFd::from(ours))
         .unwrap();
-    let failed = report_frame(&TemplateReport::ImportFailed("Traceback: import failed".into()));
+    let failed = report_frame(&ForkServerReport::ImportFailed("Traceback: import failed".into()));
     theirs.write_all(&failed).unwrap();
     drop(theirs);
     match lanes.start_run(HostKind::Dedicated, Box::new(|_| {})) {
-        Err(LaneStartError::TemplateFailed {
+        Err(StartRunError::ForkServerFailed {
             lane: LaneIndex(0),
             failure,
             ..
@@ -2499,8 +2502,8 @@ fn a_failed_start_leaves_no_descriptor_of_its_lanes_open() {
         || {
             use std::io::Write;
             let reports = [
-                TemplateReport::ImportFailed("Traceback: import failed".into()),
-                TemplateReport::LaneFdsMissing {
+                ForkServerReport::ImportFailed("Traceback: import failed".into()),
+                ForkServerReport::LaneFdsMissing {
                     lane: LaneIndex(0),
                     got: 1,
                 },
@@ -2509,7 +2512,7 @@ fn a_failed_start_leaves_no_descriptor_of_its_lanes_open() {
                 let lanes = lanes(2);
                 let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
                 lanes
-                    .attach_template(Pid::new(1).unwrap(), OwnedFd::from(ours))
+                    .attach_fork_server(Pid::new(1).unwrap(), OwnedFd::from(ours))
                     .unwrap();
                 theirs.write_all(&report_frame(&report)).unwrap();
                 drop(theirs);
@@ -2541,7 +2544,7 @@ fn publish_into(
     let (job, answer) = job();
     host.with_lane(LaneIndex(i), |lane, end| {
         let slot = end.request_slot().expect("the lane has room");
-        if let Err((e, _)) = publish(&mut lane.waiting, slot, job, &mut ShellFx::new(host)) {
+        if let Err((e, _)) = publish(&mut lane.waiters, slot, job, &mut ShellFx::new(host)) {
             panic!("request refused: {e:?}");
         }
     })
@@ -2593,8 +2596,8 @@ fn an_answer_counter_stepped_back_kills_the_worker_and_fails_only_its_lane() {
         }
         assert_eq!(&answered(&mut in_fine).expect("the other lane answers").body[..], b"ok");
         {
-            let owned = host.owned.borrow();
-            assert!(matches!(&owned.lanes[0].worker, LaneWorker::Faulted { worker } if *worker == faulty_worker.tag()));
+            let owned = host.core.borrow();
+            assert!(matches!(&owned.lanes[0].worker, LaneWorker::Faulted { worker } if *worker == faulty_worker.id()));
             assert!(matches!(owned.lanes[1].worker, LaneWorker::Running { .. }));
         }
         assert_eq!(window_of(host, 0), (0, 2), "the slots stay the worker's until it dies");
@@ -2649,7 +2652,7 @@ fn a_faulted_workers_death_frees_its_slots_and_the_next_worker_starts_after_them
             assert_peer_corrupted(answer, fault);
         }
         assert_eq!(window_of(&host, 0), (2, 2));
-        assert!(host.owned.borrow().lanes[0].waiting.iter().all(Option::is_none));
+        assert!(host.core.borrow().lanes[0].waiters.iter().all(Option::is_none));
         assert_eq!((h.load(HeaderWord::Taken), h.load(HeaderWord::RespHead)), (2, 2));
         host.shutdown().await;
     });
@@ -2682,7 +2685,7 @@ fn a_worker_flooding_its_wake_pipe_is_faulted_and_only_its_lane_fails() {
         }
         assert!(filled > 256, "the pipe took {filled} bytes");
         answer_with(&mut peer(&run, 1), ok_answer);
-        assert_eq!(PipeDoorbell::new(honest).ring(&ShmWord::new(0)).ok(), Some(HostBellOutcome::Rung));
+        assert_eq!(PipeDoorbell::new(honest).ring(&ShmWord::new(0)).ok(), Some(RequesterBellOutcome::Rung));
 
         assert_eq!(host.hear_bells().ok(), Some(2), "both pipes hold bytes");
         assert_eq!(*host.muted.borrow(), [0]);
@@ -2696,19 +2699,19 @@ fn a_worker_flooding_its_wake_pipe_is_faulted_and_only_its_lane_fails() {
             }
         }
         assert_eq!(&answered(&mut in_fine).expect("the other lane answers").body[..], b"ok");
-        assert!(matches!(&host.owned.borrow().lanes[0].worker, LaneWorker::Faulted { worker } if *worker == flooding_worker.tag()));
+        assert!(matches!(&host.core.borrow().lanes[0].worker, LaneWorker::Faulted { worker } if *worker == flooding_worker.id()));
         assert_eq!(lanes.stats.peer_faults.load(Relaxed), 1);
-        assert_eq!(host.owned.borrow().ends[1].fault(), None);
+        assert_eq!(host.core.borrow().ends[1].fault(), None);
 
         flooding.wait().unwrap();
         report_death(&host, flooding_worker).await;
-        assert!(matches!(host.owned.borrow().lanes[0].worker, LaneWorker::Forking { .. }), "the lane forks its next worker");
+        assert!(matches!(host.core.borrow().lanes[0].worker, LaneWorker::Forking { .. }), "the lane forks its next worker");
         assert!(host.listen_again().is_ok());
         assert_eq!(*host.muted.borrow(), [0], "no pipe is listened to before the next worker runs");
 
         let next = ended_worker(0, 1);
         host.with_lane(LaneIndex(0), |lane, _| {
-            lane.worker = LaneWorker::Running { worker: next.tag(), starting: None, head: None };
+            lane.worker = LaneWorker::Running { worker: next.id(), starting: None, head: None };
         });
         assert!(host.listen_again().is_ok());
         assert!(host.muted.borrow().is_empty());
@@ -2772,7 +2775,7 @@ fn a_dead_worker_with_taken_out_of_range_fails_every_request_it_held() {
 #[test]
 fn a_handler_is_timed_by_the_host_whatever_its_worker_writes() {
     let lanes = lanes_configured(1, |geometry| {
-        host_config(
+        lane_config(
             geometry,
             Duration::from_nanos(1),
             DEPTH as usize,
@@ -2785,7 +2788,7 @@ fn a_handler_is_timed_by_the_host_whatever_its_worker_writes() {
         let _answer = publish_into(host, 0);
         raw(&fds, 0, lanes.geometry).store(HeaderWord::Taken, 0);
         host.check_timeouts();
-        let seen = match host.owned.borrow().lanes[0].worker {
+        let seen = match host.core.borrow().lanes[0].worker {
             LaneWorker::Running { head, .. } => head,
             _ => None,
         };
@@ -2797,7 +2800,7 @@ fn a_handler_is_timed_by_the_host_whatever_its_worker_writes() {
         }
         host.check_timeouts();
         assert!(
-            matches!(&host.owned.borrow().lanes[0].worker, LaneWorker::Overrun { worker: w, .. } if *w == worker.tag())
+            matches!(&host.core.borrow().lanes[0].worker, LaneWorker::Overrun { worker: w, .. } if *w == worker.id())
         );
         assert_eq!(lanes.stats.timeouts_killed.load(Relaxed), 1);
     });
@@ -2883,7 +2886,7 @@ fn closing_a_host_mid_fork_kills_the_worker_the_fork_makes_after_the_close() {
         .expect("the host owns the lane");
         Rc::clone(&host).shutdown().await;
         assert!(host.forks.borrow().is_empty(), "the closed host still waits for a fork");
-        assert!(matches!(host.owned.borrow().lanes[0].worker, LaneWorker::Gone));
+        assert!(matches!(host.core.borrow().lanes[0].worker, LaneWorker::Gone));
         answer_fork.send(()).unwrap();
     });
     let status = forked.wait().unwrap();
@@ -2927,7 +2930,7 @@ fn a_corrupt_counter_seen_mid_fork_is_the_replacements_fault_once_it_runs() {
 
         host.with_lane(LaneIndex(0), |lane, _| {
             lane.worker = LaneWorker::Running {
-                worker: worker.tag(),
+                worker: worker.id(),
                 starting: None,
                 head: None,
             }

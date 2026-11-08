@@ -49,10 +49,10 @@ class Server:
     def __init__(self, mode: modes.Mode, cpus: str, log_path: Path) -> None:
         self.log_path = log_path
         self.log: IO[str] = open(log_path, "w")
-        env = {**os.environ, **mode.server.env()}
+        env = {**os.environ, **mode.env()}
         self.proc = subprocess.Popen(
             ["taskset", "-c", cpus, sys.executable, "-m", "mipyre", "run", APP,
-             "--host", "127.0.0.1", "--port", "0", *mode.run_args()],
+             "--host", "127.0.0.1", "--port", "0"],
             stdout=self.log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, start_new_session=True,
         )
         self.port = self._wait_for_port()

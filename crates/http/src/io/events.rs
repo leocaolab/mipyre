@@ -36,7 +36,7 @@ const LOG_PERIOD: Duration = Duration::from_secs(60);
 /// `mipyre_cpu::CacheLine` again, which this package may not depend on, so each events module pads
 /// its own.
 #[repr(align(128))]
-struct OwnLine<T>(T);
+struct CachePadded<T>(T);
 
 /// Holds one value per kind, so a kind added without a field does not compile. The counts, which
 /// telemetry reads, and the log throttles, which are logging policy, are two of these, kept apart.
@@ -60,32 +60,32 @@ impl<T> HttpEventTable<T> {
     }
 }
 
-impl HttpEventTable<OwnLine<AtomicU64>> {
+impl HttpEventTable<CachePadded<AtomicU64>> {
     const fn counts() -> Self {
         HttpEventTable {
-            malformed_request: OwnLine(AtomicU64::new(0)),
-            oversized_request_head: OwnLine(AtomicU64::new(0)),
-            first_request_timed_out: OwnLine(AtomicU64::new(0)),
-            request_head_timed_out: OwnLine(AtomicU64::new(0)),
-            forwarded_for_unreadable: OwnLine(AtomicU64::new(0)),
+            malformed_request: CachePadded(AtomicU64::new(0)),
+            oversized_request_head: CachePadded(AtomicU64::new(0)),
+            first_request_timed_out: CachePadded(AtomicU64::new(0)),
+            request_head_timed_out: CachePadded(AtomicU64::new(0)),
+            forwarded_for_unreadable: CachePadded(AtomicU64::new(0)),
         }
     }
 }
 
-impl HttpEventTable<OwnLine<LogThrottle>> {
+impl HttpEventTable<CachePadded<LogThrottle>> {
     const fn throttles() -> Self {
         HttpEventTable {
-            malformed_request: OwnLine(LogThrottle::new(LOG_PERIOD)),
-            oversized_request_head: OwnLine(LogThrottle::new(LOG_PERIOD)),
-            first_request_timed_out: OwnLine(LogThrottle::new(LOG_PERIOD)),
-            request_head_timed_out: OwnLine(LogThrottle::new(LOG_PERIOD)),
-            forwarded_for_unreadable: OwnLine(LogThrottle::new(LOG_PERIOD)),
+            malformed_request: CachePadded(LogThrottle::new(LOG_PERIOD)),
+            oversized_request_head: CachePadded(LogThrottle::new(LOG_PERIOD)),
+            first_request_timed_out: CachePadded(LogThrottle::new(LOG_PERIOD)),
+            request_head_timed_out: CachePadded(LogThrottle::new(LOG_PERIOD)),
+            forwarded_for_unreadable: CachePadded(LogThrottle::new(LOG_PERIOD)),
         }
     }
 }
 
-static HTTP_EVENT_COUNTS: HttpEventTable<OwnLine<AtomicU64>> = HttpEventTable::counts();
-static HTTP_EVENT_THROTTLES: HttpEventTable<OwnLine<LogThrottle>> = HttpEventTable::throttles();
+static HTTP_EVENT_COUNTS: HttpEventTable<CachePadded<AtomicU64>> = HttpEventTable::counts();
+static HTTP_EVENT_THROTTLES: HttpEventTable<CachePadded<LogThrottle>> = HttpEventTable::throttles();
 
 /// Counts one `event` without deciding its log line.
 pub fn count(event: HttpEvent) {
@@ -172,8 +172,8 @@ mod tests {
     /// Holds a fresh count and throttle per kind, decided at the time a test hands in, as the
     /// statics are by [`degrade`].
     struct Tables {
-        counts: HttpEventTable<OwnLine<AtomicU64>>,
-        throttles: HttpEventTable<OwnLine<LogThrottle>>,
+        counts: HttpEventTable<CachePadded<AtomicU64>>,
+        throttles: HttpEventTable<CachePadded<LogThrottle>>,
     }
 
     impl Tables {
@@ -197,20 +197,20 @@ mod tests {
     fn an_error_whose_source_is_the_peer_going_away_is_the_peer_going_away() {
         // A `hyper::Error` from a reset connection has its own text and the io error as cause.
         #[derive(Debug)]
-        struct Wrapper(io::Error);
-        impl std::fmt::Display for Wrapper {
+        struct StubError(io::Error);
+        impl std::fmt::Display for StubError {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("connection error")
             }
         }
-        impl Error for Wrapper {
+        impl Error for StubError {
             fn source(&self) -> Option<&(dyn Error + 'static)> {
                 Some(&self.0)
             }
         }
-        let reset = Wrapper(io::Error::from(io::ErrorKind::ConnectionReset));
+        let reset = StubError(io::Error::from(io::ErrorKind::ConnectionReset));
         assert!(peer_went_away(&reset));
-        let refused = Wrapper(io::Error::from(io::ErrorKind::PermissionDenied));
+        let refused = StubError(io::Error::from(io::ErrorKind::PermissionDenied));
         assert!(!peer_went_away(&refused));
     }
 

@@ -17,7 +17,7 @@ impl WorkerCounts {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum SplitError {
+pub enum SplitWorkersError {
     #[error("subinterpreters=0: the sub-interpreter pool needs at least one")]
     NoWorkers,
     #[error(
@@ -53,15 +53,15 @@ impl RouteKinds {
 }
 
 /// Splits `n` workers between the kinds needed, giving async the smaller half when both are.
-pub(crate) fn split_workers(n: usize, kinds: RouteKinds) -> Result<WorkerCounts, SplitError> {
+pub(crate) fn split_workers(n: usize, kinds: RouteKinds) -> Result<WorkerCounts, SplitWorkersError> {
     let split = |sync_workers, async_workers| WorkerCounts {
         sync_workers,
         async_workers,
     };
     match kinds {
         RouteKinds::Empty => Ok(split(n, 0)),
-        _ if n == 0 => Err(SplitError::NoWorkers),
-        RouteKinds::Both if n == 1 => Err(SplitError::OneWorkerForBothKinds),
+        _ if n == 0 => Err(SplitWorkersError::NoWorkers),
+        RouteKinds::Both if n == 1 => Err(SplitWorkersError::OneWorkerForBothKinds),
         RouteKinds::Both => Ok(split(n - n / 2, n / 2)),
         RouteKinds::Sync => Ok(split(n, 0)),
         RouteKinds::Async => Ok(split(0, n)),
@@ -69,7 +69,7 @@ pub(crate) fn split_workers(n: usize, kinds: RouteKinds) -> Result<WorkerCounts,
 }
 
 /// Splits `n` workers for a route table; a `runtime="main"` route needs no pool worker.
-pub fn split_workers_for_routes(n: usize, counts: &PlaceCounts) -> Result<WorkerCounts, SplitError> {
+pub fn split_workers_for_routes(n: usize, counts: &PlaceCounts) -> Result<WorkerCounts, SplitWorkersError> {
     split_workers(n, RouteKinds::of(counts))
 }
 
@@ -77,7 +77,7 @@ pub fn split_workers_for_routes(n: usize, counts: &PlaceCounts) -> Result<Worker
 mod tests {
     use super::*;
 
-    fn split(sync_workers: usize, async_workers: usize) -> Result<WorkerCounts, SplitError> {
+    fn split(sync_workers: usize, async_workers: usize) -> Result<WorkerCounts, SplitWorkersError> {
         Ok(WorkerCounts {
             sync_workers,
             async_workers,
@@ -86,10 +86,10 @@ mod tests {
 
     #[test]
     fn both_kinds_share_the_workers_async_half_rounded_down() {
-        assert_eq!(split_workers(0, RouteKinds::Both), Err(SplitError::NoWorkers));
+        assert_eq!(split_workers(0, RouteKinds::Both), Err(SplitWorkersError::NoWorkers));
         assert_eq!(
             split_workers(1, RouteKinds::Both),
-            Err(SplitError::OneWorkerForBothKinds)
+            Err(SplitWorkersError::OneWorkerForBothKinds)
         );
         assert_eq!(split_workers(2, RouteKinds::Both), split(1, 1));
         assert_eq!(split_workers(3, RouteKinds::Both), split(2, 1));
@@ -104,8 +104,8 @@ mod tests {
             assert_eq!(split_workers(n, RouteKinds::Async), split(0, n));
             assert_eq!(split_workers(n, RouteKinds::Empty), split(n, 0));
         }
-        assert_eq!(split_workers(0, RouteKinds::Sync), Err(SplitError::NoWorkers));
-        assert_eq!(split_workers(0, RouteKinds::Async), Err(SplitError::NoWorkers));
+        assert_eq!(split_workers(0, RouteKinds::Sync), Err(SplitWorkersError::NoWorkers));
+        assert_eq!(split_workers(0, RouteKinds::Async), Err(SplitWorkersError::NoWorkers));
     }
 
     #[test]
@@ -146,7 +146,7 @@ mod tests {
                     ..PlaceCounts::default()
                 }
             ),
-            Err(SplitError::OneWorkerForBothKinds)
+            Err(SplitWorkersError::OneWorkerForBothKinds)
         );
         assert_eq!(
             split_workers_for_routes(
@@ -162,8 +162,10 @@ mod tests {
 
     #[test]
     fn split_errors_render_their_reason() {
-        assert!(SplitError::NoWorkers.to_string().starts_with("subinterpreters=0"));
-        assert!(SplitError::OneWorkerForBothKinds
+        assert!(SplitWorkersError::NoWorkers
+            .to_string()
+            .starts_with("subinterpreters=0"));
+        assert!(SplitWorkersError::OneWorkerForBothKinds
             .to_string()
             .contains("needs at least 2"));
     }

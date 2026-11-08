@@ -81,7 +81,12 @@ pub struct ListenerSpec {
     pub tls: Option<Arc<TlsAcceptor>>,
 }
 
-impl ListenerSpec {
+/// It holds at least one listener and each port once, because only [`ListenerSet::new`] and
+/// [`ListenerSet::one`] make one.
+#[derive(Clone)]
+pub struct ListenerSet(Vec<ListenerSpec>);
+
+impl ListenerSet {
     /// Builds one server's listeners: `addr`, then the extra TLS ports, then the extra plain
     /// ports, all on `addr`'s host. With extra TLS ports `addr` serves plain; without them it
     /// speaks TLS when an acceptor is given.
@@ -89,7 +94,7 @@ impl ListenerSpec {
     /// # Errors
     ///
     /// Returns [`ListenerSetError`] for extra TLS ports without an acceptor or a repeated port.
-    pub fn set(
+    pub fn new(
         addr: SocketAddr,
         tls: Option<Arc<TlsAcceptor>>,
         extra_tls_ports: &[u16],
@@ -120,14 +125,7 @@ impl ListenerSpec {
         }
         Ok(ListenerSet(specs))
     }
-}
 
-/// It holds at least one listener and each port once, because only [`ListenerSpec::set`] and
-/// [`ListenerSet::one`] make one.
-#[derive(Clone)]
-pub struct ListenerSet(Vec<ListenerSpec>);
-
-impl ListenerSet {
     pub fn one(spec: ListenerSpec) -> Self {
         ListenerSet(vec![spec])
     }
@@ -259,7 +257,7 @@ pub struct EndpointConnection {
 /// Merges one accept loop's endpoints into one stream of connections.
 pub struct EndpointSource {
     /// Never empty, because an [`Endpoints`] group never is.
-    slots: Vec<(TcpAcceptor, Option<Arc<TlsAcceptor>>)>,
+    acceptors: Vec<(TcpAcceptor, Option<Arc<TlsAcceptor>>)>,
     turn: PollTurn,
 }
 
@@ -271,14 +269,14 @@ impl EndpointSource {
     ///
     /// Returns the error of the first socket the runtime refuses.
     pub fn new(endpoints: Endpoints) -> Result<Self, ListenerError> {
-        let slots = endpoints
+        let acceptors = endpoints
             .groups
             .into_iter()
             .flatten()
             .map(|endpoint| Ok((TcpAcceptor::register(endpoint.listener)?, endpoint.tls)))
             .collect::<Result<_, ListenerError>>()?;
         Ok(EndpointSource {
-            slots,
+            acceptors,
             turn: PollTurn::default(),
         })
     }
@@ -292,16 +290,16 @@ impl EndpointSource {
     pub async fn accept(&mut self) -> Result<EndpointConnection, AcceptError> {
         loop {
             let (accepted, index) = std::future::poll_fn(|cx| {
-                for i in self.turn.order(self.slots.len()) {
-                    if let Poll::Ready(accepted) = self.slots[i].0.poll_accept(cx) {
+                for i in self.turn.order(self.acceptors.len()) {
+                    if let Poll::Ready(accepted) = self.acceptors[i].0.poll_accept(cx) {
                         return Poll::Ready((accepted, i));
                     }
                 }
                 Poll::Pending
             })
             .await;
-            self.turn.served(index, self.slots.len());
-            let (tcp_acceptor, tls) = &self.slots[index];
+            self.turn.served(index, self.acceptors.len());
+            let (tcp_acceptor, tls) = &self.acceptors[index];
             match accepted {
                 Ok(tcp) => return Ok(EndpointConnection { tcp, tls: tls.clone() }),
                 Err(e) => tcp_acceptor.recover(e).await.map_err(AcceptError::ListenerBroken)?,
@@ -353,7 +351,7 @@ impl TransportDriver for Endpoints {
         let stream = match connection.tcp.register() {
             Ok(stream) => stream,
             Err(e) => {
-                if let Some(held) = events::degrade(StreamEvent::RegisterFailed) {
+                if let Some(held) = events::count_and_admit(StreamEvent::RegisterFailed) {
                     tracing::warn!(
                         error = %e,
                         %remote,
@@ -383,21 +381,21 @@ mod tests {
 
     #[test]
     fn extra_plain_ports_are_plain_listeners_on_the_same_host() {
-        let specs = ListenerSpec::set(loopback(8080), None, &[], &[8082]).unwrap();
+        let specs = ListenerSet::new(loopback(8080), None, &[], &[8082]).unwrap();
         let shape: Vec<_> = specs.specs().iter().map(|s| (s.addr, s.tls.is_some())).collect();
         assert_eq!(shape, [(loopback(8080), false), (loopback(8082), false)]);
     }
 
     #[test]
     fn extra_tls_ports_need_a_certificate() {
-        let err = ListenerSpec::set(loopback(8000), None, &[8443], &[])
+        let err = ListenerSet::new(loopback(8000), None, &[8443], &[])
             .err()
             .expect("no certificate");
         let ListenerSetError::ExtraTlsWithoutCert(ports) = err else {
             panic!("expected ExtraTlsWithoutCert, got {err:?}");
         };
         assert_eq!(ports, vec![8443]);
-        let plain = ListenerSpec::set(loopback(8000), None, &[], &[]).unwrap();
+        let plain = ListenerSet::new(loopback(8000), None, &[], &[]).unwrap();
         assert_eq!(plain.specs().len(), 1);
         assert!(plain.specs()[0].tls.is_none());
     }
@@ -408,13 +406,13 @@ mod tests {
     fn a_port_configured_twice_is_refused() {
         let cert = None;
         for (extra_tls, extra_plain) in [(&[][..], &[8000u16][..]), (&[], &[8082, 8082])] {
-            let err = ListenerSpec::set(loopback(8000), cert.clone(), extra_tls, extra_plain)
+            let err = ListenerSet::new(loopback(8000), cert.clone(), extra_tls, extra_plain)
                 .err()
                 .expect("a repeated port");
             assert!(matches!(err, ListenerSetError::DuplicatePort(_)), "{err:?}");
             assert!(err.to_string().contains("configured twice"), "{err}");
         }
-        let twice_zero = ListenerSpec::set(loopback(0), None, &[], &[0]);
+        let twice_zero = ListenerSet::new(loopback(0), None, &[], &[0]);
         assert!(twice_zero.is_ok(), "each port 0 is its own kernel pick");
     }
 

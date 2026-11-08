@@ -21,11 +21,9 @@ use super::worker::start::WorkerRecipe;
 use super::worker::sync_runner::SyncRunner;
 use super::worker::{SubInterpreterWorker, WorkerIndex};
 use crate::exchange::error::{refuse, Capacity, ErrorRecord, HandlerError, ReplyHolder, UnansweredError, WorkerGroup};
-use crate::exchange::loop_wait::LoopMailbox;
 use crate::exchange::request::Request;
-use crate::websocket::{WsConnection, WsEngines};
 use mipyre_http::plan::response::HandlerResponse;
-use mipyre_http::plan::route::{HandlerKind, RouteId, RouteKey, RuntimeChoice, WsPlace};
+use mipyre_http::plan::route::{CallConvention, HandlerKind, RouteId, RouteKey, RuntimeChoice};
 
 mod serve;
 mod split;
@@ -57,16 +55,25 @@ pub(crate) fn answer_if_awaited<T>(tx: tokio::sync::oneshot::Sender<T>, value: T
 }
 
 pub struct PoolJob {
-    pub(crate) route: mipyre_http::plan::route::RouteId,
+    pub(crate) route: RouteId,
+    pub(crate) convention: CallConvention,
     /// It is built on the Tokio thread and moves into the worker's interpreter unchanged.
     pub(crate) request: Request,
     pub(crate) reply: PoolReplySender,
 }
 
 impl PoolJob {
-    pub(crate) fn into_request(self) -> (mipyre_http::plan::route::RouteId, Request, PoolReplySender) {
-        (self.route, self.request, self.reply)
+    pub(crate) fn into_request(self) -> (RouteId, CallConvention, Request, PoolReplySender) {
+        (self.route, self.convention, self.request, self.reply)
     }
+}
+
+/// What a pool is asked to run: a worker route's hooks and handler, on a worker of the handler's
+/// kind, or a gRPC method's handler, on a sync worker.
+#[derive(Clone, Copy, Debug)]
+pub enum PoolCall {
+    Route(RouteId, HandlerKind),
+    Unary(RouteId),
 }
 
 /// The sync workers the pools' watchdogs abandoned whose threads still run, and the pools at their
@@ -187,8 +194,6 @@ const QUEUE_SLOTS_PER_WORKER: usize = 128;
 pub struct InterpreterPool {
     sync_queue: Option<WorkerQueue>,
     async_queue: Option<AsyncWorkers>,
-    /// Is `None` when no WebSocket route runs on a worker.
-    websockets: Option<WsEngines>,
 }
 
 /// The queue of the `def` workers; `lives` says why it has no receiver left once its workers are
@@ -242,17 +247,6 @@ impl InterpreterPool {
             }
         };
         let sync_count = NonZeroUsize::new(split.sync_workers);
-        let serves_websockets = recipe.expected().websockets.iter().any(|w| w.place == WsPlace::Worker);
-        let mailboxes: Vec<Option<Arc<LoopMailbox<WsConnection>>>> = (0..split.async_workers)
-            .map(|_| {
-                serves_websockets
-                    .then(LoopMailbox::new)
-                    .transpose()
-                    .map(|m| m.map(Arc::new))
-            })
-            .collect::<std::io::Result<_>>()
-            .map_err(PoolError::DoorbellNotMade)?;
-        let websockets = serves_websockets.then(|| WsEngines::new(mailboxes.iter().flatten().cloned().collect()));
 
         let (sync_lives, sync_worker_lives) = LiveWorkers::new(
             WorkerKind::PoolSync,
@@ -318,11 +312,7 @@ impl InterpreterPool {
             }
         }
         let mut async_handles: Vec<WorkerThread> = Vec::with_capacity(split.async_workers);
-        for (((i, life), inbox), connections) in (split.sync_workers..n)
-            .zip(async_worker_lives)
-            .zip(async_inboxes)
-            .zip(mailboxes)
-        {
+        for ((i, life), inbox) in (split.sync_workers..n).zip(async_worker_lives).zip(async_inboxes) {
             let index = WorkerIndex::new(i);
             let start_handle = gate.enlist();
             let recipe = Arc::clone(recipe);
@@ -332,7 +322,7 @@ impl InterpreterPool {
                 }) else {
                     return;
                 };
-                serve_async(worker, inbox, connections, life)
+                serve_async(worker, inbox, life)
             });
             match spawned {
                 Ok(handle) => async_handles.push(WorkerThread { handle, lane: None }),
@@ -376,15 +366,8 @@ impl InterpreterPool {
                 workers,
                 lives: async_lives,
             }),
-            websockets,
         };
         Ok((pool, threads))
-    }
-
-    /// Returns where this pool's WebSocket connections are handed, `None` when no WebSocket route
-    /// runs on a worker.
-    pub fn websocket_engines(&self) -> Option<&WsEngines> {
-        self.websockets.as_ref()
     }
 
     pub fn async_workers(&self) -> usize {
@@ -401,23 +384,30 @@ impl InterpreterPool {
 }
 
 impl HandoffBackend for InterpreterPool {
-    type Ask = (RouteId, HandlerKind, Request);
+    type Ask = (PoolCall, Request);
     type Reply = Result<Result<HandlerResponse, ErrorRecord>, HandlerError>;
     type Refusal = UnansweredError;
     type Run = PoolRun;
 
     /// Queues the request on the worker kind that runs it; a full queue is refused, and the
     /// caller answers 503.
-    fn submit(&self, (route, kind, request): Self::Ask) -> Result<PoolRun, UnansweredError> {
+    fn submit(&self, (call, request): Self::Ask) -> Result<PoolRun, UnansweredError> {
+        let (route, convention) = match call {
+            PoolCall::Route(route, HandlerKind::Sync) => (route, CallConvention::Http),
+            PoolCall::Route(route, HandlerKind::Async) => return self.submit_async(route, request),
+            PoolCall::Unary(method) => (method, CallConvention::GrpcUnary),
+        };
         // A request of a kind the pool has no workers for is a mistake in building the server,
         // not a closed pool, so that request alone is refused and the server keeps serving.
-        let queue = match kind {
-            HandlerKind::Sync => self.sync_queue.as_ref(),
-            HandlerKind::Async => return self.submit_async(route, request),
-        };
+        let queue = self.sync_queue.as_ref();
         let queue = queue.ok_or(UnansweredError::NoWorkers(RuntimeChoice::Worker))?;
         let (reply, answered) = tokio::sync::oneshot::channel();
-        queue.submit(PoolJob { route, request, reply })?;
+        queue.submit(PoolJob {
+            route,
+            convention,
+            request,
+            reply,
+        })?;
         PoolJob::inc_created();
         Ok(PoolRun(answered))
     }
@@ -483,7 +473,7 @@ pub(super) fn answer_queue_if_last(last: Option<Arc<str>>, queued: &JobReceiver<
         return;
     };
     while let Some(job) = queued.try_recv() {
-        let (_, request, reply) = job.into_request();
+        let (_, _, request, reply) = job.into_request();
         let label = request.label();
         let refused = refuse(UnansweredError::WorkersDied {
             group: WorkerGroup::Subinterp,
@@ -521,6 +511,7 @@ mod tests {
                 let (reply, answered) = tokio::sync::oneshot::channel();
                 tx.try_send(PoolJob {
                     route,
+                    convention: CallConvention::Http,
                     request: Request::new(head, crate::exchange::RequestBody::Buffered(Default::default())),
                     reply,
                 })
@@ -531,7 +522,7 @@ mod tests {
         (rx, replies)
     }
 
-    fn ask(kind: HandlerKind) -> (RouteId, HandlerKind, Request) {
+    fn ask(kind: HandlerKind) -> (PoolCall, Request) {
         let mut table = RouteTable::<(), ()>::new();
         table
             .insert("GET", "/", (), "index".into(), HandlerPlace::Worker(kind))
@@ -544,7 +535,7 @@ mod tests {
             request_id: mipyre_http::plan::request_id::RequestId::mint(),
         };
         let request = Request::new(head, crate::exchange::RequestBody::Buffered(Default::default()));
-        (table.route_id(0), kind, request)
+        (PoolCall::Route(table.route_id(0), kind), request)
     }
 
     /// Builds a pool with only `async def` workers, as a TPC server has, without starting an
@@ -559,7 +550,6 @@ mod tests {
                 workers: NonZeroUsize::MIN,
                 lives: LiveWorkers::new(WorkerKind::PoolAsync, 1, Arc::new(|_| {}), &counters).0,
             }),
-            websockets: None,
         };
         (inbox, pool)
     }
@@ -575,7 +565,6 @@ mod tests {
                 lives: LiveWorkers::new(WorkerKind::PoolSync, 1, Arc::new(|_| {}), &counters).0,
             }),
             async_queue: None,
-            websockets: None,
         };
         (rx, pool)
     }

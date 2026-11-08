@@ -341,16 +341,6 @@ class Mipyre(_RouteVerbs):
         """Disable response compression. No-op if already disabled."""
         self._engine.configure_compression(None)
 
-    def enable_grpc_benchmark(self) -> None:
-        """Serve HttpArena's ``benchmark.BenchmarkService/GetSum`` gRPC method.
-
-        Off by default. When enabled, only a ``POST`` to exactly
-        ``/benchmark.BenchmarkService/GetSum`` with an ``application/grpc*``
-        content-type is answered by the built-in service; every other request,
-        gRPC or not, is routed to your handlers as usual.
-        """
-        self._engine.enable_grpc_benchmark()
-
     def add_fast_response(
         self,
         method: str,
@@ -587,44 +577,97 @@ class Mipyre(_RouteVerbs):
         return _decorator_or_call(self._engine.fallback, handler)
 
     # ------------------------------------------------------------------
+    # gRPC
+    # ------------------------------------------------------------------
+
+    def unary_unary(self, path: str, handler: Callable[[bytes], bytes] | None = None) -> Callable:
+        """Serve the gRPC unary method at ``path`` (``/package.Service/Method``) with ``handler``.
+        Use as decorator or direct call::
+
+            @app.unary_unary("/benchmark.BenchmarkService/GetSum")
+            def get_sum(message: bytes) -> bytes:
+                request = benchmark_pb2.SumRequest.FromString(message)
+                return benchmark_pb2.SumReply(result=request.a + request.b).SerializeToString()
+
+        The handler takes the request message and returns the reply message, both ``bytes``:
+        the app encodes and decodes them (with ``protobuf``, as grpcio does for a method handler
+        with no serializers). The engine reads the call's frame and writes the reply's, with
+        ``grpc-status`` in the trailers. A handler that raises
+        ``mipyre.grpc.GrpcError(code, details)`` ends the call with that code and details; any
+        other exception ends it ``UNKNOWN``, and a reply that is not ``bytes`` ``INTERNAL``,
+        with the error's text as ``grpc-message``.
+
+        It is a ``def``, run on the sub-interpreter workers whatever the app's runtime; an
+        ``async def`` raises ``TypeError``. The ``before_request`` / ``after_request`` hooks do
+        not run for it. A ``POST`` to ``path`` without an ``application/grpc`` content type is
+        routed as any HTTP request. A path that is not a method's, or one already registered,
+        raises ``ValueError``.
+        """
+        return _decorator_or_call(lambda fn: self._engine.unary_unary(path, fn), handler)
+
+    # ------------------------------------------------------------------
     # WebSocket
     # ------------------------------------------------------------------
 
     def websocket(
-        self, path: str, handler: Callable | None = None, *, runtime: Runtime | str | None = None
+        self,
+        path: str,
+        on_message: Callable | None = None,
+        *,
+        on_connect: Callable | None = None,
+        on_close: Callable | None = None,
+        runtime: Runtime | str | None = None,
     ) -> Callable:
-        """Register an ``async def`` WebSocket handler. Use as decorator or direct call.
-
-        The handler receives a ``WebSocket`` whose receives and sends are awaited::
+        """Register a WebSocket route whose ``def on_message(ws, msg)`` is called once per
+        message. Use as decorator or direct call::
 
             @app.websocket("/ws")
-            async def ws_handler(ws):
-                async for msg in ws:
-                    await ws.send(f"echo: {msg}")
+            def echo(ws, msg):
+                return msg
+
+        ``msg`` is ``str`` for a text message and ``bytes`` for a binary one. What the handler
+        returns is sent back: ``None`` sends nothing, ``str`` a text message, ``bytes`` a binary
+        one. ``ws.send(msg)`` sends more; what it sent goes out before the return value, all of
+        it written together once the handler returns. ``on_connect(ws)`` is called once the
+        upgrade is answered, and its return value is sent the same way; ``on_close(ws, code,
+        reason)`` is called once when the connection ends, only if ``on_connect`` was, and its
+        return value is not sent. ``ws.data`` holds whatever the handlers keep for the
+        connection.
+
+        One connection's calls run one at a time, in the order its messages came; while a call
+        runs the connection is not read, so a client that sends faster than the handler keeps
+        up is slowed by TCP. A client that reads more slowly than the server sends is closed
+        with 1008: a connection holds at most one ``max_websocket_message_size`` of unsent
+        messages, and a ``ws.send`` that does not fit returns False. A message longer than
+        ``max_websocket_message_size`` raises ``ValueError`` instead and the connection stays
+        open.
+
+        ``ws.subscribe(topic)``, ``ws.publish(topic, msg)`` and ``mipyre.publish(topic, msg)``
+        send to every connection subscribed to a topic, in any interpreter; ``ws.publish`` skips
+        the sender.
 
         ``path`` is a route path like any other: ``{name}`` parameters land in
-        ``ws.request.params``. A ``def`` handler raises ``TypeError``.
+        ``ws.request.params``. The ``before_request`` hooks run on the upgrade request, and one
+        that returns a response refuses the upgrade with it. An ``async def`` handler raises
+        ``TypeError``.
 
-        ``runtime``: where the handler runs, the app's runtime unless given. By default each
-        connection is a task on one of the async sub-interpreter workers' engines, which share
-        no GIL; module state is per worker, so connections on different workers do not see
-        each other's globals (use ``app.state`` to share). ``runtime="main"`` runs every
-        connection on the main interpreter's async engine instead, where they share the main
-        interpreter's globals and its GIL. ``runtime="process"`` raises ``ValueError``.
+        ``runtime``: where the handlers run, the app's runtime unless given. By default they
+        run on the sub-interpreter worker of the thread that holds the connection, inline, as
+        that thread's ``def`` routes do, which needs the thread-per-core server
+        (``MIPYRE_TPC=0`` refuses to start with such a route). ``runtime="main"`` runs them on
+        the main interpreter's threads instead, where connections share its globals and its
+        GIL. ``runtime="process"`` raises ``ValueError``.
 
-        The ``before_request`` hooks run on the engine's loop before the 101: write the hooks
-        an app with WebSocket routes has as ``async def``, since a ``def`` hook that blocks
-        stalls every connection on that engine while it runs.
-
-        A connection waiting for a message holds no thread. The number of open connections is
-        capped by ``max_websocket_connections`` (default 1024; past it an upgrade is answered
-        503).
+        The number of open connections is capped by ``max_websocket_connections`` (default
+        1024; past it an upgrade is answered 503).
         """
         place = self.runtime if runtime is None else Runtime.parse(runtime, f"websocket {path}")
         if place is Runtime.ISOLATED:
             self._engine._use_isolation()
         engine_runtime = _ENGINE_RUNTIME[place]
-        return _decorator_or_call(lambda fn: self._engine.websocket(path, fn, engine_runtime), handler)
+        return _decorator_or_call(
+            lambda fn: self._engine.websocket(path, fn, on_connect, on_close, engine_runtime), on_message
+        )
 
     # ------------------------------------------------------------------
     # Static files

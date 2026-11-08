@@ -11,14 +11,7 @@ Rust sets in it before it runs:
   does not serve;
 - `BEFORE_HOOKS`, `AFTER_HOOKS`: the app's hooks;
 - `UNHOOKED`: the types of a handler's value sent as returned, after hooks unrun: main's
-  `Stream`, none in a worker (which cannot stream);
-- `WEBSOCKETS`: `None` when the engine serves no WebSocket route, else this engine's end of the
-  connections handed to it and the WebSocket handlers indexed like main's WebSocket routes,
-  `None` for one this engine does not serve.
-
-Each WebSocket connection runs as a Task too (`async_requests.connection_runner`), for as long
-as its handler runs; its receives and sends wait on the loop through one doorbell for all of
-them (`_LoopWaits`).
+  `Stream`, none in a worker (which cannot stream).
 
 Each request comes as a job that carries where its answer goes; the engine answers it
 with `_worker_send` / `_worker_fail`. A job the engine lets go of unanswered (its task
@@ -41,7 +34,6 @@ HANDLERS: list = globals()["HANDLERS"]
 BEFORE_HOOKS: list = globals()["BEFORE_HOOKS"]
 AFTER_HOOKS: list = globals()["AFTER_HOOKS"]
 UNHOOKED: tuple = globals()["UNHOOKED"]
-WEBSOCKETS: tuple[_engine._ConnectionInbox, list] | None = globals()["WEBSOCKETS"]
 
 
 # One job's coroutine. Each runs as its own Task, so per-request state kept in ContextVars
@@ -59,29 +51,4 @@ def _take():
     return _engine._worker_take(INBOX)
 
 
-def _watch_connections(loop: asyncio.AbstractEventLoop, inbox: _engine._ConnectionInbox, handlers: list) -> None:
-    waits = _engine._LoopWaits(loop)
-    loop.add_reader(waits.doorbell, waits.run)
-    run = async_requests.connection_runner(handlers, BEFORE_HOOKS, waits)
-    task = asyncio.Task
-
-    def start() -> None:
-        try:
-            jobs = inbox.take()
-        except BaseException:
-            # The doorbell stays readable, and looking again would spin.
-            loop.remove_reader(inbox.doorbell)
-            raise
-        for job in jobs:
-            task(run(job), loop=loop, eager_start=True)
-
-    loop.add_reader(inbox.doorbell, start)
-
-
-async def _serve() -> None:
-    if WEBSOCKETS is not None:
-        _watch_connections(asyncio.get_running_loop(), *WEBSOCKETS)
-    await async_requests.serve(INBOX.doorbell, _take, _process_request)
-
-
-asyncio.run(_serve())
+asyncio.run(async_requests.serve(INBOX.doorbell, _take, _process_request))

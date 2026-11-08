@@ -17,7 +17,7 @@ import pytest
 import mipyre
 from mipyre import engine
 from tests._helpers import bound_port, poll_until, read_file
-from mipyre._clone import PrivateCopyError, _is_bytecode_temp, claim_name, clone_tree, ensure_private_dir
+from mipyre._clone import PrivateCopyError, _is_bytecode_temp, _refusal, claim_name, clone_tree, ensure_private_dir
 from mipyre._process_lane.server import (
     START_REFUSED,
     _remove_stale_run_dirs,
@@ -160,8 +160,51 @@ def test_a_dir_others_can_write_is_not_private(tmp_path):
     shared = tmp_path / "shared"
     shared.mkdir()
     shared.chmod(0o777)
-    with pytest.raises(PrivateCopyError, match="writable by other users"):
+    with pytest.raises(PrivateCopyError, match="writable by other users \\(mode 777\\)"):
         ensure_private_dir(str(shared))
+
+
+@pytest.mark.parametrize("mode", [0o700, 0o755], ids=oct)
+def test_a_dir_only_its_owner_can_write_is_private(mode):
+    assert _refusal("/d", stat.S_IFDIR | mode, 1000, 1000) is None
+
+
+@pytest.mark.parametrize("mode", [0o720, 0o702, 0o775], ids=oct)
+def test_a_dir_with_a_group_or_other_write_bit_is_refused(mode):
+    refused = _refusal("/d", stat.S_IFDIR | mode, 1000, 1000)
+    assert f"/d is writable by other users (mode {mode:o})" in str(refused)
+
+
+def test_a_dir_owned_by_another_user_is_refused():
+    assert "owned by uid 1001, not this user (1000)" in str(_refusal("/d", stat.S_IFDIR | 0o700, 1001, 1000))
+
+
+def test_a_symlink_is_refused():
+    assert "not a directory" in str(_refusal("/d", stat.S_IFLNK | 0o777, 1000, 1000))
+
+
+@pytest.fixture(params=[0o002, 0o022, 0o077], ids=lambda u: f"umask{u:03o}")
+def umask(request):
+    previous = os.umask(request.param)
+    yield
+    os.umask(previous)
+
+
+@pytest.mark.parametrize("first, second", [("root/run", "root"), ("root", "root/run")])
+def test_every_level_it_makes_is_owner_only_in_either_order(tmp_path, umask, first, second):
+    ensure_private_dir(str(tmp_path / first))
+    ensure_private_dir(str(tmp_path / second))
+    assert stat.S_IMODE((tmp_path / "root").stat().st_mode) == 0o700
+    assert stat.S_IMODE((tmp_path / "root" / "run").stat().st_mode) == 0o700
+
+
+def test_a_level_that_already_existed_keeps_its_mode(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o775)
+    ensure_private_dir(str(shared / "mine" / "run"))
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o775
+    assert stat.S_IMODE((shared / "mine").stat().st_mode) == 0o700
 
 
 def test_a_symlink_is_not_a_private_dir(tmp_path):

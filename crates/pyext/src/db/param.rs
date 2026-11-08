@@ -6,6 +6,7 @@
 //! encoded as the type the server inferred: `None` becomes a NULL of that type, `5` an int4 or a
 //! numeric as needed.
 
+use mipyre_pg::numeric;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};
 use sqlx::encode::IsNull;
@@ -15,8 +16,7 @@ use sqlx::postgres::{PgArgumentBuffer, PgArguments, PgTypeInfo};
 use sqlx::{Arguments, Postgres, TypeInfo};
 
 use super::error::{ParamError, ParamValueError};
-use super::kind::{PgKind, JSONB_VERSION};
-use super::numeric;
+use super::pg_type::{PgType, JSONB_VERSION};
 use super::py_types::{StdlibTypes, PG_EPOCH_ORDINAL};
 
 /// Holds a Python argument copied out of the interpreter, so the query can run without the GIL.
@@ -74,7 +74,7 @@ impl PyParam {
         }
         Self::extract_stdlib(obj)
             .map_err(unreadable)?
-            .ok_or_else(|| ParamError::Unsupported {
+            .ok_or_else(|| ParamError::UnsupportedPythonType {
                 index,
                 python_type: obj
                     .get_type()
@@ -179,41 +179,41 @@ fn to_wire(ty: &PgTypeInfo, param: PyParam, index: usize) -> Result<Option<Vec<u
             })
     };
 
-    let wire = match (PgKind::of(ty), param) {
+    let wire = match (PgType::of(ty), param) {
         (_, PyParam::Null) => return Ok(None),
-        (PgKind::Bool, PyParam::Bool(b)) => vec![u8::from(b)],
-        (PgKind::Int2, PyParam::Int(i)) => i16::try_from(i)
+        (PgType::Bool, PyParam::Bool(b)) => vec![u8::from(b)],
+        (PgType::Int2, PyParam::Int(i)) => i16::try_from(i)
             .map_err(|_| out_of_range(&i, "int2"))?
             .to_be_bytes()
             .to_vec(),
-        (PgKind::Int4, PyParam::Int(i)) => i32::try_from(i)
+        (PgType::Int4, PyParam::Int(i)) => i32::try_from(i)
             .map_err(|_| out_of_range(&i, "int4"))?
             .to_be_bytes()
             .to_vec(),
-        (PgKind::Int8, PyParam::Int(i)) => i.to_be_bytes().to_vec(),
-        (PgKind::Int2, PyParam::BigInt(text)) => return Err(out_of_range(&text, "int2")),
-        (PgKind::Int4, PyParam::BigInt(text)) => return Err(out_of_range(&text, "int4")),
-        (PgKind::Int8, PyParam::BigInt(text)) => return Err(out_of_range(&text, "int8")),
-        (PgKind::Float4, PyParam::Float(f)) => float4(f)?,
-        (PgKind::Float4, PyParam::Int(i)) => (i as f32).to_be_bytes().to_vec(),
-        (PgKind::Float4, PyParam::BigInt(text)) => float4(big_float(&text)?)?,
-        (PgKind::Float8, PyParam::Float(f)) => f.to_be_bytes().to_vec(),
-        (PgKind::Float8, PyParam::Int(i)) => (i as f64).to_be_bytes().to_vec(),
-        (PgKind::Float8, PyParam::BigInt(text)) => big_float(&text)?.to_be_bytes().to_vec(),
-        (PgKind::Numeric, PyParam::Int(i)) => numeric(&i.to_string())?,
-        (PgKind::Numeric, PyParam::BigInt(text)) => numeric(&text)?,
-        (PgKind::Numeric, PyParam::Float(f)) => numeric(&f.to_string())?,
-        (PgKind::Numeric, PyParam::Decimal(text)) => numeric(&text)?,
-        (PgKind::Text, PyParam::Text(s)) => s.into_bytes(),
-        (PgKind::Bytea, PyParam::Bytes(b)) => b,
-        (PgKind::Json, PyParam::Json(v)) => v.to_string().into_bytes(),
-        (PgKind::Jsonb, PyParam::Json(v)) => [&[JSONB_VERSION], v.to_string().as_bytes()].concat(),
-        (PgKind::Uuid, PyParam::Uuid(u)) => u.to_vec(),
-        (PgKind::Date, PyParam::Date(days)) => days.to_be_bytes().to_vec(),
-        (PgKind::Timestamp, PyParam::Timestamp(us)) => us.to_be_bytes().to_vec(),
-        (PgKind::Timestamptz, PyParam::TimestampTz(us)) => us.to_be_bytes().to_vec(),
+        (PgType::Int8, PyParam::Int(i)) => i.to_be_bytes().to_vec(),
+        (PgType::Int2, PyParam::BigInt(text)) => return Err(out_of_range(&text, "int2")),
+        (PgType::Int4, PyParam::BigInt(text)) => return Err(out_of_range(&text, "int4")),
+        (PgType::Int8, PyParam::BigInt(text)) => return Err(out_of_range(&text, "int8")),
+        (PgType::Float4, PyParam::Float(f)) => float4(f)?,
+        (PgType::Float4, PyParam::Int(i)) => (i as f32).to_be_bytes().to_vec(),
+        (PgType::Float4, PyParam::BigInt(text)) => float4(big_float(&text)?)?,
+        (PgType::Float8, PyParam::Float(f)) => f.to_be_bytes().to_vec(),
+        (PgType::Float8, PyParam::Int(i)) => (i as f64).to_be_bytes().to_vec(),
+        (PgType::Float8, PyParam::BigInt(text)) => big_float(&text)?.to_be_bytes().to_vec(),
+        (PgType::Numeric, PyParam::Int(i)) => numeric(&i.to_string())?,
+        (PgType::Numeric, PyParam::BigInt(text)) => numeric(&text)?,
+        (PgType::Numeric, PyParam::Float(f)) => numeric(&f.to_string())?,
+        (PgType::Numeric, PyParam::Decimal(text)) => numeric(&text)?,
+        (PgType::Text, PyParam::Text(s)) => s.into_bytes(),
+        (PgType::Bytea, PyParam::Bytes(b)) => b,
+        (PgType::Json, PyParam::Json(v)) => v.to_string().into_bytes(),
+        (PgType::Jsonb, PyParam::Json(v)) => [&[JSONB_VERSION], v.to_string().as_bytes()].concat(),
+        (PgType::Uuid, PyParam::Uuid(u)) => u.to_vec(),
+        (PgType::Date, PyParam::Date(days)) => days.to_be_bytes().to_vec(),
+        (PgType::Timestamp, PyParam::Timestamp(us)) => us.to_be_bytes().to_vec(),
+        (PgType::Timestamptz, PyParam::TimestampTz(us)) => us.to_be_bytes().to_vec(),
         // As when reading an `Other` column, the bytes are its raw wire value.
-        (PgKind::Other, PyParam::Bytes(b)) => b,
+        (PgType::Other, PyParam::Bytes(b)) => b,
         (_, param) => {
             return Err(ParamError::TypeNotAccepted {
                 index,

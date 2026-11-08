@@ -12,7 +12,7 @@ use super::lane_failure::LaneIndex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LaneWorkerProcess {
     pub lane: LaneIndex,
-    pub template: Pid,
+    pub fork_server: Pid,
 }
 
 /// Written once, by the worker's `serve()`, after the app is imported and before it serves.
@@ -21,7 +21,7 @@ static LANE_WORKER: OnceLock<LaneWorkerProcess> = OnceLock::new();
 /// This process already serves a lane: `serve()` runs once per worker process.
 #[derive(Debug, thiserror::Error)]
 #[error("this process already serves process lane {}, so it cannot serve lane {}", .serving.lane, .asked.lane)]
-pub struct AlreadyLaneWorkerError {
+pub struct MarkLaneWorkerError {
     serving: LaneWorkerProcess,
     asked: LaneWorkerProcess,
 }
@@ -30,9 +30,9 @@ pub struct AlreadyLaneWorkerError {
 ///
 /// # Errors
 ///
-/// Returns [`AlreadyLaneWorkerError`] when the process already serves a lane.
-pub fn mark_lane_worker(process: LaneWorkerProcess) -> Result<(), AlreadyLaneWorkerError> {
-    LANE_WORKER.set(process).map_err(|asked| AlreadyLaneWorkerError {
+/// Returns [`MarkLaneWorkerError`] when the process already serves a lane.
+pub fn mark_lane_worker(process: LaneWorkerProcess) -> Result<(), MarkLaneWorkerError> {
+    LANE_WORKER.set(process).map_err(|asked| MarkLaneWorkerError {
         serving: *LANE_WORKER.get().unwrap_or(&asked),
         asked,
     })
@@ -44,7 +44,7 @@ pub fn mark_lane_worker(process: LaneWorkerProcess) -> Result<(), AlreadyLaneWor
      of its own (process lane {lane}), where {what} would be a copy apart from the server's, \
      silently out of step with it. Use it from a runtime='subinterp' or runtime='main' route."
 )]
-pub struct NotInLaneWorker {
+pub struct UnsupportedInLaneWorkerError {
     what: &'static str,
     lane: LaneIndex,
 }
@@ -53,8 +53,8 @@ pub struct NotInLaneWorker {
 ///
 /// # Errors
 ///
-/// Returns [`NotInLaneWorker`] in a process-lane worker.
-pub fn refuse_in_lane_worker(what: &'static str) -> Result<(), NotInLaneWorker> {
+/// Returns [`UnsupportedInLaneWorkerError`] in a process-lane worker.
+pub fn refuse_in_lane_worker(what: &'static str) -> Result<(), UnsupportedInLaneWorkerError> {
     match refusal(LANE_WORKER.get(), what) {
         Some(refused) => Err(refused),
         None => Ok(()),
@@ -62,8 +62,8 @@ pub fn refuse_in_lane_worker(what: &'static str) -> Result<(), NotInLaneWorker> 
 }
 
 /// The refusal of `what` in a process that is `worker`, or `None` in one that serves no lane.
-fn refusal(worker: Option<&LaneWorkerProcess>, what: &'static str) -> Option<NotInLaneWorker> {
-    worker.map(|worker| NotInLaneWorker {
+fn refusal(worker: Option<&LaneWorkerProcess>, what: &'static str) -> Option<UnsupportedInLaneWorkerError> {
+    worker.map(|worker| UnsupportedInLaneWorkerError {
         what,
         lane: worker.lane,
     })
@@ -82,7 +82,7 @@ mod tests {
     fn a_lane_worker_refuses_naming_its_lane() {
         let worker = LaneWorkerProcess {
             lane: LaneIndex(3),
-            template: Pid::new(1).expect("1 is a pid"),
+            fork_server: Pid::new(1).expect("1 is a pid"),
         };
         let refused = refusal(Some(&worker), "PgPool").expect("a lane worker refuses");
         assert!(refused

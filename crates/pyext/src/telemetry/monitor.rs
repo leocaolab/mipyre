@@ -340,7 +340,7 @@ pub(crate) fn read_counters() -> Counters {
         rss_bytes: *MEMORY_RSS_BYTES.lock(),
         precompressed_fallbacks: static_files::total(StaticDegradation::PrecompressedFallback),
         static_unwatched_mounts: static_files::total(StaticDegradation::UnwatchedMount),
-        static_answers_cut: static_files::total(StaticDegradation::AnswerCut),
+        static_answers_cut: static_files::total(StaticDegradation::ResponseTruncated),
         db_results_undeliverable: degradations.db_results_undeliverable,
         log_lines_dropped: log_lines_dropped(),
         gil_congested_waits: gil.congested_waits,

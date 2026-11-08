@@ -63,7 +63,7 @@ pub enum RequestBody {
 
 #[derive(Debug, thiserror::Error)]
 #[error("req.stream was already taken: a streamed body is read through one stream")]
-pub(crate) struct BodyStreamAlreadyTaken;
+pub(crate) struct TakeStreamError;
 
 impl RequestBody {
     pub fn streamed(rx: BodyReceiver) -> Self {
@@ -93,10 +93,10 @@ impl RequestBody {
     }
 
     /// Returns `None` for a buffered body, and the receiver only the first time for a streamed one.
-    pub(crate) fn take_stream(&self) -> Result<Option<BodyReceiver>, BodyStreamAlreadyTaken> {
+    pub(crate) fn take_stream(&self) -> Result<Option<BodyReceiver>, TakeStreamError> {
         match self {
             RequestBody::Buffered(_) | RequestBody::Framed(..) | RequestBody::Received(_) => Ok(None),
-            RequestBody::Streamed(slot) => slot.lock().take().map(Some).ok_or(BodyStreamAlreadyTaken),
+            RequestBody::Streamed(slot) => slot.lock().take().map(Some).ok_or(TakeStreamError),
         }
     }
 }
@@ -123,7 +123,7 @@ impl Request {
         self.head.parts.uri.query().unwrap_or("")
     }
 
-    fn buffered_body<'a>(&'a self, py: Python<'a>) -> PyResult<&'a [u8]> {
+    pub(crate) fn buffered_body<'a>(&'a self, py: Python<'a>) -> PyResult<&'a [u8]> {
         self.body
             .bytes(py)?
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(STREAMED_BODY))
@@ -571,7 +571,7 @@ mod tests {
         let (_tx, rx) = mipyre_http::io::body::body_channel();
         let body = RequestBody::streamed(rx);
         assert!(matches!(body.take_stream(), Ok(Some(_))));
-        assert!(matches!(body.take_stream(), Err(BodyStreamAlreadyTaken)));
+        assert!(matches!(body.take_stream(), Err(TakeStreamError)));
     }
 
     use super::*;
@@ -599,9 +599,9 @@ mod tests {
     }
 
     /// Hands `frames` over one at a time, all there.
-    struct Frames(std::collections::VecDeque<Bytes>);
+    struct FakeBody(std::collections::VecDeque<Bytes>);
 
-    impl hyper::body::Body for Frames {
+    impl hyper::body::Body for FakeBody {
         type Data = Bytes;
         type Error = hyper::Error;
         fn poll_frame(
@@ -614,7 +614,7 @@ mod tests {
 
     /// Reads `frames` the way a buffered route does.
     fn read_frames(frames: &[&'static [u8]]) -> BodyFrames {
-        let body = Frames(frames.iter().map(|f| Bytes::from_static(f)).collect());
+        let body = FakeBody(frames.iter().map(|f| Bytes::from_static(f)).collect());
         let limits = mipyre_http::plan::limits::Limits::DEFAULT;
         let read = std::pin::pin!(mipyre_http::io::body::read_body(body, &limits));
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());

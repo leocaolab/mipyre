@@ -45,7 +45,7 @@ impl RequestId {
     pub fn mint() -> Self {
         let number = BLOCK_LEFT.with(|block| next_number(block, &NEXT_BLOCK));
         RequestId::Server(ServerRequestId {
-            process: *PROCESS_SEED,
+            process_seed: *PROCESS_SEED,
             number,
         })
     }
@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn the_header_value_is_the_id_as_written() {
         let minted = RequestId::Server(ServerRequestId {
-            process: 0x0123_4567_89ab_cdef,
+            process_seed: 0x0123_4567_89ab_cdef,
             number: 42,
         });
         assert_eq!(minted.header_value(), "0123456789abcdef000000000000002a");
@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn the_text_is_the_id_as_displayed() {
         let minted = RequestId::Server(ServerRequestId {
-            process: 0x0123_4567_89ab_cdef,
+            process_seed: 0x0123_4567_89ab_cdef,
             number: 42,
         });
         assert_eq!(minted.with_text(str::to_owned), minted.to_string());

@@ -23,7 +23,7 @@ use crate::on_main::MultiThreadServer;
 use crate::request::handle_request;
 use crate::site::Site;
 use crate::sync::{AtomicUsize, Ordering};
-use crate::websocket::{upgrade_or, WsUpgrade};
+use crate::websocket::{upgrade_on_main_or, MainWsUpgrade};
 use crate::ServeError;
 use crate::ServerCounters;
 use mipyre_http::io::clock::Clock;
@@ -118,7 +118,7 @@ pub fn serve_multi_thread<D: TransportDriver>(
     stop: CancellationToken,
     deadline: &ShutdownDeadline,
     counters: Arc<ServerCounters>,
-    ws: Option<WsUpgrade>,
+    ws: Option<MainWsUpgrade>,
 ) -> Result<(), ServeError> {
     Clock::process().start().map_err(ServeError::ClockNotStarted)?;
     let rt = io_runtime(servers.io_threads()).map_err(ServeError::IoRuntimeNotBuilt)?;
@@ -190,7 +190,7 @@ pub fn serve_multi_thread<D: TransportDriver>(
 /// `stop` completes.
 async fn serve_accepted<D: TransportDriver>(
     accepted: D::Connection,
-    ws: Option<WsUpgrade>,
+    ws: Option<MainWsUpgrade>,
     servers: Arc<IoThreadServers>,
     stop: StopWaiter,
 ) {
@@ -203,7 +203,7 @@ async fn serve_accepted<D: TransportDriver>(
     };
     match ws {
         Some(ws) => {
-            let svc = service_fn(move |req: Request<Incoming>| upgrade_or(req, &ws, peer, &handle));
+            let svc = service_fn(move |req: Request<Incoming>| upgrade_on_main_or(req, &ws, peer, &handle));
             drive_connection(
                 stream,
                 svc,

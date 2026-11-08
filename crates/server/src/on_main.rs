@@ -58,6 +58,15 @@ impl Backends for MultiThreadServer {
         match *worker {}
     }
 
+    fn call_unary_inline(
+        worker: &Infallible,
+        _: &Site,
+        _: RouteId,
+        _: mipyre_runtime::exchange::Request,
+    ) -> Result<mipyre_http::plan::response::HandlerResponse, mipyre_runtime::exchange::HandlerError> {
+        match *worker {}
+    }
+
     #[inline]
     fn main(&self) -> Option<&MainThreads> {
         self.main.as_deref()
@@ -188,9 +197,9 @@ mod tests {
     use super::*;
 
     /// A client that has sent the head and never sends its body; it counts the feeder's polls.
-    struct SilentClient(Arc<AtomicUsize>);
+    struct StubRequestBody(Arc<AtomicUsize>);
 
-    impl Body for SilentClient {
+    impl Body for StubRequestBody {
         type Data = Bytes;
         type Error = hyper::Error;
 
@@ -203,13 +212,13 @@ mod tests {
     #[derive(Debug)]
     struct Full;
 
-    struct FullBackend;
+    struct StubFullBackend;
 
     /// A backend whose run has answered by its first poll, keeping the body's reader as a handler
     /// whose response streams does.
-    struct ReadyBackend(std::sync::Mutex<Option<BodyReceiver>>);
+    struct StubReadyBackend(std::sync::Mutex<Option<BodyReceiver>>);
 
-    impl HandoffBackend for ReadyBackend {
+    impl HandoffBackend for StubReadyBackend {
         type Ask = BodyReceiver;
         type Reply = ();
         type Refusal = Full;
@@ -221,7 +230,7 @@ mod tests {
         }
     }
 
-    impl HandoffBackend for FullBackend {
+    impl HandoffBackend for StubFullBackend {
         type Ask = BodyReceiver;
         type Reply = ();
         type Refusal = Full;
@@ -239,7 +248,7 @@ mod tests {
         let polls = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = body_channel();
         let feeder = AbortOnDropHandle::new(tokio::spawn(stream_body_feeder(
-            SilentClient(Arc::clone(&polls)),
+            StubRequestBody(Arc::clone(&polls)),
             tx,
             usize::MAX,
             BodyTimeAllowance::absolute(BodyGrace::from_secs(HOUR).unwrap()),
@@ -262,7 +271,7 @@ mod tests {
         let (feeder, rx, polls) = feeding_a_silent_client().await;
         let abort = feeder.abort_handle();
 
-        let refused = await_streamed(&FullBackend, rx, RequestBudget::from_secs(HOUR).unwrap(), feeder).await;
+        let refused = await_streamed(&StubFullBackend, rx, RequestBudget::from_secs(HOUR).unwrap(), feeder).await;
         settle().await;
 
         assert!(matches!(refused, Err(Full)));
@@ -279,7 +288,7 @@ mod tests {
     async fn an_answered_ask_keeps_its_feeder_for_a_response_that_still_reads_the_body() {
         let (feeder, rx, polls) = feeding_a_silent_client().await;
         let abort = feeder.abort_handle();
-        let backend = ReadyBackend(std::sync::Mutex::new(None));
+        let backend = StubReadyBackend(std::sync::Mutex::new(None));
 
         let answered = await_streamed(&backend, rx, RequestBudget::from_secs(HOUR).unwrap(), feeder).await;
         settle().await;

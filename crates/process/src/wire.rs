@@ -1,8 +1,11 @@
 //! Encodes the requests and answers that cross a lane as little-endian, length-prefixed fields, written straight
 //! into a channel slot's writer and read out of the bytes a slot held.
 
+use std::fmt::{self, Write as _};
+
 use bytes::Bytes;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::Uri;
 
 use super::lane_failure::{LaneDecodeError, TaggedField, WorkerFailure};
 use super::route::LaneRequestError;
@@ -195,22 +198,76 @@ pub struct SlotRequest<'a> {
     pub body: &'a [u8],
 }
 
+impl LaneRequest {
+    /// Returns the bytes the request takes in a slot, over-counted: its body, target, headers and
+    /// path parameters, with a margin for the fields' framing. It is public for a bench to count.
+    #[doc(hidden)]
+    pub fn approx_message_len(&self) -> usize {
+        let head = &self.head;
+        self.body.len()
+            + target_len(&head.parts.uri)
+            + head
+                .parts
+                .headers
+                .iter()
+                .map(|(k, v)| k.as_str().len() + v.len() + PAIR_MIN_BYTES)
+                .sum::<usize>()
+            + head
+                .params
+                .located()
+                .map(|(name, _)| name.len() + PARAM_MIN_BYTES)
+                .sum::<usize>()
+            + 256
+    }
+}
+
+/// Returns the target as it came when it is origin-form (or `*`), which a message carries as is;
+/// a target with a scheme or authority has no such text and is rendered.
+#[inline]
+fn as_received(uri: &Uri) -> Option<&str> {
+    match (uri.scheme(), uri.authority(), uri.path_and_query()) {
+        (None, None, Some(target)) => Some(target.as_str()),
+        _ => None,
+    }
+}
+
+/// Returns the bytes `uri` takes in a message, without rendering it.
+#[inline]
+fn target_len(uri: &Uri) -> usize {
+    as_received(uri).map_or_else(|| rendered_len(uri), str::len)
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "ByteCount never fails a write, so only a Display impl that fails on its own could: \
+              that is a broken Display, which `to_string` panics on too"
+)]
+fn rendered_len(uri: &Uri) -> usize {
+    let mut count = ByteCount(0);
+    write!(count, "{uri}").expect("a Display impl does not fail on its own");
+    count.0
+}
+
+/// Counts the bytes written to it and keeps none of them.
+struct ByteCount(usize);
+
+impl fmt::Write for ByteCount {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0 += s.len();
+        Ok(())
+    }
+}
+
 #[inline]
 pub(crate) fn encode_request(w: &mut SlotWriter<'_>, req: &LaneRequest) -> Result<(), SlotRoomError> {
-    w.restart();
+    w.clear();
     let head = &req.head;
     put_field(w, req.route_key.method.as_str().as_bytes())?;
     put_field(w, req.route_key.path.as_bytes())?;
     put_field(w, head.parts.method.as_str().as_bytes())?;
-    // An origin-form target is written as it came; only a target with a scheme or authority is
-    // rendered.
-    match (
-        head.parts.uri.scheme(),
-        head.parts.uri.authority(),
-        head.parts.uri.path_and_query(),
-    ) {
-        (None, None, Some(target)) => put_field(w, target.as_str().as_bytes())?,
-        _ => put_field(w, head.parts.uri.to_string().as_bytes())?,
+    match as_received(&head.parts.uri) {
+        Some(target) => put_field(w, target.as_bytes())?,
+        None => put_field(w, head.parts.uri.to_string().as_bytes())?,
     }
     put_headers(w, &head.parts.headers)?;
     put_u16(w, head.params.len() as u16)?;
@@ -233,7 +290,7 @@ pub(crate) fn encode_request(w: &mut SlotWriter<'_>, req: &LaneRequest) -> Resul
     match &head.request_id {
         RequestId::Server(id) => {
             put_u8(w, SERVER_ID)?;
-            w.put(&id.process.to_le_bytes())?;
+            w.put(&id.process_seed.to_le_bytes())?;
             w.put(&id.number.to_le_bytes())?;
         }
         RequestId::Client(id) => {
@@ -297,7 +354,7 @@ pub fn decode_request(buf: &[u8]) -> Result<SlotRequest<'_>, LaneDecodeError> {
     };
     let request_id = match r.u8()? {
         SERVER_ID => RequestId::Server(ServerRequestId {
-            process: u64::from_le_bytes(r.array()?),
+            process_seed: u64::from_le_bytes(r.array()?),
             number: u64::from_le_bytes(r.array()?),
         }),
         CLIENT_ID => {
@@ -331,8 +388,8 @@ pub fn decode_request(buf: &[u8]) -> Result<SlotRequest<'_>, LaneDecodeError> {
 const OK: u8 = 0;
 const FAILED: u8 = 1;
 
-pub(crate) fn encode_response(w: &mut SlotWriter<'_>, data: &HandlerResponse) -> Result<(), SlotRoomError> {
-    w.restart();
+pub(crate) fn encode_handler_response(w: &mut SlotWriter<'_>, data: &HandlerResponse) -> Result<(), SlotRoomError> {
+    w.clear();
     put_u8(w, OK)?;
     put_u16(w, data.status.as_u16())?;
     put_field(w, data.content_type().as_bytes())?;
@@ -369,7 +426,7 @@ pub(crate) fn encode_failure(
     traceback: Option<&str>,
 ) -> Result<(), SlotRoomError> {
     let room = (w.room() as usize).saturating_sub(16) / 2;
-    w.restart();
+    w.clear();
     put_u8(w, FAILED)?;
     put_field(w, cut_to_fit(error, room).as_bytes())?;
     match traceback {
@@ -383,12 +440,12 @@ pub(crate) fn encode_failure(
 
 /// Writes the response or the failure; a response that does not fit is replaced by a failure
 /// saying so.
-pub fn encode_answer(
+pub fn encode_response(
     w: &mut SlotWriter<'_>,
     result: &Result<HandlerResponse, WorkerFailure>,
 ) -> Result<(), SlotRoomError> {
     match result {
-        Ok(data) => match encode_response(w, data) {
+        Ok(data) => match encode_handler_response(w, data) {
             Ok(()) => Ok(()),
             Err(e) => encode_failure(w, &format!("the response does not fit the process lane: {e}"), None),
         },
@@ -411,7 +468,7 @@ fn content_type(msg: &Bytes, at: std::ops::Range<usize>) -> Result<HeaderValue, 
 
 /// Decodes an answer the host copied out of its slot; the body and an uncommon content type are slices of `msg`,
 /// so nothing of it is copied again.
-pub(crate) fn decode_answer(msg: Bytes) -> Result<HandlerResponse, LaneRequestError> {
+pub fn decode_response(msg: Bytes) -> Result<HandlerResponse, LaneRequestError> {
     let mut r = MessageReader::new(&msg);
     match r.u8()? {
         OK => {
@@ -436,7 +493,7 @@ pub(crate) fn decode_answer(msg: Bytes) -> Result<HandlerResponse, LaneRequestEr
             Err(LaneRequestError::WorkerFailed(WorkerFailure { error, traceback }))
         }
         tag => Err(LaneRequestError::Malformed(LaneDecodeError::UnknownTag {
-            field: TaggedField::AnswerKind,
+            field: TaggedField::ResponseKind,
             tag,
         })),
     }
@@ -451,7 +508,7 @@ pub(crate) mod tests {
     use http::StatusCode;
     use mipyre_shm::adapter::doorbell::FutexDoorbell;
     use mipyre_shm::adapter::parker::FutexParker;
-    use mipyre_shm::channel::{Channel, HeapMemory, HostEnd, PeerEnd, Wait};
+    use mipyre_shm::channel::{Channel, HeapMemory, PeerEnd, RequesterEnd, WaitOutcome};
     use mipyre_shm::plan::geometry::{Geometry, SlotBytes, SLOT_HEADER};
     use mipyre_shm::plan::ring::RingDepth;
     use mipyre_shm::plan::spin_window::SpinWindow;
@@ -463,12 +520,12 @@ pub(crate) mod tests {
         let slot_bytes = SlotBytes::new(room + SLOT_HEADER).expect("a slot holds its header");
         let geometry = Geometry::new(RingDepth::new(1).expect("1 is a power of two"), slot_bytes).unwrap();
         let channel = Arc::new(Channel::new(HeapMemory::new(&geometry)));
-        let mut host = HostEnd::new(Arc::clone(&channel), FutexDoorbell);
+        let mut host = RequesterEnd::new(Arc::clone(&channel), FutexDoorbell);
         let mut slot = host.request_slot().expect("an empty ring has room");
         let out = slot.write(fill);
         slot.publish().unwrap_or_else(|never| match never {});
         let mut peer = PeerEnd::new(channel, FutexDoorbell, FutexParker);
-        let Ok(Wait::Request(request)) = peer.wait_for_request(SpinWindow::until(0), || 0, 1) else {
+        let Ok(WaitOutcome::Request(request)) = peer.wait_for_request(SpinWindow::until(0), || 0, 1) else {
             panic!("the request was published");
         };
         (
@@ -510,7 +567,7 @@ pub(crate) mod tests {
     }
 
     fn encoded_response(response: &HandlerResponse) -> Bytes {
-        let (fits, bytes) = written(MIN_ROOM, |w| encode_response(w, response));
+        let (fits, bytes) = written(MIN_ROOM, |w| encode_handler_response(w, response));
         fits.expect("the response fits");
         bytes
     }
@@ -521,6 +578,24 @@ pub(crate) mod tests {
         let err = refused.unwrap_err();
         assert_eq!(err.room, 256);
         assert!(err.needed > 1024, "{err:?}");
+    }
+
+    /// A target is sized at exactly the bytes it is written as, whether it is carried as it came
+    /// (origin-form, `*`) or rendered (authority-form, absolute-form).
+    #[test]
+    fn a_target_is_sized_at_the_bytes_it_is_written_as() {
+        for (target, received) in [
+            ("/", true),
+            ("/a/b?c=d&e", true),
+            ("*", true),
+            ("example.com:443", false),
+            ("http://example.com", false),
+            ("http://user:pw@example.com:8080/p?q=1", false),
+        ] {
+            let uri: Uri = target.parse().unwrap();
+            assert_eq!(as_received(&uri).is_some(), received, "{target}");
+            assert_eq!(target_len(&uri), uri.to_string().len(), "{target}");
+        }
     }
 
     fn with_param(name: &str, value: std::ops::Range<usize>) -> LaneRequest {
@@ -572,7 +647,7 @@ pub(crate) mod tests {
     fn the_request_id_round_trips_through_its_slot() {
         for id in [
             RequestId::Server(ServerRequestId {
-                process: 0x0123_4567_89ab_cdef,
+                process_seed: 0x0123_4567_89ab_cdef,
                 number: 42,
             }),
             RequestId::Client(ClientRequestId::parse("trace-7f/abc=").unwrap()),
@@ -594,7 +669,7 @@ pub(crate) mod tests {
     }
 
     fn worker_failure(answer: Bytes) -> WorkerFailure {
-        match decode_answer(answer) {
+        match decode_response(answer) {
             Err(LaneRequestError::WorkerFailed(failure)) => failure,
             other => panic!("expected the worker's failure, got {other:?}"),
         }
@@ -603,11 +678,11 @@ pub(crate) mod tests {
     #[test]
     fn an_answer_of_an_unknown_kind_or_empty_is_malformed() {
         assert!(matches!(
-            decode_answer(Bytes::from_static(&[9])),
+            decode_response(Bytes::from_static(&[9])),
             Err(LaneRequestError::Malformed(_))
         ));
         assert!(matches!(
-            decode_answer(Bytes::new()),
+            decode_response(Bytes::new()),
             Err(LaneRequestError::Malformed(_))
         ));
     }
@@ -615,14 +690,14 @@ pub(crate) mod tests {
     #[test]
     fn a_malformed_answer_says_which_way_by_its_variant() {
         assert!(matches!(
-            decode_answer(Bytes::from_static(&[9])),
+            decode_response(Bytes::from_static(&[9])),
             Err(LaneRequestError::Malformed(LaneDecodeError::UnknownTag {
-                field: TaggedField::AnswerKind,
+                field: TaggedField::ResponseKind,
                 tag: 9
             }))
         ));
         assert!(matches!(
-            decode_answer(Bytes::new()),
+            decode_response(Bytes::new()),
             Err(LaneRequestError::Malformed(LaneDecodeError::Truncated {
                 wanted: 1,
                 at: 0,
@@ -630,7 +705,7 @@ pub(crate) mod tests {
             }))
         ));
         assert!(matches!(
-            decode_answer(Bytes::from_static(&[FAILED, 1, 0, 0, 0, 0xff])),
+            decode_response(Bytes::from_static(&[FAILED, 1, 0, 0, 0, 0xff])),
             Err(LaneRequestError::Malformed(LaneDecodeError::NotUtf8(_)))
         ));
     }
@@ -644,10 +719,10 @@ pub(crate) mod tests {
             HeaderLines::new(),
         );
         let bytes = encoded_response(&response);
-        assert!(decode_answer(bytes.clone()).is_ok());
+        assert!(decode_response(bytes.clone()).is_ok());
         for cut in 0..bytes.len() {
             assert!(
-                matches!(decode_answer(bytes.slice(..cut)), Err(LaneRequestError::Malformed(_))),
+                matches!(decode_response(bytes.slice(..cut)), Err(LaneRequestError::Malformed(_))),
                 "cut at {cut} decoded"
             );
         }
@@ -675,7 +750,7 @@ pub(crate) mod tests {
         );
         let (refused_then_fits, bytes) = written(MIN_ROOM, |w| {
             (
-                encode_response(w, &response).is_err(),
+                encode_handler_response(w, &response).is_err(),
                 encode_failure(w, "too large", None),
             )
         });
@@ -706,7 +781,7 @@ pub(crate) mod tests {
                 HeaderValue::from_static(content_type),
                 HeaderLines::new(),
             );
-            let back = decode_answer(encoded_response(&response)).unwrap();
+            let back = decode_response(encoded_response(&response)).unwrap();
             assert_eq!(back.content_type().as_bytes(), content_type.as_bytes());
             assert_eq!(&back.body[..], b"body");
         }
@@ -731,25 +806,24 @@ pub(crate) mod tests {
             assert_eq!(failure.error, "boom");
             assert_eq!(failure.traceback.as_deref(), traceback);
         }
-        // A worker's failure takes the `encode_answer` path, so it is checked too.
+        // A worker's failure takes the `encode_response` path, so it is checked too.
         let failed = Err(WorkerFailure {
             error: "boom".into(),
             traceback: None,
         });
-        let (fits, bytes) = written(MIN_ROOM, |w| encode_answer(w, &failed));
+        let (fits, bytes) = written(MIN_ROOM, |w| encode_response(w, &failed));
         fits.unwrap();
         assert_eq!(worker_failure(bytes).traceback, None);
     }
 
     /// An answer that claims more header lines than it holds: OK, status 200, an empty content type and
-    /// 65,536 header lines, in 11 bytes. It is
-    /// `__fuzz__/runtime__process__wire_fuzz__any_answer_bytes_decode_or_are_refused/corpus/` 's regression input too.
+    /// 65,536 header lines, in 11 bytes. It is a regression input of the answer decoder's fuzz target too.
     const CLAIMS_65536_LINES: [u8; 11] = [0x00, 0xc8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00];
 
     #[test]
     fn an_answer_claiming_more_lines_than_its_bytes_hold_is_malformed_not_a_panic() {
         assert!(matches!(
-            decode_answer(Bytes::from_static(&CLAIMS_65536_LINES)),
+            decode_response(Bytes::from_static(&CLAIMS_65536_LINES)),
             Err(LaneRequestError::Malformed(LaneDecodeError::CountPastEnd {
                 count: 65_536,
                 least: PAIR_MIN_BYTES,
@@ -775,12 +849,12 @@ pub(crate) mod tests {
     fn a_line_count_is_held_to_what_the_rest_of_the_answer_holds() {
         let held = answer_of_empty_lines(3, 3 * PAIR_MIN_BYTES);
         assert!(matches!(
-            decode_answer(held),
+            decode_response(held),
             Err(LaneRequestError::Malformed(LaneDecodeError::BadHeaderName(_)))
         ));
         let past = answer_of_empty_lines(4, 3 * PAIR_MIN_BYTES);
         assert!(matches!(
-            decode_answer(past),
+            decode_response(past),
             Err(LaneRequestError::Malformed(LaneDecodeError::CountPastEnd {
                 count: 4,
                 least: PAIR_MIN_BYTES,
@@ -797,7 +871,7 @@ pub(crate) mod tests {
         let lines = 24_577;
         let answer = answer_of_empty_lines(lines, lines as usize * PAIR_MIN_BYTES);
         assert!(matches!(
-            decode_answer(answer),
+            decode_response(answer),
             Err(LaneRequestError::Malformed(LaneDecodeError::TooManyLines {
                 count: 24_577,
                 max: MAX_LINES

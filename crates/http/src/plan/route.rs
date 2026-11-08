@@ -197,8 +197,8 @@ pub enum WsRouteError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WsRouteId(usize);
 
-/// Where a WebSocket route's handler runs: on a sub-interpreter worker's async engine, or on
-/// main's (`runtime="main"`).
+/// Where a WebSocket route's handlers run: inline on the sub-interpreter worker of the TPC thread
+/// that holds the connection, or on main's `def` threads (`runtime="main"`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WsPlace {
     Worker,
@@ -210,6 +210,31 @@ pub enum WsPlace {
 pub struct WsRoute {
     pub path: String,
     pub place: WsPlace,
+}
+
+/// The `def` functions an app registered for one WebSocket path: `on_message` is called for each
+/// message, `on_connect` once the connection is open and `on_close` once it has ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WsHandlers<H> {
+    pub on_message: H,
+    pub on_connect: Option<H>,
+    pub on_close: Option<H>,
+}
+
+impl<H> WsHandlers<H> {
+    pub fn iter(&self) -> impl Iterator<Item = &H> {
+        std::iter::once(&self.on_message)
+            .chain(self.on_connect.as_ref())
+            .chain(self.on_close.as_ref())
+    }
+
+    pub fn map<T>(&self, f: impl Fn(&H) -> T) -> WsHandlers<T> {
+        WsHandlers {
+            on_message: f(&self.on_message),
+            on_connect: self.on_connect.as_ref().map(&f),
+            on_close: self.on_close.as_ref().map(&f),
+        }
+    }
 }
 
 impl WsRouteId {
@@ -350,6 +375,19 @@ pub enum HandlerCall {
     /// buffered body.
     Main(HandlerTarget, MainHandler),
     Lane(RouteId),
+    /// A gRPC method's call, which runs on a sub-interpreter worker like a `def` route; only
+    /// [`crate::plan::request::decide`] makes one, since the HTTP routers do not hold the method.
+    Grpc(RouteId),
+}
+
+/// How a route's handler is called and what it returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallConvention {
+    /// The handler takes the HTTP request and returns a response.
+    Http,
+    /// The handler takes a gRPC unary call's request message as `bytes` and returns its reply
+    /// message; the server reads and writes the frames and the status around them.
+    GrpcUnary,
 }
 
 pub struct Route {
@@ -357,6 +395,7 @@ pub struct Route {
     pub name: String,
     pub key: RouteKey,
     pub runtime: HandlerPlace,
+    pub convention: CallConvention,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -584,7 +623,7 @@ pub struct RouteTable<H, D> {
     fallback: Option<HandlerTarget>,
     /// WebSocket routes have their own router because one may share a path with a `GET` route;
     /// the `Upgrade` header picks between them.
-    ws_handlers: Vec<H>,
+    ws_handlers: Vec<WsHandlers<H>>,
     /// Is indexed like `ws_handlers`.
     ws_routes: Vec<WsRoute>,
     ws_router: Router<WsRouteId>,
@@ -597,21 +636,28 @@ pub struct RouteTable<H, D> {
     /// The counts when `Mipyre.run()` began, which mark what the script registered; what main
     /// adds after them exists only on main. It is private, so the counts never exceed the table.
     sealed: Option<RouteCounts>,
-    grpc_methods: Vec<GrpcMethod>,
+    /// The gRPC methods among `routes`, which the HTTP routers do not hold, so a request reaches
+    /// one only as a gRPC call.
+    grpc_methods: Vec<RouteId>,
 }
 
-/// A gRPC method the engine answers itself, outside the route table, because it needs HTTP/2
-/// trailers that a route's response cannot carry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GrpcMethod {
-    BenchmarkGetSum,
+/// A gRPC method path that cannot be registered.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum GrpcMethodError {
+    #[error("{path:?} is not a gRPC method path: it is /package.Service/Method")]
+    NotAMethodPath { path: String },
+    #[error("the gRPC method {path} is registered twice")]
+    AlreadyRegistered { path: String },
 }
 
-impl GrpcMethod {
-    pub const fn path(self) -> &'static str {
-        match self {
-            GrpcMethod::BenchmarkGetSum => "/benchmark.BenchmarkService/GetSum",
-        }
+/// Returns whether `path` is `/{service}/{method}` with neither part empty, as gRPC's `:path` is.
+fn is_grpc_method_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    match rest.split_once('/') {
+        Some((service, method)) => !service.is_empty() && !method.is_empty() && !method.contains('/'),
+        None => false,
     }
 }
 
@@ -628,6 +674,7 @@ struct RouteCounts {
 pub struct ExpectedRoute {
     pub key: RouteKey,
     pub on_worker: bool,
+    pub convention: CallConvention,
 }
 
 impl ExpectedRoute {
@@ -635,6 +682,7 @@ impl ExpectedRoute {
         ExpectedRoute {
             key: route.key.clone(),
             on_worker: matches!(route.runtime, HandlerPlace::Worker(_)),
+            convention: route.convention,
         }
     }
 }
@@ -677,10 +725,18 @@ impl RouteManifest {
         let list = |s: &Self| {
             let mut out = String::new();
             for (i, route) in s.routes.iter().enumerate() {
-                let ExpectedRoute { key, on_worker } = route;
+                let ExpectedRoute {
+                    key,
+                    on_worker,
+                    convention,
+                } = route;
                 let mark = if i == first_diff { "  <-- first difference" } else { "" };
                 let place = if *on_worker { "" } else { " (not on a sub-interpreter)" };
-                out.push_str(&format!("    [{i}] {key}{place}{mark}\n"));
+                let grpc = match convention {
+                    CallConvention::Http => "",
+                    CallConvention::GrpcUnary => " (gRPC method)",
+                };
+                out.push_str(&format!("    [{i}] {key}{grpc}{place}{mark}\n"));
             }
             for (i, WsRoute { path, place }) in s.websockets.iter().enumerate() {
                 let place = if *place == WsPlace::Worker {
@@ -733,16 +789,43 @@ impl<H, D> RouteTable<H, D> {
         }
     }
 
-    /// Registers a gRPC method the engine answers itself; registering it again changes nothing.
-    pub fn add_grpc_method(&mut self, method: GrpcMethod) {
-        if !self.grpc_methods.contains(&method) {
-            self.grpc_methods.push(method);
+    /// Registers a gRPC unary method at `path`, whose `def` handler runs on a sub-interpreter
+    /// worker; a refused one leaves the table untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `path` is not `/package.Service/Method` or has a method already.
+    pub fn add_grpc_method(&mut self, path: &str, handler: H, name: String) -> Result<RouteId, GrpcMethodError> {
+        if !is_grpc_method_path(path) {
+            return Err(GrpcMethodError::NotAMethodPath { path: path.to_string() });
         }
+        if self.grpc_method(path).is_some() {
+            return Err(GrpcMethodError::AlreadyRegistered { path: path.to_string() });
+        }
+        let id = RouteId(self.routes.len());
+        let target = HandlerTarget(self.handlers.len());
+        self.handlers.push(handler);
+        self.routes.push(Route {
+            handler: target,
+            name,
+            key: RouteKey {
+                method: Method::POST,
+                path: path.to_string(),
+            },
+            runtime: HandlerPlace::Worker(HandlerKind::Sync),
+            convention: CallConvention::GrpcUnary,
+        });
+        self.grpc_methods.push(id);
+        Ok(id)
     }
 
-    #[inline]
-    pub fn grpc_method(&self, path: &str) -> Option<GrpcMethod> {
-        self.grpc_methods.iter().copied().find(|m| m.path() == path)
+    /// Returns the gRPC method registered at exactly `path`.
+    #[inline(never)]
+    pub fn grpc_method(&self, path: &str) -> Option<RouteId> {
+        self.grpc_methods
+            .iter()
+            .copied()
+            .find(|id| self.routes[id.0].key.path == path)
     }
 
     /// Adds a hook that runs before every route's handler, after the hooks added earlier.
@@ -798,7 +881,7 @@ impl<H, D> RouteTable<H, D> {
     pub fn handlers(&self) -> impl Iterator<Item = &H> {
         self.handlers
             .iter()
-            .chain(self.ws_handlers.iter())
+            .chain(self.ws_handlers.iter().flat_map(WsHandlers::iter))
             .chain(self.before_hooks.iter())
             .chain(self.after_hooks.iter())
     }
@@ -820,11 +903,12 @@ impl<H, D> RouteTable<H, D> {
                     name: r.name.clone(),
                     key: r.key.clone(),
                     runtime: r.runtime,
+                    convention: r.convention,
                 })
                 .collect(),
             routers: self.routers.clone(),
             fallback: self.fallback,
-            ws_handlers: copy_all(&self.ws_handlers),
+            ws_handlers: self.ws_handlers.iter().map(|h| h.map(&copy)).collect(),
             ws_routes: self.ws_routes.clone(),
             ws_router: self.ws_router.clone(),
             before_hooks: copy_all(&self.before_hooks),
@@ -873,6 +957,7 @@ impl<H, D> RouteTable<H, D> {
             name,
             key,
             runtime,
+            convention: CallConvention::Http,
         });
         Ok(())
     }
@@ -888,13 +973,13 @@ impl<H, D> RouteTable<H, D> {
         Ok(self.fast_responses.get_or_default(&method).insert(path, response))
     }
 
-    /// Registers the WebSocket handler for `path`.
+    /// Registers the WebSocket handlers for `path`.
     ///
     /// # Errors
     ///
-    /// Returns an error when `path` already has a handler, or the router would read it
+    /// Returns an error when `path` already has handlers, or the router would read it
     /// differently from what it says.
-    pub fn add_websocket(&mut self, path: &str, handler: H, place: WsPlace) -> Result<(), WsRouteError> {
+    pub fn add_websocket(&mut self, path: &str, handlers: WsHandlers<H>, place: WsPlace) -> Result<(), WsRouteError> {
         template_params(path).map_err(|source| WsRouteError::MisreadPath {
             path: path.to_string(),
             source,
@@ -906,7 +991,7 @@ impl<H, D> RouteTable<H, D> {
                 path: path.to_string(),
                 source,
             })?;
-        self.ws_handlers.push(handler);
+        self.ws_handlers.push(handlers);
         self.ws_routes.push(WsRoute {
             path: path.to_string(),
             place,
@@ -932,12 +1017,12 @@ impl<H, D> RouteTable<H, D> {
         Some((*matched.value, Params::of_match(path, &matched.params)))
     }
 
-    pub fn ws_handler(&self, id: WsRouteId) -> &H {
+    pub fn ws_handler(&self, id: WsRouteId) -> &WsHandlers<H> {
         &self.ws_handlers[id.0]
     }
 
     /// Returns the WebSocket handlers, indexed by [`WsRouteId::index`].
-    pub fn ws_handlers(&self) -> &[H] {
+    pub fn ws_handlers(&self) -> &[WsHandlers<H>] {
         &self.ws_handlers
     }
 
@@ -996,7 +1081,7 @@ impl<H, D> RouteTable<H, D> {
     }
 
     /// Returns whether any request can run on the main interpreter, counting the fallback and the
-    /// `runtime="main"` WebSocket handlers, which run on main's async engine.
+    /// `runtime="main"` WebSocket handlers.
     pub fn uses_main(&self) -> bool {
         self.fallback.is_some()
             || self.has_websockets_on(WsPlace::Main)
@@ -1024,7 +1109,7 @@ impl<H, D> RouteTable<H, D> {
 
     /// Returns the methods that have a route for `path` as an `Allow` value; only a request
     /// that matched no route asks, so the scan is off the hot path.
-    pub(crate) fn allowed_methods(&self, path: &str) -> Option<HeaderValue> {
+    pub fn allowed_methods(&self, path: &str) -> Option<HeaderValue> {
         let routed = self
             .routers
             .iter()
@@ -1092,8 +1177,8 @@ fn allow_value<'a>(methods: impl Iterator<Item = &'a str>) -> Option<HeaderValue
     Some(HeaderValue::from_str(&methods.join(", ")).expect("HTTP method names are tokens, valid in a header value"))
 }
 
-/// How many of a table's routes run in each place; a WebSocket route counts as an `async def`
-/// one where it runs.
+/// How many of a table's routes run in each place; a WebSocket route counts as a `def` one with a
+/// buffered body where it runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlaceCounts {
     pub worker_sync: usize,
@@ -1118,11 +1203,10 @@ impl PlaceCounts {
             };
             *count += 1;
         }
-        // A WebSocket handler is an `async def` that runs on an async engine.
         for route in &table.ws_routes {
             match route.place {
-                WsPlace::Worker => counts.worker_async += 1,
-                WsPlace::Main => counts.main_async += 1,
+                WsPlace::Worker => counts.worker_sync += 1,
+                WsPlace::Main => counts.main_buffered += 1,
             }
         }
         counts
@@ -1142,8 +1226,19 @@ impl PlaceCounts {
     }
 }
 
+/// Returns handlers with `on_message` alone, as most route tests register.
 #[cfg(test)]
-mod fuzz;
+mod ws_test_handlers {
+    use super::WsHandlers;
+
+    pub(super) fn only<H>(on_message: H) -> WsHandlers<H> {
+        WsHandlers {
+            on_message,
+            on_connect: None,
+            on_close: None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod route_model;
@@ -1557,14 +1652,16 @@ mod ws_route_tests {
     fn a_table_has_websocket_routes_once_one_is_added() {
         let mut t = table();
         assert!(!t.has_websocket_routes());
-        t.add_websocket("/ws", 1, WsPlace::Main).unwrap();
+        t.add_websocket("/ws", ws_test_handlers::only(1), WsPlace::Main)
+            .unwrap();
         assert!(t.has_websocket_routes());
     }
 
     #[test]
     fn a_param_is_where_its_value_sits_in_the_path_and_decoded_only_when_read() {
         let mut t = table();
-        t.add_websocket("/img{id}.png/{*rest}", 1, WsPlace::Main).unwrap();
+        t.add_websocket("/img{id}.png/{*rest}", ws_test_handlers::only(1), WsPlace::Main)
+            .unwrap();
         let path = "/img%2542.png/a/b";
         let (_, params) = t.websocket(path).unwrap();
         let located: Vec<(&str, Range<usize>)> = params.located().collect();
@@ -1583,9 +1680,10 @@ mod ws_route_tests {
     #[test]
     fn a_websocket_path_is_a_template_with_decoded_params() {
         let mut t = table();
-        t.add_websocket("/chat/{room}", 7, WsPlace::Main).unwrap();
+        t.add_websocket("/chat/{room}", ws_test_handlers::only(7), WsPlace::Main)
+            .unwrap();
         let (id, params) = t.websocket("/chat/a%20b").unwrap();
-        assert_eq!(*t.ws_handler(id), 7);
+        assert_eq!(t.ws_handler(id).on_message, 7);
         assert_eq!(
             decoded_pairs(&params, "/chat/a%20b"),
             vec![("room".to_string(), "a b".to_string())]
@@ -1596,17 +1694,22 @@ mod ws_route_tests {
     #[test]
     fn a_duplicate_websocket_path_is_refused_and_keeps_the_first() {
         let mut t = table();
-        t.add_websocket("/ws", 1, WsPlace::Main).unwrap();
-        let err = t.add_websocket("/ws", 2, WsPlace::Main).unwrap_err();
+        t.add_websocket("/ws", ws_test_handlers::only(1), WsPlace::Main)
+            .unwrap();
+        let err = t
+            .add_websocket("/ws", ws_test_handlers::only(2), WsPlace::Main)
+            .unwrap_err();
         assert!(err.to_string().contains("/ws"), "{err}");
         let (id, _) = t.websocket("/ws").unwrap();
-        assert_eq!(*t.ws_handler(id), 1);
+        assert_eq!(t.ws_handler(id).on_message, 1);
     }
 
     #[test]
     fn a_colon_websocket_path_is_refused() {
         let mut t = table();
-        let err = t.add_websocket("/ws/:id", 1, WsPlace::Main).unwrap_err();
+        let err = t
+            .add_websocket("/ws/:id", ws_test_handlers::only(1), WsPlace::Main)
+            .unwrap_err();
         assert!(err.to_string().contains("{id}"), "{err}");
         assert!(t.websocket("/ws/:id").is_none());
     }
@@ -1622,19 +1725,21 @@ mod ws_route_tests {
             HandlerPlace::Main(MainHandler::Sync(BodyMode::Buffered)),
         )
         .unwrap();
-        t.add_websocket("/ws", 2, WsPlace::Main).unwrap();
+        t.add_websocket("/ws", ws_test_handlers::only(2), WsPlace::Main)
+            .unwrap();
         let (id, _) = t.websocket("/ws").unwrap();
-        assert_eq!(*t.ws_handler(id), 2);
+        assert_eq!(t.ws_handler(id).on_message, 2);
         assert!(t.resolve(&Method::GET, "/ws").is_some());
     }
 
     #[test]
     fn a_copy_keeps_the_websocket_routes() {
         let mut t = table();
-        t.add_websocket("/ws/{id}", 3, WsPlace::Main).unwrap();
+        t.add_websocket("/ws/{id}", ws_test_handlers::only(3), WsPlace::Main)
+            .unwrap();
         let copy = t.copy_with(|h| h + 10);
         let (id, params) = copy.websocket("/ws/9").unwrap();
-        assert_eq!(*copy.ws_handler(id), 13);
+        assert_eq!(copy.ws_handler(id).on_message, 13);
         assert_eq!(
             decoded_pairs(&params, "/ws/9"),
             vec![("id".to_string(), "9".to_string())]
@@ -1837,5 +1942,79 @@ mod method_tests {
         }
         assert!(t.fast_response(&method("PURGE"), "/fast").is_some());
         assert!(t.fast_response(&method("purge"), "/fast").is_none());
+    }
+}
+
+#[cfg(test)]
+mod grpc_method_tests {
+    use super::*;
+
+    const GET_SUM: &str = "/benchmark.BenchmarkService/GetSum";
+
+    #[test]
+    fn a_method_path_is_a_service_and_a_method() {
+        assert!(is_grpc_method_path(GET_SUM));
+        assert!(is_grpc_method_path("/s/m"));
+        for not in ["", "/", "//", "/s", "/s/", "//m", "s/m", "/s/m/", "/s/m/x"] {
+            assert!(!is_grpc_method_path(not), "{not:?}");
+        }
+    }
+
+    #[test]
+    fn a_method_is_a_worker_route_the_http_routers_do_not_hold() {
+        let mut t = RouteTable::<u32, ()>::new();
+        let id = t.add_grpc_method(GET_SUM, 7, "get_sum".into()).unwrap();
+        assert_eq!(t.grpc_method(GET_SUM), Some(id));
+        assert_eq!(t.grpc_method("/benchmark.BenchmarkService/GetSumX"), None);
+        let route = t.route(id);
+        assert_eq!(*t.handler(route.handler), 7);
+        assert_eq!(route.runtime, HandlerPlace::Worker(HandlerKind::Sync));
+        assert_eq!(route.convention, CallConvention::GrpcUnary);
+        assert!(t.resolve(&Method::POST, GET_SUM).is_none());
+        assert!(t.allowed_methods(GET_SUM).is_none());
+        assert!(t.uses_workers());
+    }
+
+    #[test]
+    fn a_refused_method_leaves_the_table_untouched() {
+        let mut t = RouteTable::<u32, ()>::new();
+        assert_eq!(
+            t.add_grpc_method("/GetSum", 1, "h".into()),
+            Err(GrpcMethodError::NotAMethodPath { path: "/GetSum".into() })
+        );
+        t.add_grpc_method(GET_SUM, 1, "h".into()).unwrap();
+        assert_eq!(
+            t.add_grpc_method(GET_SUM, 2, "h".into()),
+            Err(GrpcMethodError::AlreadyRegistered { path: GET_SUM.into() })
+        );
+        assert_eq!(t.routes().len(), 1);
+        assert_eq!(t.handlers().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn an_http_route_and_a_method_at_one_path_are_two_routes() {
+        let mut t = RouteTable::<u32, ()>::new();
+        t.insert("POST", GET_SUM, 1, "h".into(), HandlerPlace::Worker(HandlerKind::Sync))
+            .unwrap();
+        let id = t.add_grpc_method(GET_SUM, 2, "g".into()).unwrap();
+        assert!(matches!(
+            t.resolve(&Method::POST, GET_SUM),
+            Some((HandlerCall::Worker(_, _), _))
+        ));
+        assert_eq!(t.grpc_method(GET_SUM), Some(id));
+        let manifest = RouteManifest::of(&t);
+        assert_eq!(manifest.routes[0].convention, CallConvention::Http);
+        assert_eq!(manifest.routes[1].convention, CallConvention::GrpcUnary);
+        assert_ne!(manifest.routes[0], manifest.routes[1]);
+    }
+
+    #[test]
+    fn a_copy_keeps_the_methods() {
+        let mut t = RouteTable::<u32, ()>::new();
+        let id = t.add_grpc_method(GET_SUM, 1, "h".into()).unwrap();
+        let copy = t.copy_with(|h| h + 10);
+        assert_eq!(copy.grpc_method(GET_SUM), Some(id));
+        assert_eq!(copy.route(id).convention, CallConvention::GrpcUnary);
+        assert_eq!(*copy.handler(copy.route(id).handler), 11);
     }
 }

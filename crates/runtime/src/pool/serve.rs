@@ -5,18 +5,16 @@ use std::time::Duration;
 
 use super::watchdog::SyncLane;
 use super::{answer_if_awaited, answer_queue_if_last, PoolJob};
-use std::sync::Arc;
 
 use crate::engine_queue::{EngineInbox, EngineJob};
 use crate::exchange::error::WorkerGroup;
 use crate::exchange::error::{refuse, HandlerError, UnansweredError};
-use crate::exchange::loop_wait::LoopMailbox;
 use crate::job_queue::JobReceiver;
 use crate::live_workers::WorkerLife;
-use crate::websocket::WsConnection;
 use crate::worker::async_engine::AsyncEngine;
 use crate::worker::sync_runner::{ServeOutcome, UnitOutcome};
 use crate::worker::SubInterpreterWorker;
+use mipyre_http::plan::route::CallConvention;
 
 /// Turns an error caused by the watchdog's interruption into the budget's 504
 /// (`UnansweredError::Interrupted`), so the client gets the same answer whether the worker's reply
@@ -55,14 +53,17 @@ pub(super) fn serve_sync(
             continue;
         }
 
-        let (route, request, reply) = req.into_request();
+        let (route, convention, request, reply) = req.into_request();
         let label = request.label();
 
         lane.begin(route.index());
         let UnitOutcome {
             served: ServeOutcome { response, retired },
             interrupted,
-        } = worker.serve(route, request, |unit| lane.publish_unit(unit));
+        } = match convention {
+            CallConvention::Http => worker.serve(route, request, |unit| lane.publish_unit(unit)),
+            CallConvention::GrpcUnary => worker.serve_unary(route, request, |unit| lane.publish_unit(unit)),
+        };
         lane.end();
 
         let answer = settle_interrupted(response, interrupted, budget);
@@ -74,7 +75,7 @@ pub(super) fn serve_sync(
             if let Some(life) = lane.take_life() {
                 answer_queue_if_last(life.retired(&retirement), &rx);
             }
-            worker.end_on_own_thread();
+            drop(worker);
             return;
         }
     }
@@ -82,24 +83,14 @@ pub(super) fn serve_sync(
     if let Some(life) = lane.take_life() {
         life.stopped();
     }
-    worker.end_on_own_thread();
+    drop(worker);
 }
 
 /// Runs the async engine (`_worker/async_engine.py`) until its queue closes or it stops; requests it
 /// had taken were answered as it let go of them (see `AsyncJob`). The last async worker to die
 /// answers the requests still queued with why.
-/// Serves until the engine ends; it then stops taking WebSocket connections, so one handed later
-/// goes to another engine or is refused at once instead of waiting out its handshake's budget.
-pub(super) fn serve_async(
-    mut worker: SubInterpreterWorker<AsyncEngine>,
-    inbox: EngineInbox,
-    connections: Option<Arc<LoopMailbox<WsConnection>>>,
-    life: WorkerLife,
-) {
-    let (ended, left) = worker.run_async_engine(inbox, connections.clone());
-    if let Some(connections) = connections {
-        drop(connections.close());
-    }
+pub(super) fn serve_async(mut worker: SubInterpreterWorker<AsyncEngine>, inbox: EngineInbox, life: WorkerLife) {
+    let (ended, left) = worker.run_async_engine(inbox);
     match ended {
         Ok(()) => life.stopped(),
         Err(e) => {
@@ -115,7 +106,7 @@ pub(super) fn serve_async(
         }
     }
 
-    worker.end_on_own_thread();
+    drop(worker);
 }
 
 fn refuse_left(left: impl IntoIterator<Item = EngineJob>, cause: &std::sync::Arc<str>) {

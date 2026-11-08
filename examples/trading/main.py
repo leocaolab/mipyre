@@ -75,14 +75,10 @@ def get_signals(data):
 
 
 @app.websocket("/ws/prices")
-async def price_stream(ws):
+def price_stream(ws, msg):
     """Answer each text message, a comma-separated list of tickers or "all", with their
     quotes."""
-    async for msg in ws:
-        if isinstance(msg, bytes):
-            continue
-        wanted = TICKERS if msg.strip().lower() == "all" else [t.strip().upper() for t in msg.split(",")]
-        try:
-            await ws.send(json.dumps({t: get_live_price(t) for t in wanted if t in TICKERS}))
-        except ConnectionError:
-            return  # the client left
+    if isinstance(msg, bytes):
+        return None
+    wanted = TICKERS if msg.strip().lower() == "all" else [t.strip().upper() for t in msg.split(",")]
+    return json.dumps({t: get_live_price(t) for t in wanted if t in TICKERS})

@@ -123,7 +123,7 @@ pub struct StaticLookups<'r, 'p, D> {
     headers: &'p HeaderMap,
 }
 
-pub(crate) fn lookups<'r, 'p, D: AsRef<StaticMountRule>>(
+pub fn lookups<'r, 'p, D: AsRef<StaticMountRule>>(
     path: &'p str,
     headers: &'p HeaderMap,
     mounts: &'r [D],
@@ -243,11 +243,35 @@ pub fn choose_precompressed(accept_encoding: Option<&str>, has: CodingSet) -> Op
 }
 
 #[cfg(test)]
-mod fuzz;
+mod lookup_check;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_known_climbs_out_of_a_root_are_refused_or_stay_under_it() {
+        let long = format!("/static/{}", "a/".repeat(4096));
+        let spellings = [
+            "/static/../etc/passwd",
+            "/static/a/../../etc/passwd",
+            "/static/%2e%2e/etc/passwd",
+            "/static/%2E%2e%2fetc%2fpasswd",
+            "/static/.%2e/x",
+            "/static/..\\..\\etc\\passwd",
+            "/static/%5c..%5c..%5cetc",
+            "/static/x%00.txt",
+            "/static/%2fetc%2fpasswd",
+            "/static//etc/passwd",
+            "/static/./.",
+            "/static/%c0%ae%c0%ae/etc",
+            "/static/..%00/x",
+            long.as_str(),
+        ];
+        for path in spellings {
+            lookup_check::look_up(&(path.as_bytes().to_vec(), b"br, gzip".to_vec()));
+        }
+    }
 
     #[test]
     fn equivalent_spellings_of_a_path_share_one_entry() {
@@ -273,9 +297,9 @@ mod tests {
         assert_eq!(rule.relative("/s/"), None);
     }
 
-    struct Mount(StaticMountRule, &'static str);
+    struct StubMount(StaticMountRule, &'static str);
 
-    impl AsRef<StaticMountRule> for Mount {
+    impl AsRef<StaticMountRule> for StubMount {
         fn as_ref(&self) -> &StaticMountRule {
             &self.0
         }
@@ -284,9 +308,9 @@ mod tests {
     #[test]
     fn mounts_are_asked_in_order_and_accept_encoding_only_on_a_precompressed_one() {
         let mounts = [
-            Mount(StaticMountRule::new("/a", Copies::Original).unwrap(), "first"),
-            Mount(StaticMountRule::new("/b", Copies::Precompressed).unwrap(), "second"),
-            Mount(StaticMountRule::new("/a", Copies::Precompressed).unwrap(), "third"),
+            StubMount(StaticMountRule::new("/a", Copies::Original).unwrap(), "first"),
+            StubMount(StaticMountRule::new("/b", Copies::Precompressed).unwrap(), "second"),
+            StubMount(StaticMountRule::new("/a", Copies::Precompressed).unwrap(), "third"),
         ];
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, http::HeaderValue::from_static("br"));
@@ -311,7 +335,7 @@ mod tests {
 
     #[test]
     fn a_refused_path_is_yielded_as_its_refusal() {
-        let mounts = [Mount(StaticMountRule::new("/a", Copies::Original).unwrap(), "only")];
+        let mounts = [StubMount(StaticMountRule::new("/a", Copies::Original).unwrap(), "only")];
         let headers = HeaderMap::new();
         let mut asked = lookups("/a/%2e%2e/etc/passwd", &headers, &mounts);
         assert!(matches!(

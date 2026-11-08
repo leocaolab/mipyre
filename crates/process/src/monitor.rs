@@ -43,11 +43,11 @@ impl ProcessMonitor {
     pub(crate) fn add(&self, worker: Arc<WorkerProcess>) -> std::io::Result<()> {
         let token = self.next_token.get();
         match self.fd.get_ref().add(worker.handle(), worker.pid().into(), token)? {
-            super::os::Registration::Watching => {
+            super::os::ExitWatchStatus::Watching => {
                 self.next_token.set(token.wrapping_add(1));
                 self.watched.borrow_mut().insert(token, worker);
             }
-            super::os::Registration::Gone => {
+            super::os::ExitWatchStatus::AlreadyExited => {
                 worker.record_exit();
                 self.early.borrow_mut().push(worker);
             }

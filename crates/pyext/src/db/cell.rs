@@ -1,13 +1,13 @@
-//! Converts Postgres result cells to Python objects, dispatched on the column's `PgKind`.
+//! Converts Postgres result cells to Python objects, dispatched on the column's `PgType`.
 
+use mipyre_pg::numeric;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 use sqlx::postgres::{PgRow, PgValueRef};
 use sqlx::{Column, Decode, Postgres, Row, ValueRef};
 
-use super::kind::{PgKind, JSONB_VERSION};
-use super::numeric;
+use super::pg_type::{PgType, JSONB_VERSION};
 use super::py_types::{StdlibTypes, PG_EPOCH_ORDINAL};
 
 pub(crate) fn row_to_dict(py: Python<'_>, row: &PgRow) -> PyResult<Py<PyDict>> {
@@ -29,35 +29,35 @@ fn cell_to_py(py: Python<'_>, value: PgValueRef<'_>) -> PyResult<Py<PyAny>> {
     if value.is_null() {
         return Ok(py.None());
     }
-    let kind = PgKind::of(&value.type_info());
+    let kind = PgType::of(&value.type_info());
     let bytes = value.as_bytes().map_err(wire_error)?;
     Ok(match kind {
-        PgKind::Bool => decode::<bool>(value)?.into_pyobject(py)?.to_owned().into_any(),
-        PgKind::Int2 => decode::<i16>(value)?.into_pyobject(py)?.into_any(),
-        PgKind::Int4 => decode::<i32>(value)?.into_pyobject(py)?.into_any(),
-        PgKind::Int8 => decode::<i64>(value)?.into_pyobject(py)?.into_any(),
-        PgKind::Float4 => decode::<f32>(value)?.into_pyobject(py)?.into_any(),
-        PgKind::Float8 => decode::<f64>(value)?.into_pyobject(py)?.into_any(),
-        PgKind::Text => PyString::new(py, decode::<&str>(value)?).into_any(),
-        PgKind::Bytea | PgKind::Other => PyBytes::new(py, bytes).into_any(),
-        PgKind::Json => json(py, bytes)?,
-        PgKind::Jsonb => match bytes.split_first() {
+        PgType::Bool => decode::<bool>(value)?.into_pyobject(py)?.to_owned().into_any(),
+        PgType::Int2 => decode::<i16>(value)?.into_pyobject(py)?.into_any(),
+        PgType::Int4 => decode::<i32>(value)?.into_pyobject(py)?.into_any(),
+        PgType::Int8 => decode::<i64>(value)?.into_pyobject(py)?.into_any(),
+        PgType::Float4 => decode::<f32>(value)?.into_pyobject(py)?.into_any(),
+        PgType::Float8 => decode::<f64>(value)?.into_pyobject(py)?.into_any(),
+        PgType::Text => PyString::new(py, decode::<&str>(value)?).into_any(),
+        PgType::Bytea | PgType::Other => PyBytes::new(py, bytes).into_any(),
+        PgType::Json => json(py, bytes)?,
+        PgType::Jsonb => match bytes.split_first() {
             Some((&JSONB_VERSION, text)) => json(py, text)?,
             _ => return Err(PyRuntimeError::new_err("jsonb value without version 1 header")),
         },
-        PgKind::Numeric => {
+        PgType::Numeric => {
             let text = numeric::decode(bytes).map_err(wire_error)?;
             StdlibTypes::get(py)?.decimal.bind(py).call1((text,))?
         }
         // `UUID(hex=None, bytes=None, ...)` takes `bytes` by position, so no keyword dict is
         // built per cell.
-        PgKind::Uuid => StdlibTypes::get(py)?
+        PgType::Uuid => StdlibTypes::get(py)?
             .uuid
             .bind(py)
             .call1((py.None(), PyBytes::new(py, bytes)))?,
-        PgKind::Date => date(py, decode::<i32>(value)?)?,
-        PgKind::Timestamp => timestamp(py, decode::<i64>(value)?, false)?,
-        PgKind::Timestamptz => timestamp(py, decode::<i64>(value)?, true)?,
+        PgType::Date => date(py, decode::<i32>(value)?)?,
+        PgType::Timestamp => timestamp(py, decode::<i64>(value)?, false)?,
+        PgType::Timestamptz => timestamp(py, decode::<i64>(value)?, true)?,
     }
     .unbind())
 }

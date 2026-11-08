@@ -1,6 +1,6 @@
-//! The channel's Shuttle model: one host thread runs four channels, each with a peer thread of
-//! its own, through the shipping ends ([`HostEnd`], [`PeerEnd`], `sleep_all`, `wake_all`) over a [`ModelMemory`] and
-//! the same kernel as the Loom models (`model.rs`: the peer sleeps on a futex, the host on its one wake pipe, neither
+//! The channel's Shuttle model: one caller thread runs four channels, each with a peer thread of
+//! its own, through the shipping ends ([`RequesterEnd`], [`PeerEnd`], `prepare_to_wait`, `finish_wait`) over a [`ModelMemory`] and
+//! the same kernel as the Loom models (`model.rs`: the peer sleeps on a futex, the caller on its one wake pipe, neither
 //! with a timeout). Loom enumerates two threads and a few steps; this runs five threads and 800 requests under
 //! seeded PCT schedules, so it checks the protocol at scale: nothing is lost, duplicated or reordered, and a wake is
 //! never lost (a lost one leaves every thread asleep, which Shuttle reports as a deadlock). Shuttle runs every
@@ -17,14 +17,16 @@ use bytes::BytesMut;
 use shuttle::scheduler::PctScheduler;
 use shuttle::{thread, Config, Runner};
 
-use crate::channel::{sleep_all, wake_all, Channel, HostEnd, ModelMemory, PeerEnd, SleepVerdict, Wait, MODEL_SLOT};
-use crate::model::{FutexModel, PipeModel};
+use crate::channel::{
+    finish_wait, prepare_to_wait, Channel, ModelMemory, PeerEnd, RequesterEnd, SleepDecision, WaitOutcome, MODEL_SLOT,
+};
+use crate::model::{FakeFutex, FakeWakePipe};
 use crate::plan::geometry::{Geometry, SlotBytes};
 use crate::plan::ring::{RingDepth, Seq};
 use crate::plan::spin_window::SpinWindow;
 
-type Host = HostEnd<ModelMemory, FutexModel>;
-type Peer = PeerEnd<ModelMemory, PipeModel, FutexModel>;
+type Requester = RequesterEnd<ModelMemory, FakeFutex>;
+type Peer = PeerEnd<ModelMemory, FakeWakePipe, FakeFutex>;
 
 const CHANNELS: usize = 4;
 const REQUESTS: usize = 200;
@@ -36,7 +38,7 @@ const PCT_DEPTH: usize = 3;
 /// The fixed schedules: [`SCHEDULES`] PCT schedules drawn from this seed, the same on every run. One seed and
 /// many schedules, not many seeds of one schedule each: PCT picks where to change priorities from the run lengths it
 /// has seen, so the first schedule of a seed changes them nowhere useful, and 32 one-schedule seeds missed the lost
-/// wake that [`a_host_that_says_it_sleeps_after_its_last_look_loses_a_wake`] plants (8 schedules of one seed miss it
+/// wake that [`a_caller_that_says_it_sleeps_after_its_last_look_loses_a_wake`] plants (8 schedules of one seed miss it
 /// too, 16 find it).
 const SEED: u64 = 0;
 const SCHEDULES: usize = 32;
@@ -65,19 +67,19 @@ fn peer(mut peer: Peer, n: usize) -> Vec<(Seq, u8)> {
     let mut taken = Vec::with_capacity(n);
     while taken.len() < n {
         let Ok(wait) = peer.wait_for_request(SpinWindow::until(0), || 0, 0);
-        let Wait::Request(request) = wait else { continue };
+        let WaitOutcome::Request(request) = wait else { continue };
         let seq = request.seq();
         let byte = request.bytes().unwrap()[0];
-        let Ok(_) = request.answer(|w| w.put(&[answer_byte(byte)]).unwrap());
+        let Ok(_) = request.respond(|w| w.put(&[answer_byte(byte)]).unwrap());
         taken.push((seq, byte));
     }
     taken
 }
 
-/// The host: keeps every channel's ring full until each has sent [`REQUESTS`], reads every answer, and sleeps as the
-/// host's park hook does when there is nothing to read (say awake, say asleep and look once more, wait on the pipe
+/// The caller: keeps every channel's ring full until each has sent [`REQUESTS`], reads every answer, and sleeps as the
+/// caller's park hook does when there is nothing to read (say awake, say asleep and look once more, wait on the pipe
 /// only on `Park`). Returns each channel's answers in the order read.
-fn host(ends: &mut [Host; CHANNELS], pipe: &PipeModel) -> [Vec<(Seq, u8)>; CHANNELS] {
+fn caller(ends: &mut [Requester; CHANNELS], pipe: &FakeWakePipe) -> [Vec<(Seq, u8)>; CHANNELS] {
     let mut sent = [0usize; CHANNELS];
     let mut read: [Vec<(Seq, u8)>; CHANNELS] = Default::default();
     let mut buf = BytesMut::new();
@@ -89,7 +91,7 @@ fn host(ends: &mut [Host; CHANNELS], pipe: &PipeModel) -> [Vec<(Seq, u8)>; CHANN
                 let Ok(_) = slot.publish();
                 sent[i] += 1;
             }
-            let mut ready = end.answers().expect("a correct peer");
+            let mut ready = end.responses().expect("a correct peer");
             while let Some(seq) = ready.take_next(&mut buf).expect("a correct peer") {
                 read[i].push((seq, buf[0]));
                 buf.clear();
@@ -105,8 +107,8 @@ fn host(ends: &mut [Host; CHANNELS], pipe: &PipeModel) -> [Vec<(Seq, u8)>; CHANN
         if room {
             continue;
         }
-        wake_all(ends);
-        if sleep_all(ends) == SleepVerdict::Park {
+        finish_wait(ends);
+        if prepare_to_wait(ends) == SleepDecision::Park {
             pipe.wait_and_drain();
         }
     }
@@ -115,7 +117,7 @@ fn host(ends: &mut [Host; CHANNELS], pipe: &PipeModel) -> [Vec<(Seq, u8)>; CHANN
 /// One run: every request is taken once, in order, by its channel's peer, and its answer read once, in order, with
 /// what the peer answered; the pipe holds at most one byte per answer.
 fn model() {
-    let (futex, pipe) = (FutexModel::default(), PipeModel::default());
+    let (futex, pipe) = (FakeFutex::default(), FakeWakePipe::default());
     let channels: Vec<_> = (0..CHANNELS).map(|_| channel()).collect();
     let peers: Vec<_> = channels
         .iter()
@@ -124,9 +126,10 @@ fn model() {
             thread::spawn(move || peer(end, REQUESTS))
         })
         .collect();
-    let mut ends: [Host; CHANNELS] = std::array::from_fn(|i| HostEnd::new(Arc::clone(&channels[i]), futex.clone()));
+    let mut ends: [Requester; CHANNELS] =
+        std::array::from_fn(|i| RequesterEnd::new(Arc::clone(&channels[i]), futex.clone()));
 
-    let read = host(&mut ends, &pipe);
+    let read = caller(&mut ends, &pipe);
 
     let expected: Vec<(Seq, u8)> = (0..REQUESTS).map(|n| (Seq::new(n as u32), request_byte(n))).collect();
     for (i, taken) in peers.into_iter().map(|p| p.join().unwrap()).enumerate() {
@@ -163,29 +166,29 @@ fn every_request_is_taken_and_answered_once_in_order_under_the_fixed_schedules()
     assert_eq!(ended.load(std::sync::atomic::Ordering::Relaxed), SCHEDULES);
 }
 
-/// The check itself: a host that says it sleeps only after its last look, as a host with no `sleep_all` would, loses
+/// The check itself: a caller that says it sleeps only after its last look, as a caller with no `prepare_to_wait` would, loses
 /// a wake in one of the fixed schedules (the peer publishes between the look and the flag, sees no flag and
 /// rings nothing), and Shuttle reports the deadlock. It runs that shape on bare words, not the shipping code.
 #[test]
 #[should_panic(expected = "deadlock")]
-fn a_host_that_says_it_sleeps_after_its_last_look_loses_a_wake() {
+fn a_caller_that_says_it_sleeps_after_its_last_look_loses_a_wake() {
     use crate::sync::{AtomicU32, Ordering::SeqCst};
     let lost = || {
-        let pipe = PipeModel::default();
+        let pipe = FakeWakePipe::default();
         let words = Arc::new((AtomicU32::new(0), AtomicU32::new(0)));
         let peer = thread::spawn({
             let (pipe, words) = (pipe.clone(), Arc::clone(&words));
             move || {
-                let (published, host_sleeping) = &*words;
+                let (published, requester_sleeping) = &*words;
                 published.store(1, SeqCst);
-                if host_sleeping.load(SeqCst) == 1 {
+                if requester_sleeping.load(SeqCst) == 1 {
                     let Ok(()) = crate::protocol::doorbell::Doorbell::ring(&pipe, published);
                 }
             }
         });
-        let (published, host_sleeping) = &*words;
+        let (published, requester_sleeping) = &*words;
         let seen = published.load(SeqCst);
-        host_sleeping.store(1, SeqCst);
+        requester_sleeping.store(1, SeqCst);
         if seen == 0 {
             pipe.wait_and_drain();
         }

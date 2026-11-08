@@ -1,15 +1,16 @@
-"""The app every runtime mode is measured on; the runtime comes from `mipyre run --runtime`.
+"""The app every runtime mode is measured on; `BENCH_RUNTIME` names the runtime, unset is the default.
 
 numpy is imported inside its handler, so a sub-interpreter never loads it.
 """
 
 import functools
+import os
 
 from mipyre import Mipyre
 
 CPU_ITERATIONS = 60_000
 
-app = Mipyre()
+app = Mipyre(runtime=os.environ.get("BENCH_RUNTIME"))
 
 
 @app.get("/plaintext")

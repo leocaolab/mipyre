@@ -88,6 +88,16 @@ impl<'py, L: EventLoopProvider> Chain<'_, 'py, L> {
         self.call(handler, (req,), RequestStage::Handler, meaning)
     }
 
+    /// Calls a WebSocket handler with `args` and returns its value, with any awaitable already
+    /// run.
+    pub(crate) fn callback<A: PyCallArgs<'py>>(
+        &mut self,
+        handler: &Py<PyAny>,
+        args: A,
+    ) -> Result<Bound<'py, PyAny>, HandlerError> {
+        self.call(handler, args, RequestStage::Handler, ExceptionMapping::AsRaised)
+    }
+
     /// Runs the after hooks; each sees the response so far and may replace it by returning
     /// something other than `None`.
     ///
@@ -163,7 +173,7 @@ impl<'py, L: EventLoopProvider> Chain<'_, 'py, L> {
 /// `mipyre.engine.NoEventLoopError` naming the route and what works instead, with asyncio's error
 /// as its cause; any other error comes back unchanged. A `def` handler has no current loop because
 /// the worker's loop was set on the thread that built the worker, not on the one serving.
-fn explain_no_current_loop(py: Python<'_>, key: &RouteKey, handler: &Py<PyAny>, raised: PyErr) -> PyErr {
+pub(crate) fn explain_no_current_loop(py: Python<'_>, key: &RouteKey, handler: &Py<PyAny>, raised: PyErr) -> PyErr {
     if !is_no_current_loop(py, &raised) {
         return raised;
     }
@@ -202,7 +212,7 @@ fn explain_no_current_loop(py: Python<'_>, key: &RouteKey, handler: &Py<PyAny>, 
 /// Adds to `raised`, as a note, the advice `mipyre._worker.imports.explain` gives when it is an
 /// extension that can't load in a sub-interpreter; when the check itself raises, the note says
 /// that instead. Any other error comes back unchanged.
-fn explain_not_for_subinterpreters(py: Python<'_>, raised: PyErr) -> PyErr {
+pub(crate) fn explain_not_for_subinterpreters(py: Python<'_>, raised: PyErr) -> PyErr {
     let explained = py
         .import(intern!(py, "mipyre._worker.imports"))
         .and_then(|imports| imports.call_method1(intern!(py, "explain"), (raised.value(py),)))

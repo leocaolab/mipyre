@@ -22,7 +22,7 @@ pub(super) struct Inbox<T> {
 
 /// Why [`Inbox::send`] gave its item back.
 #[derive(Debug)]
-pub(super) enum InboxRefusal<T> {
+pub(super) enum TrySendError<T> {
     Full(T),
     Closed(T),
 }
@@ -38,11 +38,11 @@ impl<T> Inbox<T> {
 
     /// Puts `item` in and wakes the task waiting in [`Inbox::next`]. Never waits. An item that
     /// meets a close on its way in is dropped, as if the close had come just after it.
-    pub(super) fn send(&self, item: T) -> Result<(), InboxRefusal<T>> {
+    pub(super) fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         if self.closed.load(Ordering::Relaxed) {
-            return Err(InboxRefusal::Closed(item));
+            return Err(TrySendError::Closed(item));
         }
-        self.items.push(item).map_err(InboxRefusal::Full)?;
+        self.items.push(item).map_err(TrySendError::Full)?;
         // Pairs with the fence in `close`: either this load sees the close, or the close's drain
         // sees this item.
         fence(Ordering::SeqCst);
@@ -104,11 +104,11 @@ mod tests {
     #[test]
     fn an_inbox_takes_up_to_its_capacity_and_hands_the_next_back_as_full() {
         let inbox = inbox(2);
-        assert!(inbox.send(1).is_ok());
-        assert!(inbox.send(2).is_ok());
-        assert!(matches!(inbox.send(3), Err(InboxRefusal::Full(3))));
+        assert!(inbox.try_send(1).is_ok());
+        assert!(inbox.try_send(2).is_ok());
+        assert!(matches!(inbox.try_send(3), Err(TrySendError::Full(3))));
         assert_eq!(inbox.take(), Some(1));
-        assert!(inbox.send(3).is_ok(), "a taken item makes room for one");
+        assert!(inbox.try_send(3).is_ok(), "a taken item makes room for one");
         assert_eq!(inbox.take(), Some(2));
         assert_eq!(inbox.take(), Some(3));
         assert_eq!(inbox.take(), None);
@@ -118,7 +118,7 @@ mod tests {
     fn a_closed_inbox_drops_what_is_left_and_hands_every_later_item_back() {
         let dropped = std::sync::Arc::new(());
         let inbox = Inbox::new(NonZeroUsize::MIN);
-        assert!(inbox.send(std::sync::Arc::clone(&dropped)).is_ok());
+        assert!(inbox.try_send(std::sync::Arc::clone(&dropped)).is_ok());
         inbox.close();
         assert_eq!(
             std::sync::Arc::strong_count(&dropped),
@@ -127,15 +127,15 @@ mod tests {
         );
         assert!(inbox.is_closed());
         assert!(matches!(
-            inbox.send(std::sync::Arc::clone(&dropped)),
-            Err(InboxRefusal::Closed(_))
+            inbox.try_send(std::sync::Arc::clone(&dropped)),
+            Err(TrySendError::Closed(_))
         ));
         assert!(inbox.take().is_none());
     }
 
-    struct WakeFlag(AtomicBool);
+    struct SpyWaker(AtomicBool);
 
-    impl futures_util::task::ArcWake for WakeFlag {
+    impl futures_util::task::ArcWake for SpyWaker {
         fn wake_by_ref(flag: &std::sync::Arc<Self>) {
             flag.0.store(true, Ordering::Relaxed);
         }
@@ -144,13 +144,13 @@ mod tests {
     #[test]
     fn a_waiting_taker_is_woken_by_a_send_and_gets_the_item() {
         let inbox = inbox(1);
-        let flag = std::sync::Arc::new(WakeFlag(AtomicBool::new(false)));
+        let flag = std::sync::Arc::new(SpyWaker(AtomicBool::new(false)));
         let waker = futures_util::task::waker(std::sync::Arc::clone(&flag));
         let mut cx = std::task::Context::from_waker(&waker);
         let mut next = std::pin::pin!(inbox.next());
         assert!(next.as_mut().poll(&mut cx).is_pending());
         assert!(!flag.0.load(Ordering::Relaxed));
-        assert!(inbox.send(7).is_ok());
+        assert!(inbox.try_send(7).is_ok());
         assert!(flag.0.load(Ordering::Relaxed), "the send woke the waiting taker");
         assert_eq!(next.as_mut().poll(&mut cx), Poll::Ready(7));
     }

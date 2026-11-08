@@ -49,6 +49,7 @@ pub(crate) fn render(record: ErrorRecord, counters: &SiteCounters) -> Response<F
                 UnansweredError::WorkerLost(_)
                 | UnansweredError::NoWorkers(_)
                 | UnansweredError::NotOnWorker(_)
+                | UnansweredError::WebSocketNotOnWorker(_)
                 | UnansweredError::Lane(LaneUnansweredError::Dropped) => {
                     response::error_response(GENERIC_500, &request_id)
                 }
@@ -69,7 +70,9 @@ pub(crate) fn render(record: ErrorRecord, counters: &SiteCounters) -> Response<F
             response::bad_request_response(&reject.to_string())
         }
         HandlerError::Http { answer, .. } => response::build_response(*answer),
+        // Only a gRPC method's call reads a raised `GrpcError`, and it is answered by `grpc.rs`.
         HandlerError::Raised { .. }
+        | HandlerError::Grpc { .. }
         | HandlerError::ContextNotExited { .. }
         | HandlerError::ContextLost { .. }
         | HandlerError::Panicked { .. }

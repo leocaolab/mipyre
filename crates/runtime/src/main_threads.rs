@@ -30,15 +30,20 @@ use tokio::sync::oneshot;
 
 use super::engine_queue::{one_engine_queue, EngineInbox, EngineJob, EngineReply, EngineSender};
 use super::job_queue::{job_queue, JobReceiver, JobSendError, JobSender};
-use super::worker::async_engine::{run_engine_module, EngineFailure, EngineRoutes, EngineWebSockets};
+use super::worker::async_engine::{run_engine_module, EngineFailure, EngineRoutes};
+use crate::exchange::error::catch_panic;
 use crate::exchange::error::{refuse, Capacity, ErrorRecord, HandlerError, ReplyHolder, UnansweredError, WorkerGroup};
-use crate::exchange::loop_wait::LoopMailbox;
 use crate::exchange::request::Request;
+use crate::exchange::websocket::{Outbox, WsClose};
 use crate::exchange::HandlerReply;
+use crate::hook_chain::Chain;
+use crate::main_call::{main_chain, ThreadLoop};
+use crate::request_context::in_reused_context;
 use crate::sync::{Mutex, OnceLock};
-use crate::websocket::{WsConnection, WsEngines};
+use crate::websocket::{self, SessionKey, Sessions, WsEvent, WsSession, WsUpgradeAnswer};
 use crate::{answer_if_awaited, call_handler_with_hooks, PoolJob};
-use mipyre_http::plan::route::{HandlerPlace, HandlerTarget, MainHandler, WsPlace};
+use mipyre_http::io::request_head::RequestLabel;
+use mipyre_http::plan::route::{HandlerPlace, HandlerTarget, MainHandler, WsRouteId};
 use mipyre_http::plan::site::SiteRules;
 use mipyre_subinterp::context::SpareContext;
 use mipyre_tpc::{OsThread, Spawner, ThreadJoinError};
@@ -82,6 +87,46 @@ pub(crate) struct MainJob {
 
 pub(crate) type MainReplySender = oneshot::Sender<Result<HandlerReply, ErrorRecord>>;
 
+/// What the `def` threads take from their queue: a request, or a call of a `runtime="main"`
+/// WebSocket connection.
+/// A WebSocket call is boxed so that a request, the def path's work, moves no more bytes than
+/// before there were two kinds.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "boxing the request instead would allocate once per request on the def path"
+)]
+pub(crate) enum MainWork {
+    Request(MainJob),
+    WebSocket(Box<MainWsJob>),
+}
+
+/// One call of a WebSocket connection on main, with where its answer goes.
+pub(crate) struct MainWsJob {
+    route: WsRouteId,
+    call: MainWsCall,
+}
+
+enum MainWsCall {
+    /// The request is boxed, as an upgrade is once per connection and the calls are many.
+    Open {
+        request: Box<Request>,
+        outbox: Arc<Outbox>,
+        reply: oneshot::Sender<Result<WsUpgradeAnswer, HandlerError>>,
+    },
+    Event {
+        session: SessionKey,
+        event: WsEvent,
+        reply: oneshot::Sender<Result<(), HandlerError>>,
+    },
+    /// `on_close` is called when `close` says how the connection ended; the label names the
+    /// connection in the log line of one that raised.
+    Close {
+        session: WsSession,
+        close: Option<WsClose>,
+        label: RequestLabel,
+    },
+}
+
 /// Reports what the OS would not give while the server starts; it fails the start, because
 /// serving with fewer threads than the fewest kept would be a silent capacity cut.
 #[derive(Debug, thiserror::Error)]
@@ -105,12 +150,9 @@ impl From<MainThreadStartError> for PyErr {
 
 /// Sends work to the main interpreter's threads; they exit once every sender is gone.
 pub struct MainThreads {
-    tx: JobSender<MainJob>,
-    /// Is `None` when the table has no `async def` main route and no `runtime="main"` WebSocket
-    /// route.
+    tx: JobSender<MainWork>,
+    /// Is `None` when the table has no `async def` main route.
     engine: Option<MainEngine>,
-    /// Is `None` when the table has no `runtime="main"` WebSocket route.
-    websockets: Option<WsEngines>,
     max_threads: usize,
     set: Arc<DefThreadSet>,
 }
@@ -121,6 +163,9 @@ struct DefThreadSet {
     /// threads and the thread starting it never touches Python.
     rules: MainRules,
     min_threads: usize,
+    /// Holds the `ws` of every `runtime="main"` WebSocket connection; its last reference goes
+    /// attached to main.
+    sessions: Arc<Mutex<Sessions>>,
     roster: Mutex<ThreadRoster>,
     not_started_log: LogThrottle,
 }
@@ -160,10 +205,11 @@ impl MainThreads {
         let min_threads = sizes.min_threads();
         let retires = min_threads < sizes.max_threads.get();
         let shutdown_timeout = rules.settings.limits.shutdown_timeout.get();
-        let (tx, rx) = job_queue::<MainJob>(sizes.queue.get());
+        let (tx, rx) = job_queue::<MainWork>(sizes.queue.get());
         let set = Arc::new(DefThreadSet {
             rules: crate::copy_rules(rules, py),
             min_threads,
+            sessions: Arc::default(),
             roster: Mutex::new(ThreadRoster {
                 threads: Vec::with_capacity(min_threads),
                 numbered: 0,
@@ -198,20 +244,7 @@ impl MainThreads {
         }
         drop(rx);
 
-        let connections = if rules.routes.ws_routes().iter().any(|w| w.place == WsPlace::Main) {
-            match LoopMailbox::new() {
-                Ok(mailbox) => Some(Arc::new(mailbox)),
-                Err(source) => {
-                    drop(tx);
-                    py.detach(|| handles.join(&ShutdownDeadline::new(shutdown_timeout)));
-                    return Err(MainThreadStartError::DoorbellNotMade(source));
-                }
-            }
-        } else {
-            None
-        };
-        let websockets = connections.as_ref().map(|c| WsEngines::new(vec![Arc::clone(c)]));
-        let (engine, handles) = match engine_routes(py, rules, connections) {
+        let (engine, handles) = match engine_routes(py, rules) {
             None => (None, handles),
             Some(routes) => {
                 let (jobs, inbox) = match one_engine_queue(sizes.queue.get()) {
@@ -259,7 +292,6 @@ impl MainThreads {
         let threads = MainThreads {
             tx,
             engine,
-            websockets,
             max_threads: sizes.max_threads.get(),
             set,
         };
@@ -271,7 +303,7 @@ impl MainThreads {
     /// threads already running, of which there are at least the fewest kept.
     #[cold]
     #[inline(never)]
-    fn start_def_thread(&self, rx: JobReceiver<MainJob>) {
+    fn start_def_thread(&self, rx: JobReceiver<MainWork>) {
         let mut roster = self.set.roster.lock();
         reap_finished(&mut roster.threads);
         let i = roster.numbered;
@@ -334,28 +366,106 @@ impl HandoffBackend for MainThreads {
     // which copies the 352-byte request into the job.
     #[inline(always)]
     fn submit(&self, (target, handler, request): Self::Ask) -> Result<MainRun, UnansweredError> {
-        let group = WorkerGroup::Main;
         if handler == MainHandler::Async {
             return self.submit_async(target, request);
         }
         let (reply, answered) = oneshot::channel();
         self.tx
-            .try_send_or_grow(MainJob { target, request, reply }, self.max_threads, |rx| {
-                self.start_def_thread(rx);
-            })
-            .map_err(|e| match e {
-                JobSendError::QueueFull => UnansweredError::Overloaded(Capacity::WorkQueue(group)),
-                JobSendError::NoReceiverLeft => UnansweredError::WorkersGone(group),
-            })?;
+            .try_send_or_grow(
+                MainWork::Request(MainJob { target, request, reply }),
+                self.max_threads,
+                |rx| {
+                    self.start_def_thread(rx);
+                },
+            )
+            .map_err(refusal)?;
         Ok(MainRun(answered))
     }
 }
 
+/// Says why the `def` threads' queue refused a job.
+#[inline]
+fn refusal(e: JobSendError) -> UnansweredError {
+    let group = WorkerGroup::Main;
+    match e {
+        JobSendError::QueueFull => UnansweredError::Overloaded(Capacity::WorkQueue(group)),
+        JobSendError::NoReceiverLeft => UnansweredError::WorkersGone(group),
+    }
+}
+
 impl MainThreads {
-    /// Returns where this server's `runtime="main"` WebSocket connections are handed, `None` when
-    /// it has none.
-    pub fn websocket_engines(&self) -> Option<&WsEngines> {
-        self.websockets.as_ref()
+    /// Hands a `runtime="main"` WebSocket upgrade to the `def` threads, which run its hooks and
+    /// open its session.
+    ///
+    /// # Errors
+    ///
+    /// Refuses as a request is refused when the queue is full or has no thread.
+    pub fn ws_open(
+        &self,
+        route: WsRouteId,
+        request: Request,
+        outbox: Arc<Outbox>,
+    ) -> Result<impl Future<Output = Result<WsUpgradeAnswer, HandlerError>> + Send + 'static, UnansweredError> {
+        let (reply, answered) = oneshot::channel();
+        self.submit_ws(MainWsJob {
+            route,
+            call: MainWsCall::Open {
+                request: Box::new(request),
+                outbox,
+                reply,
+            },
+        })?;
+        Ok(async move { answered.await.unwrap_or_else(|_| Err(lost())) })
+    }
+
+    /// Hands one call of a connection to the `def` threads.
+    ///
+    /// # Errors
+    ///
+    /// Refuses as a request is refused when the queue is full or has no thread.
+    pub fn ws_call(
+        &self,
+        route: WsRouteId,
+        session: &WsSession,
+        event: WsEvent,
+    ) -> Result<impl Future<Output = Result<(), HandlerError>> + Send + 'static, UnansweredError> {
+        let (reply, answered) = oneshot::channel();
+        self.submit_ws(MainWsJob {
+            route,
+            call: MainWsCall::Event {
+                session: session.key(),
+                event,
+                reply,
+            },
+        })?;
+        Ok(async move { answered.await.unwrap_or_else(|_| Err(lost())) })
+    }
+
+    /// Hands a connection's end to the `def` threads, which call its `on_close` when `close` says
+    /// how it ended, and let go of its session.
+    ///
+    /// # Errors
+    ///
+    /// Refuses as a request is refused; the session is then held until the server stops.
+    pub fn ws_close(
+        &self,
+        route: WsRouteId,
+        session: WsSession,
+        close: Option<WsClose>,
+        label: RequestLabel,
+    ) -> Result<(), UnansweredError> {
+        self.submit_ws(MainWsJob {
+            route,
+            call: MainWsCall::Close { session, close, label },
+        })
+    }
+
+    fn submit_ws(&self, job: MainWsJob) -> Result<(), UnansweredError> {
+        self.tx
+            .try_send_or_grow(MainWork::WebSocket(Box::new(job)), self.max_threads, |rx| {
+                self.start_def_thread(rx)
+            })
+            .map_err(refusal)
     }
 
     /// Queues an `async def` ask for main's async engine; out of line, so the `def` path's code does
@@ -405,11 +515,7 @@ impl Future for MainRun {
 /// Returns what main's async engine serves: the `async def` main routes' handlers, indexed by
 /// [`HandlerTarget`] (`None` for any other), and the app's hooks; `None` when there is no such
 /// route.
-fn engine_routes(
-    py: Python<'_>,
-    rules: &MainRules,
-    connections: Option<Arc<LoopMailbox<WsConnection>>>,
-) -> Option<EngineRoutes> {
+fn engine_routes(py: Python<'_>, rules: &MainRules) -> Option<EngineRoutes> {
     let routes = &rules.routes;
     let targets: Vec<HandlerTarget> = routes
         .routes()
@@ -417,7 +523,7 @@ fn engine_routes(
         .filter(|route| route.runtime == HandlerPlace::Main(MainHandler::Async))
         .map(|route| route.handler)
         .collect();
-    if targets.is_empty() && connections.is_none() {
+    if targets.is_empty() {
         return None;
     }
     let len = targets.iter().map(|target| target.index() + 1).max().unwrap_or(0);
@@ -431,15 +537,6 @@ fn engine_routes(
         before: copy(routes.before_hooks()),
         after: copy(routes.after_hooks()),
         streams: true,
-        websockets: connections.map(|connections| EngineWebSockets {
-            handlers: routes
-                .ws_routes()
-                .iter()
-                .zip(routes.ws_handlers())
-                .map(|(route, h)| (route.place == WsPlace::Main).then(|| h.clone_ref(py)))
-                .collect(),
-            connections,
-        }),
     })
 }
 
@@ -447,15 +544,9 @@ fn engine_routes(
 /// records why, and the jobs queued for it then, and every one submitted after, are refused at once
 /// with that, so their callers are not left to time out.
 fn serve_async(inbox: EngineInbox, routes: EngineRoutes, died: &OnceLock<Arc<str>>) {
-    let connections = routes.websockets.as_ref().map(|ws| Arc::clone(&ws.connections));
     let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         mipyre_subinterp::attach::with_main(|py| run_engine_module(py, inbox, routes))
     }));
-    // A connection handed after the engine ended is refused at once instead of waiting out its
-    // handshake's budget.
-    if let Some(connections) = connections {
-        drop(connections.close());
-    }
     let (cause, left): (Arc<str>, _) = match ended {
         Ok((Ok(()), _)) => return,
         Ok((Err(EngineFailure::Setup(exception)), left)) => (
@@ -539,41 +630,100 @@ fn log_panicked(thread: &str, message: &str) {
 
 /// Serves `def` jobs until the queue closes or, when `retires`, until it idles past the keepalive
 /// with more than the fewest threads running.
-fn serve_def(i: usize, rx: JobReceiver<MainJob>, set: Arc<DefThreadSet>, retires: bool) {
+fn serve_def(i: usize, rx: JobReceiver<MainWork>, set: Arc<DefThreadSet>, retires: bool) {
     let min_threads = set.min_threads;
+    let sessions = Arc::clone(&set.sessions);
     // The set may be the last reference to the template, so it goes attached.
     let rules = mipyre_subinterp::attach::with_main(move |py| crate::copy_rules(&set.rules, py));
     let mut spare = SpareContext::default();
     if retires {
         let mut receiver = rx;
         while let Some((job, next)) = receiver.recv_or_retire(min_threads, DEF_THREAD_KEEPALIVE) {
-            dispatch_one(&rules, &mut spare, job);
+            dispatch(&rules, &sessions, &mut spare, job);
             receiver = next;
         }
     } else {
         while let Some(job) = rx.recv() {
-            dispatch_one(&rules, &mut spare, job);
+            dispatch(&rules, &sessions, &mut spare, job);
         }
     }
     // Python objects this thread owns must go while attached, before the thread state does.
     mipyre_subinterp::attach::with_main(move |py| {
         crate::close_thread_event_loop(py);
         spare.release(py);
-        drop(rules);
+        drop((rules, sessions));
     });
     tracing::info!(target: "mipyre::server", thread = i, "main-interpreter thread exiting");
 }
 
-fn dispatch_one(rules: &MainRules, spare: &mut SpareContext, job: MainJob) {
-    let MainJob { target, request, reply } = job;
-
-    // The caller already gave up, so the main GIL is not spent on a reply nobody reads.
-    if reply.is_closed() {
-        return;
+/// Runs one job. A request's fields are taken straight out of the job the queue handed over, so
+/// it is copied no more often than when the queue held requests alone.
+fn dispatch(rules: &MainRules, sessions: &Mutex<Sessions>, spare: &mut SpareContext, work: MainWork) {
+    match work {
+        MainWork::Request(MainJob { target, request, reply }) => {
+            // The caller already gave up, so the main GIL is not spent on a reply nobody reads.
+            if reply.is_closed() {
+                return;
+            }
+            let result = call_handler_with_hooks(rules, spare, target, request);
+            answer_if_awaited(reply, result);
+        }
+        MainWork::WebSocket(job) => run_ws_job(rules, sessions, spare, *job),
     }
+}
 
-    let result = call_handler_with_hooks(rules, spare, target, request);
-    answer_if_awaited(reply, result);
+/// Runs one WebSocket call on main. The table's lock is held only to find or file a `ws`, never
+/// across a call, since a handler that waits on I/O releases the GIL and another thread runs.
+#[inline(never)]
+fn run_ws_job(rules: &MainRules, sessions: &Mutex<Sessions>, spare: &mut SpareContext, job: MainWsJob) {
+    let MainWsJob { route, call } = job;
+    let handlers = rules.routes.ws_handler(route);
+    mipyre_subinterp::attach::with_main(|py| match call {
+        MainWsCall::Open { request, outbox, reply } => {
+            if reply.is_closed() {
+                return;
+            }
+            let opened = in_main_context(py, spare, |chain| {
+                websocket::open(chain, rules.routes.before_hooks(), *request, outbox)
+            });
+            let answer = opened.map(|opened| match opened {
+                Ok(ws) => WsUpgradeAnswer::Accepted(sessions.lock().insert(ws)),
+                Err(response) => WsUpgradeAnswer::Refused(response),
+            });
+            if let Err(Ok(WsUpgradeAnswer::Accepted(session))) = reply.send(answer) {
+                // The upgrade stopped waiting, so no connection will end this session.
+                drop(sessions.lock().remove(session));
+            }
+        }
+        MainWsCall::Event { session, event, reply } => {
+            let ws = sessions.lock().ws(py, session);
+            let called = in_main_context(py, spare, |chain| websocket::call(chain, handlers, &ws, event));
+            answer_if_awaited(reply, called);
+        }
+        MainWsCall::Close { session, close, label } => {
+            let ws = sessions.lock().remove(session).into_bound(py);
+            let Some(close) = close else {
+                return;
+            };
+            if let Err(e) = in_main_context(py, spare, |chain| websocket::close(chain, handlers, &ws, &close)) {
+                drop(e.log(&label));
+            }
+        }
+    });
+}
+
+/// Runs `f` with a chain for main in a context of its own, as a request is; a panic is the
+/// call's error.
+fn in_main_context<'py, T>(
+    py: Python<'py>,
+    spare: &mut SpareContext,
+    f: impl FnOnce(&mut Chain<'_, 'py, ThreadLoop>) -> Result<T, HandlerError>,
+) -> Result<T, HandlerError> {
+    catch_panic(|| in_reused_context(py, spare, |rc| f(&mut main_chain(py, rc))))
+}
+
+fn lost() -> HandlerError {
+    refuse(UnansweredError::WorkerLost(ReplyHolder::Main))
 }
 
 #[cfg(test)]
@@ -648,7 +798,13 @@ mod tests {
         }
         let (_, _, request) = ask(DEF);
         let mut spare = SpareContext::default();
-        dispatch_one(&rules, &mut spare, MainJob { target, request, reply });
+        let sessions = Mutex::new(Sessions::default());
+        dispatch(
+            &rules,
+            &sessions,
+            &mut spare,
+            MainWork::Request(MainJob { target, request, reply }),
+        );
         mipyre_subinterp::attach::with_main(move |py| {
             spare.release(py);
             let runs = calls.bind(py).len();
@@ -669,11 +825,12 @@ mod tests {
 
     /// Builds the backend without threads or an engine, allowed no more `def` threads than the
     /// returned receiver, which stands in for its one thread.
-    fn threads_of(capacity: usize) -> (JobReceiver<MainJob>, MainThreads) {
+    fn threads_of(capacity: usize) -> (JobReceiver<MainWork>, MainThreads) {
         let (tx, rx) = job_queue(capacity);
         let set = Arc::new(DefThreadSet {
             rules: no_rules(),
             min_threads: 1,
+            sessions: Arc::default(),
             roster: Mutex::new(ThreadRoster {
                 threads: Vec::new(),
                 numbered: 0,
@@ -683,7 +840,6 @@ mod tests {
         let threads = MainThreads {
             tx,
             engine: None,
-            websockets: None,
             max_threads: 1,
             set,
         };
@@ -739,7 +895,9 @@ mod tests {
     async fn a_queued_job_replies_through_its_run() {
         let (threads, main) = threads_of(1);
         let run = main.submit(ask(DEF)).expect("the queue has room");
-        let MainJob { reply, .. } = threads.try_recv().expect("the job was queued");
+        let Some(MainWork::Request(MainJob { reply, .. })) = threads.try_recv() else {
+            panic!("the request was queued");
+        };
         let answer = mipyre_http::plan::response::HandlerResponse::new(
             hyper::StatusCode::OK,
             bytes::Bytes::from_static(b"{}"),
@@ -768,7 +926,9 @@ mod tests {
     fn a_dropped_run_closes_its_jobs_reply() {
         let (threads, main) = threads_of(1);
         drop(main.submit(ask(DEF)).expect("the queue has room"));
-        let MainJob { reply, .. } = threads.try_recv().expect("the job was queued");
+        let Some(MainWork::Request(MainJob { reply, .. })) = threads.try_recv() else {
+            panic!("the request was queued");
+        };
         assert!(
             reply.is_closed(),
             "a def thread would still run the job nobody waits for"

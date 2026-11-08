@@ -152,12 +152,12 @@ impl<T> JobQueue<T> {
     /// receiver waited `keepalive` with nothing to take while it was one more than `min`; it is then
     /// counted out under the same lock, so two receivers timing out together never leave fewer than
     /// `min`.
-    fn recv_or_retire(&self, min: usize, keepalive: Duration) -> Taken<T> {
+    fn recv_or_retire(&self, min: usize, keepalive: Duration) -> RecvOrRetire<T> {
         let mut state = self.lock();
         loop {
             match state.front() {
-                QueueFront::Job(job) => return Taken::Job(job),
-                QueueFront::Closed => return Taken::Closed,
+                QueueFront::Job(job) => return RecvOrRetire::Job(job),
+                QueueFront::Closed => return RecvOrRetire::Closed,
                 QueueFront::Empty if !is_surplus(state.receivers, min) => {
                     state.sleepers += 1;
                     state = self.ready.wait(state).unwrap_or_else(PoisonError::into_inner);
@@ -175,7 +175,7 @@ impl<T> JobQueue<T> {
                     // is looked at again before it retires.
                     if waited.timed_out() && state.jobs.is_empty() && is_surplus(state.receivers, min) {
                         state.receivers -= 1;
-                        return Taken::Retired;
+                        return RecvOrRetire::Retired;
                     }
                 }
             }
@@ -184,7 +184,7 @@ impl<T> JobQueue<T> {
 }
 
 /// What a receiver that may retire gets from the queue.
-enum Taken<T> {
+enum RecvOrRetire<T> {
     Job(T),
     Closed,
     Retired,
@@ -250,9 +250,9 @@ impl<T> JobReceiver<T> {
     /// then already counted out.
     pub(crate) fn recv_or_retire(mut self, min: usize, keepalive: Duration) -> Option<(T, Self)> {
         match self.queue.recv_or_retire(min, keepalive) {
-            Taken::Job(job) => Some((job, self)),
-            Taken::Closed => None,
-            Taken::Retired => {
+            RecvOrRetire::Job(job) => Some((job, self)),
+            RecvOrRetire::Closed => None,
+            RecvOrRetire::Retired => {
                 self.retired = true;
                 None
             }

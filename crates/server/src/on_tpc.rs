@@ -16,7 +16,7 @@ use hyper::Response;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::site::Site;
-use crate::tpc::{ThreadWorker, TpcThread};
+use crate::tpc::{ThreadWorker, TpcThread, WorkerLease};
 use mipyre_core::InlineTimer;
 use mipyre_http::io::body::ResponseBody;
 use mipyre_http::io::request_head::{RequestHead, RequestLabel};
@@ -59,6 +59,16 @@ impl Backends for TpcThread {
         route: RouteId,
     ) -> impl Future<Output = Response<ResponseBody>> + 'a {
         run_inline(site, worker, prepared, route)
+    }
+
+    #[inline]
+    fn call_unary_inline(
+        worker: &ThreadWorker,
+        site: &Site,
+        method: RouteId,
+        request: exchange::Request,
+    ) -> Result<HandlerResponse, HandlerError> {
+        call_worker(site, worker, method, request, WorkerLease::serve_unary)
     }
 
     #[inline]
@@ -119,23 +129,38 @@ async fn call_inline(
     label: &RequestLabel,
 ) -> Response<ResponseBody> {
     let accept_encoding = AcceptEncoding::of(&head, site.rules.settings.compression.as_ref());
+    let result = call_worker(
+        site,
+        thread_worker,
+        route,
+        exchange::Request::new(head, body),
+        WorkerLease::serve,
+    );
+    // A failure is logged here, on this thread, once.
+    http_response(result.map_err(|e| e.log(label)), &accept_encoding, &site.counters).await
+}
+
+/// Runs `route` on this thread's worker by `serve` and holds its answer to the request budget: a
+/// handler that ran past it gets the budget's refusal, not its late answer.
+#[inline]
+fn call_worker<'w>(
+    site: &Site,
+    thread_worker: &'w ThreadWorker,
+    route: RouteId,
+    request: exchange::Request,
+    serve: impl FnOnce(WorkerLease<'w>, RouteId, exchange::Request) -> Result<HandlerResponse, HandlerError>,
+) -> Result<HandlerResponse, HandlerError> {
     // This is checked after the body is read, because another request on this thread may have
     // retired the worker meanwhile.
-    let lease = match thread_worker.lease() {
-        Ok(lease) => lease,
-        Err(why) => {
-            let refused = refuse(UnansweredError::WorkerRetired(why));
-            let refused = Err::<HandlerResponse, _>(refused.log(label));
-            return http_response(refused, &accept_encoding, &site.counters).await;
-        }
-    };
-    let request = exchange::Request::new(head, body);
+    let lease = thread_worker
+        .lease()
+        .map_err(|why| refuse(UnansweredError::WorkerRetired(why)))?;
     let timer = InlineTimer::start();
 
-    let response = lease.serve(route, request);
+    let response = serve(lease, route, request);
 
     let budget = site.rules.settings.limits.request_budget;
-    let result = match timer.overran(budget) {
+    match timer.overran(budget) {
         None => response,
         Some(took) => Err(refuse(overrun(
             response,
@@ -143,9 +168,7 @@ async fn call_inline(
             budget.get(),
             &site.rules.routes.route(route).name,
         ))),
-    };
-    // A failure is logged here, on this thread, once.
-    http_response(result.map_err(|e| e.log(label)), &accept_encoding, &site.counters).await
+    }
 }
 
 /// Builds the error for a call to `handler` that ran past `budget`, carrying what the handler

@@ -69,7 +69,7 @@ pub(crate) fn _driver_start_template(
     env: Vec<(String, String)>,
 ) -> PyResult<libc::pid_t> {
     start_new_process(|| fork_python(py), python, module, &args, &keep_fds, &env)
-        .map(StartedProcess::fork_answer)
+        .map(StartedProcess::into_fork_return)
         .map_err(start_error)
 }
 
@@ -85,7 +85,7 @@ pub(crate) fn _driver_spawn_template(
     env: Vec<(String, String)>,
 ) -> PyResult<libc::pid_t> {
     spawn_python(python, module, &args, &keep_fds, &env)
-        .map(StartedProcess::fork_answer)
+        .map(StartedProcess::into_fork_return)
         .map_err(start_error)
 }
 
@@ -102,7 +102,7 @@ pub(crate) fn _driver_start_import_worker(
     env: Vec<(String, String)>,
 ) -> PyResult<libc::pid_t> {
     start_new_process(|| fork_python(py), python, module, &args, &keep_fds, &env)
-        .map(StartedProcess::fork_answer)
+        .map(StartedProcess::into_fork_return)
         .map_err(start_error)
 }
 
@@ -110,6 +110,6 @@ pub(crate) fn _driver_start_import_worker(
 #[pyfunction]
 pub(crate) fn _driver_fork_worker(py: Python<'_>) -> PyResult<libc::pid_t> {
     fork_python(py)
-        .map(StartedProcess::fork_answer)
+        .map(StartedProcess::into_fork_return)
         .map_err(|e| start_error(ProcessStartError::Fork(e)))
 }

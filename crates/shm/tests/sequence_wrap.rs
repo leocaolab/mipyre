@@ -9,15 +9,15 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use mipyre_shm::channel::{Channel, HeapMemory, HostEnd, PeerEnd, Wait};
+use mipyre_shm::channel::{Channel, HeapMemory, PeerEnd, RequesterEnd, WaitOutcome};
 use mipyre_shm::plan::geometry::{Geometry, SlotBytes};
 use mipyre_shm::plan::ring::{RingDepth, Seq};
 use mipyre_shm::plan::spin_window::SpinWindow;
 use mipyre_shm::protocol::doorbell::{AtomicU32, Doorbell, Parker};
 
-struct NoBell;
+struct StubDoorbell;
 
-impl Doorbell for NoBell {
+impl Doorbell for StubDoorbell {
     type Outcome = ();
     type Error = Infallible;
     fn ring(&self, _: &AtomicU32) -> Result<(), Infallible> {
@@ -25,9 +25,9 @@ impl Doorbell for NoBell {
     }
 }
 
-struct NoSleep;
+struct StubParker;
 
-impl Parker for NoSleep {
+impl Parker for StubParker {
     type Error = Infallible;
     fn park(&self, _: &AtomicU32, _: u32, _: u64) -> Result<(), Infallible> {
         Ok(())
@@ -41,26 +41,26 @@ fn the_ends_carry_every_request_across_the_wrap_of_the_sequence() {
     const DEPTH: u32 = 8;
     let geometry = Geometry::new(RingDepth::new(DEPTH).unwrap(), SlotBytes::new(16).unwrap()).unwrap();
     let channel = Arc::new(Channel::new(HeapMemory::new(&geometry)));
-    let mut host = HostEnd::new(Arc::clone(&channel), NoBell);
-    let mut peer = PeerEnd::new(channel, NoBell, NoSleep);
+    let mut caller = RequesterEnd::new(Arc::clone(&channel), StubDoorbell);
+    let mut peer = PeerEnd::new(channel, StubDoorbell, StubParker);
     let total = (1u64 << 32) + 4 * u64::from(DEPTH);
     let mut buf = BytesMut::with_capacity(64);
     let (mut sent, mut read) = (0u64, 0u64);
     while read < total {
         while sent < total {
-            let Some(mut slot) = host.request_slot() else { break };
+            let Some(mut slot) = caller.request_slot() else { break };
             slot.write(|w| w.put(&sent.to_le_bytes())).unwrap();
             slot.publish().unwrap_or_else(|never| match never {});
             sent += 1;
         }
-        while let Ok(Wait::Request(request)) = peer.wait_for_request(SpinWindow::until(0), || 0, 1) {
+        while let Ok(WaitOutcome::Request(request)) = peer.wait_for_request(SpinWindow::until(0), || 0, 1) {
             let mut n = [0u8; 8];
             n.copy_from_slice(&request.bytes().unwrap());
             request
-                .answer(|w| w.put(&n).unwrap())
+                .respond(|w| w.put(&n).unwrap())
                 .unwrap_or_else(|never| match never {});
         }
-        let mut ready = host.answers().unwrap();
+        let mut ready = caller.responses().unwrap();
         while let Some(seq) = ready.take_next(&mut buf).unwrap() {
             assert_eq!(seq, Seq::new(read as u32));
             assert_eq!(&buf[..], &read.to_le_bytes()[..], "request {read}");
@@ -68,5 +68,5 @@ fn the_ends_carry_every_request_across_the_wrap_of_the_sequence() {
             read += 1;
         }
     }
-    assert_eq!(host.window().read(), Seq::new(total as u32));
+    assert_eq!(caller.window().read(), Seq::new(total as u32));
 }

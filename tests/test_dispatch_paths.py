@@ -1035,19 +1035,46 @@ def test_type_mismatch_is_a_param_error(values_pool):
 
 
 # ---------------------------------------------------------------------------
-# gRPC: the body read has the body grace and is counted; trailing bytes refused
+# gRPC: methods registered with unary_unary, their messages encoded with protobuf; the body read
+# has the body grace and is counted; trailing bytes refused
 # ---------------------------------------------------------------------------
+
+GRPC_FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "grpc")
 
 GRPC_SCRIPT = """
 import os
+import sys
+sys.path.insert(0, GRPC_FIXTURES)
+import benchmark_pb2
 from mipyre import Mipyre
+from mipyre.grpc import GrpcError, StatusCode
 app = Mipyre(runtime=os.environ.get("MIPYRE_TEST_MODE"))
 app.max_body_size = 64
 app.request_timeout = REQUEST_BUDGET
 app.body_grace = REQUEST_BUDGET
-app.enable_grpc_benchmark()
 app.enable_metrics()
-""".replace("REQUEST_BUDGET", str(REQUEST_BUDGET_S)) + RUN
+
+@app.unary_unary("/benchmark.BenchmarkService/GetSum")
+def get_sum(message):
+    request = benchmark_pb2.SumRequest.FromString(message)
+    return benchmark_pb2.SumReply(result=request.a + request.b).SerializeToString()
+
+@app.unary_unary("/test.Calls/Refuse")
+def refuse(message):
+    raise GrpcError(StatusCode.INVALID_ARGUMENT, "a is negative: 100% sure")
+
+@app.unary_unary("/test.Calls/Raise")
+def fail(message):
+    raise KeyError("bad sum")
+
+@app.unary_unary("/test.Calls/Text")
+def text(message):
+    return "not bytes"
+
+@app.post("/rpc")
+def rpc(req):
+    return "user handler: " + req.headers.get("content-type", "")
+""".replace("REQUEST_BUDGET", str(REQUEST_BUDGET_S)).replace("GRPC_FIXTURES", repr(GRPC_FIXTURES)) + RUN
 
 GET_SUM = "/benchmark.BenchmarkService/GetSum"
 
@@ -1057,9 +1084,16 @@ def _grpc_frame(message: bytes, declared: int | None = None) -> bytes:
     return b"\x00" + n.to_bytes(4, "big") + message
 
 
-def _grpc_call(port: int, body: bytes, end: bool = True) -> dict[str, str]:
-    """One h2c call to GetSum; returns its trailers. `end=False` leaves the request body
-    open, as a stalled client does."""
+class GrpcReply:
+    def __init__(self, headers: dict[str, str], body: bytes, trailers: dict[str, str]):
+        self.headers = headers
+        self.body = body
+        self.trailers = trailers
+
+
+def _grpc_call(port: int, body: bytes, end: bool = True, path: str = GET_SUM) -> GrpcReply:
+    """One h2c call to `path`. `end=False` leaves the request body open, as a stalled client
+    does."""
     import h2.config
     import h2.connection
     import h2.events
@@ -1069,33 +1103,116 @@ def _grpc_call(port: int, body: bytes, end: bool = True) -> dict[str, str]:
         conn.initiate_connection()
         stream = conn.get_next_available_stream_id()
         conn.send_headers(stream, [
-            (":method", "POST"), (":path", GET_SUM), (":scheme", "http"),
+            (":method", "POST"), (":path", path), (":scheme", "http"),
             (":authority", f"{HOST}:{port}"), ("content-type", "application/grpc"),
             ("te", "trailers"),
         ])
         conn.send_data(stream, body, end_stream=end)
         s.sendall(conn.data_to_send())
+        headers: dict[str, str] = {}
+        data = bytearray()
         trailers: dict[str, str] = {}
         while not trailers:
-            data = s.recv(65536)
-            if not data:
+            received = s.recv(65536)
+            if not received:
                 break
-            for event in conn.receive_data(data):
-                if isinstance(event, h2.events.TrailersReceived):
+            for event in conn.receive_data(received):
+                if isinstance(event, h2.events.ResponseReceived):
+                    headers = {k.decode(): v.decode() for k, v in event.headers}
+                elif isinstance(event, h2.events.DataReceived):
+                    data += event.data
+                    conn.acknowledge_received_data(event.flow_controlled_length, stream)
+                elif isinstance(event, h2.events.TrailersReceived):
                     trailers = {k.decode(): v.decode() for k, v in event.headers}
             s.sendall(conn.data_to_send())
-        return trailers
+        return GrpcReply(headers, bytes(data), trailers)
+
+
+def _benchmark_pb2():
+    """Return the generated messages, the module the served script imports."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("benchmark_pb2", os.path.join(GRPC_FIXTURES, "benchmark_pb2.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sum(port: int, a: int, b: int) -> GrpcReply:
+    message = _benchmark_pb2().SumRequest(a=a, b=b).SerializeToString()
+    return _grpc_call(port, _grpc_frame(message))
+
+
+def _sum_result(reply: GrpcReply) -> int:
+    flag, length, message = reply.body[0], int.from_bytes(reply.body[1:5], "big"), reply.body[5:]
+    assert (flag, length) == (0, len(message)), reply.body
+    return _benchmark_pb2().SumReply.FromString(message).result
+
+
+@pytest.mark.parametrize("path", ["tpc", "pool"])
+def test_grpc_get_sum_is_the_apps_protobuf_handler(path):
+    with serve(GRPC_SCRIPT, path) as srv:
+        reply = _sum(srv.port, 2, 3)
+        assert reply.trailers["grpc-status"] == "0", reply.trailers
+        assert reply.headers["content-type"] == "application/grpc", reply.headers
+        assert _sum_result(reply) == 5
+        negative = _sum(srv.port, -7, 3)
+        assert negative.trailers["grpc-status"] == "0", negative.trailers
+        assert _sum_result(negative) == -4
+        # A POST to another path, gRPC content type or not, is the HTTP routes'.
+        other = srv.post("/rpc", _grpc_frame(b""), headers={"Content-Type": "application/grpc"})
+        assert (other.status, other.body) == (200, b"user handler: application/grpc")
+
+
+def test_grpc_a_handlers_failure_is_the_calls_status_with_its_cause():
+    with serve(GRPC_SCRIPT, "tpc") as srv:
+        refused = _grpc_call(srv.port, _grpc_frame(b""), path="/test.Calls/Refuse").trailers
+        assert refused["grpc-status"] == "3", refused
+        assert refused["grpc-message"] == "a is negative: 100%25 sure", refused
+        raised = _grpc_call(srv.port, _grpc_frame(b""), path="/test.Calls/Raise").trailers
+        assert raised["grpc-status"] == "2", raised
+        assert "KeyError: 'bad sum'" in raised["grpc-message"], raised
+        text = _grpc_call(srv.port, _grpc_frame(b""), path="/test.Calls/Text").trailers
+        assert text["grpc-status"] == "13", text
+        assert "returned str, not bytes" in text["grpc-message"], text
+
+
+GRPC_REFUSED = """
+from mipyre import Mipyre
+app = Mipyre()
+
+async def get_sum(message):
+    return message
+
+try:
+    app.unary_unary("/benchmark.BenchmarkService/GetSum", get_sum)
+except TypeError as e:
+    print("TypeError:", e)
+
+try:
+    app.unary_unary("/GetSum", lambda message: message)
+except ValueError as e:
+    print("ValueError:", e)
+"""
+
+
+def test_grpc_an_async_handler_and_a_path_that_names_no_method_are_refused():
+    r = subprocess.run([PYTHON, "-c", GRPC_REFUSED], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "TypeError: gRPC method /benchmark.BenchmarkService/GetSum:" in r.stdout, r.stdout
+    assert "is an `async def`" in r.stdout, r.stdout
+    assert "ValueError:" in r.stdout and "/GetSum" in r.stdout, r.stdout
 
 
 def test_grpc_trailing_bytes_after_the_message_are_refused():
     with serve(GRPC_SCRIPT, "tpc") as srv:
-        ok = _grpc_call(srv.port, _grpc_frame(bytes([0x08, 2, 0x10, 3])))
+        ok = _grpc_call(srv.port, _grpc_frame(bytes([0x08, 2, 0x10, 3]))).trailers
         assert ok["grpc-status"] == "0", ok
-        trailing = _grpc_call(srv.port, _grpc_frame(bytes([0x08, 2, 0x10, 3]), declared=2))
+        trailing = _grpc_call(srv.port, _grpc_frame(bytes([0x08, 2, 0x10, 3]), declared=2)).trailers
         assert trailing["grpc-status"] == "13", trailing
         assert "nothing after it" in trailing["grpc-message"], trailing
         # The size cap (max_body_size) still applies.
-        too_large = _grpc_call(srv.port, _grpc_frame(b"\x08\x01" * 64))
+        too_large = _grpc_call(srv.port, _grpc_frame(b"\x08\x01" * 64)).trailers
         assert too_large["grpc-status"] == "8", too_large
 
 
@@ -1103,7 +1220,7 @@ def test_grpc_stalled_body_is_deadline_exceeded():
     # The body read used to have no deadline at all.
     with serve(GRPC_SCRIPT, "tpc") as srv:
         started = time.monotonic()
-        stalled = _grpc_call(srv.port, b"\x00\x00\x00", end=False)
+        stalled = _grpc_call(srv.port, b"\x00\x00\x00", end=False).trailers
         assert stalled["grpc-status"] == "4", stalled
         took = time.monotonic() - started
         # Not before the budget (a monotonic clock cannot run short). How long after is the machine's; the deadline's
@@ -1116,7 +1233,7 @@ def test_grpc_calls_are_counted(path):
     with serve(GRPC_SCRIPT, path, env={"MIPYRE_METRICS": "1"}) as srv:
         before = metric_count(srv.get("/metrics").body.decode(), "mipyre_http_requests_total")
         for _ in range(3):
-            assert _grpc_call(srv.port, _grpc_frame(bytes([0x08, 1])))["grpc-status"] == "0"
+            assert _grpc_call(srv.port, _grpc_frame(bytes([0x08, 1]))).trailers["grpc-status"] == "0"
         after = metric_count(srv.get("/metrics").body.decode(), "mipyre_http_requests_total")
         # This server's own count: what the readiness check sent, then the first page read and
         # the three calls.

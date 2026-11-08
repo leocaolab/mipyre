@@ -52,4 +52,4 @@ pub use self::tpc::{drive_conn, serve_on_workers, tpc_accept_loop_inline, TpcThr
 pub use self::tpc::{
     log_startup, report_pinning, run_tpc, thread_cpus, tpc_banner, AcceptMode, ServeError, TpcServer, TpcThreads,
 };
-pub use self::websocket::{upgrade_target, OpenConnections, WsUpgrade};
+pub use self::websocket::{main_upgrade_target, upgrade_target, MainWsUpgrade, OpenConnections, WsUpgrade};

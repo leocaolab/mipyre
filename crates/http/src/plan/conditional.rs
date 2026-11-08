@@ -23,7 +23,7 @@ impl EntityTag {
         self.0.clone()
     }
 
-    fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
 }
@@ -88,9 +88,6 @@ fn trim_list_start(list: &[u8]) -> &[u8] {
         .unwrap_or(list.len());
     list.get(start..).unwrap_or_default()
 }
-
-#[cfg(test)]
-mod fuzz;
 
 #[cfg(test)]
 mod tests {

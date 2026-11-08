@@ -17,7 +17,7 @@ use mipyre_http::plan::limits::{
     connection_limit, BodyGrace, BodyMinRate, BodyTimeLimit, ByteLimit, InterruptGrace, MessageByteLimit, PingAfter,
     PongWithin, RequestBudget, ShutdownTimeout,
 };
-use mipyre_http::plan::route::{RuntimeChoice, WsPlace};
+use mipyre_http::plan::route::{RuntimeChoice, WsHandlers, WsPlace};
 use mipyre_http::plan::site::{AccessLog, ServeSettings};
 use mipyre_runtime::AbandonedWorker;
 use mipyre_runtime::Routes;
@@ -212,13 +212,14 @@ impl App {
         Ok(())
     }
 
-    /// Answer HttpArena's `benchmark.BenchmarkService/GetSum` gRPC method.
-    ///
-    /// Only a POST to that exact path with an `application/grpc*` content type reaches it.
-    fn enable_grpc_benchmark(&mut self) {
-        self.routes
-            .write()
-            .add_grpc_method(mipyre_http::plan::route::GrpcMethod::BenchmarkGetSum);
+    /// Serve the gRPC unary method at `path` (`/package.Service/Method`) with `handler`, a `def`
+    /// that takes the request message as `bytes` and returns the reply message as `bytes`, on
+    /// the sub-interpreter workers. A path that is not a method's, or one registered twice,
+    /// raises `ValueError`; an `async def` handler `TypeError`; and a method registered once the
+    /// app is sealed `LateRegistrationError`.
+    fn unary_unary(slf: &Bound<'_, Self>, path: &str, handler: Py<PyAny>) -> PyResult<()> {
+        Self::serve_in_worker(slf)?;
+        slf.borrow_mut().add_grpc_method(slf.py(), path, handler)
     }
 
     /// Serve each run's metrics at `GET path` and count every answer of every run; a second call
@@ -549,24 +550,35 @@ impl App {
         Ok(())
     }
 
-    /// Register the `async def` WebSocket handler for `path`, whose `{name}` parameters land in
-    /// `ws.request.params`, to run on a sub-interpreter worker or, with `runtime=Main`, on the
-    /// main interpreter. A `def` handler raises `TypeError`; `runtime=Lane`, or a second handler
-    /// for the same path, `ValueError`; and a worker route registered once the app is sealed
-    /// `LateRegistrationError`.
-    #[pyo3(signature = (path, handler, runtime=PyRuntimeChoice::Worker))]
+    /// Register the WebSocket handlers for `path`, whose `{name}` parameters land in
+    /// `ws.request.params`, to run on the sub-interpreter worker of the thread that holds the
+    /// connection or, with `runtime=Main`, on the main interpreter: `on_message(ws, msg)` is
+    /// called once per message, `on_connect(ws)` once the upgrade is answered, and
+    /// `on_close(ws, code, reason)` once the connection ends. An `async def` handler raises
+    /// `TypeError`; `runtime=Lane`, or a second registration for the same path, `ValueError`; and
+    /// a worker route registered once the app is sealed `LateRegistrationError`.
+    #[pyo3(signature = (path, on_message, on_connect=None, on_close=None, runtime=PyRuntimeChoice::Worker))]
     fn websocket(
         slf: &Bound<'_, Self>,
         path: &str,
-        handler: Bound<'_, PyAny>,
+        on_message: Bound<'_, PyAny>,
+        on_connect: Option<Bound<'_, PyAny>>,
+        on_close: Option<Bound<'_, PyAny>>,
         runtime: PyRuntimeChoice,
     ) -> PyResult<()> {
         Self::serve_in_worker(slf)?;
-        if !crate::pyapi::is_async_handler(&handler)? {
-            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                "websocket {path}: the handler must be an `async def`: it awaits ws.recv() and ws.send() on an \
-                 async engine, where a blocking wait would stall every other connection"
-            )));
+        let handlers = WsHandlers {
+            on_message,
+            on_connect,
+            on_close,
+        };
+        for handler in handlers.iter() {
+            if crate::pyapi::is_async_handler(handler)? {
+                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                    "websocket {path}: {handler} is an `async def`; a WebSocket handler is a `def`, called \
+                     once per message on the thread that holds the connection"
+                )));
+            }
         }
         let place = match runtime {
             PyRuntimeChoice::Worker => WsPlace::Worker,
@@ -587,7 +599,7 @@ impl App {
             )));
         }
         routes
-            .add_websocket(path, handler.unbind(), place)
+            .add_websocket(path, handlers.map(|h| h.clone().unbind()), place)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 

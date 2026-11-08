@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use mipyre_cpu::CoreId;
 use mipyre_tpc::{
-    CoreSlot, Leftover, LocalTasks, ShutdownDeadline, Spawner, StopCause, ThreadError, ThreadFailure, ThreadHandle,
+    CoreSlot, LocalTasks, ShutdownDeadline, Spawner, StopCause, StrayWork, ThreadError, ThreadFailure, ThreadHandle,
     ThreadHooks, ThreadResults, ThreadStop,
 };
 
@@ -138,12 +138,12 @@ fn report(joined: &ThreadResults<(), ServeError>, grace: Duration, counters: &Se
     }
     for left in &joined.left_running {
         match left.what {
-            Leftover::Thread => tracing::error!(
+            StrayWork::Thread => tracing::error!(
                 target: "mipyre::server",
                 thread = %left.thread,
                 "TPC thread still running at the join deadline ({grace:?}); left behind"
             ),
-            Leftover::BlockingCalls(calls) => report_blocking_calls_left(&left.thread, calls.get(), counters),
+            StrayWork::BlockingCalls(calls) => report_blocking_calls_left(&left.thread, calls.get(), counters),
         }
     }
 }
@@ -445,10 +445,10 @@ mod stop_tests {
         Some(StopCause::ThreadFailed { thread: thread.into() })
     }
 
-    fn left(thread: &str) -> mipyre_tpc::ThreadLeftover {
-        mipyre_tpc::ThreadLeftover {
+    fn left(thread: &str) -> mipyre_tpc::StrayThread {
+        mipyre_tpc::StrayThread {
             thread: thread.into(),
-            what: Leftover::Thread,
+            what: StrayWork::Thread,
         }
     }
 
@@ -477,9 +477,9 @@ mod stop_tests {
         );
     }
 
-    struct Held;
+    struct DummyState;
 
-    impl mipyre_subinterp::Releasable for Held {
+    impl mipyre_subinterp::Releasable for DummyState {
         fn release(self, _py: pyo3::Python<'_>) {}
     }
 
@@ -490,9 +490,9 @@ mod stop_tests {
     fn a_panicking_serve_leaves_no_thread_state_attached() {
         pyo3::Python::initialize();
         let joined = on_tpc_thread("tpc-panic-test", |stop| {
-            let mut interp = match mipyre_subinterp::SubInterpreter::<Held>::create_on_this_thread::<
+            let mut interp = match mipyre_subinterp::SubInterpreter::<DummyState>::create_on_this_thread::<
                 mipyre_subinterp::NewInterpreterError,
-            >("tpc-panic-test".to_string(), std::convert::identity, |_py| Ok(Held))
+            >(std::convert::identity, |_py| Ok(DummyState))
             {
                 Ok(interp) => interp,
                 Err(e) => panic!("no sub-interpreter for the test: {e}"),
@@ -511,7 +511,7 @@ mod stop_tests {
             });
             // SAFETY: this only reads the calling thread's current thread state.
             let detached_after = unsafe { pyo3::ffi::PyThreadState_GetUnchecked() }.is_null();
-            interp.end_on_own_thread();
+            drop(interp);
             Ok((served, attached_while_served.get(), detached_after))
         });
         let [(served, attached_while_served, detached_after)] =

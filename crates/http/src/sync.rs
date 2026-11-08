@@ -84,16 +84,16 @@ mod model {
     }
 
     pub enum Entry<'a, K, V> {
-        Occupied(FullSlot<'a, K, V>),
-        Vacant(EmptySlot<'a, K, V>),
+        Occupied(OccupiedEntry<'a, K, V>),
+        Vacant(VacantEntry<'a, K, V>),
     }
 
-    pub struct FullSlot<'a, K, V> {
+    pub struct OccupiedEntry<'a, K, V> {
         map: MutexGuard<'a, HashMap<K, V>>,
         key: K,
     }
 
-    pub struct EmptySlot<'a, K, V> {
+    pub struct VacantEntry<'a, K, V> {
         map: MutexGuard<'a, HashMap<K, V>>,
         key: K,
     }
@@ -120,9 +120,9 @@ mod model {
         pub(crate) fn entry(&self, key: K) -> Entry<'_, K, V> {
             let map = self.0.lock();
             if map.contains_key(&key) {
-                Entry::Occupied(FullSlot { map, key })
+                Entry::Occupied(OccupiedEntry { map, key })
             } else {
-                Entry::Vacant(EmptySlot { map, key })
+                Entry::Vacant(VacantEntry { map, key })
             }
         }
 
@@ -160,7 +160,7 @@ mod model {
         clippy::expect_used,
         reason = "a model, built only under `--cfg sync_model`: the key was found under the lock the guard still holds"
     )]
-    impl<K: Hash + Eq, V> FullSlot<'_, K, V> {
+    impl<K: Hash + Eq, V> OccupiedEntry<'_, K, V> {
         pub(crate) fn get(&self) -> &V {
             self.map.get(&self.key).expect(HELD)
         }
@@ -170,7 +170,7 @@ mod model {
         }
     }
 
-    impl<K: Hash + Eq, V> EmptySlot<'_, K, V> {
+    impl<K: Hash + Eq, V> VacantEntry<'_, K, V> {
         pub(crate) fn insert(mut self, value: V) {
             self.map.insert(self.key, value);
         }

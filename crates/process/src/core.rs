@@ -10,7 +10,7 @@ use mipyre_http::plan::response::HandlerResponse;
 use mipyre_shm::adapter::doorbell::FutexDoorbell;
 use mipyre_shm::adapter::mapped::MappedMemory;
 use mipyre_shm::channel::{
-    Attempt, DeadPeerAnswer, DeadPeerError, PeerFault, RequestSlot, SlotRoomError, StartOutcome,
+    Attempt, DeadPeerResponse, PeerFault, RequestSlot, SlotRoomError, StartOutcome, TakeOverError,
 };
 use mipyre_shm::plan::ring::{RingDepth, SeqRange};
 
@@ -29,7 +29,7 @@ use super::wire;
 /// (`ServerLanes::take_attempt`), so no two workers share a tag, and a death is matched to the
 /// worker it is about by it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct WorkerTag {
+pub(super) struct WorkerId {
     pub(super) lane: LaneIndex,
     pub(super) attempt: Attempt,
     pub(super) pid: Pid,
@@ -47,7 +47,7 @@ pub(super) struct Replacement {
 pub(super) enum LaneWorker {
     /// A worker runs the lane's requests.
     Running {
-        worker: WorkerTag,
+        worker: WorkerId,
         /// Set while it is a replacement whose start is still being watched.
         starting: Option<Replacement>,
         /// What the host last saw at the head of the lane while this worker runs it; `None`
@@ -59,7 +59,7 @@ pub(super) enum LaneWorker {
     /// Killed for running a handler past the timeout (once): its death answers 504.
     /// `head_since_ns` is when the host first saw that handler's request at the head.
     Overrun {
-        worker: WorkerTag,
+        worker: WorkerId,
         starting: Option<Replacement>,
         head_since_ns: u64,
     },
@@ -77,7 +77,7 @@ pub(super) enum LaneWorker {
     /// Killed for writing what no correct worker writes into its channel. Its requests were
     /// answered 502 when that was seen, and none of them runs again; until it is dead the lane
     /// takes none.
-    Faulted { worker: WorkerTag },
+    Faulted { worker: WorkerId },
 }
 
 impl LaneWorker {
@@ -94,19 +94,19 @@ impl LaneWorker {
 pub(super) struct LocalLane {
     pub(super) index: LaneIndex,
     /// Holds who waits for sequence `k`, at `k`'s slot.
-    pub(super) waiting: Vec<Option<LaneReplySender>>,
+    pub(super) waiters: Vec<Option<LaneReplySender>>,
     pub(super) queued: VecDeque<LaneJob>,
     pub(super) worker: LaneWorker,
 }
 
 /// A host's lanes and, at the same place in another list, their channel ends (the ends are one
-/// slice, which the host's park hook hands to `sleep_all` whole), and the crash streaks of the
+/// slice, which the host's park hook hands to `prepare_to_wait` whole), and the crash streaks of the
 /// lanes that have one: everything the host decides with, and nothing it does IO with.
 pub(super) struct HostCore {
     pub(super) lanes: Vec<LocalLane>,
     pub(super) ends: Vec<LaneEnd>,
     /// Holds only the lanes in a crash run, so it is empty while they all serve.
-    pub(super) crash_runs: Vec<LaneCrashStreak>,
+    pub(super) crash_streaks: Vec<LaneCrashStreak>,
 }
 
 impl LocalLane {
@@ -128,7 +128,7 @@ impl LocalLane {
 
     /// Returns why `dead`, the worker this lane runs now, dies, as far as the host caused it, at
     /// `now_ns`; `None` for a worker the lane no longer runs (an earlier worker's late event).
-    pub(super) fn death_cause(&self, dead: WorkerTag, now_ns: u64) -> Option<DeathCause> {
+    pub(super) fn death_cause(&self, dead: WorkerId, now_ns: u64) -> Option<DeathCause> {
         match &self.worker {
             LaneWorker::Running { worker, head, .. } if *worker == dead => Some(DeathCause::Crashed { seen: *head }),
             LaneWorker::Overrun {
@@ -155,7 +155,7 @@ impl LocalLane {
         self.worker = LaneWorker::CrashWait;
         // No worker runs the lane until the next fork, which starts after the requests given up.
         let given_up = end.abandon();
-        let mut replies = self.take_replies(given_up, depth);
+        let mut replies = self.take_waiters(given_up, depth);
         replies.extend(self.queued.drain(..).map(|j| j.reply));
         replies
             .into_iter()
@@ -166,7 +166,7 @@ impl LocalLane {
     /// Looks at the head of the lane at `now_ns` and, when the request its worker runs has run
     /// past `timeout_ns` since the host first saw it there, marks the worker overrun and returns
     /// it for the host to kill (its death answers 504).
-    pub(super) fn overrun(&mut self, end: &LaneEnd, now_ns: u64, timeout_ns: u64) -> Option<WorkerTag> {
+    pub(super) fn overrun(&mut self, end: &LaneEnd, now_ns: u64, timeout_ns: u64) -> Option<WorkerId> {
         let LaneWorker::Running {
             worker,
             starting,
@@ -207,7 +207,7 @@ impl LocalLane {
             LaneWorker::Running { worker, .. } | LaneWorker::Overrun { worker, .. } => {
                 self.worker = LaneWorker::Faulted { worker };
                 let refusal = || Err(LaneRequestError::Rejected(peer_corrupted(i, worker.pid, fault)));
-                let held = self.take_replies(end.window().outstanding(), depth);
+                let held = self.take_waiters(end.window().outstanding(), depth);
                 done.extend(held.into_iter().map(|r| (r, refusal())));
                 FaultStep::Killed(worker)
             }
@@ -216,7 +216,7 @@ impl LocalLane {
                 // No worker serves the lane: it is stopping (gone), or its requests left it (waiting).
                 let given_up = end.abandon();
                 let refusal = || Err(LaneRequestError::Rejected(LaneUnansweredError::ShuttingDown));
-                done.extend(self.take_replies(given_up, depth).into_iter().map(|r| (r, refusal())));
+                done.extend(self.take_waiters(given_up, depth).into_iter().map(|r| (r, refusal())));
                 FaultStep::GaveUp
             }
         }
@@ -235,7 +235,11 @@ impl LocalLane {
     /// Looks, at `now_ns`, at the start report of a replacement the lane runs and has not yet
     /// seen ready: ready (with the respawn latency) clears the watch; a failed start, or a report
     /// that cannot be read, is why the lane breaks; nothing yet is `None`.
-    pub(super) fn look_at_start(&mut self, end: &LaneEnd, now_ns: impl FnOnce() -> u64) -> Option<StartLook> {
+    pub(super) fn check_replacement_start(
+        &mut self,
+        end: &LaneEnd,
+        now_ns: impl FnOnce() -> u64,
+    ) -> Option<ReplacementStart> {
         let (LaneWorker::Running { worker, starting, .. } | LaneWorker::Overrun { worker, starting, .. }) =
             &mut self.worker
         else {
@@ -245,15 +249,17 @@ impl LocalLane {
         match end.start_report(replacement.attempt) {
             Ok(Some(StartOutcome::Ready)) => {
                 *starting = None;
-                Some(StartLook::Ready {
+                Some(ReplacementStart::Ready {
                     latency_us: now_ns().saturating_sub(replacement.since_ns) / 1_000,
                 })
             }
             Ok(Some(StartOutcome::Failed(note))) => {
                 let failure = String::from_utf8_lossy(&note).into_owned();
-                Some(StartLook::Failed(LaneLossError::ReplacementNotStarted { failure }))
+                Some(ReplacementStart::Failed(LaneLossError::ReplacementNotStarted {
+                    failure,
+                }))
             }
-            Err(source) => Some(StartLook::Failed(LaneLossError::ReplacementReportUnreadable {
+            Err(source) => Some(ReplacementStart::Failed(LaneLossError::ReplacementReportUnreadable {
                 pid: worker.pid,
                 source,
             })),
@@ -266,7 +272,7 @@ impl LocalLane {
     pub(super) fn break_for_good(&mut self, why: &Arc<LaneLossError>) -> Breakage {
         let newly = self.broken_why().is_none();
         // A lane waiting out a crash loop was taken out of `usable_lanes` already.
-        let was_waiting = self.waiting();
+        let was_waiting = self.in_crash_wait();
         let counted = self.worker.takes_requests();
         let before = std::mem::replace(&mut self.worker, LaneWorker::Broken { why: Arc::clone(why) });
         let was_forking = matches!(before, LaneWorker::Forking { .. });
@@ -275,25 +281,25 @@ impl LocalLane {
             counted,
             was_waiting,
             was_forking,
-            replies: self.take_every_reply(),
+            replies: self.take_every_waiter(),
         }
     }
 
     /// Takes who waits on every request of the lane, in its slots or queued.
-    pub(super) fn take_every_reply(&mut self) -> Vec<LaneReplySender> {
-        let mut replies: Vec<_> = self.waiting.iter_mut().filter_map(Option::take).collect();
+    pub(super) fn take_every_waiter(&mut self) -> Vec<LaneReplySender> {
+        let mut replies: Vec<_> = self.waiters.iter_mut().filter_map(Option::take).collect();
         replies.extend(self.queued.drain(..).map(|j| j.reply));
         replies
     }
 
-    pub(super) fn waiting(&self) -> bool {
+    pub(super) fn in_crash_wait(&self) -> bool {
         matches!(self.worker, LaneWorker::CrashWait)
     }
 
     /// Takes who waits for each request in `range`, leaving the slots as they are.
-    pub(super) fn take_replies(&mut self, range: SeqRange, depth: RingDepth) -> Vec<LaneReplySender> {
+    pub(super) fn take_waiters(&mut self, range: SeqRange, depth: RingDepth) -> Vec<LaneReplySender> {
         (0..range.len())
-            .filter_map(|k| self.waiting[range.start().after(k).slot_index(depth)].take())
+            .filter_map(|k| self.waiters[range.start().after(k).slot_index(depth)].take())
             .collect()
     }
 }
@@ -303,7 +309,7 @@ impl LocalLane {
 /// request are as they were.
 pub(super) struct LaneCrashStreak {
     pub(super) lane: LaneIndex,
-    pub(super) run: CrashStreak,
+    pub(super) streak: CrashStreak,
     /// Where the lane's reading stood as its last death left it: an answer read since moves the
     /// end's `read` past it, which ends the run. Compared at the next death (and by the
     /// crash-loop watch), not counted per answer, so reading answers costs nothing more.
@@ -318,8 +324,8 @@ pub(super) fn soonest_wait(
     backoff: &CrashBackoff,
 ) -> Option<CrashLoopWait> {
     runs.iter()
-        .filter(|r| owned.iter().any(|l| l.index == r.lane && l.waiting()))
-        .map(|r| r.run.wait(r.lane, backoff))
+        .filter(|r| owned.iter().any(|l| l.index == r.lane && l.in_crash_wait()))
+        .map(|r| r.streak.wait(r.lane, backoff))
         .reduce(CrashLoopWait::sooner)
 }
 
@@ -330,14 +336,14 @@ pub(super) type Completions = Vec<(LaneReplySender, Result<HandlerResponse, Lane
 /// waits for it onto `done`; returns how many it took, and the worker's fault when it found one
 /// (the answers before it are taken).
 #[inline]
-pub(super) fn take_answers(
+pub(super) fn take_responses(
     end: &mut LaneEnd,
     buf: &mut BytesMut,
     waiting: &mut [Option<LaneReplySender>],
     depth: RingDepth,
     done: &mut Completions,
 ) -> (u64, Result<(), PeerFault>) {
-    let mut ready = match end.answers() {
+    let mut ready = match end.responses() {
         Ok(ready) => ready,
         Err(fault) => return (0, Err(fault)),
     };
@@ -347,7 +353,7 @@ pub(super) fn take_answers(
         // `ANSWER_BUFFER_BYTES`, the size `buf` started with (`BytesMut::reserve`).
         match ready.take_next(buf) {
             Ok(Some(seq)) => {
-                let outcome = wire::decode_answer(buf.split().freeze());
+                let outcome = wire::decode_response(buf.split().freeze());
                 if let Some(reply) = waiting[seq.slot_index(depth)].take() {
                     done.push((reply, outcome));
                 }
@@ -395,10 +401,10 @@ pub(super) fn peer_corrupted(i: LaneIndex, pid: Pid, fault: PeerFault) -> LaneUn
 /// What the death of a lane's worker left: why it died, where the lane's reading stood (before the
 /// request it died running is skipped: an answer since the last death ends a crash streak, a skip
 /// is not one), the requests its death answers, and the fault in the counters it left, if any.
-pub(super) struct Burial {
+pub(super) struct WorkerDeath {
     pub(super) cause: DeathCause,
     pub(super) read_at_death: u32,
-    pub(super) answered: Completions,
+    pub(super) completions: Completions,
     pub(super) fault: Option<PeerFault>,
 }
 
@@ -406,15 +412,15 @@ pub(super) struct Burial {
 /// `now_ns`): reads what it answered, answers 502 what it was running (504 when it overran
 /// `timeout`) and what it never took (it could write their bytes, so none runs on the next
 /// worker), and leaves the lane with no worker. `None` when `dead` is not the lane's worker.
-pub(super) fn bury(
+pub(super) fn take_over_lane(
     lane: &mut LocalLane,
     end: &mut LaneEnd,
-    dead: WorkerTag,
+    dead: WorkerId,
     exit: &WorkerExit,
     now_ns: u64,
     timeout: Duration,
     depth: RingDepth,
-) -> Option<Burial> {
+) -> Option<WorkerDeath> {
     let cause = lane.death_cause(dead, now_ns)?;
     let (i, pid) = (dead.lane, dead.pid);
     let mut fault = None;
@@ -427,7 +433,7 @@ pub(super) fn bury(
             // Its requests were answered when its fault was seen; none runs again.
             let given_up = end.abandon();
             let refusal = |r| (r, Err(LaneRequestError::Rejected(LaneUnansweredError::ShuttingDown)));
-            answered.extend(lane.take_replies(given_up, depth).into_iter().map(refusal));
+            answered.extend(lane.take_waiters(given_up, depth).into_iter().map(refusal));
             read_before
         }
         DeathCause::Crashed { .. } | DeathCause::Overran { .. } => {
@@ -438,12 +444,12 @@ pub(super) fn bury(
             let mut dead_answers = Vec::new();
             match end.take_over(&mut dead_answers) {
                 Ok(split) => {
-                    for DeadPeerAnswer { seq, message } in dead_answers {
+                    for DeadPeerResponse { seq, message } in dead_answers {
                         let outcome = match message {
-                            Ok(bytes) => wire::decode_answer(bytes),
+                            Ok(bytes) => wire::decode_response(bytes),
                             Err(e) => Err(LaneRequestError::Rejected(peer_corrupted(i, pid, PeerFault::Length(e)))),
                         };
-                        if let Some(reply) = lane.waiting[seq.slot_index(depth)].take() {
+                        if let Some(reply) = lane.waiters[seq.slot_index(depth)].take() {
                             answered.push((reply, outcome));
                         }
                     }
@@ -470,7 +476,7 @@ pub(super) fn bury(
                                 }
                             }
                         };
-                        if let Some(reply) = lane.waiting[ran_seq.slot_index(depth)].take() {
+                        if let Some(reply) = lane.waiters[ran_seq.slot_index(depth)].take() {
                             answered.push((reply, Err(LaneRequestError::Rejected(refusal))));
                         }
                     }
@@ -483,10 +489,10 @@ pub(super) fn bury(
                         };
                         (reply, Err(LaneRequestError::Rejected(refusal)))
                     };
-                    answered.extend(lane.take_replies(split.handed(), depth).into_iter().map(untaken));
-                    split.answered().end()
+                    answered.extend(lane.take_waiters(split.untaken(), depth).into_iter().map(untaken));
+                    split.responded().end()
                 }
-                Err(DeadPeerError {
+                Err(TakeOverError {
                     cause: counters,
                     abandoned,
                 }) => {
@@ -499,17 +505,17 @@ pub(super) fn bury(
                             Err(LaneRequestError::Rejected(peer_corrupted(i, pid, counter_fault))),
                         )
                     };
-                    answered.extend(lane.take_replies(abandoned, depth).into_iter().map(refusal));
+                    answered.extend(lane.take_waiters(abandoned, depth).into_iter().map(refusal));
                     read_before
                 }
             }
         }
     };
     lane.worker = LaneWorker::Gone;
-    Some(Burial {
+    Some(WorkerDeath {
         cause,
         read_at_death: read_at_death.get(),
-        answered,
+        completions: answered,
         fault,
     })
 }
@@ -527,13 +533,13 @@ pub(super) fn streak_after_death(
 ) -> (CrashStreak, Option<u32>) {
     match runs.iter().position(|r| r.lane == lane) {
         Some(k) if runs[k].read_at_death == read_at_death => {
-            let mut streak = runs.swap_remove(k).run;
+            let mut streak = runs.swap_remove(k).streak;
             streak.died(now_ns, exit.clone());
             (streak, None)
         }
         // A streak whose lane answered since its last death is over.
         found => {
-            let recovered = found.and_then(|k| runs.swap_remove(k).run.answered());
+            let recovered = found.and_then(|k| runs.swap_remove(k).streak.answered());
             (CrashStreak::first(now_ns, exit.clone()), recovered)
         }
     }
@@ -542,15 +548,15 @@ pub(super) fn streak_after_death(
 /// What a lane did with a fault its worker wrote ([`LocalLane::fault`]).
 pub(super) enum FaultStep {
     /// The worker is faulted and must be killed.
-    Killed(WorkerTag),
+    Killed(WorkerId),
     /// Nothing changed: the lane has no worker that runs it yet, or is out of service.
     Kept,
     /// The lane had no worker and gave its requests up.
     GaveUp,
 }
 
-/// What one look at a host's crash runs found ([`tend_crash_runs`]).
-pub(super) struct Tend {
+/// What one look at a host's crash runs found ([`check_crash_streaks`]).
+pub(super) struct CrashStreakCheck {
     /// The lanes whose crash-loop wait is over: the host forks their next worker.
     pub(super) forks: Vec<LaneIndex>,
     /// The lanes that answered since their last death, and how many crashes their run held.
@@ -563,8 +569,8 @@ pub(super) struct Tend {
 
 /// Looks once at a host's crash runs at `now_ns`: a lane that answered ends its run, a waiting
 /// lane whose wait is over is due to fork, and a looping lane's alert comes due again.
-pub(super) fn tend_crash_runs(owned: &mut HostCore, backoff: &CrashBackoff, now: u64) -> Tend {
-    let mut tend = Tend {
+pub(super) fn check_crash_streaks(owned: &mut HostCore, backoff: &CrashBackoff, now: u64) -> CrashStreakCheck {
+    let mut tend = CrashStreakCheck {
         forks: Vec::new(),
         recovered: Vec::new(),
         alerts: Vec::new(),
@@ -573,7 +579,7 @@ pub(super) fn tend_crash_runs(owned: &mut HostCore, backoff: &CrashBackoff, now:
     let HostCore {
         lanes,
         ends,
-        crash_runs: runs,
+        crash_streaks: runs,
     } = owned;
     let mut k = 0;
     while k < runs.len() {
@@ -585,23 +591,23 @@ pub(super) fn tend_crash_runs(owned: &mut HostCore, backoff: &CrashBackoff, now:
         let (lane, end) = (&lanes[at], &ends[at]);
         if end.window().read().get() != entry.read_at_death {
             let ended = runs.swap_remove(k);
-            if let Some(crashes) = ended.run.answered() {
+            if let Some(crashes) = ended.streak.answered() {
                 tend.recovered.push((ended.lane, crashes));
             }
             continue;
         }
-        let forks = lane.waiting() && entry.run.respawn(backoff, now) == RespawnStep::Fork;
+        let forks = lane.in_crash_wait() && entry.streak.respawn(backoff, now) == RespawnStep::Fork;
         if forks {
             tend.forks.push(entry.lane);
         }
-        if entry.run.alert_due(backoff, now) {
+        if entry.streak.alert_due(backoff, now) {
             tend.alerts.push(entry.lane);
         }
-        if let Some(alert_at) = entry.run.alert_at_ns(backoff) {
+        if let Some(alert_at) = entry.streak.alert_at_ns(backoff) {
             // A looping lane is looked at again when it forks (waiting), else after the first
             // wait (has it answered yet?), and at its next alert at the latest.
-            let look_at = if lane.waiting() && !forks {
-                entry.run.wait(entry.lane, backoff).fork_at_ns
+            let look_at = if lane.in_crash_wait() && !forks {
+                entry.streak.wait(entry.lane, backoff).fork_at_ns
             } else {
                 now.saturating_add(backoff.first.as_nanos().min(u128::from(u64::MAX)) as u64)
             };
@@ -613,8 +619,8 @@ pub(super) fn tend_crash_runs(owned: &mut HostCore, backoff: &CrashBackoff, now:
     tend
 }
 
-/// What a look at a replacement's start found ([`LocalLane::look_at_start`]).
-pub(super) enum StartLook {
+/// What a look at a replacement's start found ([`LocalLane::check_replacement_start`]).
+pub(super) enum ReplacementStart {
     Ready {
         latency_us: u64,
     },
@@ -639,12 +645,12 @@ pub(super) struct Breakage {
 pub(super) enum LaneNotice {
     /// A worker died (logged for every death while the run serves).
     WorkerDied {
-        worker: WorkerTag,
+        worker: WorkerId,
         cause: DeathCause,
         exit: WorkerExit,
     },
     /// A worker wrote what no worker writes; it is killed.
-    PeerFault { worker: WorkerTag, fault: PeerFault },
+    PeerFault { worker: WorkerId, fault: PeerFault },
     /// A lane with no worker found what no worker writes in its channel, and gave its requests up.
     FaultWithoutWorker { lane: LaneIndex, fault: PeerFault },
     /// A lane answered after a crash streak of `crashes`.
@@ -675,7 +681,7 @@ pub(super) trait HostEffects {
     /// The number of a new start attempt (`ServerLanes::take_attempt`).
     fn take_attempt(&mut self) -> Attempt;
     /// Kills `worker`.
-    fn kill(&mut self, worker: WorkerTag);
+    fn kill(&mut self, worker: WorkerId);
     /// Asks for lane `lane`'s next worker, as start attempt `attempt`; the answer comes back as
     /// [`HostCore::forked`].
     fn fork(&mut self, lane: LaneIndex, attempt: Attempt);
@@ -683,14 +689,14 @@ pub(super) trait HostEffects {
     /// makes is killed.
     fn drop_fork(&mut self, lane: LaneIndex);
     /// `worker` is dead and its lane forgets it.
-    fn forget(&mut self, worker: WorkerTag);
+    fn forget(&mut self, worker: WorkerId);
     /// A request published into a lane woke its sleeping worker.
     fn woke_worker(&mut self);
     /// A queued request nobody waited for any more was dropped instead of run.
     fn skipped_unawaited(&mut self);
     /// Answers whoever waits on `reply`.
     fn reply(&mut self, reply: LaneReplySender, outcome: Result<HandlerResponse, LaneRequestError>);
-    fn say(&mut self, notice: LaneNotice);
+    fn report(&mut self, notice: LaneNotice);
     /// Lane `lane` broke for good with `why` (`newly`: the first time); the run decides what it
     /// does to the server.
     fn lane_lost(&mut self, lane: LaneIndex, why: Arc<LaneLossError>, newly: bool);
@@ -751,7 +757,7 @@ pub(super) fn refill(lane: &mut LocalLane, end: &mut LaneEnd, fx: &mut impl Host
             fx.skipped_unawaited();
             continue;
         }
-        if let Err((e, job)) = publish(&mut lane.waiting, slot, job, fx) {
+        if let Err((e, job)) = publish(&mut lane.waiters, slot, job, fx) {
             fx.reply(job.reply, Err(LaneRequestError::TooLarge(e)));
         }
     }
@@ -793,7 +799,7 @@ impl HostCore {
         job: LaneJob,
         queue_per_worker: usize,
         fx: &mut impl HostEffects,
-    ) -> Result<(), Rejection> {
+    ) -> Result<(), SubmitError> {
         let HostCore { lanes, ends, .. } = self;
         let loads = lanes
             .iter()
@@ -802,17 +808,17 @@ impl HostCore {
         let k = match health::lane_pick(loads, queue_per_worker) {
             LanePick::Lane(k) => k,
             LanePick::Full => {
-                return Err(Rejection::Refused(
+                return Err(SubmitError::Refused(
                     LaneRequestError::Rejected(health::lanes_full()),
                     job,
                 ));
             }
-            LanePick::NoLane => return Err(Rejection::NoLane(job)),
+            LanePick::NoLane => return Err(SubmitError::NoLane(job)),
         };
         let (lane, end) = (&mut lanes[k], &mut ends[k]);
         match end.request_slot() {
-            Some(slot) if lane.queued.is_empty() => publish(&mut lane.waiting, slot, job, fx)
-                .map_err(|(e, job)| Rejection::Refused(LaneRequestError::TooLarge(e), job))?,
+            Some(slot) if lane.queued.is_empty() => publish(&mut lane.waiters, slot, job, fx)
+                .map_err(|(e, job)| SubmitError::Refused(LaneRequestError::TooLarge(e), job))?,
             Some(_) | None => lane.queued.push_back(job),
         }
         Ok(())
@@ -827,7 +833,7 @@ impl HostCore {
         now_ns: u64,
         host: usize,
     ) -> LaneUnansweredError {
-        let wait = soonest_wait(&self.lanes, &self.crash_runs, backoff).map(|wait| (wait, now_ns));
+        let wait = soonest_wait(&self.lanes, &self.crash_streaks, backoff).map(|wait| (wait, now_ns));
         let cause = || {
             let cause = match self.lanes.iter().find_map(LocalLane::broken_why) {
                 Some(why) => why.to_string(),
@@ -839,7 +845,7 @@ impl HostCore {
     }
 
     /// Reads every published answer of the host's lanes into `done` (each copied out of its slot
-    /// into `buf`, [`take_answers`]) and refills each lane read; returns how many it read. A lane
+    /// into `buf`, [`take_responses`]) and refills each lane read; returns how many it read. A lane
     /// with nothing new costs one atomic load. A worker that wrote what no worker writes is
     /// handled where it is found ([`fault`]).
     pub(super) fn collect(
@@ -851,10 +857,10 @@ impl HostCore {
     ) -> u64 {
         let mut read = 0u64;
         for (lane, end) in self.lanes.iter_mut().zip(self.ends.iter_mut()) {
-            if !end.has_news() {
+            if !end.has_responses_or_fault() {
                 continue;
             }
-            match take_answers(end, buf, &mut lane.waiting, depth, done) {
+            match take_responses(end, buf, &mut lane.waiters, depth, done) {
                 (took, Ok(())) => {
                     read += took;
                     refill(lane, end, fx);
@@ -870,17 +876,17 @@ impl HostCore {
 
     /// The host's lane waiting out a crash loop that forks first.
     pub(super) fn soonest_wait(&self, backoff: &CrashBackoff) -> Option<CrashLoopWait> {
-        soonest_wait(&self.lanes, &self.crash_runs, backoff)
+        soonest_wait(&self.lanes, &self.crash_streaks, backoff)
     }
 
     /// `dead`, which the host saw die, ended with `exit` (the host read it after the death, at
-    /// `now_ns`): takes over its lane's channel ([`bury`]), refills the lane for the next worker,
+    /// `now_ns`): takes over its lane's channel ([`take_over_lane`]), refills the lane for the next worker,
     /// and decides what follows — while the run serves, the next worker now or after a crash-loop
     /// wait ([`HostCore::crashed`]), or the lane breaks when the worker refused to start; while it
     /// stops (`stopping`), none. A worker its lane no longer runs changes nothing.
     pub(super) fn worker_exited(
         &mut self,
-        dead: WorkerTag,
+        dead: WorkerId,
         exit: &WorkerExit,
         now_ns: u64,
         stopping: bool,
@@ -891,16 +897,16 @@ impl HostCore {
         let Some((lane, end)) = self.lane(i) else {
             return;
         };
-        let Some(burial) = bury(lane, end, dead, exit, now_ns, config.timeout, config.depth) else {
+        let Some(burial) = take_over_lane(lane, end, dead, exit, now_ns, config.timeout, config.depth) else {
             return;
         };
         if let Some(fault) = burial.fault {
-            fx.say(LaneNotice::PeerFault { worker: dead, fault });
+            fx.report(LaneNotice::PeerFault { worker: dead, fault });
         }
         fx.forget(dead);
         refill(lane, end, fx);
         if !stopping {
-            fx.say(LaneNotice::WorkerDied {
+            fx.report(LaneNotice::WorkerDied {
                 worker: dead,
                 cause: burial.cause,
                 exit: exit.clone(),
@@ -912,7 +918,7 @@ impl HostCore {
             self.crashed(i, burial.read_at_death, exit, now_ns, config, fx);
         }
         fx.load(self.load());
-        for (reply, outcome) in burial.answered {
+        for (reply, outcome) in burial.completions {
             fx.reply(reply, outcome);
         }
     }
@@ -931,9 +937,9 @@ impl HostCore {
         fx: &mut impl HostEffects,
     ) {
         let backoff = config.crash_backoff;
-        let (mut streak, recovered) = streak_after_death(&mut self.crash_runs, i, read_at_death, exit, now_ns);
+        let (mut streak, recovered) = streak_after_death(&mut self.crash_streaks, i, read_at_death, exit, now_ns);
         if let Some(crashes) = recovered {
-            fx.say(LaneNotice::Recovered { lane: i, crashes });
+            fx.report(LaneNotice::Recovered { lane: i, crashes });
         }
         let alert = streak.alert_due(&backoff, now_ns);
         let Some((lane, end)) = self.lane(i) else {
@@ -952,9 +958,9 @@ impl HostCore {
             }
         };
         let read_at_death = end.window().read().get();
-        self.crash_runs.push(LaneCrashStreak {
+        self.crash_streaks.push(LaneCrashStreak {
             lane: i,
-            run: streak,
+            streak,
             read_at_death,
         });
         if refused.is_some() {
@@ -971,15 +977,15 @@ impl HostCore {
 
     /// Says lane `i`'s crash-loop alert, with its streak's facts.
     fn say_crash_loop(&mut self, i: LaneIndex, backoff: &CrashBackoff, fx: &mut impl HostEffects) {
-        let waiting = self.lane(i).is_some_and(|(lane, _)| lane.waiting());
-        let Some(run) = self.crash_runs.iter().find(|r| r.lane == i) else {
+        let waiting = self.lane(i).is_some_and(|(lane, _)| lane.in_crash_wait());
+        let Some(run) = self.crash_streaks.iter().find(|r| r.lane == i) else {
             return;
         };
-        let crashes = run.run.crashes();
-        fx.say(LaneNotice::CrashLoop {
+        let crashes = run.streak.crashes();
+        fx.report(LaneNotice::CrashLoop {
             lane: i,
             crashes,
-            exit: run.run.last_exit().clone(),
+            exit: run.streak.last_exit().clone(),
             wait: backoff.wait(crashes),
             waiting,
         });
@@ -1009,7 +1015,7 @@ impl HostCore {
         config: &CoreConfig,
         fx: &mut impl HostEffects,
     ) -> bool {
-        fx.say(LaneNotice::LaneLost {
+        fx.report(LaneNotice::LaneLost {
             lane: i,
             why: Arc::clone(why),
         });
@@ -1030,9 +1036,9 @@ impl HostCore {
             fx.usable_lanes(-1);
         }
         // A broken lane's crash run is over: it forks no more.
-        if let Some(k) = self.crash_runs.iter().position(|r| r.lane == i) {
-            if self.crash_runs.swap_remove(k).run.alerted() {
-                fx.say(LaneNotice::LoopEnded { lane: i });
+        if let Some(k) = self.crash_streaks.iter().position(|r| r.lane == i) {
+            if self.crash_streaks.swap_remove(k).streak.alerted() {
+                fx.report(LaneNotice::LoopEnded { lane: i });
             }
         }
         if was_waiting {
@@ -1052,16 +1058,21 @@ impl HostCore {
         newly
     }
 
-    /// Looks once at the crash runs at `now_ns` ([`tend_crash_runs`]): forks the lanes whose wait
+    /// Looks once at the crash runs at `now_ns` ([`check_crash_streaks`]): forks the lanes whose wait
     /// is over, says the recoveries and the alerts due, and returns when to look again (`None`
     /// once no lane loops).
-    pub(super) fn tend(&mut self, now_ns: u64, config: &CoreConfig, fx: &mut impl HostEffects) -> Option<u64> {
-        let Tend {
+    pub(super) fn check_crash_streaks(
+        &mut self,
+        now_ns: u64,
+        config: &CoreConfig,
+        fx: &mut impl HostEffects,
+    ) -> Option<u64> {
+        let CrashStreakCheck {
             forks,
             recovered,
             alerts,
             next_ns,
-        } = tend_crash_runs(self, &config.crash_backoff, now_ns);
+        } = check_crash_streaks(self, &config.crash_backoff, now_ns);
         let forked = forks.len();
         for i in forks {
             if let Some((lane, end)) = self.lane(i) {
@@ -1075,7 +1086,7 @@ impl HostCore {
             fx.crash_wait(self.soonest_wait(&config.crash_backoff), false);
         }
         for (lane, crashes) in recovered {
-            fx.say(LaneNotice::Recovered { lane, crashes });
+            fx.report(LaneNotice::Recovered { lane, crashes });
         }
         for i in alerts {
             self.say_crash_loop(i, &config.crash_backoff, fx);
@@ -1089,7 +1100,7 @@ impl HostCore {
     pub(super) fn forked(
         &mut self,
         i: LaneIndex,
-        answer: Result<WorkerTag, LaneLossError>,
+        answer: Result<WorkerId, LaneLossError>,
         config: &CoreConfig,
         fx: &mut impl HostEffects,
     ) {
@@ -1117,12 +1128,17 @@ impl HostCore {
     /// Looks at the start reports of the replacements not yet seen ready (the time, `now_ns`, is
     /// read only for one that is): a ready
     /// one is said with its latency; one that cannot start breaks its lane (it would fail again).
-    pub(super) fn look_at_starts(&mut self, now_ns: impl Fn() -> u64, config: &CoreConfig, fx: &mut impl HostEffects) {
+    pub(super) fn check_replacement_starts(
+        &mut self,
+        now_ns: impl Fn() -> u64,
+        config: &CoreConfig,
+        fx: &mut impl HostEffects,
+    ) {
         let mut failed = Vec::new();
         for (lane, end) in self.lanes.iter_mut().zip(self.ends.iter()) {
-            match lane.look_at_start(end, &now_ns) {
-                Some(StartLook::Ready { latency_us }) => fx.say(LaneNotice::Respawned { latency_us }),
-                Some(StartLook::Failed(why)) => failed.push((lane.index, why)),
+            match lane.check_replacement_start(end, &now_ns) {
+                Some(ReplacementStart::Ready { latency_us }) => fx.report(LaneNotice::Respawned { latency_us }),
+                Some(ReplacementStart::Failed(why)) => failed.push((lane.index, why)),
                 None => {}
             }
         }
@@ -1137,7 +1153,7 @@ impl HostCore {
         for (lane, end) in self.lanes.iter_mut().zip(self.ends.iter()) {
             if let Some(worker) = lane.overrun(end, now_ns, timeout) {
                 fx.kill(worker);
-                fx.say(LaneNotice::TimedOut);
+                fx.report(LaneNotice::TimedOut);
             }
         }
     }
@@ -1146,9 +1162,9 @@ impl HostCore {
     /// 503, the crash runs end with it, and a replacement still forking is dropped, since no answer
     /// of its fork is read once the host ends.
     pub(super) fn close(&mut self, fx: &mut impl HostEffects) {
-        for ended in self.crash_runs.drain(..) {
-            if ended.run.alerted() {
-                fx.say(LaneNotice::LoopEnded { lane: ended.lane });
+        for ended in self.crash_streaks.drain(..) {
+            if ended.streak.alerted() {
+                fx.report(LaneNotice::LoopEnded { lane: ended.lane });
             }
         }
         for lane in &mut self.lanes {
@@ -1156,7 +1172,7 @@ impl HostCore {
                 lane.worker = LaneWorker::Gone;
                 fx.drop_fork(lane.index);
             }
-            for reply in lane.take_every_reply() {
+            for reply in lane.take_every_waiter() {
                 fx.reply(
                     reply,
                     Err(LaneRequestError::Rejected(LaneUnansweredError::ShuttingDown)),
@@ -1180,11 +1196,11 @@ pub(super) fn fault(
 ) {
     match lane.fault(end, fault, depth, done) {
         FaultStep::Killed(worker) => {
-            fx.say(LaneNotice::PeerFault { worker, fault });
+            fx.report(LaneNotice::PeerFault { worker, fault });
             fx.kill(worker);
         }
         FaultStep::Kept => {}
-        FaultStep::GaveUp => fx.say(LaneNotice::FaultWithoutWorker {
+        FaultStep::GaveUp => fx.report(LaneNotice::FaultWithoutWorker {
             lane: lane.index,
             fault,
         }),
@@ -1203,7 +1219,7 @@ pub(super) fn refused_start(exit: &WorkerExit) -> bool {
 }
 
 /// A request [`HostCore::submit`] could not place, handed back.
-pub(super) enum Rejection {
+pub(super) enum SubmitError {
     /// No lane of the host takes requests: [`HostCore::no_lane_refusal`] says why.
     NoLane(LaneJob),
     /// Refused, with why: the lanes are full, or it does not fit a slot.

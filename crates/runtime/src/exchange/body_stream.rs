@@ -33,11 +33,12 @@ pub use py_error::BodyReadError as PyBodyReadError;
 /// The server hangs this on a `BodyReadError` it raises, as `_rejection`, so the dispatcher can
 /// answer the rejection as what it is.
 #[pyclass(frozen, name = "_BodyRejection", module = "mipyre.engine")]
-struct Rejection(BodyReadError);
+struct BodyRejection(BodyReadError);
 
 fn body_rejected(py: Python<'_>, reject: BodyReadError) -> PyErr {
     let err = PyBodyReadError::new_err(reject.to_string());
-    let carried = Bound::new(py, Rejection(reject)).and_then(|r| err.value(py).setattr(intern!(py, "_rejection"), r));
+    let carried =
+        Bound::new(py, BodyRejection(reject)).and_then(|r| err.value(py).setattr(intern!(py, "_rejection"), r));
     match carried {
         Ok(()) => err,
         Err(failed) => {
@@ -53,7 +54,7 @@ pub(crate) fn rejection_of(py: Python<'_>, err: &PyErr) -> Option<BodyReadError>
         return None;
     }
     let carried = err.value(py).getattr(intern!(py, "_rejection")).ok()?;
-    let rejection = carried.cast::<Rejection>().ok()?;
+    let rejection = carried.cast::<BodyRejection>().ok()?;
     Some(rejection.get().0.clone())
 }
 
@@ -61,11 +62,11 @@ enum StreamState {
     Open(BodyReceiver),
     Finished,
     /// Every later read raises this error again.
-    Failed(BodyStreamError),
+    Failed(ReadBodyStreamError),
 }
 
 #[derive(Clone)]
-enum BodyStreamError {
+enum ReadBodyStreamError {
     Rejected(BodyReadError),
     /// The handler did not read the body within this request budget.
     Unread(std::time::Duration),
@@ -73,15 +74,15 @@ enum BodyStreamError {
     CutOff,
 }
 
-impl BodyStreamError {
+impl ReadBodyStreamError {
     fn to_py(&self, py: Python<'_>) -> PyErr {
         match self {
-            BodyStreamError::Rejected(reject) => body_rejected(py, reject.clone()),
-            BodyStreamError::Unread(budget) => PyOSError::new_err(format!(
+            ReadBodyStreamError::Rejected(reject) => body_rejected(py, reject.clone()),
+            ReadBodyStreamError::Unread(budget) => PyOSError::new_err(format!(
                 "the handler did not read its streamed request body within the request budget \
                  ({budget:?}); the server stopped reading the body"
             )),
-            BodyStreamError::CutOff => PyOSError::new_err(
+            ReadBodyStreamError::CutOff => PyOSError::new_err(
                 "the request body stream ended before the body did: the server stopped \
                  feeding it (the request was abandoned)",
             ),
@@ -114,7 +115,7 @@ impl BodyStream {
     }
 
     /// Waits for the next chunk, returning `None` at the body's end; must run detached.
-    fn next_message(&self) -> Result<Option<bytes::Bytes>, BodyStreamError> {
+    fn next_message(&self) -> Result<Option<bytes::Bytes>, ReadBodyStreamError> {
         let mut state = self.lock();
         let rx = match &mut *state {
             StreamState::Open(rx) => rx,
@@ -127,9 +128,9 @@ impl BodyStream {
                 *state = StreamState::Finished;
                 return Ok(None);
             }
-            Some(BodyMessage::Rejected(reject)) => BodyStreamError::Rejected(reject),
-            Some(BodyMessage::Unread(budget)) => BodyStreamError::Unread(budget),
-            None => BodyStreamError::CutOff,
+            Some(BodyMessage::Rejected(reject)) => ReadBodyStreamError::Rejected(reject),
+            Some(BodyMessage::Unread(budget)) => ReadBodyStreamError::Unread(budget),
+            None => ReadBodyStreamError::CutOff,
         };
         *state = StreamState::Failed(failure.clone());
         Err(failure)
@@ -151,9 +152,9 @@ impl BodyStream {
                     *state = StreamState::Finished;
                     return Ok(total);
                 }
-                Some(BodyMessage::Rejected(reject)) => break BodyStreamError::Rejected(reject),
-                Some(BodyMessage::Unread(budget)) => break BodyStreamError::Unread(budget),
-                None => break BodyStreamError::CutOff,
+                Some(BodyMessage::Rejected(reject)) => break ReadBodyStreamError::Rejected(reject),
+                Some(BodyMessage::Unread(budget)) => break ReadBodyStreamError::Unread(budget),
+                None => break ReadBodyStreamError::CutOff,
             }
         };
         *state = StreamState::Failed(failure.clone());
@@ -163,7 +164,7 @@ impl BodyStream {
 
 enum DrainError {
     AlreadyRead,
-    StreamFailed(BodyStreamError),
+    StreamFailed(ReadBodyStreamError),
 }
 
 #[pymethods]

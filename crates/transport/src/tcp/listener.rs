@@ -17,7 +17,7 @@ use crate::tcp::os;
 #[inline]
 fn refused_option(event: TcpEvent, set: std::io::Result<()>) -> Option<(std::io::Error, u64)> {
     let errno = set.err()?;
-    events::degrade(event).map(|held| (errno, held))
+    events::count_and_admit(event).map(|held| (errno, held))
 }
 
 /// Enables TCP_QUICKACK on Linux and does nothing elsewhere. A failure is counted and logged
@@ -34,7 +34,7 @@ pub fn setup_tcp_quickack(stream: &std::net::TcpStream) {
 #[cold]
 #[inline(never)]
 fn quickack_refused(errno: std::io::Error) {
-    if let Some(held) = events::degrade(TcpEvent::QuickackFailed) {
+    if let Some(held) = events::count_and_admit(TcpEvent::QuickackFailed) {
         tracing::warn!(
             ?errno,
             held,
@@ -391,7 +391,7 @@ fn configure(stream: std::net::TcpStream, remote: SocketAddr) -> TcpConnection {
 #[cold]
 #[inline(never)]
 fn nodelay_refused(errno: std::io::Error, remote: SocketAddr) {
-    if let Some(held) = events::degrade(TcpEvent::NodelayFailed) {
+    if let Some(held) = events::count_and_admit(TcpEvent::NodelayFailed) {
         tracing::warn!(
             error = %errno,
             %remote,

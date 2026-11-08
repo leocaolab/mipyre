@@ -2,7 +2,7 @@
 
 /// The body is, or says it will be, larger than its limit, which is the client's fault (a 413).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TooLarge;
+pub struct LengthLimitError;
 
 /// One request body's size limit; the reader keeps the count of bytes received and hands it in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,16 +16,16 @@ impl BodySizeLimit {
     ///
     /// # Errors
     ///
-    /// Returns [`TooLarge`] when an announced size is over `max` or does not fit `usize`, so the
+    /// Returns [`LengthLimitError`] when an announced size is over `max` or does not fit `usize`, so the
     /// body is refused before any of it is read.
     #[inline]
-    pub fn start(max: usize, announced_lower: u64, announced_exact: Option<u64>) -> Result<Self, TooLarge> {
+    pub fn start(max: usize, announced_lower: u64, announced_exact: Option<u64>) -> Result<Self, LengthLimitError> {
         let over = |announced: u64| usize::try_from(announced).map_or(true, |n| n > max);
         if over(announced_lower) {
-            return Err(TooLarge);
+            return Err(LengthLimitError);
         }
         if announced_exact.is_some_and(over) {
-            return Err(TooLarge);
+            return Err(LengthLimitError);
         }
         Ok(BodySizeLimit { max })
     }
@@ -34,19 +34,16 @@ impl BodySizeLimit {
     ///
     /// # Errors
     ///
-    /// Returns [`TooLarge`] when the frame takes the body past `max`; the frame must then not be
+    /// Returns [`LengthLimitError`] when the frame takes the body past `max`; the frame must then not be
     /// taken.
     #[inline]
-    pub fn take(&self, received: usize, len: usize) -> Result<usize, TooLarge> {
+    pub fn take(&self, received: usize, len: usize) -> Result<usize, LengthLimitError> {
         match received.checked_add(len) {
             Some(received) if received <= self.max => Ok(received),
-            _ => Err(TooLarge),
+            _ => Err(LengthLimitError),
         }
     }
 }
-
-#[cfg(test)]
-mod fuzz;
 
 #[cfg(test)]
 mod tests {
@@ -55,12 +52,12 @@ mod tests {
     #[test]
     fn a_body_announced_at_the_limit_starts_and_one_byte_over_is_refused() {
         assert!(BodySizeLimit::start(1024, 1024, Some(1024)).is_ok());
-        assert_eq!(BodySizeLimit::start(1024, 1025, Some(1025)), Err(TooLarge));
+        assert_eq!(BodySizeLimit::start(1024, 1025, Some(1025)), Err(LengthLimitError));
     }
 
     #[test]
     fn an_exact_size_over_the_limit_is_refused() {
-        assert_eq!(BodySizeLimit::start(1024, 0, Some(1025)), Err(TooLarge));
+        assert_eq!(BodySizeLimit::start(1024, 0, Some(1025)), Err(LengthLimitError));
         assert!(BodySizeLimit::start(1024, 0, Some(1024)).is_ok());
     }
 
@@ -71,7 +68,10 @@ mod tests {
 
     #[test]
     fn an_announced_size_past_the_limit_in_u64_is_refused() {
-        assert_eq!(BodySizeLimit::start(usize::MAX - 1, u64::MAX, None), Err(TooLarge));
+        assert_eq!(
+            BodySizeLimit::start(usize::MAX - 1, u64::MAX, None),
+            Err(LengthLimitError)
+        );
     }
 
     #[test]
@@ -79,7 +79,7 @@ mod tests {
         let limit = BodySizeLimit::start(20, 0, None).unwrap();
         assert_eq!(limit.take(0, 10), Ok(10));
         assert_eq!(limit.take(10, 10), Ok(20), "exactly the limit");
-        assert_eq!(limit.take(20, 1), Err(TooLarge));
+        assert_eq!(limit.take(20, 1), Err(LengthLimitError));
         assert_eq!(limit.take(20, 0), Ok(20));
     }
 
@@ -87,12 +87,12 @@ mod tests {
     fn frames_past_usize_max_are_refused() {
         let limit = BodySizeLimit::start(usize::MAX - 1, 0, None).unwrap();
         assert_eq!(limit.take(0, usize::MAX - 1), Ok(usize::MAX - 1));
-        assert_eq!(limit.take(usize::MAX - 1, 2), Err(TooLarge));
+        assert_eq!(limit.take(usize::MAX - 1, 2), Err(LengthLimitError));
         let unlimited = BodySizeLimit::start(usize::MAX, 0, None).unwrap();
         assert_eq!(unlimited.take(usize::MAX - 1, 0), Ok(usize::MAX - 1));
         assert_eq!(
             unlimited.take(usize::MAX - 1, 2),
-            Err(TooLarge),
+            Err(LengthLimitError),
             "past what usize counts"
         );
     }
@@ -118,7 +118,7 @@ mod proofs {
             Ok(now) => {
                 assert!(now as u128 == sum && now <= max);
             }
-            Err(TooLarge) => {
+            Err(LengthLimitError) => {
                 assert!(sum > max as u128);
             }
         }

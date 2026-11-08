@@ -59,14 +59,12 @@ impl LocalTasks {
     where
         F: Future<Output = ()> + 'static,
     {
-        self.0.running.set(self.0.running.get() + 1);
-        let guard = TaskCountGuard(Rc::clone(&self.0));
-        tokio::task::spawn_local(async move {
-            if let Err(payload) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
-                record_panic(&guard.0, payload, clock::now());
-            }
-            drop(guard);
-        });
+        spawn_counted(&self.0, task);
+    }
+
+    /// Returns a handle that spawns tasks counted with these, for a task that starts another.
+    pub fn spawner(&self) -> LocalSpawner {
+        LocalSpawner(Rc::clone(&self.0))
     }
 
     pub fn len(&self) -> usize {
@@ -96,6 +94,39 @@ impl LocalTasks {
     pub fn idle(&mut self) -> IdleWaiter<'_> {
         IdleWaiter(&self.0)
     }
+}
+
+/// Spawns tasks counted by the [`LocalTasks`] it came from, so the drain waits for them too. It is
+/// `Rc`, so it stays on the thread whose `LocalSet` runs them.
+#[derive(Clone)]
+pub struct LocalSpawner(Rc<TaskCount>);
+
+impl LocalSpawner {
+    /// Spawns `task` as [`LocalTasks::spawn_local`] does.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a `LocalSet`, as `tokio::task::spawn_local` does.
+    pub fn spawn_local<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        spawn_counted(&self.0, task);
+    }
+}
+
+fn spawn_counted<F>(count: &Rc<TaskCount>, task: F)
+where
+    F: Future<Output = ()> + 'static,
+{
+    count.running.set(count.running.get() + 1);
+    let guard = TaskCountGuard(Rc::clone(count));
+    tokio::task::spawn_local(async move {
+        if let Err(payload) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
+            record_panic(&guard.0, payload, clock::now());
+        }
+        drop(guard);
+    });
 }
 
 /// Counts a task's panic and logs its text unless the thread's panic line is held back; returns
@@ -161,6 +192,25 @@ mod tests {
                 tokio::task::yield_now().await;
             });
             assert_eq!(tasks.len(), 1);
+            tasks.idle().await;
+            assert!(tasks.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_task_spawned_by_another_through_a_spawner_is_counted_until_it_ends() {
+        local(async {
+            let mut tasks = LocalTasks::new();
+            let spawner = tasks.spawner();
+            let (started, start) = tokio::sync::oneshot::channel::<()>();
+            tasks.spawn_local(async move {
+                spawner.spawn_local(async move {
+                    drop(start.await);
+                });
+            });
+            tokio::task::yield_now().await;
+            assert_eq!(tasks.len(), 1);
+            assert!(started.send(()).is_ok(), "the spawned task is still waiting");
             tasks.idle().await;
             assert!(tasks.is_empty());
         });

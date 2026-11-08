@@ -101,12 +101,12 @@ const ROOT: &str = "/srv";
 const MOUNT_CAP: u64 = 1 << 20;
 
 /// A read of `resolved` under the root, asked for as `requested`, one byte long.
-struct Read {
+struct CacheMiss {
     requested: RequestPath,
     file: Arc<StaticFile>,
 }
 
-fn read(requested: &str, resolved: &str) -> Read {
+fn read(requested: &str, resolved: &str) -> CacheMiss {
     let root = Path::new(ROOT);
     let file = StaticFile::new(
         FileContents {
@@ -116,7 +116,7 @@ fn read(requested: &str, resolved: &str) -> Read {
         None,
         root.join(resolved),
     );
-    Read {
+    CacheMiss {
         requested: RequestPath {
             path: root.join(requested),
             link_dirs: Box::default(),
@@ -145,10 +145,10 @@ fn followed() -> (Arc<MountCache>, Arc<CacheBudget>) {
 
 /// Keeps `read` under `key` as a miss does: an alias of the file the cache holds, else the file
 /// read under a reservation of its size; and tells whether it was kept.
-fn keep_file(cache: &MountCache, key: &str, ticket: MissGeneration, read: Read) -> bool {
+fn keep_file(cache: &MountCache, key: &str, ticket: MissGeneration, read: CacheMiss) -> bool {
     let key = Box::from(key.as_bytes());
-    let kept = match cache.held(&read.file.resolved) {
-        Some(held) => cache.keep_held(key, ticket, read.requested, held),
+    let kept = match cache.cached_file(&read.file.resolved) {
+        Some(held) => cache.keep_cached(key, ticket, read.requested, held),
         None => cache
             .reserve(read.file.cached_len())
             .and_then(|reserved| cache.keep_read(key, ticket, read.requested, reserved, read.file)),

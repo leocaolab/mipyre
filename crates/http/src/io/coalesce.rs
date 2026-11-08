@@ -43,7 +43,7 @@ use crate::plan::coalesce::{
     PollPhase, Protocol, WriteAction,
 };
 use mipyre_transport::stream::events::{self, StreamEvent};
-use mipyre_transport::stream::linger::{linger, Close, LingerBounds};
+use mipyre_transport::stream::linger::{linger, CloseStyle, LingerBounds};
 use mipyre_transport::stream::peer_gone;
 use mipyre_util::clock;
 use mipyre_util::throttle::LogThrottle;
@@ -100,16 +100,16 @@ impl sealed::Sealed for LocalShare {}
 /// cost every HTTP/2 poll 14. A relaxed atomic is a plain load or store, so the one-thread kind
 /// pays nothing for it.
 #[doc(hidden)]
-pub struct ConnectionCore<L> {
+pub struct CoalesceInner<L> {
     passthrough: AtomicBool,
     state: L,
 }
 
 impl Sharing for SendShare {
-    type Share<X> = Arc<ConnectionCore<Mutex<X>>>;
+    type Share<X> = Arc<CoalesceInner<Mutex<X>>>;
     #[inline]
     fn new<X>(state: X) -> Self::Share<X> {
-        Arc::new(ConnectionCore {
+        Arc::new(CoalesceInner {
             passthrough: AtomicBool::new(false),
             state: Mutex::new(state),
         })
@@ -134,10 +134,10 @@ impl Sharing for SendShare {
 }
 
 impl Sharing for LocalShare {
-    type Share<X> = Rc<ConnectionCore<RefCell<X>>>;
+    type Share<X> = Rc<CoalesceInner<RefCell<X>>>;
     #[inline]
     fn new<X>(state: X) -> Self::Share<X> {
-        Rc::new(ConnectionCore {
+        Rc::new(CoalesceInner {
             passthrough: AtomicBool::new(false),
             state: RefCell::new(state),
         })
@@ -466,7 +466,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, S: Sharing> AsyncWrite for CoalescingIo<
         if let Some(e) = core.take_failure() {
             return Poll::Ready(Err(e));
         }
-        let decision = crate::plan::coalesce::write(&core.conn, core.out.len(), core.draining(), bufs);
+        let decision = crate::plan::coalesce::decide_write(&core.conn, core.out.len(), core.draining(), bufs);
         if decision.drain_first() {
             ready!(core.poll_drain(cx))?;
         }
@@ -533,7 +533,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin, S: Sharing> Flusher<T, S> {
     /// # Errors
     ///
     /// Returns the error of a write-out that failed, here or at an earlier poll's end.
-    pub async fn finish<F: Future<Output = ()>>(self, close: Close, bounds: LingerBounds, stop: F) -> io::Result<()> {
+    pub async fn finish<F: Future<Output = ()>>(
+        self,
+        close: CloseStyle,
+        bounds: LingerBounds,
+        stop: F,
+    ) -> io::Result<()> {
         let Some(mut state) = S::sole(self.shared) else {
             return Ok(());
         };
@@ -541,7 +546,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, S: Sharing> Flusher<T, S> {
             return Err(e);
         }
         std::future::poll_fn(|cx| state.poll_write_out(cx)).await?;
-        if close == Close::Lingering && !state.peer_closed {
+        if close == CloseStyle::Lingering && !state.peer_closed {
             linger(&mut state.inner, bounds, stop).await;
         }
         Ok(())

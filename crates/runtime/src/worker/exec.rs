@@ -58,7 +58,7 @@ macro_rules! bundled {
 pub(super) use bundled;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScriptFailure {
+pub enum ScriptDiagnosis {
     RelativeImport,
     /// It holds the explanation `mipyre._worker.imports.explain` gave.
     NotForSubinterpreters(Box<str>),
@@ -66,18 +66,18 @@ pub enum ScriptFailure {
     NotDiagnosed(Box<str>),
 }
 
-impl std::fmt::Display for ScriptFailure {
+impl std::fmt::Display for ScriptDiagnosis {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ScriptFailure::RelativeImport => f.write_str(
+            ScriptDiagnosis::RelativeImport => f.write_str(
                 "\n(A worker executes the script as a module of its own, \
                  `__mipyre_worker__`, outside any package, so a relative import in it \
                  (`from . import x`, `from .models import X`) cannot resolve there. Import by \
                  absolute name (`from mypkg.models import X`), with the package importable \
                  from sys.path.)",
             ),
-            ScriptFailure::NotForSubinterpreters(text) => f.write_str(text),
-            ScriptFailure::NotDiagnosed(why) => write!(
+            ScriptDiagnosis::NotForSubinterpreters(text) => f.write_str(text),
+            ScriptDiagnosis::NotDiagnosed(why) => write!(
                 f,
                 "\n(The engine could not tell whether this failed on a relative import or on an \
                  extension that can't load in a sub-interpreter: {why}.)"
@@ -103,7 +103,7 @@ pub(super) enum ExtensionLoader {
 #[derive(Debug)]
 pub(super) struct ExecFailure {
     pub(super) raised: PyErr,
-    pub(super) failure: Option<ScriptFailure>,
+    pub(super) diagnosis: Option<ScriptDiagnosis>,
 }
 
 /// Creates a module registered in `sys.modules`, with builtins and, for the script, `__file__`.
@@ -133,7 +133,7 @@ pub(super) fn exec_in(
     // The path is spelled as `os.fsdecode` would, so a path that is not UTF-8 keeps its bytes.
     let file = src.file.as_os_str().into_pyobject(py).map_err(|e| ExecFailure {
         raised: PyErr::from(e),
-        failure: None,
+        diagnosis: None,
     })?;
     let dict = module.dict();
     // SAFETY: The thread is attached (`py`), `src.text` is NUL-terminated, and `file` and `dict`
@@ -154,7 +154,7 @@ pub(super) fn exec_in(
         })
     };
     ran.map(drop).map_err(|e| ExecFailure {
-        failure: script_failure(py, &e, &file, src, loader),
+        diagnosis: script_failure(py, &e, &file, src, loader),
         raised: e,
     })
 }
@@ -168,7 +168,7 @@ fn script_failure(
     filename: &Bound<'_, PyString>,
     src: &PythonSource<'_>,
     loader: ExtensionLoader,
-) -> Option<ScriptFailure> {
+) -> Option<ScriptDiagnosis> {
     let explanation = (loader == ExtensionLoader::CPython).then(|| explain(py, err));
     let relative_import = err.is_instance_of::<PyImportError>(py).then(|| {
         failing_line(py, err, filename)
@@ -204,10 +204,10 @@ fn diagnosis(
     filename: impl std::fmt::Display,
     explanation: Option<Result<Option<String>, CheckError>>,
     relative_import: Option<Result<bool, CheckError>>,
-) -> Option<ScriptFailure> {
+) -> Option<ScriptDiagnosis> {
     match (explanation, relative_import) {
-        (Some(Ok(Some(text))), _) => Some(ScriptFailure::NotForSubinterpreters(text.into_boxed_str())),
-        (_, Some(Ok(true))) => Some(ScriptFailure::RelativeImport),
+        (Some(Ok(Some(text))), _) => Some(ScriptDiagnosis::NotForSubinterpreters(text.into_boxed_str())),
+        (_, Some(Ok(true))) => Some(ScriptDiagnosis::RelativeImport),
         (explanation, relative_import) => {
             let raised: Vec<String> = [
                 explanation
@@ -220,7 +220,7 @@ fn diagnosis(
             .into_iter()
             .flatten()
             .collect();
-            (!raised.is_empty()).then(|| ScriptFailure::NotDiagnosed(raised.join("; ").into()))
+            (!raised.is_empty()).then(|| ScriptDiagnosis::NotDiagnosed(raised.join("; ").into()))
         }
     }
 }
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn the_relative_import_hint_is_only_for_a_relative_import() {
-        assert!(ScriptFailure::RelativeImport
+        assert!(ScriptDiagnosis::RelativeImport
             .to_string()
             .contains("outside any package, so a relative import"));
     }
@@ -280,13 +280,13 @@ mod tests {
     #[test]
     fn an_extension_explanation_wins_over_a_relative_import() {
         let failure = diagnosis("app.py", Some(Ok(Some("copy it".into()))), Some(Ok(true)));
-        assert_eq!(failure, Some(ScriptFailure::NotForSubinterpreters("copy it".into())));
+        assert_eq!(failure, Some(ScriptDiagnosis::NotForSubinterpreters("copy it".into())));
     }
 
     #[test]
     fn a_relative_import_is_named_even_when_the_other_check_raised() {
         let failure = diagnosis("app.py", Some(Err(raised("boom"))), Some(Ok(true)));
-        assert_eq!(failure, Some(ScriptFailure::RelativeImport));
+        assert_eq!(failure, Some(ScriptDiagnosis::RelativeImport));
     }
 
     #[test]
@@ -300,7 +300,7 @@ mod tests {
         let failure = diagnosis("app.py", Some(Err(raised("one"))), Some(Err(raised("two"))));
         assert_eq!(
             failure,
-            Some(ScriptFailure::NotDiagnosed(
+            Some(ScriptDiagnosis::NotDiagnosed(
                 "the sub-interpreter check of app.py raised one; \
                  the relative-import check of app.py raised two"
                     .into()
@@ -313,7 +313,7 @@ mod tests {
         let failure = diagnosis("app.py", Some(Ok(None)), Some(Err(raised("two"))));
         assert_eq!(
             failure,
-            Some(ScriptFailure::NotDiagnosed(
+            Some(ScriptDiagnosis::NotDiagnosed(
                 "the relative-import check of app.py raised two".into()
             ))
         );
