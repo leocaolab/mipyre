@@ -2,7 +2,7 @@
 
 All notable changes to mipyre are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/): within 1.x, the public API does not break.
 
-## [4.1.0] — unreleased
+## [4.1.0] — 2026-11-12
 
 On the thread-per-core server, `async def` handlers run on each thread's own event loop, beside its `def` handlers, and the separate pool of async workers is gone.
 
