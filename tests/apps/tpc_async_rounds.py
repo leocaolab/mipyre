@@ -1,8 +1,8 @@
 """App for tests/test_server_topology.py: a sync route and `async def` routes served by the TPC
 sub-interpreter server. Its own module: a worker serves one app per module.
 
-With one TPC thread the async pool has one worker, so every `async def` request runs on one
-event loop and shares this module's state."""
+With one TPC thread every `async def` request runs on that thread's event loop and shares this
+module's state."""
 
 import asyncio
 import os

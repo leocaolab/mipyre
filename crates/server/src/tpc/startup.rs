@@ -6,6 +6,7 @@ use mipyre_cpu::{CoreId, PinOrder, PinOrderError};
 use mipyre_http::plan::route::PlaceCounts;
 use mipyre_tpc::AffinityOutcome;
 
+use super::admission::LoopLimits;
 use crate::ServerCounters;
 
 /// Renders the banner before the server is handed to its threads; [`log_startup`] prints it once
@@ -16,16 +17,20 @@ pub fn tpc_banner(
     logical_cpus: NonZeroUsize,
     pin_order: &Result<PinOrder, PinOrderError>,
     has_workers: bool,
-    async_workers: usize,
+    loop_limits: Option<LoopLimits>,
     counts: PlaceCounts,
 ) -> String {
     let mut banner = format!("  {}\n", tpc_threads_line(threads, logical_cpus.get(), pin_order));
-    // An async route gives every thread a worker too, so without workers there is no async pool.
+    // An async route gives every thread a worker too, so without workers there is no loop.
     if !has_workers {
         banner.push_str("  Sub-interpreters: none (no route runs on one)\n");
     }
-    if async_workers > 0 {
-        banner.push_str(&format!("  Async workers: {async_workers} (async def routes)\n"));
+    if let Some(limits) = loop_limits {
+        banner.push_str(&format!(
+            "  Async def: on each TPC thread's loop, at most {} per thread ({} with large bodies)\n",
+            limits.tasks(),
+            limits.large_bodies()
+        ));
     }
     let stream_count = counts.main_streamed;
     banner.push_str(&format!(

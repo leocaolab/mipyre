@@ -11,8 +11,8 @@ app = Mipyre()
 app.request_timeout = 0.5
 
 _two = asyncio.Semaphore(2)
-# Requests in the round now: one that got its 504 has left it (its task was cancelled), so the
-# two let in after it do not count it.
+# Requests in the round now. A 504 does not cancel a request's Task, so the two let in first
+# hold the semaphore for good and no round is ever complete.
 _in_round = [0]
 _all_in = asyncio.Event()
 

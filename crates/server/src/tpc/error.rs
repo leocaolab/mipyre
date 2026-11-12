@@ -4,7 +4,7 @@ use mipyre_tpc::SpawnError;
 use mipyre_transport::driver::AcceptError;
 use mipyre_transport::tcp::listener::ListenerError;
 
-use mipyre_runtime::StartError;
+use mipyre_runtime::{StartError, WorkerStartError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
@@ -33,6 +33,13 @@ pub enum ServeError {
     AcceptStopped(#[from] AcceptError),
     #[error("process lane host could not start: {0}")]
     LaneHost(#[source] std::io::Error),
+    /// A TPC thread's worker could not open the event loop its `async def` routes run on.
+    #[error(transparent)]
+    LoopNotOpened(Box<WorkerStartError>),
+    /// A TPC thread's runtime would not watch its event loop's poller, so the loop's driver
+    /// could not wait for the fds the loop watches.
+    #[error("a TPC thread's event loop poller could not be registered with its runtime: {0}")]
+    LoopPollerNotRegistered(#[source] std::io::Error),
     /// The fanout acceptor found TPC worker `worker`'s inbox closed while the run was not
     /// stopping, so it can hand that worker no connection.
     #[cfg(target_os = "macos")]
@@ -64,7 +71,9 @@ impl ServeError {
             | ServeError::NotListening(_)
             | ServeError::Start(_)
             | ServeError::AcceptStopped(_)
-            | ServeError::LaneHost(_) => &[],
+            | ServeError::LaneHost(_)
+            | ServeError::LoopNotOpened(_)
+            | ServeError::LoopPollerNotRegistered(_) => &[],
             #[cfg(target_os = "macos")]
             ServeError::WorkerInboxClosed { .. } => &[],
         }

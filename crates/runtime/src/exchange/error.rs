@@ -236,6 +236,8 @@ pub enum ReplyHolder {
     PoolWorker,
     Main,
     AsyncEngine,
+    /// A TPC thread's event loop closed while the request's Task was still live.
+    RequestLoop,
 }
 
 impl fmt::Display for ReplyHolder {
@@ -244,6 +246,7 @@ impl fmt::Display for ReplyHolder {
             ReplyHolder::PoolWorker => "the sub-interpreter worker dropped the request",
             ReplyHolder::Main => "the runtime='main' threads dropped the request",
             ReplyHolder::AsyncEngine => "the async engine dropped the request without answering it",
+            ReplyHolder::RequestLoop => "the TPC thread's event loop dropped the request before its Task answered it",
         })
     }
 }
@@ -289,6 +292,10 @@ pub enum Capacity {
     /// These are the permits for large bodies buffered for pool routes.
     AdmissionPermits,
     WebsocketConnections,
+    /// These are a TPC thread's seats for `async def` requests on its event loop.
+    LoopTasks,
+    /// These are a TPC thread's seats for `async def` requests with a large body on its loop.
+    LoopLargeBodies,
 }
 
 impl fmt::Display for Capacity {
@@ -297,6 +304,8 @@ impl fmt::Display for Capacity {
             Capacity::WorkQueue(group) => group.queue(),
             Capacity::AdmissionPermits => "admission permits",
             Capacity::WebsocketConnections => "websocket connections",
+            Capacity::LoopTasks => "the TPC thread's async def requests",
+            Capacity::LoopLargeBodies => "the TPC thread's async def requests with large bodies",
         })
     }
 }
@@ -330,6 +339,11 @@ pub enum UnansweredError {
     /// words for why it retired.
     #[error("this thread's sub-interpreter worker retired: {0}")]
     WorkerRetired(Arc<str>),
+    /// The thread's event loop starts no more request Tasks: it cancelled its Tasks or closed, at
+    /// the server's stop or after its worker retired. At the stop the thread's `def` requests are
+    /// still served; after a retirement they are refused as `WorkerRetired`.
+    #[error("this thread's event loop takes no more requests: the server is stopping or its worker retired")]
+    LoopClosed,
     #[error("{0}")]
     WorkerLost(ReplyHolder),
     /// The duration is the app's `request_timeout`.
@@ -339,9 +353,9 @@ pub enum UnansweredError {
     /// raised rides along so the request logs once.
     #[error(
         "handler {handler} ran past the {budget:?} request budget ({took:?}), \
-         blocking its TPC thread the whole time; answered 504 only once it returned. A sync \
-         `def` runs inline and cannot be preempted; make slow work `async def` or runtime='main', \
-         where the 504 is sent on time{}",
+         blocking its TPC thread the whole time; answered 504 only once it returned or awaited. \
+         Python on a TPC thread cannot be preempted; make slow work an `async def` that awaits, \
+         or runtime='main', where the 504 is sent on time{}",
         raised.as_ref().map(|e| format!("; it also raised: {e}")).unwrap_or_default()
     )]
     Overran {
@@ -376,6 +390,7 @@ impl UnansweredError {
             | UnansweredError::NotOnWorker(_)
             | UnansweredError::WebSocketNotOnWorker(_)
             | UnansweredError::WorkerRetired(_)
+            | UnansweredError::LoopClosed
             | UnansweredError::WorkerLost(_)
             | UnansweredError::TimedOut(_)
             | UnansweredError::Lane(_) => None,
@@ -389,9 +404,9 @@ impl UnansweredError {
             UnansweredError::Overloaded(_) | UnansweredError::Lane(LaneUnansweredError::Full) => {
                 Some(&OVERLOAD_THROTTLE)
             }
-            UnansweredError::WorkersGone(_) | UnansweredError::Lane(LaneUnansweredError::ShuttingDown) => {
-                Some(&WORKERS_GONE_THROTTLE)
-            }
+            UnansweredError::WorkersGone(_)
+            | UnansweredError::LoopClosed
+            | UnansweredError::Lane(LaneUnansweredError::ShuttingDown) => Some(&WORKERS_GONE_THROTTLE),
             UnansweredError::Lane(LaneUnansweredError::LaneCrashLooping { .. }) => Some(&CRASH_LOOP_THROTTLE),
             UnansweredError::WorkersDied { .. }
             | UnansweredError::NoWorkers(_)
@@ -693,6 +708,8 @@ mod tests {
             Capacity::WorkQueue(WorkerGroup::Subinterp),
             Capacity::AdmissionPermits,
             Capacity::WebsocketConnections,
+            Capacity::LoopTasks,
+            Capacity::LoopLargeBodies,
         ] {
             throttled_by(refuse(UnansweredError::Overloaded(capacity)), &OVERLOAD_THROTTLE);
         }

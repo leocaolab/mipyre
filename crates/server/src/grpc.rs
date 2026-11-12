@@ -198,6 +198,7 @@ fn code_of(error: &HandlerError) -> GrpcCode {
             | UnansweredError::WorkersGone(_)
             | UnansweredError::WorkersDied { .. }
             | UnansweredError::WorkerRetired(_)
+            | UnansweredError::LoopClosed
             | UnansweredError::Lane(
                 LaneUnansweredError::Full
                 | LaneUnansweredError::ShuttingDown

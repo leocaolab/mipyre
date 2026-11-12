@@ -591,8 +591,8 @@ fn stopped_by(stop: &ServerRunStop, served: PyResult<()>) -> PyResult<()> {
 
 /// Runs the TPC server, its main-interpreter threads and then its TPC threads started by `spawner`. With a
 /// sub-interpreter route each TPC thread has a worker and runs `def` routes inline on it, and
-/// `async def` routes go to an async pool so their awaits overlap and their 504 is sent on time;
-/// without one the threads have no worker. Either way `runtime="main"` routes and the fallback go
+/// `async def` routes as Tasks on that worker's event loop, so their awaits overlap; without one
+/// the threads have no worker. Either way `runtime="main"` routes and the fallback go
 /// to the main interpreter's threads, whose full queue answers 503.
 fn serve_tpc<D: TransportDriver>(
     py: Python<'_>,
@@ -620,24 +620,17 @@ fn serve_tpc<D: TransportDriver>(
     } = run;
     let counts = PlaceCounts::of(&site.rules.routes);
     // Workers rebuild the app by executing its script, so it is read only when a route runs on
-    // one: an app made in a function or at a prompt has no script to give them. The async pool is
-    // built before the TPC threads, so if they then fail, dropping it ends its workers on their
-    // own threads.
-    let (tpc_threads, async_pool, async_threads) = if site.rules.routes.uses_workers() {
+    // one: an app made in a function or at a prompt has no script to give them. Each TPC thread
+    // runs its `async def` routes on its own worker's event loop.
+    let (tpc_threads, loop_limits) = if site.rules.routes.uses_workers() {
         let program = app.program(py, command_line, isolate_dir.as_deref())?;
-        let (async_pool, async_threads) = if counts.worker_async > 0 {
-            let kinds = mipyre_runtime::RouteKinds::of(&counts);
-            let split = WorkerCounts {
-                sync_workers: 0,
-                async_workers: crate::boot::topology::tpc_async_workers(threads, kinds).get(),
-            };
-            let recipe = Arc::new(worker_recipe(&program, &site, tuning.gc, &store));
-            let (pool, threads) = build_pool(py, split, &recipe, &site, &tuning, server_stop, &worker_counters)
-                .map_err(|e| pool_failure(py, e, &abandoned))?;
-            (Some(Arc::new(pool)), Some(threads))
-        } else {
-            (None, None)
-        };
+        let loop_limits = (counts.worker_async > 0).then(|| {
+            mipyre_server::LoopLimits::new(
+                tuning
+                    .async_queue_capacity
+                    .unwrap_or(mipyre_server::LoopLimits::DEFAULT_TASKS),
+            )
+        });
         let sites = thread_sites(py, &site, threads.get());
         let (_, lives) = LiveWorkers::new(
             WorkerKind::TpcThread,
@@ -649,29 +642,17 @@ fn serve_tpc<D: TransportDriver>(
             threads: sites.into_iter().zip(lives).collect(),
             recipe: Arc::new(worker_recipe(&program, &site, tuning.gc, &store)),
         };
-        (with_workers, async_pool, async_threads)
+        (with_workers, loop_limits)
     } else {
         // The TPC threads parse HTTP, host the lanes and feed the main interpreter's threads.
         (
             mipyre_server::TpcThreads::NoWorkers(thread_sites(py, &site, threads.get())),
             None,
-            None,
         )
     };
-    let end_async_pool = |async_pool: Option<Arc<mipyre_runtime::InterpreterPool>>, threads: Option<PoolThreads>| {
-        drop(async_pool);
-        if let Some(threads) = threads {
-            abandoned.join(threads, deadline);
-        }
-    };
 
-    let (main, main_handles) = match spawn_main(py, &site, &tuning, spawner) {
-        Ok((main, handles)) => (main.map(Arc::new), handles),
-        Err(failed) => {
-            py.detach(|| end_async_pool(async_pool, async_threads));
-            return Err(failed);
-        }
-    };
+    let (main, main_handles) = spawn_main(py, &site, &tuning, spawner)?;
+    let main = main.map(Arc::new);
     // The copies' last references drop here, attached, as `ServerRun::serve`'s keepalive does.
     let _thread_sites_keepalive = Keepalive::new(tpc_threads.sites());
     mipyre_server::report_pinning(&pin_order, threads.get(), &site.counters.run);
@@ -681,15 +662,13 @@ fn serve_tpc<D: TransportDriver>(
         cpus.logical(),
         &pin_order,
         site.rules.routes.uses_workers(),
-        async_pool
-            .as_deref()
-            .map_or(0, mipyre_runtime::InterpreterPool::async_workers),
+        loop_limits,
         counts,
     );
     let server = mipyre_server::TpcServer {
         threads: tpc_threads,
         main: main.clone(),
-        async_pool: async_pool.clone(),
+        loop_limits,
         gc: tuning.gc,
         cpus: thread_cpus,
         counters: Arc::clone(&site.counters.run),
@@ -703,10 +682,9 @@ fn serve_tpc<D: TransportDriver>(
     let served = py
         .detach(|| {
             let served = mipyre_server::run_tpc(transport, server, accept, announce, server_stop, deadline, spawner);
-            // The TPC threads are joined, so these are the last references to the pool and
-            // the main interpreter's threads. Both are joined by the deadline the TPC threads
-            // were, so the three groups together take at most the stop's grace.
-            end_async_pool(async_pool, async_threads);
+            // The TPC threads are joined, so this is the last reference to the main interpreter's
+            // threads. They are joined by the deadline the TPC threads were, so the two groups
+            // together take at most the stop's grace.
             drop(main);
             abandoned.join_main(main_handles, deadline);
             served

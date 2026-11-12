@@ -2,6 +2,29 @@
 
 All notable changes to mipyre are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/): within 1.x, the public API does not break.
 
+## [4.1.0] — unreleased
+
+On the thread-per-core server, `async def` handlers run on each thread's own event loop, beside its `def` handlers, and the separate pool of async workers is gone.
+
+### Added
+
+- `/metrics` has `mipyre_loop_tasks_live{thread}`, the `async def` requests each thread-per-core thread's loop holds now, `mipyre_loop_tasks_left_total`, and `mipyre_loop_finalizers_cut_off_total` (see Changed).
+
+### Changed
+
+- On the thread-per-core server (the default), a thread runs its `async def` handlers as tasks on its sub-interpreter worker's own event loop, on the same thread as its `def` handlers; no `mipyre-async-worker-*` threads start. A handler's awaits overlap the other requests on its thread. The loop is mipyre's own (`TpcEventLoop`), with asyncio's I/O methods: connections, servers, `sock_*`, pipes, `run_in_executor` / `to_thread`, and subprocesses on Linux. The multi-thread server (`MIPYRE_TPC=0`) keeps its async pool.
+- `async_queue_capacity` is a limit per thread-per-core thread (default 128), not per pool, and a sixteenth of it (at least one) may hold a body larger than 64 KiB; past either, the request is answered `503`, before its body is read or once its bytes cross 64 KiB.
+- The request budget of an `async def` on the thread-per-core server is checked when the handler awaits or returns: one that awaits gets its `504` on time and its task runs on (it is not cancelled); one that holds the thread without awaiting gets its `504` once it lets go, as a `def` does.
+- At the stop, the loop keeps turning while the connections drain, so a request still sending its body is answered. Once they are gone (or shortly before the shutdown deadline) it cancels the tasks still running, those the handlers started included, closes open async generators and waits for the default executor, as `asyncio.run` does at its end. A loop whose finalizers did not end by the deadline (a task that ignores its cancel) logs a warning and counts it in `mipyre_loop_finalizers_cut_off_total`.
+- A `ContextVar` the app sets at import reads its default in an `async def` handler on the thread-per-core server, as it does in a `def` handler: each request's task starts in a new, empty context. On the async pool it read the value set at import.
+- A request that arrives after its thread's loop cancelled its tasks or closed (at the stop, or after its worker retired) gets `503` and is logged as `server event loop closed`.
+- The access log's `source` for these requests is `tpc-loop` (was `subinterp`), and the start banner says `Async def: on each TPC thread's loop, at most N per thread (M with large bodies)` in place of `Async workers: N`.
+- Building from source uses the Rust toolchain pinned in `rust-toolchain.toml` (1.99.1).
+
+### Fixed
+
+- rustix 1.1.6 (RUSTSEC-2026-0486).
+
 ## [4.0.0] — 2026-11-08
 
 A WebSocket handler is a `def` called once per message, and an app serves gRPC unary methods with a Python handler. The WebSocket change breaks the 3.0 API; it is listed under Breaking.

@@ -80,15 +80,17 @@ not measured with the reason.
 
 ## Results
 
-Measured 2026-11-08, 11:05–12:39 EST, for the 4.0.0 release.
+Measured 2026-11-12, 12:11–16:37 EST, for the 4.1.0 release.
 
-- Code: mipyre at commit `87fc071e`; Python 3.14.7, numpy 2.5.4.
+- Code: mipyre at commit `3944ef6f`; Python 3.14.7, numpy 2.5.4.
 - Machine: AMD Ryzen 7 7840HS, 8 cores / 16 threads (SMT siblings are CPU n and n+8),
   Linux 7.0.0-38-generic.
 - Core split: server on CPUs 0-3,8-11 (4 physical cores with their SMT siblings), `wrk` on
   CPUs 4-7,12-15; everything under `nice -n 10`.
-- Load: the 1-minute load average at the start of each run was 0.53–1.49. No run was
-  disturbed by a build or CI test run.
+- Load: the 1-minute load average at the start of each run was 0.62–1.49, and every run but
+  one waited for the 5-minute load average to be at or under 2 (`main / tpc` `/numpy`, third
+  repetition, started at 6.85 after a burst during its wait). No run was disturbed by a build
+  or CI test run.
 - Tool: `wrk` 4.1.0, `-t 8 -c 64 -d 10s --latency`, after a 2 s warm-up, against a fresh
   server per run; default mipyre settings otherwise.
 - Each cell: median (min–max) of 3 repetitions. Errors are the sum over the 3 runs of socket
@@ -96,39 +98,39 @@ Measured 2026-11-08, 11:05–12:39 EST, for the 4.0.0 release.
 
 | mode / server | scenario | requests/s | p50 ms | p99 ms | server cores used | client cores used | errors | reps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| subinterp / tpc | plaintext | 465,932 (461,960–472,078) | 0.13 (0.12–0.14) | 0.22 (0.21–0.24) | 4.0 (4.0–4.0) | 5.5 (5.4–5.5) | 0 | 3 |
-| subinterp / tpc | json | 458,079 (455,279–460,845) | 0.13 (0.12–0.15) | 0.24 (0.23–0.25) | 4.0 (4.0–4.0) | 5.4 (5.4–5.5) | 0 | 3 |
-| subinterp / tpc | cpu | 1,689 (1,688–1,692) | 36.35 (34.61–37.09) | 50.79 (45.53–51.31) | 4.0 (4.0–4.0) | 0.1 (0.1–0.1) | 0 | 3 |
-| subinterp / multi-thread | plaintext | 378,906 (376,188–383,981) | 0.16 (0.16–0.16) | 0.42 (0.38–0.43) | 7.1 (7.1–7.2) | 4.5 (4.5–4.6) | 0 | 3 |
-| subinterp / multi-thread | json | 375,221 (374,991–376,905) | 0.16 (0.16–0.16) | 0.41 (0.41–0.42) | 7.1 (7.1–7.1) | 4.5 (4.5–4.5) | 0 | 3 |
-| subinterp / multi-thread | cpu | 1,992 (1,971–1,993) | 32.00 (32.00–32.06) | 33.37 (33.15–34.02) | 8.0 (8.0–8.0) | 0.1 (0.1–0.1) | 0 | 3 |
-| isolated / tpc | plaintext | 471,866 (471,006–472,740) | 0.14 (0.13–0.14) | 0.23 (0.21–0.24) | 4.0 (4.0–4.0) | 5.5 (5.4–5.5) | 0 | 3 |
-| isolated / tpc | json | 458,496 (457,702–461,108) | 0.14 (0.12–0.14) | 0.22 (0.21–0.26) | 4.0 (4.0–4.0) | 5.4 (5.4–5.5) | 0 | 3 |
-| isolated / tpc | cpu | 1,702 (1,701–1,709) | 33.37 (33.00–36.57) | 47.68 (45.29–54.95) | 4.0 (4.0–4.0) | 0.1 (0.1–0.1) | 0 | 3 |
-| process start=import / tpc | plaintext | 381,047 (380,307–381,244) | 0.15 (0.15–0.16) | 0.29 (0.28–0.32) | 6.7 (6.6–6.7) | 4.5 (4.5–4.5) | 0 | 3 |
-| process start=import / tpc | json | 376,182 (374,014–384,239) | 0.18 (0.16–0.18) | 0.31 (0.30–0.33) | 6.7 (6.7–6.9) | 4.4 (4.4–4.5) | 0 | 3 |
-| process start=import / tpc | cpu | 1,690 (1,683–1,697) | 35.90 (34.60–37.85) | 48.01 (39.31–50.51) | 4.1 (4.1–4.1) | 0.1 (0.1–0.1) | 0 | 3 |
-| process start=import / tpc | numpy | 318,369 (316,971–321,114) | 0.19 (0.18–0.19) | 0.32 (0.31–0.35) | 7.6 (7.6–7.7) | 3.9 (3.8–3.9) | 0 | 3 |
-| process start=fork / tpc | plaintext | 381,343 (381,214–382,253) | 0.16 (0.14–0.16) | 0.30 (0.27–0.31) | 6.6 (6.6–6.7) | 4.5 (4.5–4.5) | 0 | 3 |
-| process start=fork / tpc | json | 379,990 (376,123–381,564) | 0.16 (0.16–0.17) | 0.32 (0.25–0.32) | 6.6 (6.6–6.8) | 4.5 (4.4–4.5) | 0 | 3 |
-| process start=fork / tpc | cpu | 1,678 (1,673–1,684) | 35.87 (35.65–42.04) | 48.13 (46.56–48.19) | 4.1 (4.1–4.1) | 0.1 (0.1–0.1) | 0 | 3 |
-| process start=fork / tpc | numpy | 321,831 (320,331–323,630) | 0.18 (0.18–0.20) | 0.35 (0.31–0.36) | 7.7 (7.7–7.8) | 3.9 (3.8–3.9) | 0 | 3 |
-| process start=fork / multi-thread | plaintext | 238,415 (237,219–239,570) | 0.25 (0.24–0.25) | 0.75 (0.75–0.76) | 6.3 (6.2–6.3) | 2.7 (2.7–2.7) | 0 | 3 |
-| process start=fork / multi-thread | json | 233,790 (233,131–234,365) | 0.25 (0.25–0.25) | 0.75 (0.74–0.76) | 6.3 (6.2–6.3) | 2.7 (2.7–2.7) | 0 | 3 |
-| process start=fork / multi-thread | cpu | 1,675 (1,665–1,683) | 35.19 (31.04–36.96) | 109.02 (76.50–142.81) | 4.2 (4.2–4.2) | 0.1 (0.1–0.1) | 0 | 3 |
-| process start=fork / multi-thread | numpy | 192,661 (192,355–195,365) | 0.31 (0.31–0.31) | 0.94 (0.89–0.95) | 6.4 (6.4–6.4) | 2.3 (2.2–2.3) | 0 | 3 |
-| main / tpc | plaintext | 315,024 (314,529–316,115) | 0.20 (0.20–0.20) | 0.33 (0.33–0.37) | 6.1 (6.1–6.2) | 3.7 (3.7–3.8) | 0 | 3 |
-| main / tpc | json | 292,869 (289,662–293,520) | 0.21 (0.21–0.21) | 0.33 (0.33–0.33) | 6.3 (6.3–6.3) | 3.5 (3.5–3.5) | 0 | 3 |
-| main / tpc | cpu | 427 (426–428) | 144.79 (144.35–144.94) | 223.40 (222.57–226.62) | 1.0 (1.0–1.0) | 0.0 (0.0–0.0) | 0 | 3 |
-| main / tpc | numpy | 107,473 (106,443–107,578) | 0.57 (0.57–0.57) | 0.92 (0.92–0.94) | 3.6 (3.6–3.6) | 1.3 (1.3–1.3) | 0 | 3 |
-| main / multi-thread | plaintext | 173,511 (172,841–178,680) | 0.35 (0.34–0.35) | 1.48 (1.38–1.51) | 5.6 (5.6–5.7) | 2.1 (2.1–2.1) | 0 | 3 |
-| main / multi-thread | json | 175,007 (174,298–176,605) | 0.35 (0.34–0.35) | 1.38 (1.37–1.40) | 5.4 (5.4–5.4) | 2.1 (2.1–2.1) | 0 | 3 |
-| main / multi-thread | cpu | 362 (361–362) | 129.22 (128.82–134.45) | 1,350.00 (1,340.00–1,440.00) | 1.1 (1.1–1.1) | 0.0 (0.0–0.0) | 23 | 3 |
+| subinterp / tpc | plaintext | 464,500 (457,178–465,637) | 0.14 (0.13–0.14) | 0.21 (0.21–0.29) | 4.0 (4.0–4.0) | 5.5 (5.4–5.5) | 0 | 3 |
+| subinterp / tpc | json | 451,048 (448,770–453,666) | 0.14 (0.13–0.15) | 0.26 (0.21–0.27) | 4.0 (4.0–4.0) | 5.4 (5.3–5.4) | 0 | 3 |
+| subinterp / tpc | cpu | 1,681 (1,604–1,688) | 39.63 (35.62–42.28) | 46.67 (42.10–66.78) | 4.0 (4.0–4.0) | 0.1 (0.1–0.1) | 0 | 3 |
+| subinterp / multi-thread | plaintext | 371,425 (364,779–372,816) | 0.16 (0.16–0.16) | 0.42 (0.42–0.44) | 7.0 (7.0–7.1) | 4.5 (4.4–4.5) | 0 | 3 |
+| subinterp / multi-thread | json | 349,362 (336,417–367,957) | 0.17 (0.16–0.17) | 0.51 (0.43–0.55) | 6.8 (6.6–7.0) | 4.3 (4.2–4.4) | 0 | 3 |
+| subinterp / multi-thread | cpu | 1,932 (1,906–1,953) | 33.00 (32.97–33.07) | 34.99 (34.02–36.00) | 8.0 (8.0–8.0) | 0.1 (0.1–0.1) | 0 | 3 |
+| isolated / tpc | plaintext | 459,030 (399,615–463,622) | 0.14 (0.14–0.15) | 0.24 (0.23–0.26) | 4.0 (4.0–4.0) | 5.4 (4.9–5.4) | 0 | 3 |
+| isolated / tpc | json | 420,614 (420,526–452,641) | 0.13 (0.13–0.15) | 0.24 (0.24–0.27) | 4.0 (4.0–4.0) | 5.1 (5.1–5.4) | 0 | 3 |
+| isolated / tpc | cpu | 1,639 (1,583–1,641) | 42.29 (37.37–42.52) | 62.83 (56.51–69.12) | 4.0 (4.0–4.0) | 0.1 (0.1–0.1) | 0 | 3 |
+| process start=import / tpc | plaintext | 377,351 (371,823–378,260) | 0.15 (0.14–0.17) | 0.32 (0.27–0.34) | 6.6 (6.6–6.9) | 4.5 (4.4–4.5) | 0 | 3 |
+| process start=import / tpc | json | 367,014 (362,292–368,941) | 0.16 (0.15–0.16) | 0.37 (0.31–0.52) | 6.7 (6.6–6.7) | 4.3 (4.3–4.4) | 0 | 3 |
+| process start=import / tpc | cpu | 1,676 (1,650–1,681) | 41.00 (40.04–44.29) | 46.28 (46.15–53.38) | 4.1 (4.1–4.1) | 0.1 (0.1–0.1) | 0 | 3 |
+| process start=import / tpc | numpy | 317,086 (312,631–318,170) | 0.19 (0.18–0.20) | 0.30 (0.28–0.50) | 7.7 (7.7–7.7) | 3.9 (3.8–3.9) | 0 | 3 |
+| process start=fork / tpc | plaintext | 373,818 (357,954–379,877) | 0.16 (0.16–0.17) | 0.35 (0.26–0.62) | 6.6 (6.6–6.6) | 4.4 (4.3–4.5) | 0 | 3 |
+| process start=fork / tpc | json | 365,517 (359,025–372,529) | 0.17 (0.16–0.18) | 0.35 (0.30–0.53) | 6.7 (6.6–6.7) | 4.4 (4.3–4.4) | 0 | 3 |
+| process start=fork / tpc | cpu | 1,634 (1,347–1,665) | 37.04 (34.85–44.25) | 57.51 (55.12–69.97) | 4.1 (4.1–4.1) | 0.1 (0.1–0.1) | 0 | 3 |
+| process start=fork / tpc | numpy | 313,456 (286,560–328,672) | 0.18 (0.18–0.21) | 0.35 (0.33–1.15) | 7.6 (7.2–7.7) | 3.9 (3.6–4.0) | 0 | 3 |
+| process start=fork / multi-thread | plaintext | 201,487 (132,360–216,691) | 0.30 (0.27–0.39) | 0.85 (0.85–3.61) | 5.7 (4.0–6.0) | 2.4 (1.7–2.7) | 0 | 3 |
+| process start=fork / multi-thread | json | 234,258 (232,278–235,500) | 0.25 (0.25–0.25) | 0.75 (0.73–0.76) | 6.3 (6.3–6.3) | 2.7 (2.7–2.7) | 0 | 3 |
+| process start=fork / multi-thread | cpu | 1,647 (1,646–1,666) | 35.61 (30.76–43.93) | 119.34 (67.81–139.38) | 4.2 (4.2–4.2) | 0.1 (0.1–0.1) | 0 | 3 |
+| process start=fork / multi-thread | numpy | 192,267 (181,410–193,837) | 0.31 (0.31–0.33) | 0.92 (0.90–0.98) | 6.4 (6.2–6.4) | 2.3 (2.3–2.3) | 0 | 3 |
+| main / tpc | plaintext | 310,327 (301,847–313,703) | 0.20 (0.20–0.20) | 0.38 (0.34–0.42) | 6.1 (6.0–6.1) | 3.8 (3.7–3.8) | 0 | 3 |
+| main / tpc | json | 285,770 (280,598–292,494) | 0.21 (0.21–0.23) | 0.41 (0.31–0.42) | 6.2 (6.1–6.3) | 3.5 (3.4–3.5) | 0 | 3 |
+| main / tpc | cpu | 413 (394–421) | 150.19 (147.10–157.98) | 218.29 (217.26–222.42) | 1.0 (1.0–1.0) | 0.0 (0.0–0.0) | 0 | 3 |
+| main / tpc | numpy | 106,618 (103,091–107,446) | 0.57 (0.57–0.59) | 0.94 (0.91–1.00) | 3.6 (3.6–3.6) | 1.3 (1.3–1.3) | 0 | 3 |
+| main / multi-thread | plaintext | 174,749 (160,316–176,951) | 0.35 (0.34–0.37) | 1.45 (1.42–1.58) | 5.7 (5.2–5.7) | 2.1 (2.0–2.1) | 0 | 3 |
+| main / multi-thread | json | 171,925 (169,836–173,314) | 0.35 (0.35–0.36) | 1.52 (1.50–1.56) | 5.5 (5.5–5.6) | 2.0 (2.0–2.1) | 0 | 3 |
+| main / multi-thread | cpu | 366 (364–368) | 134.24 (134.02–144.02) | 1,300.00 (1,200.00–1,340.00) | 1.1 (1.1–1.1) | 0.0 (0.0–0.0) | 14 | 3 |
 
 Reading the table:
 
 - `/cpu` is the parallelism test. On the sub-interpreter and process modes it runs on every
-  core the server has: about 1,700 requests/s on 4 server cores, and about 2,000 on the
+  core the server has: about 1,700 requests/s on 4 server cores, and about 1,900 on the
   multi-thread server's 8 sub-interpreters, which also use the SMT siblings. On `main` it
   is serial: about 400 requests/s on one core, whichever server is in front.
 - The errors on `main / multi-thread` `/cpu` are all `wrk` timeouts (2 s): 64 connections queue
@@ -138,5 +140,5 @@ Reading the table:
   server uses more CPU per request than in `subinterp` mode; `start=import` and `start=fork`
   differ only in how a worker starts, which this benchmark does not measure, and serve
   requests at the same speed.
-- `/numpy` runs in parallel in `process` mode (about 320,000 requests/s) and on one interpreter
+- `/numpy` runs in parallel in `process` mode (about 315,000 requests/s) and on one interpreter
   lock in `main` mode (about 107,000).

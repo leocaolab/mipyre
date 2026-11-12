@@ -444,7 +444,7 @@ impl InterpreterPool {
         let job = EngineJob {
             handler: route.index(),
             request,
-            reply: EngineReply::Pool(reply),
+            reply: EngineReply::Worker(reply),
         };
         workers.jobs.submit(job).map_err(|e| refused(e, &workers.lives))?;
         PoolJob::inc_created();
@@ -577,8 +577,8 @@ mod tests {
 
     fn pool_reply(job: EngineJob) -> PoolReplySender {
         match job.reply {
-            EngineReply::Pool(reply) => reply,
-            EngineReply::Main(_) => panic!("a pool job answers the pool"),
+            EngineReply::Worker(reply) => reply,
+            EngineReply::Loop(_) | EngineReply::Main(_) => panic!("a pool job answers the pool"),
         }
     }
 

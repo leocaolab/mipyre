@@ -5,11 +5,13 @@ use std::cell::{Cell, RefCell, RefMut};
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::oneshot;
 
 use mipyre_http::io::body::ResponseBody;
 use mipyre_http::plan::response::HandlerResponse;
@@ -21,11 +23,15 @@ use crate::conn::{drive_connection, drive_local_connection, ConnectionTimeouts, 
 use crate::site::Site;
 use crate::websocket::{upgrade_or, WsUpgrade};
 use mipyre_http::io::clock::Clock;
-use mipyre_runtime::exchange::{self, HandlerError, Outbox, WsClose};
+use mipyre_runtime::exchange::{self, refuse, HandlerError, Outbox, UnansweredError, WsClose};
 use mipyre_runtime::{
-    MainThreads, Retirement, SubInterpreterWorker, ThreadResident, WorkerIndex, WorkerLife, WsEvent, WsSession,
-    WsUpgradeAnswer,
+    LiveTasks, LoopBell, LoopCallError, LoopReply, MainThreads, NextWait, PollerReadiness, RequestLoop, Retirement,
+    SubInterpreterWorker, ThreadResident, WorkerIndex, WorkerLife, WsEvent, WsSession, WsUpgradeAnswer,
 };
+
+use super::admission::{LoopLimits, LoopSeats};
+use super::deadline::Deadlines;
+use super::ServeError;
 
 /// The thread's connection tasks share it through an `Rc`, one non-atomic clone per request, and
 /// it never leaves the thread.
@@ -36,14 +42,16 @@ pub struct TpcThread {
     pub(crate) site: Arc<Site>,
     /// It is `None` when the table has no main-interpreter route.
     pub(crate) main: Option<Arc<MainThreads>>,
-    /// It is `None` when the table has no `async def` route.
-    pub(crate) async_pool: Option<Arc<mipyre_runtime::InterpreterPool>>,
 }
 
 /// A worker retires when its `gc.collect()` fails and then takes no more requests: the thread
 /// stops taking connections and closes the ones it has, the other TPC threads take its share, and
 /// the server stops once none is left (`LiveWorkers`). A retired interpreter is kept only to be
 /// ended on its own thread.
+///
+/// When the table has `async def` routes it also holds the thread's event loop, which they run
+/// on, and what the thread's requests to it share. The loop is in a cell of its own, so a `def`
+/// request borrows only the worker, as it does without one.
 pub struct ThreadWorker {
     worker: RefCell<SubInterpreterWorker>,
     /// It is shared with the fanout acceptor, which stops handing this thread connections once it
@@ -51,23 +59,72 @@ pub struct ThreadWorker {
     retired: Arc<OnceLock<Arc<str>>>,
     /// It is taken when the worker retires or ends.
     life: Cell<Option<WorkerLife>>,
-    /// Wakes the thread's accept loop when the worker retires.
+    /// Wakes the thread's accept loop and its event loop's driver when the worker retires.
     retiring: tokio::sync::Notify,
+    /// It is `None` when the table has no `async def` route, so the thread opens no loop. It is
+    /// boxed to keep a `def` request's `ThreadWorker` small: its size moves the allocations of
+    /// every request on the thread between mimalloc's size classes.
+    event_loop: Option<Box<ThreadEventLoop>>,
+}
+
+/// A TPC thread's event loop and what the thread's `async def` requests to it share: how many it
+/// holds at once, the seats of those reading their bodies, and their budgets.
+pub(crate) struct ThreadEventLoop {
+    pub(crate) limits: LoopLimits,
+    pub(crate) seats: LoopSeats,
+    pub(crate) deadlines: Deadlines,
+    /// It is `None` before the loop opens and once it closes.
+    open: RefCell<Option<OpenLoop>>,
+}
+
+/// An open event loop, and whether it still starts request Tasks.
+struct OpenLoop {
+    tasks: RequestLoop,
+    /// It is set once the loop's live Tasks were cancelled, at the stop or when the worker
+    /// retires. No request Task starts after that: the cancel would miss it, and the finalizers
+    /// wait for the live Tasks to end.
+    cancelled: bool,
 }
 
 impl ThreadWorker {
     /// The server makes `retired` before the thread starts, so the fanout acceptor can read it.
-    pub(crate) fn new(worker: SubInterpreterWorker, life: WorkerLife, retired: Arc<OnceLock<Arc<str>>>) -> Self {
+    pub(crate) fn new(
+        worker: SubInterpreterWorker,
+        life: WorkerLife,
+        retired: Arc<OnceLock<Arc<str>>>,
+        loop_limits: Option<LoopLimits>,
+    ) -> Self {
         ThreadWorker {
             worker: RefCell::new(worker),
             retired,
             life: Cell::new(Some(life)),
             retiring: tokio::sync::Notify::new(),
+            event_loop: loop_limits.map(|limits| {
+                Box::new(ThreadEventLoop {
+                    limits,
+                    seats: LoopSeats::default(),
+                    deadlines: Deadlines::default(),
+                    open: RefCell::new(None),
+                })
+            }),
         }
     }
 
+    /// Returns the worker, its event loop closed first if it is still open.
     pub(crate) fn into_worker(self) -> SubInterpreterWorker {
-        self.worker.into_inner()
+        let mut worker = self.worker.into_inner();
+        if let Some(left) = self.event_loop.and_then(|event_loop| event_loop.open.into_inner()) {
+            worker.close_event_loop(left.tasks);
+        }
+        worker
+    }
+
+    /// Returns the worker with its event loop, on a thread whose table has `async def` routes.
+    pub(crate) fn on_loop(&self) -> Option<LoopWorker<'_>> {
+        self.event_loop.as_deref().map(|event_loop| LoopWorker {
+            worker: self,
+            event_loop,
+        })
     }
 
     /// Takes the next request while the worker serves, or returns why it retired.
@@ -98,8 +155,13 @@ impl ThreadWorker {
         }
     }
 
+    /// Returns whether the worker has retired.
+    pub(crate) fn has_retired(&self) -> bool {
+        self.retired.get().is_some()
+    }
+
     /// Retires the worker: it takes no more requests, the live workers learn of it, and the
-    /// thread's accept loop is woken. The cause was logged where the collect failed.
+    /// thread's accept loop and loop driver are woken. The cause was logged where it happened.
     fn retire(&self, retirement: &Retirement) {
         let why: Arc<str> = retirement.to_string().into();
         // Only a serving worker runs a request or a collect, so this is its first
@@ -112,7 +174,8 @@ impl ThreadWorker {
         if let Some(life) = self.life.take() {
             life.retired(retirement);
         }
-        self.retiring.notify_one();
+        // Both waiters check `retired` before they wait, on this thread, so none is missed.
+        self.retiring.notify_waiters();
     }
 
     /// Completes once the worker has retired.
@@ -130,10 +193,136 @@ impl ThreadWorker {
 
     /// Ends the worker on its own thread; one still serving stops counting as live first.
     pub(crate) fn end(self) {
-        if let Some(life) = self.life.into_inner() {
+        if let Some(life) = self.life.take() {
             life.stopped();
         }
-        drop(self.worker.into_inner());
+        drop(self.into_worker());
+    }
+}
+
+/// The worker of a TPC thread that has an event loop, with that loop: what an `async def` request
+/// and the loop's driver use. The driver's calls go on after the worker retires, so none of them
+/// asks whether it serves.
+#[derive(Clone, Copy)]
+pub struct LoopWorker<'w> {
+    pub(crate) worker: &'w ThreadWorker,
+    pub(crate) event_loop: &'w ThreadEventLoop,
+}
+
+/// What a TPC thread's loop driver waits on beside its timers: the loop's bell, and its poller's
+/// fd registered with the thread's runtime.
+pub(crate) struct LoopWakeups {
+    pub(crate) bell: Arc<LoopBell>,
+    pub(crate) poller: PollerReadiness,
+}
+
+impl LoopWorker<'_> {
+    /// Opens the event loop in the worker and returns what its driver waits on. It runs on the
+    /// thread's runtime.
+    ///
+    /// # Errors
+    ///
+    /// The loop could not be opened, or its poller's fd not registered with this thread's runtime;
+    /// the loop is closed again then.
+    pub(crate) fn open(&self) -> Result<LoopWakeups, ServeError> {
+        let opened = self
+            .worker
+            .worker
+            .borrow_mut()
+            .open_event_loop()
+            .map_err(|e| ServeError::LoopNotOpened(Box::new(e)))?;
+        match opened.register_poller() {
+            Ok(poller) => {
+                let bell = opened.bell();
+                *self.event_loop.open.borrow_mut() = Some(OpenLoop {
+                    tasks: opened,
+                    cancelled: false,
+                });
+                Ok(LoopWakeups { bell, poller })
+            }
+            Err(error) => {
+                self.worker.worker.borrow_mut().close_event_loop(opened);
+                Err(ServeError::LoopPollerNotRegistered(error))
+            }
+        }
+    }
+
+    /// Returns how many request Tasks are live on the loop, or `None` once it is closed.
+    pub(crate) fn live(&self) -> Option<LiveTasks> {
+        self.event_loop.open.borrow().as_ref().map(|open| open.tasks.live())
+    }
+
+    /// Returns how many request Tasks are live on the loop while it starts new ones, or `None`
+    /// once it cancelled its Tasks or closed.
+    pub(crate) fn taking(&self) -> Option<LiveTasks> {
+        self.event_loop
+            .open
+            .borrow()
+            .as_ref()
+            .filter(|open| !open.cancelled)
+            .map(|open| open.tasks.live())
+    }
+
+    /// Turns the loop once and returns how its driver waits next. A loop that failed too many
+    /// turns in a row retires the worker, and its driver turns again to end it.
+    pub(crate) fn turn(&self) -> NextWait {
+        let turned = {
+            let mut event_loop = self.event_loop.open.borrow_mut();
+            let Some(open) = event_loop.as_mut() else {
+                return NextWait::Parked;
+            };
+            self.worker.worker.borrow_mut().turn(&mut open.tasks)
+        };
+        match turned {
+            Ok(wait) => wait,
+            Err(retirement) => {
+                self.worker.retire(&retirement);
+                NextWait::Now
+            }
+        }
+    }
+
+    /// Cancels the request Tasks live on the loop, and refuses every request Task after; a
+    /// closed loop has none.
+    ///
+    /// # Errors
+    ///
+    /// What a cancel raised or a panic in it, after all were tried.
+    pub(crate) fn cancel_live_tasks(&self) -> Result<(), LoopCallError> {
+        match self.event_loop.open.borrow_mut().as_mut() {
+            Some(open) => {
+                open.cancelled = true;
+                self.worker.worker.borrow_mut().cancel_live_tasks(&open.tasks).map(drop)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Starts the loop's finalizers, which wait at most `timeout` for the default executor; the
+    /// receiver hears when they end. A closed loop has none to start.
+    ///
+    /// # Errors
+    ///
+    /// What starting them raised or a panic in it.
+    pub(crate) fn start_finalizers(&self, timeout: Duration) -> Result<Option<oneshot::Receiver<()>>, LoopCallError> {
+        match self.event_loop.open.borrow().as_ref() {
+            Some(open) => self
+                .worker
+                .worker
+                .borrow_mut()
+                .start_finalizers(&open.tasks, timeout)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Closes the loop and returns the request Tasks it still had live, which are dropped with
+    /// it, or `None` when it was closed already.
+    pub(crate) fn close(&self) -> Option<LiveTasks> {
+        let open = self.event_loop.open.borrow_mut().take()?;
+        let left = open.tasks.live();
+        self.worker.worker.borrow_mut().close_event_loop(open.tasks);
+        Some(left)
     }
 }
 
@@ -196,6 +385,28 @@ impl WorkerLease<'_> {
         opened.response
     }
 
+    /// Starts `request` for `route` as a Task on `on`, the thread's event loop; `large` marks it
+    /// as holding a large body.
+    ///
+    /// # Errors
+    ///
+    /// Refuses the request once the loop has cancelled its Tasks or closed, and returns what
+    /// starting the Task raised.
+    pub(crate) fn start_task(
+        self,
+        on: &ThreadEventLoop,
+        route: RouteId,
+        request: exchange::Request,
+        large: bool,
+    ) -> Result<LoopReply, HandlerError> {
+        let WorkerLease { mut worker, .. } = self;
+        let mut event_loop = on.open.borrow_mut();
+        let Some(open) = event_loop.as_mut().filter(|open| !open.cancelled) else {
+            return Err(refuse(UnansweredError::LoopClosed));
+        };
+        worker.start_task(&mut open.tasks, route, request, large)
+    }
+
     /// Calls a WebSocket connection's handler for `event` on the worker.
     pub(crate) fn ws_call(self, route: WsRouteId, session: &WsSession, event: WsEvent) -> Result<(), HandlerError> {
         let WorkerLease { mut worker, owner } = self;
@@ -220,6 +431,11 @@ impl WorkerLease<'_> {
 }
 
 impl TpcThread {
+    /// Returns the thread's worker with its event loop, when the table has `async def` routes.
+    pub(crate) fn on_loop(&self) -> Option<LoopWorker<'_>> {
+        self.worker.as_ref().and_then(ThreadWorker::on_loop)
+    }
+
     /// Ends the worker on this thread once no connection task holds `tpc_thread`; one still
     /// shared is leaked with an error rather than pulled from under its task.
     pub(crate) fn end(tpc_thread: Rc<TpcThread>) {

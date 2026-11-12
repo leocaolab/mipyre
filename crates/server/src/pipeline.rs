@@ -38,6 +38,8 @@ pub(crate) enum ResponseSource {
     Pool,
     /// The TPC thread's own sub-interpreter ran it.
     Inline,
+    /// The TPC thread's own sub-interpreter ran it as a Task on its event loop.
+    Loop,
     /// It is a WebSocket upgrade's 101 or its rejection.
     WebSocket,
     /// A process-lane worker ran it.
@@ -51,6 +53,7 @@ impl ResponseSource {
             ResponseSource::Main => "main",
             ResponseSource::Pool => "subinterp",
             ResponseSource::Inline => "tpc-inline",
+            ResponseSource::Loop => "tpc-loop",
             ResponseSource::WebSocket => "websocket",
             ResponseSource::Process => "process",
         }

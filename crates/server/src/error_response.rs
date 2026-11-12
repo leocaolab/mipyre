@@ -43,6 +43,7 @@ pub(crate) fn render(record: ErrorRecord, counters: &SiteCounters) -> Response<F
                 UnansweredError::WorkerRetired(_) => {
                     response::unavailable_response("server worker retired", &request_id)
                 }
+                UnansweredError::LoopClosed => response::unavailable_response("server event loop closed", &request_id),
                 UnansweredError::TimedOut(_)
                 | UnansweredError::Overran { .. }
                 | UnansweredError::Interrupted { .. } => response::gateway_timeout_response(&request_id),

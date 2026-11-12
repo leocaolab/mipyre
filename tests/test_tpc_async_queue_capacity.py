@@ -1,6 +1,6 @@
-"""The thread-per-core server sizes its async pool by `MIPYRE_ASYNC_QUEUE_CAPACITY`: with room
-for one `async def` request, a second one arriving while the first waits is answered 503, and
-the first still finishes once its gate opens.
+"""The thread-per-core server holds `MIPYRE_ASYNC_QUEUE_CAPACITY` `async def` requests per thread:
+with room for one, a second one arriving while the first waits is answered 503, and the first
+still finishes once its gate opens.
 """
 import os
 import signal
@@ -49,12 +49,12 @@ def test_a_request_past_the_tpc_async_capacity_is_refused(tmp_path):
     with open(script_path, "w") as f:
         f.write(SERVER_SCRIPT)
     entered, gate = tmp_path / "entered", tmp_path / "gate"
-    # Two threads with a def route among the routes give the async pool one worker.
+    # The limit is per thread, so with one thread both requests reach the same one.
     env = dict(
         os.environ,
         HOLD_ENTERED=str(entered),
         HOLD_GATE=str(gate),
-        MIPYRE_THREADS="2",
+        MIPYRE_THREADS="1",
         MIPYRE_ASYNC_QUEUE_CAPACITY="1",
     )
     env.pop("MIPYRE_TPC", None)

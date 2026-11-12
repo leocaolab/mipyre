@@ -49,11 +49,13 @@ pub(crate) fn serve_exception(py: Python<'_>, failed: ServeError) -> PyErr {
         | ServeError::NotSpawned(_)
         | ServeError::FailedWhileStopping { .. }
         | ServeError::LaneHost(_)
+        | ServeError::LoopPollerNotRegistered(_)
         | ServeError::ThreadsStopped { root: None, .. }) => PyRuntimeError::new_err(failed.to_string()),
         #[cfg(target_os = "macos")]
         failed @ ServeError::WorkerInboxClosed { .. } => PyRuntimeError::new_err(failed.to_string()),
         ServeError::NotListening(e) => listener_exception(e),
         ServeError::Start(e) => e.into_pyerr(py),
+        ServeError::LoopNotOpened(e) => (*e).into_pyerr(py),
         failed @ ServeError::AcceptStopped(_) => PyOSError::new_err(format!("the server stopped: {failed}")),
         ServeError::ThreadsStopped { root: Some(root), .. } => serve_exception(py, *root),
     }

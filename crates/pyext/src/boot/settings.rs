@@ -811,8 +811,8 @@ flags! {
         code: [server_flags("async_queue_capacity")],
         shape: FlagShape::Positive,
         used: AsyncWorkerRoutes,
-        default: "128 per pool worker",
-        doc: "async def requests queued or running before 503",
+        default: "128 per pool worker / per TPC thread",
+        doc: "async def requests queued or running before 503; on TPC, per thread, a sixteenth of them with large bodies",
     },
     metrics: bool = {
         name: "metrics", file: PyprojectKey::Top("metrics"),

@@ -297,12 +297,12 @@ PANIC_CASES = [
     ("pool", "/gil-panic", "/gil-ok"),  # pool's main-interpreter dispatch
     ("gil", "/panic", "/ok"),  # GIL mode
     ("pool", "/async-panic", "/async-ok"),  # the async engine
-    ("tpc", "/async-panic", "/async-ok"),  # TPC's async pool
+    ("tpc", "/async-panic", "/async-ok"),  # the TPC thread's event loop
 ]
 
 # A Python exception answers the same generic 500; only this text proves the panic went
-# through Rust's catch and was logged as one. In the async engine the panic surfaces in
-# the handler's task as PyO3's PanicException, which the engine logs as the task's error.
+# through Rust's catch and was logged as one. In the async engine and on the TPC thread's loop
+# the panic surfaces in the handler's task as PyO3's PanicException, logged as the task's error.
 PANIC_TEXT = "a Rust panic while running the request: "
 ASYNC_PANIC_TEXT = "the request's async task raised PanicException: "
 
@@ -335,6 +335,23 @@ def test_panic_is_a_logged_500_and_the_thread_survives(path, route, healthy):
             _assert_panic_logged_once(srv, f"{prefix}injected-panic {n}", body["request_id"])
         r = srv.get(healthy)
         assert (r.status, r.body) == (200, b"fine")
+
+
+@pytest.mark.needs_feature("fault_injection")
+def test_a_panic_in_an_async_def_on_tpc_is_answered_once_and_its_loop_still_ends_cleanly():
+    # The panic ends only its own Task: the request is answered once, through that Task, and at the
+    # stop the loop's finalizers run as Tasks of their own, which a Task left running would refuse.
+    with serve(PANIC_SCRIPT, "tpc") as srv:
+        r = srv.get("/async-panic?n=7")
+        assert r.status == 500, (r.status, r.body)
+        request_id = r.json()["request_id"]
+        assert srv.get("/async-ok").status == 200
+        said = srv.records_at_exit(lambda record: _fields(record).get("request_id") == request_id)
+        assert len(said) == 1, said
+        assert f"{ASYNC_PANIC_TEXT}injected-panic 7" in _record_text(said[0]), said
+        log = srv.stop()
+    assert "finalizers raised" not in log, log[-2000:]
+    assert "Cannot enter into task" not in log, log[-2000:]
 
 
 # ---------------------------------------------------------------------------

@@ -46,10 +46,6 @@ impl RouteKinds {
             (true, true) => RouteKinds::Both,
         }
     }
-
-    pub fn has_sync(self) -> bool {
-        matches!(self, RouteKinds::Sync | RouteKinds::Both)
-    }
 }
 
 /// Splits `n` workers between the kinds needed, giving async the smaller half when both are.
@@ -114,7 +110,10 @@ mod tests {
             for kinds in [RouteKinds::Both, RouteKinds::Sync, RouteKinds::Async] {
                 if let Ok(s) = split_workers(n, kinds) {
                     assert_eq!(s.total(), n);
-                    assert!(!kinds.has_sync() || s.sync_workers > 0, "n={n}: {s:?}");
+                    assert!(
+                        !matches!(kinds, RouteKinds::Sync | RouteKinds::Both) || s.sync_workers > 0,
+                        "n={n}: {s:?}"
+                    );
                     assert!(
                         !matches!(kinds, RouteKinds::Async | RouteKinds::Both) || s.async_workers > 0,
                         "n={n}: {s:?}"

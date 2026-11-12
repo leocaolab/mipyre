@@ -50,6 +50,7 @@ pub use self::stop::{watching_stop_signals, Disposition, ServerRunStop, ServerSt
 #[cfg(feature = "bench")]
 pub use self::tpc::{drive_conn, serve_on_workers, tpc_accept_loop_inline, TpcThread};
 pub use self::tpc::{
-    log_startup, report_pinning, run_tpc, thread_cpus, tpc_banner, AcceptMode, ServeError, TpcServer, TpcThreads,
+    log_startup, report_pinning, run_tpc, thread_cpus, tpc_banner, AcceptMode, LoopLimits, ServeError, TpcServer,
+    TpcThreads,
 };
 pub use self::websocket::{main_upgrade_target, upgrade_target, MainWsUpgrade, OpenConnections, WsUpgrade};

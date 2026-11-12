@@ -478,7 +478,7 @@ fn async_engine() {
                                     .submit(crate::engine_queue::EngineJob {
                                         handler: route.index(),
                                         request: request(&[]),
-                                        reply: crate::engine_queue::EngineReply::Pool(reply),
+                                        reply: crate::engine_queue::EngineReply::Worker(reply),
                                     })
                                     .expect("the queue holds the whole window");
                                 answers.push(answer);

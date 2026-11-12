@@ -10,6 +10,7 @@ use mipyre_tpc::{LocalStop, LocalTasks, ShutdownDeadline};
 use mipyre_transport::driver::{AcceptError, TransportDriver};
 
 use super::conn::{serve_accepted, ThreadWorker, TpcThread};
+use super::loop_driver::LoopDriver;
 use super::threads::{serve_on_workers, ThreadDrain};
 use super::{topology_label, AcceptMode, ServeError, TpcServer};
 use crate::request::handle_request;
@@ -72,6 +73,15 @@ pub async fn tpc_accept_loop_inline<D: TransportDriver>(
         thread,
     )
     .map_err(ServeError::LaneHost)?;
+    let event_loop = match LoopDriver::start(&tpc_thread) {
+        Ok(event_loop) => event_loop,
+        Err(failed) => {
+            if let Some(host) = lane_host {
+                host.shutdown().await;
+            }
+            return Err(failed);
+        }
+    };
     let tracker = LocalTasks::new();
     let ws = upgrade_target(&tpc_thread, &conn_stop, &tracker);
     let ended = loop {
@@ -113,6 +123,7 @@ pub async fn tpc_accept_loop_inline<D: TransportDriver>(
     ThreadDrain {
         connections: tracker,
         lane_host,
+        event_loop,
     }
     .finish(&deadline, &tpc_thread.site.counters.run)
     .await;

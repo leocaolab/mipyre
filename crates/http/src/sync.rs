@@ -15,6 +15,8 @@ pub(crate) use parking_lot::{Mutex, MutexGuard};
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64};
 
 #[cfg(sync_model)]
+pub(crate) use self::model::TryUpdate;
+#[cfg(sync_model)]
 pub(crate) use self::model::{DashMap, Entry};
 #[cfg(sync_model)]
 pub(crate) use self::model::{Mutex, MutexGuard};
@@ -173,6 +175,28 @@ mod model {
     impl<K: Hash + Eq, V> VacantEntry<'_, K, V> {
         pub(crate) fn insert(mut self, value: V) {
             self.map.insert(self.key, value);
+        }
+    }
+
+    /// Std's `AtomicU64::try_update`, which Loom 0.7 still names `fetch_update` (std deprecated
+    /// that name in 1.99).
+    pub(crate) trait TryUpdate {
+        fn try_update(
+            &self,
+            set_order: std::sync::atomic::Ordering,
+            fetch_order: std::sync::atomic::Ordering,
+            f: impl FnMut(u64) -> Option<u64>,
+        ) -> Result<u64, u64>;
+    }
+
+    impl TryUpdate for loom::sync::atomic::AtomicU64 {
+        fn try_update(
+            &self,
+            set_order: std::sync::atomic::Ordering,
+            fetch_order: std::sync::atomic::Ordering,
+            f: impl FnMut(u64) -> Option<u64>,
+        ) -> Result<u64, u64> {
+            self.fetch_update(set_order, fetch_order, f)
         }
     }
 }

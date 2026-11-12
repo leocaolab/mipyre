@@ -4,6 +4,7 @@
 
 mod declaration;
 mod engine_queue;
+mod event_loop;
 pub mod exchange;
 mod hook_chain;
 mod isolation;
@@ -29,6 +30,7 @@ mod worker_api;
 mod worker_app;
 
 pub use self::declaration::DeclarationError;
+pub use self::event_loop::{LiveTasks, LoopBell, NextWait, PollerReadiness};
 pub use self::isolation::_note_isolated;
 pub(crate) use self::isolation::report_startup;
 pub use self::lane_worker::serve as serve_lane_worker;
@@ -47,8 +49,9 @@ pub use self::shared_map::{map_for_new, AppStore, StateValue};
 pub use self::start::{start_here, StartError, StartGate, StartHandle, ThreadResident};
 pub use self::websocket::{WsEvent, WsSession, WsUpgradeAnswer};
 pub use self::worker::program::{app_file, CommandLine, MissingAppFileError, WorkerProgram};
-pub use self::worker::start::{WorkerException, WorkerRecipe};
-pub use self::worker::sync_runner::{Retirement, SyncRunner};
+pub use self::worker::request_loop::{LoopCallError, LoopReply, RequestLoop, TurnError};
+pub use self::worker::start::{WorkerException, WorkerRecipe, WorkerStartError};
+pub use self::worker::sync_runner::{Retirement, RetirementCause, SyncRunner};
 pub use self::worker::{SubInterpreterWorker, WorkerIndex};
 pub use self::worker_api::{_worker_fail, _worker_send, _worker_take, _worker_to_response};
 pub use self::worker_app::{

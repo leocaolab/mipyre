@@ -117,7 +117,7 @@ impl BenchWorkers {
                 recipe,
             },
             main: None,
-            async_pool: None,
+            loop_limits: None,
             cpus: cpus.to_vec(),
             counters,
         }

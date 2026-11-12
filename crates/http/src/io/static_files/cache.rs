@@ -17,6 +17,8 @@ use notify::{EventKind, RecursiveMode, Watcher};
 
 use super::degraded::{self, StaticDegradation};
 use super::{CanonicalDir, RequestPath, StaticFile};
+#[cfg(sync_model)]
+use crate::sync::TryUpdate as _;
 use crate::sync::{AtomicU64, DashMap, Entry, Mutex, Ordering};
 
 /// The cap a server's static mounts are cached under, 128 MiB: enough for any reasonable static
@@ -52,7 +54,7 @@ impl CacheBudget {
     /// past the cap instead of wrapping under it.
     fn reserve(&self, len: u64) -> Option<Reservation<'_>> {
         self.held
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
                 held.checked_add(len).filter(|&after| after <= self.cap)
             })
             .ok()?;

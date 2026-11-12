@@ -1,6 +1,7 @@
 //! Counts what the server does in one run: its answers and refusals, where its TPC threads could
 //! not be placed, the drains that ran out of time, the stop watchers that did not end cleanly, the
-//! blocking calls a stopping TPC thread left running, and the requests that failed validation.
+//! blocking calls a stopping TPC thread left running, the request Tasks on TPC threads' event
+//! loops, and the requests that failed validation.
 //!
 //! Each run holds its own [`ServerCounters`] and the paths that count are handed it, so a test
 //! counts on a handle of its own and reads exact numbers. The run's workers are counted by
@@ -242,6 +243,11 @@ pub struct ServerCounters {
     drain_closed_connections: AtomicU64,
     stop_watcher_failures: AtomicU64,
     blocking_calls_left: AtomicU64,
+    loop_tasks_left: AtomicU64,
+    loop_finalizers_cut_off: AtomicU64,
+    /// Each TPC thread with an event loop has a gauge here, by thread index, of the request Tasks
+    /// live on its loop; only that thread writes it.
+    loop_tasks_live: Mutex<Vec<(usize, Arc<CachePadded<AtomicU64>>)>>,
     /// A request answered 422 because its `body=` model or `query=` string failed validation
     /// counts here. A client sends these at will, so their log line is held to one a minute
     /// (`validation_log`), for every worker of the run together.
@@ -272,6 +278,13 @@ pub struct ServerCounts {
     pub drain_closed_connections: u64,
     pub stop_watcher_failures: u64,
     pub blocking_calls_left: u64,
+    pub loop_tasks_left: u64,
+    /// It counts the TPC threads' event loops closed at the stop's deadline before their
+    /// finalizers ended, started or not.
+    pub loop_finalizers_cut_off: u64,
+    /// It holds each TPC thread's request Tasks live on its event loop, by thread index, for the
+    /// threads that have a loop.
+    pub loop_tasks_live: Vec<(usize, u64)>,
     pub validation_failures: u64,
     pub ws_keepalive_timeouts: u64,
     /// It is `None` when the OS gave the CPU counts the run is sized from.
@@ -300,6 +313,9 @@ impl ServerCounters {
             drain_closed_connections: AtomicU64::new(0),
             stop_watcher_failures: AtomicU64::new(0),
             blocking_calls_left: AtomicU64::new(0),
+            loop_tasks_left: AtomicU64::new(0),
+            loop_finalizers_cut_off: AtomicU64::new(0),
+            loop_tasks_live: Mutex::new(Vec::new()),
             validation_failures: AtomicU64::new(0),
             validation_log: LogThrottle::new(VALIDATION_LOG_PERIOD),
             ws_keepalive_timeouts: AtomicU64::new(0),
@@ -362,6 +378,23 @@ impl ServerCounters {
         self.blocking_calls_left.fetch_add(to_u64(calls), Ordering::Relaxed);
     }
 
+    /// Counts `tasks` request Tasks a TPC thread's event loop still had live when it closed.
+    pub(crate) fn loop_tasks_left(&self, tasks: usize) {
+        self.loop_tasks_left.fetch_add(to_u64(tasks), Ordering::Relaxed);
+    }
+
+    /// Counts a TPC thread's event loop closed at the stop's deadline before its finalizers ended.
+    pub(crate) fn loop_finalizers_cut_off(&self) {
+        self.loop_finalizers_cut_off.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns TPC thread `thread`'s gauge of the request Tasks live on its event loop, at zero.
+    pub(crate) fn loop_tasks_gauge(&self, thread: usize) -> LoopTasksGauge {
+        let gauge = Arc::new(CachePadded::new(AtomicU64::new(0)));
+        self.loop_tasks_live.lock().push((thread, Arc::clone(&gauge)));
+        LoopTasksGauge(gauge)
+    }
+
     /// Counts a request that failed validation and returns, once a minute, how many such lines
     /// were held back since the last one went out; `None` while the line is held back.
     pub(crate) fn validation_failed(&self, now: Duration) -> Option<u64> {
@@ -386,11 +419,37 @@ impl ServerCounters {
             drain_closed_connections: self.drain_closed_connections.load(Ordering::Relaxed),
             stop_watcher_failures: self.stop_watcher_failures.load(Ordering::Relaxed),
             blocking_calls_left: self.blocking_calls_left.load(Ordering::Relaxed),
+            loop_tasks_left: self.loop_tasks_left.load(Ordering::Relaxed),
+            loop_finalizers_cut_off: self.loop_finalizers_cut_off.load(Ordering::Relaxed),
+            loop_tasks_live: self.loop_tasks_live(),
             validation_failures: self.validation_failures.load(Ordering::Relaxed),
             ws_keepalive_timeouts: self.ws_keepalive_timeouts.load(Ordering::Relaxed),
             cpu_sizing_fallback: self.cpu_sizing_fallback.clone(),
             unpinned_because: self.unpinned_because.lock().clone(),
         }
+    }
+}
+
+impl ServerCounters {
+    fn loop_tasks_live(&self) -> Vec<(usize, u64)> {
+        let mut live: Vec<(usize, u64)> = self
+            .loop_tasks_live
+            .lock()
+            .iter()
+            .map(|(thread, gauge)| (*thread, gauge.load(Ordering::Relaxed)))
+            .collect();
+        live.sort_unstable_by_key(|(thread, _)| *thread);
+        live
+    }
+}
+
+/// One TPC thread's count of the request Tasks live on its event loop. The thread's loop driver
+/// stores it after each turn, a store to a line no other thread writes; a metrics read loads it.
+pub(crate) struct LoopTasksGauge(Arc<CachePadded<AtomicU64>>);
+
+impl LoopTasksGauge {
+    pub(crate) fn set(&self, tasks: usize) {
+        self.0.store(to_u64(tasks), Ordering::Relaxed);
     }
 }
 

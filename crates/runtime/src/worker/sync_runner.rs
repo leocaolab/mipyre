@@ -8,6 +8,7 @@ use mipyre_subinterp::gc::{GcPolicy, GcSchedule};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use super::request_loop::TurnError;
 use super::start::{StartException, WorkerStartError};
 use super::{RequestRunner, SubInterpreterWorker, WorkerIndex};
 use crate::exchange::error::{refuse, HandlerError, PyException, RequestStage, ResponseError, UnansweredError};
@@ -41,8 +42,8 @@ pub struct SyncRunner {
     /// Holds the `ws` of every WebSocket connection this worker serves.
     sessions: Sessions,
     /// Both hook lists are in registration order.
-    before_hooks: Vec<Py<PyAny>>,
-    after_hooks: Vec<Py<PyAny>>,
+    pub(super) before_hooks: Vec<Py<PyAny>>,
+    pub(super) after_hooks: Vec<Py<PyAny>>,
     /// It is made at start when a handler or hook is `async def`, otherwise on the first
     /// awaitable, so an app that never awaits never imports asyncio (about 3 MiB a worker with
     /// ssl and subprocess). It is never the current loop of the thread a `def` handler runs on.
@@ -291,40 +292,91 @@ impl SyncRunner {
 
 /// A failed `gc.collect()`, which signals OOM, heap corruption or interpreter damage.
 #[derive(Debug, thiserror::Error)]
-enum GcCollectError {
+pub enum GcCollectError {
     #[error("gc.collect() raised {0}")]
     Raised(PyException),
     #[error("a Rust panic in gc.collect(): {0}")]
     Panicked(String),
 }
 
-/// A worker stops serving for good when its `gc.collect()` failed, because its interpreter may be
-/// damaged. It is isolated, not rebuilt: the others take its share, and the server stops once a
-/// kind has no worker left (`LiveWorkers`).
+impl GcCollectError {
+    fn traceback(&self) -> &str {
+        match self {
+            GcCollectError::Raised(exception) => exception.traceback(),
+            GcCollectError::Panicked(_) => "",
+        }
+    }
+}
+
+/// Names why a worker retires; each cause says its interpreter may be damaged.
+#[derive(Debug)]
+pub enum RetirementCause {
+    GcCollect(GcCollectError),
+    /// Its TPC thread's event loop failed turn after turn; it holds the last failure.
+    LoopTurns(TurnError),
+}
+
+/// Holds what a retirement says about its cause: the words before the failure, the failure, its
+/// traceback, and what the failure signals for the worker.
+struct CauseNotice<'a> {
+    lead: &'static str,
+    failure: &'a dyn std::fmt::Display,
+    traceback: &'a str,
+    signal: &'static str,
+}
+
+impl RetirementCause {
+    fn notice(&self) -> CauseNotice<'_> {
+        match self {
+            RetirementCause::GcCollect(failure) => CauseNotice {
+                lead: "",
+                failure,
+                traceback: failure.traceback(),
+                signal: "a worker's gc.collect() failed, which signals OOM, heap corruption or interpreter \
+                         damage: the worker retires and takes no more requests",
+            },
+            RetirementCause::LoopTurns(last) => CauseNotice {
+                lead: "its event loop failed turn after turn, the last: ",
+                failure: last,
+                traceback: last.traceback(),
+                signal: "a worker's event loop kept failing its turns, which signals interpreter damage: \
+                         the worker retires and takes no more requests",
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for RetirementCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let notice = self.notice();
+        write!(f, "{}{}", notice.lead, notice.failure)
+    }
+}
+
+/// Records that a worker stopped serving for good, because its `gc.collect()` failed or its event
+/// loop's turns kept failing and its interpreter may be damaged. It is isolated, not rebuilt: the
+/// others take its share, and the server stops once a kind has no worker left (`LiveWorkers`).
 #[derive(Debug, thiserror::Error)]
-#[error("worker {worker} retired: {failure}")]
+#[error("worker {worker} retired: {cause}")]
 pub struct Retirement {
     worker: WorkerIndex,
-    failure: GcCollectError,
+    cause: RetirementCause,
 }
 
 impl Retirement {
-    /// Logs the retirement with the failure's words and traceback; `LiveWorkers::retired`
+    /// Logs the retirement with the cause's words and traceback; `LiveWorkers::retired`
     /// counts it.
     #[cold]
-    fn new(worker: WorkerIndex, failure: GcCollectError) -> Self {
-        let retirement = Retirement { worker, failure };
-        let traceback = match &retirement.failure {
-            GcCollectError::Raised(exception) => exception.traceback(),
-            GcCollectError::Panicked(_) => "",
-        };
+    pub(super) fn new(worker: WorkerIndex, cause: RetirementCause) -> Self {
+        let retirement = Retirement { worker, cause };
+        let notice = retirement.cause.notice();
         tracing::error!(
             target: "mipyre::server",
             worker_id = worker.get(),
-            error = %retirement.failure,
-            traceback,
-            "a worker's gc.collect() failed, which signals OOM, heap corruption or interpreter \
-             damage: the worker retires and takes no more requests"
+            error = %retirement.cause,
+            traceback = notice.traceback,
+            "{}",
+            notice.signal
         );
         retirement
     }
@@ -364,7 +416,7 @@ impl SyncRunner {
     fn collect_due(&mut self, py: Python<'_>, worker: WorkerIndex) -> Option<Box<Retirement>> {
         match self.collect(py) {
             Ok(()) => None,
-            Err(failure) => Some(Box::new(Retirement::new(worker, failure))),
+            Err(failure) => Some(Box::new(Retirement::new(worker, RetirementCause::GcCollect(failure)))),
         }
     }
 
@@ -556,7 +608,7 @@ impl SubInterpreterWorker<SyncRunner> {
             Ok(gc) => gc,
             Err(payload) => Err(GcCollectError::Panicked(panic_message(&*payload))),
         };
-        gc.map_err(|failure| Retirement::new(worker, failure))
+        gc.map_err(|failure| Retirement::new(worker, RetirementCause::GcCollect(failure)))
     }
 }
 
@@ -582,7 +634,10 @@ pub(super) mod tests {
             crate::LiveWorkers::new(crate::WorkerKind::PoolSync, 2, std::sync::Arc::new(|_| {}), &counters);
         let life = lives.into_iter().next().expect("a worker's life");
         let retirement = crate::testkit::captured_log_value(|| {
-            Retirement::new(WorkerIndex::new(1), GcCollectError::Panicked("boom".into()))
+            Retirement::new(
+                WorkerIndex::new(1),
+                RetirementCause::GcCollect(GcCollectError::Panicked("boom".into())),
+            )
         });
         assert_eq!(life.retired(&retirement), None, "one worker of two is left serving");
         let counted = counters.read();
@@ -747,7 +802,7 @@ pub(super) mod tests {
         )
     }
 
-    fn get_root() -> Request {
+    pub(in crate::worker) fn get_root() -> Request {
         let (parts, ()) = hyper::Request::get("/").body(()).expect("a valid request").into_parts();
         let head = mipyre_http::io::request_head::RequestHead {
             parts,

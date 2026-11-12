@@ -74,7 +74,7 @@ struct ConnectionSlot(Arc<AtomicUsize>);
 impl ConnectionSlot {
     fn try_acquire(open: &OpenConnections, max_connections: usize) -> Option<Self> {
         open.0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < max_connections).then_some(n + 1)
             })
             .ok()

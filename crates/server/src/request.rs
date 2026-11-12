@@ -28,17 +28,32 @@ pub trait Backends {
     /// `Infallible`, so its requests carry no inline call.
     type Inline;
 
+    /// The event loop that runs an `async def` route on the request's own thread, with its
+    /// worker; a server with none says `Infallible`.
+    type OnLoop<'a>
+    where
+        Self: 'a;
+
     fn site(&self) -> &Site;
 
     /// Returns the backend of this server's `def` worker routes.
     fn sync_worker(&self) -> Option<WorkerBackend<'_, Self::Inline>>;
 
-    /// Returns the pool of this server's `async def` worker routes.
-    fn async_pool(&self) -> Option<&InterpreterPool>;
+    /// Returns the backend of this server's `async def` worker routes.
+    fn async_worker(&self) -> Option<LoopBackend<'_, Self::OnLoop<'_>>>;
 
     /// Runs `prepared` on `worker`, on the request's own thread, and finishes its response.
     fn run_inline<'a>(
         worker: &'a Self::Inline,
+        site: &'a Site,
+        prepared: HandlerRequest,
+        route: RouteId,
+    ) -> impl Future<Output = Response<ResponseBody>> + 'a;
+
+    /// Runs `prepared`'s `async def` handler on `on`, the event loop on the request's own thread,
+    /// and finishes its response.
+    fn run_on_loop<'a>(
+        on: Self::OnLoop<'a>,
         site: &'a Site,
         prepared: HandlerRequest,
         route: RouteId,
@@ -65,6 +80,13 @@ pub enum WorkerBackend<'a, I> {
     Pool(&'a InterpreterPool),
 }
 
+/// The backend that runs a server's `async def` sub-interpreter routes.
+pub enum LoopBackend<'a, L> {
+    /// The event loop of the server's worker on the request's own thread.
+    OnLoop(L),
+    Pool(&'a InterpreterPool),
+}
+
 /// Answers `req`, or hands it to the backend `server` has for its route, and finishes the response.
 ///
 /// It is generic over the server so that each server's requests poll their own copy: one future
@@ -87,8 +109,9 @@ pub async fn handle_request<B: Backends>(
             Some(WorkerBackend::Pool(pool)) => serve_on_pool(pool, site, prepared, route, kind).await,
             None => without_backend(site, prepared, RuntimeChoice::Worker),
         },
-        HandlerCall::Worker(route, kind @ HandlerKind::Async) => match server.async_pool() {
-            Some(pool) => serve_on_pool(pool, site, prepared, route, kind).await,
+        HandlerCall::Worker(route, kind @ HandlerKind::Async) => match server.async_worker() {
+            Some(LoopBackend::OnLoop(on)) => B::run_on_loop(on, site, prepared, route).await,
+            Some(LoopBackend::Pool(pool)) => serve_on_pool(pool, site, prepared, route, kind).await,
             None => without_backend(site, prepared, RuntimeChoice::Worker),
         },
         HandlerCall::Lane(route) => match site.process.as_deref() {

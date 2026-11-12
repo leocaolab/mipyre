@@ -211,29 +211,92 @@ pub fn relative_key(rel: &str) -> RelativeKey<'_> {
 
 /// Returns the MIME type for a lowercase extension without its dot, and
 /// `application/octet-stream` for an unknown one.
+///
+/// The extension is matched as one word (`ext_key`) rather than as text, so the match is integer
+/// comparisons whatever the optimizer makes of comparing short strings; under fat LTO, LLVM 23
+/// calls `bcmp` for each odd-length one.
 pub fn mime_from_ext(ext: &str) -> &'static str {
-    match ext {
-        "html" | "htm" => "text/html; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "js" | "mjs" => "application/javascript; charset=utf-8",
-        "json" => "application/json; charset=utf-8",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "webp" => "image/webp",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "pdf" => "application/pdf",
-        "xml" => "application/xml; charset=utf-8",
-        "txt" => "text/plain; charset=utf-8",
-        "wasm" => "application/wasm",
-        "map" => "application/json",
+    let Some(key) = ext_key(ext.as_bytes()) else {
+        return "application/octet-stream";
+    };
+    match key {
+        known::HTML | known::HTM => "text/html; charset=utf-8",
+        known::CSS => "text/css; charset=utf-8",
+        known::JS | known::MJS => "application/javascript; charset=utf-8",
+        known::JSON => "application/json; charset=utf-8",
+        known::PNG => "image/png",
+        known::JPG | known::JPEG => "image/jpeg",
+        known::GIF => "image/gif",
+        known::SVG => "image/svg+xml",
+        known::ICO => "image/x-icon",
+        known::WEBP => "image/webp",
+        known::WOFF => "font/woff",
+        known::WOFF2 => "font/woff2",
+        known::TTF => "font/ttf",
+        known::OTF => "font/otf",
+        known::PDF => "application/pdf",
+        known::XML => "application/xml; charset=utf-8",
+        known::TXT => "text/plain; charset=utf-8",
+        known::WASM => "application/wasm",
+        known::MAP => "application/json",
         _ => "application/octet-stream",
     }
+}
+
+const EXT_KEY_LEN: usize = 7;
+
+/// Packs an extension of at most `EXT_KEY_LEN` bytes into a word, its bytes from the lowest and its
+/// length in the top byte, so two extensions get the same word only when they are equal. A longer
+/// one has no word.
+const fn ext_key(ext: &[u8]) -> Option<u64> {
+    if ext.len() > EXT_KEY_LEN {
+        return None;
+    }
+    let mut key = (ext.len() as u64) << 56;
+    let mut i = 0;
+    while i < ext.len() {
+        key |= (ext[i] as u64) << (8 * i);
+        i += 1;
+    }
+    Some(key)
+}
+
+/// Holds the word of each extension `mime_from_ext` knows.
+mod known {
+    #[expect(
+        clippy::panic,
+        reason = "only the consts below evaluate it, so a known extension longer than EXT_KEY_LEN fails the \
+                  build and no request reaches it"
+    )]
+    const fn key(ext: &[u8]) -> u64 {
+        match super::ext_key(ext) {
+            Some(key) => key,
+            None => panic!("a known extension is at most EXT_KEY_LEN bytes"),
+        }
+    }
+
+    pub(super) const HTML: u64 = key(b"html");
+    pub(super) const HTM: u64 = key(b"htm");
+    pub(super) const CSS: u64 = key(b"css");
+    pub(super) const JS: u64 = key(b"js");
+    pub(super) const MJS: u64 = key(b"mjs");
+    pub(super) const JSON: u64 = key(b"json");
+    pub(super) const PNG: u64 = key(b"png");
+    pub(super) const JPG: u64 = key(b"jpg");
+    pub(super) const JPEG: u64 = key(b"jpeg");
+    pub(super) const GIF: u64 = key(b"gif");
+    pub(super) const SVG: u64 = key(b"svg");
+    pub(super) const ICO: u64 = key(b"ico");
+    pub(super) const WEBP: u64 = key(b"webp");
+    pub(super) const WOFF: u64 = key(b"woff");
+    pub(super) const WOFF2: u64 = key(b"woff2");
+    pub(super) const TTF: u64 = key(b"ttf");
+    pub(super) const OTF: u64 = key(b"otf");
+    pub(super) const PDF: u64 = key(b"pdf");
+    pub(super) const XML: u64 = key(b"xml");
+    pub(super) const TXT: u64 = key(b"txt");
+    pub(super) const WASM: u64 = key(b"wasm");
+    pub(super) const MAP: u64 = key(b"map");
 }
 
 /// Picks the pre-compressed copy by the same rules as dynamic compression; `None` means the
@@ -394,6 +457,91 @@ mod tests {
         assert_eq!(mime_from_ext("xyz"), "application/octet-stream");
         assert_eq!(mime_from_ext(""), "application/octet-stream");
         assert_eq!(mime_from_ext("bin"), "application/octet-stream");
+    }
+
+    fn mime_by_text(ext: &str) -> &'static str {
+        match ext {
+            "html" | "htm" => "text/html; charset=utf-8",
+            "css" => "text/css; charset=utf-8",
+            "js" | "mjs" => "application/javascript; charset=utf-8",
+            "json" => "application/json; charset=utf-8",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "svg" => "image/svg+xml",
+            "ico" => "image/x-icon",
+            "webp" => "image/webp",
+            "woff" => "font/woff",
+            "woff2" => "font/woff2",
+            "ttf" => "font/ttf",
+            "otf" => "font/otf",
+            "pdf" => "application/pdf",
+            "xml" => "application/xml; charset=utf-8",
+            "txt" => "text/plain; charset=utf-8",
+            "wasm" => "application/wasm",
+            "map" => "application/json",
+            _ => "application/octet-stream",
+        }
+    }
+
+    const KNOWN_EXTS: [&str; 22] = [
+        "html", "htm", "css", "js", "mjs", "json", "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "woff", "woff2",
+        "ttf", "otf", "pdf", "xml", "txt", "wasm", "map",
+    ];
+
+    fn assert_same_mime(ext: &str) {
+        assert_eq!(mime_from_ext(ext), mime_by_text(ext), "extension {ext:?}");
+    }
+
+    #[test]
+    fn every_known_extension_and_its_near_misses_map_as_the_text_match_does() {
+        for ext in KNOWN_EXTS {
+            assert_same_mime(ext);
+            assert_same_mime(&ext.to_ascii_uppercase());
+            assert_same_mime(&ext[..ext.len() - 1]);
+            assert_same_mime(&format!("{ext}\0"));
+            assert_same_mime(&format!("{ext}2"));
+            assert_same_mime(&format!("\0{ext}"));
+            for at in 0..ext.len() {
+                for b in 0..=0x7f_u8 {
+                    let mut near = ext.as_bytes().to_vec();
+                    near[at] = b;
+                    assert_same_mime(std::str::from_utf8(&near).unwrap());
+                }
+                let mut capital = ext.as_bytes().to_vec();
+                capital[at].make_ascii_uppercase();
+                assert_same_mime(std::str::from_utf8(&capital).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn every_extension_of_up_to_two_ascii_bytes_maps_as_the_text_match_does() {
+        assert_same_mime("");
+        for a in 0..=0x7f_u8 {
+            assert_same_mime(std::str::from_utf8(&[a]).unwrap());
+            for b in 0..=0x7f_u8 {
+                assert_same_mime(std::str::from_utf8(&[a, b]).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn extensions_around_the_longest_known_and_the_key_length_are_unknown() {
+        for ext in [
+            "woff22",
+            "woff2x",
+            "abcdefg",
+            "abcdefgh",
+            "abcdefghi",
+            "html\0\0\0",
+            "html\0\0\0\0",
+            "é",
+            "ﬀ",
+        ] {
+            assert_same_mime(ext);
+            assert_eq!(mime_from_ext(ext), "application/octet-stream", "extension {ext:?}");
+        }
     }
 
     #[test]

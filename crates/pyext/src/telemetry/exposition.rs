@@ -107,6 +107,21 @@ fn responses(out: &mut String, counts: &AnswerCounts) {
     sample(out, &format!("{name}_count"), "", all);
 }
 
+/// Writes each TPC thread's gauge of the `async def` request Tasks live on its event loop. A Task
+/// whose request got 504 counts until it ends, so a thread that answers only 503 shows here.
+fn loop_tasks(out: &mut String, live: &[(usize, u64)]) {
+    let name = "mipyre_loop_tasks_live";
+    header(
+        out,
+        name,
+        MetricType::Gauge,
+        "async def request Tasks live on each TPC thread's event loop, including ones whose request was answered 504.",
+    );
+    for (thread, tasks) in live {
+        sample(out, name, &format!("{{thread=\"{thread}\"}}"), tasks);
+    }
+}
+
 fn run_counts(out: &mut String, run: &ServerCounts, workers: &WorkerTally) {
     let ServerCounts {
         answers: answer_counts,
@@ -122,6 +137,9 @@ fn run_counts(out: &mut String, run: &ServerCounts, workers: &WorkerTally) {
         drain_closed_connections,
         stop_watcher_failures,
         blocking_calls_left,
+        loop_tasks_left,
+        loop_finalizers_cut_off,
+        loop_tasks_live,
         validation_failures,
         ws_keepalive_timeouts,
         cpu_sizing_fallback,
@@ -224,6 +242,23 @@ fn run_counts(out: &mut String, run: &ServerCounts, workers: &WorkerTally) {
          down, and left running.",
         [("", blocking_calls_left)],
     );
+    family(
+        out,
+        "mipyre_loop_tasks_left_total",
+        MetricType::Counter,
+        "async def request Tasks still live on a TPC thread's event loop when it closed at the stop or after its \
+         worker retired; they were dropped.",
+        [("", loop_tasks_left)],
+    );
+    family(
+        out,
+        "mipyre_loop_finalizers_cut_off_total",
+        MetricType::Counter,
+        "TPC threads' event loops closed at the stop's deadline before their finalizers ended (a Task that ignored \
+         its cancel, or a request Task still live): async generators or the default executor may be left unshut.",
+        [("", loop_finalizers_cut_off)],
+    );
+    loop_tasks(out, loop_tasks_live);
     family(
         out,
         "mipyre_validation_failures_total",
@@ -556,6 +591,34 @@ mod tests {
         let page = render(&run, &WorkerTally::default(), 0, &process());
         assert!(page.contains("mipyre_cpu_sizing_fallback_info{reason=\"cgroup quota \\\"max\\\"\\nunread\\\\\"} 1\n"));
         assert!(page.contains("mipyre_bad_requests_total{kind=\"malformed\"} 3\n"));
+    }
+
+    #[test]
+    fn each_tpc_threads_live_loop_tasks_are_a_sample_of_their_own() {
+        let run = ServerCounts {
+            loop_tasks_left: 2,
+            loop_tasks_live: vec![(0, 3), (1, 0)],
+            ..ServerCounts::default()
+        };
+        let page = render(&run, &WorkerTally::default(), 0, &process());
+        assert_eq!(
+            lines_of(&page, "mipyre_loop_tasks_live{"),
+            [
+                "mipyre_loop_tasks_live{thread=\"0\"} 3",
+                "mipyre_loop_tasks_live{thread=\"1\"} 0"
+            ]
+        );
+        assert!(page.contains("\nmipyre_loop_tasks_left_total 2\n"));
+    }
+
+    #[test]
+    fn loops_whose_finalizers_were_cut_off_are_counted() {
+        let run = ServerCounts {
+            loop_finalizers_cut_off: 1,
+            ..ServerCounts::default()
+        };
+        let page = render(&run, &WorkerTally::default(), 0, &process());
+        assert!(page.contains("\nmipyre_loop_finalizers_cut_off_total 1\n"));
     }
 
     #[test]

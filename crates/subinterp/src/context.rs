@@ -82,6 +82,19 @@ impl<'py> PyContext<'py> {
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyContext_New()) }.map(PyContext)
     }
 
+    /// Copies the context current on this thread state, through `contextvars.copy_context()`.
+    /// It costs a Python call rather than another `unsafe` block; an event loop calls it when
+    /// user code makes a task or adds a done callback without giving a context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Python error when `contextvars` cannot be imported or the copy cannot be made.
+    pub fn copy_current(py: Python<'py>) -> PyResult<Self> {
+        py.import(pyo3::intern!(py, "contextvars"))?
+            .call_method0(pyo3::intern!(py, "copy_context"))
+            .map(PyContext)
+    }
+
     /// Enters this context on this thread state.
     #[inline(always)]
     pub fn enter(self) -> ContextEntry<'py> {
@@ -179,7 +192,24 @@ impl<'py> ContextEntry<'py> {
     }
 }
 
+impl<'py> From<PyContext<'py>> for ContextSuspension<'py> {
+    /// Holds a context no one has entered as one to enter later, such as a new task's.
+    #[inline]
+    fn from(ctx: PyContext<'py>) -> Self {
+        ContextSuspension(ctx.0)
+    }
+}
+
 impl<'py> ContextSuspension<'py> {
+    /// Holds `context`, which a task kept between its steps, as one to enter again.
+    ///
+    /// Nothing is checked here: [`Self::enter_again`] fails when `context` is not a
+    /// `contextvars.Context` or is entered already.
+    #[inline]
+    pub fn new(context: Bound<'py, PyAny>) -> Self {
+        ContextSuspension(context)
+    }
+
     #[inline]
     pub fn context(&self) -> &Bound<'py, PyAny> {
         &self.0

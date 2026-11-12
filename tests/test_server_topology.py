@@ -1,6 +1,6 @@
 """Server and topology checks. No fixed ports: every server binds port 0.
 
-- On TPC, `async def` routes run on the async worker pool, off the TPC thread.
+- On TPC, `async def` routes run as Tasks on the TPC thread's own event loop, so their awaits overlap.
 - Topology: one `Topology` resolved at start; GC modes a topology can't run are refused.
 - `threads` / `subinterpreters` of 0, and a host that isn't an IP, are `ValueError`s naming it.
 - A port another server listens on with SO_REUSEPORT is `OSError(EADDRINUSE)`.
@@ -67,7 +67,7 @@ def _run_script(tmp_path, body: str, timeout: float = 60, env_extra=None):
 
 
 # ---------------------------------------------------------------------------
-# TPC `async def` routes go to the async pool
+# TPC `async def` routes run on the thread's event loop
 # ---------------------------------------------------------------------------
 
 

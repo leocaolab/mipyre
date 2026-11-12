@@ -19,6 +19,7 @@ use super::worker_app::WorkerRoutes;
 pub(super) mod async_engine;
 mod exec;
 pub(super) mod program;
+pub(super) mod request_loop;
 pub(super) mod start;
 pub(super) mod sync_runner;
 

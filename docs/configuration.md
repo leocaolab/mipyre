@@ -319,7 +319,7 @@ Each is also a `mipyre run` flag and a `[tool.mipyre]` key ([Every server settin
 | `MIPYRE_GC_OOM_FAILSAFE` | requests after which `idle` mode collects even without a lull | `50000` |
 | `MIPYRE_BRIDGE_WORKERS` | the most threads that run the `def` handlers of `runtime="main"` routes, on every server (`async def` ones wait on the main interpreter's event loop, holding none). Four start with the server; past them a thread starts when a request finds none free, and retires after 10 s idle | `4` (thread-per-core), `512` (`MIPYRE_TPC=0`) |
 | `MIPYRE_BRIDGE_CAPACITY` | main-interpreter requests queued (`async def`: queued or running) before `503` | 16 per thread (`64` thread-per-core, `8192` with `MIPYRE_TPC=0`) |
-| `MIPYRE_ASYNC_QUEUE_CAPACITY` | requests queued for the sub-interpreters that run `async def` handlers before `503` | 128 per worker of the pool that runs them |
+| `MIPYRE_ASYNC_QUEUE_CAPACITY` | `async def` requests a sub-interpreter holds, queued or running, before `503`: on the thread-per-core server per thread, a sixteenth of them with a body over 64 KiB; with `MIPYRE_TPC=0` per worker of the async pool | 128 per thread / per pool worker |
 | `MIPYRE_METRICS` | `1` turns on the engine's own counters and a memory (RSS) sampler | `0` |
 | `MIPYRE_TPC_ACCEPT` | macOS only: how the thread-per-core server accepts connections. `listener`: each thread runs its own accept loop on the port's one listening socket, so whichever thread is free takes the next connection (macOS's `SO_REUSEPORT` would hand every connection to one socket). `fanout`: one acceptor that hands connections to the threads | `listener` |
 
@@ -341,7 +341,7 @@ Each server setting, by its three names. A `[tool.mipyre]` key is written in `py
 | `gc_oom_failsafe` | `--gc-oom-failsafe` | `MIPYRE_GC_OOM_FAILSAFE` | `[tool.mipyre] gc_oom_failsafe` | 50000 | requests after which idle mode collects even without a lull; 0 collects only in lulls |
 | `bridge_workers` | `--bridge-workers` | `MIPYRE_BRIDGE_WORKERS` | `[tool.mipyre] bridge_workers` | 4 (thread-per-core) / 512 (tpc off) | most threads that run main-interpreter def routes |
 | `bridge_capacity` | `--bridge-capacity` | `MIPYRE_BRIDGE_CAPACITY` | `[tool.mipyre] bridge_capacity` | 16 per main-interpreter thread | main-interpreter requests queued (async def: queued or running) before 503 |
-| `async_queue_capacity` | `--async-queue-capacity` | `MIPYRE_ASYNC_QUEUE_CAPACITY` | `[tool.mipyre] async_queue_capacity` | 128 per pool worker | async def requests queued or running before 503 |
+| `async_queue_capacity` | `--async-queue-capacity` | `MIPYRE_ASYNC_QUEUE_CAPACITY` | `[tool.mipyre] async_queue_capacity` | 128 per pool worker / per TPC thread | async def requests queued or running before 503; on TPC, per thread, a sixteenth of them with large bodies |
 | `metrics` | `--metrics` | `MIPYRE_METRICS` | `[tool.mipyre] metrics` | off | count every answer and sample RSS |
 | `host` | `--host` | `MIPYRE_HOST` | `[tool.mipyre] host` | 127.0.0.1 | the address to bind |
 | `port` | `--port` | `MIPYRE_PORT` | `[tool.mipyre] port` | 8000 | the port to bind |

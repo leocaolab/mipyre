@@ -14,6 +14,7 @@ use super::engine_queue::{send_answer, EngineInbox, EngineReply, TaskPlace};
 use super::hook_chain::worker_response;
 use super::main_call::main_reply;
 use super::worker::async_engine::EngineRoutes;
+use super::worker::request_loop::LoopAnswer;
 use super::worker_app;
 use crate::exchange::error::{refuse, HandlerError, ReplyHolder, RequestStage, ResponseError, UnansweredError};
 use crate::exchange::request::Request;
@@ -96,9 +97,33 @@ pub struct AsyncJob {
     _place: TaskPlace,
 }
 
+/// Carries one request to a TPC thread's event loop, for the hook chain `job_runner` runs; it is
+/// answered exactly once, by its drop with an error if it is let go of unanswered.
+#[pyclass(module = "mipyre.engine", frozen, name = "_LoopJob")]
+pub(crate) struct LoopJob {
+    route: usize,
+    #[pyo3(get)]
+    request: Py<Request>,
+    reply: JobReply,
+}
+
+#[pymethods]
+impl LoopJob {
+    #[getter]
+    fn route(&self) -> usize {
+        self.route
+    }
+}
+
+impl LoopJob {
+    pub(crate) fn new(route: usize, request: Py<Request>, reply: JobReply) -> Self {
+        LoopJob { route, request, reply }
+    }
+}
+
 /// Holds where a request's answer goes; the label outlives the answer so a later failure still
 /// names the request.
-struct JobReply {
+pub(crate) struct JobReply {
     label: RequestLabel,
     reply: Mutex<Option<EngineReply>>,
 }
@@ -112,7 +137,7 @@ impl AsyncJob {
 }
 
 impl JobReply {
-    fn new(label: RequestLabel, reply: EngineReply) -> Self {
+    pub(crate) fn new(label: RequestLabel, reply: EngineReply) -> Self {
         JobReply {
             label,
             reply: Mutex::new(Some(reply)),
@@ -133,16 +158,38 @@ impl JobReply {
 
     /// Answers this request with what its handler or a hook returned, mapped as its caller takes
     /// it: a worker's as a response, main's also as a `Stream`.
-    fn answer(&self, value: Bound<'_, PyAny>) -> PyResult<()> {
+    pub(crate) fn answer(&self, value: Bound<'_, PyAny>) -> PyResult<()> {
         match self.take()? {
-            EngineReply::Pool(reply) => {
+            EngineReply::Worker(reply) => {
                 send_answer(reply, &self.label, worker_response(value).map_err(HandlerError::from));
+            }
+            EngineReply::Loop(reply) => {
+                let answer = worker_response(value).map(LoopAnswer).map_err(HandlerError::from);
+                send_answer(reply, &self.label, answer);
             }
             EngineReply::Main(reply) => {
                 send_answer(reply, &self.label, main_reply(value).map_err(HandlerError::from));
             }
         }
         Ok(())
+    }
+
+    /// Answers this request with the exception a handler, a hook or the answer raised, or only
+    /// logs it if the request was already answered.
+    #[inline]
+    pub(crate) fn fail_raised(&self, py: Python<'_>, exception: Bound<'_, PyBaseException>) {
+        // The engine's own exceptions carry their typed error, not yet logged.
+        let carried = if let Ok(invalid) = exception.cast::<InvalidResponse>() {
+            invalid.get().error.lock().take().map(HandlerError::Response)
+        } else if let Ok(panicked) = exception.cast::<EnginePanic>() {
+            panicked.get().error.lock().take()
+        } else {
+            None
+        };
+        let error = carried.unwrap_or_else(|| {
+            HandlerError::python(py, RequestStage::AsyncTask, &PyErr::from_value(exception.into_any()))
+        });
+        self.fail(error);
     }
 
     /// Answers this request with `error`, or only logs it if the request was already answered.
@@ -160,10 +207,11 @@ impl JobReply {
 impl Drop for JobReply {
     fn drop(&mut self) {
         if let Some(reply) = self.reply.get_mut().take() {
-            reply.fail(
-                &self.label,
-                refuse(UnansweredError::WorkerLost(ReplyHolder::AsyncEngine)),
-            );
+            let holder = match &reply {
+                EngineReply::Loop(_) => ReplyHolder::RequestLoop,
+                EngineReply::Worker(_) | EngineReply::Main(_) => ReplyHolder::AsyncEngine,
+            };
+            reply.fail(&self.label, refuse(UnansweredError::WorkerLost(holder)));
         }
     }
 }
@@ -240,28 +288,28 @@ worker_api_function! {
 fn _worker_fail(py: Python<'_>, job: &Bound<'_, AsyncJob>, exception: Bound<'_, PyBaseException>);
 answering &job.get().reply;
 {
-        let reply = &job.get().reply;
-        // The engine's own exceptions carry their typed error, not yet logged.
-        let carried = if let Ok(invalid) = exception.cast::<InvalidResponse>() {
-            invalid
-                .get()
-                .error
-                .lock()
-                .take()
-                .map(HandlerError::Response)
-        } else if let Ok(panicked) = exception.cast::<EnginePanic>() {
-            panicked.get().error.lock().take()
-        } else {
-            None
-        };
-        let error = carried.unwrap_or_else(|| {
-            HandlerError::python(
-                py,
-                RequestStage::AsyncTask,
-                &PyErr::from_value(exception.into_any()),
-            )
-        });
-        reply.fail(error);
+        job.get().reply.fail_raised(py, exception);
+        Ok(())
+    }
+}
+
+worker_api_function! {
+/// Answers the loop's `job` with anything a handler may return; what it raises goes to
+/// `_loop_fail`.
+fn _loop_send(job: &Bound<'_, LoopJob>, response: Bound<'_, PyAny>) -> ();
+raising through job.py();
+{
+        job.get().reply.answer(response)
+    }
+}
+
+worker_api_function! {
+/// Answers the loop's `job` with the exception its Task or `_loop_send` raised, or only logs it
+/// if the request was already answered.
+fn _loop_fail(py: Python<'_>, job: &Bound<'_, LoopJob>, exception: Bound<'_, PyBaseException>);
+answering &job.get().reply;
+{
+        job.get().reply.fail_raised(py, exception);
         Ok(())
     }
 }
@@ -371,7 +419,7 @@ mod tests {
     #[test]
     fn a_job_dropped_unanswered_answers_itself_and_an_answered_one_does_not() {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let dropped = JobReply::new(label(&RequestId::mint()), EngineReply::Pool(tx));
+        let dropped = JobReply::new(label(&RequestId::mint()), EngineReply::Worker(tx));
         captured_log_value(|| drop(dropped));
         match rx.try_recv().expect("the dropped job was answered") {
             Err(logged) => assert!(
@@ -385,7 +433,7 @@ mod tests {
         }
 
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let answered = JobReply::new(label(&RequestId::mint()), EngineReply::Pool(tx));
+        let answered = JobReply::new(label(&RequestId::mint()), EngineReply::Worker(tx));
         captured_log_value(|| {
             answered.fail(HandlerError::Panicked {
                 payload: "its own answer".into(),
@@ -404,7 +452,7 @@ mod tests {
     #[test]
     fn a_panic_in_a_call_that_answers_a_request_fails_it_once_and_returns() {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let reply = JobReply::new(label(&RequestId::mint()), EngineReply::Pool(tx));
+        let reply = JobReply::new(label(&RequestId::mint()), EngineReply::Worker(tx));
         let returned = captured_log_value(|| no_panic_answering("_worker_fail", &reply, panicking));
         assert!(returned.is_ok(), "the call returns normally");
         let answered = rx.try_recv().expect("the request was answered");

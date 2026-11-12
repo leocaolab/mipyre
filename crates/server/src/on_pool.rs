@@ -1,5 +1,4 @@
-//! Dispatches worker routes to the shared sub-interpreter pool when TPC is off, and a TPC thread's
-//! `async def` routes to the async pool.
+//! Dispatches worker routes to the shared sub-interpreter pool when TPC is off.
 
 use hyper::Response;
 use mipyre_core::dispatch;
@@ -25,14 +24,14 @@ use super::respond::http_response;
 /// permit budget sized for "the queue" would reject most of them, and one sized for the
 /// worst-case RAM of a body flood would not protect against it. Only large bodies need a
 /// permit.
-const ADMISSION_SKIP_BYTES: ByteLimit = ByteLimit(64 * 1024);
+pub(crate) const ADMISSION_SKIP_BYTES: ByteLimit = ByteLimit(64 * 1024);
 
 /// Returns whether a request takes its admission permit before any byte of the body is read,
 /// which it does when its `Content-Length` declares more than `ADMISSION_SKIP_BYTES`. A missing
 /// or unusable `Content-Length` declares nothing, and the collector's gate bounds that body as it
 /// arrives.
 #[inline]
-fn takes_upfront_permit(headers: &hyper::HeaderMap) -> bool {
+pub(crate) fn takes_upfront_permit(headers: &hyper::HeaderMap) -> bool {
     let declared = headers
         .get(hyper::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -90,8 +89,7 @@ fn admission_refused(_: TryAcquireError) -> HandlerError {
     refuse(UnansweredError::Overloaded(Capacity::AdmissionPermits))
 }
 
-/// Runs a worker route on `pool` and finishes its response. A TPC thread serves its
-/// `async def` routes this way too, on the async pool.
+/// Runs a worker route on `pool` and finishes its response.
 pub(super) async fn serve_on_pool(
     pool: &InterpreterPool,
     site: &Site,

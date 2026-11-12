@@ -10,6 +10,7 @@ use mipyre_transport::driver::TransportDriver;
 
 use super::conn::{serve_accepted, TpcThread};
 use super::inline::{connections_stop, retired, stopped_accepting};
+use super::loop_driver::LoopDriver;
 use super::threads::{
     join_run, left_running, serve_on_this_thread, settle, spawn_worker_threads, stopped_error, ThreadDrain,
 };
@@ -41,12 +42,12 @@ pub(super) fn run_fanout<D: TransportDriver>(
     let TpcServer {
         threads,
         main,
-        async_pool,
+        loop_limits,
         cpus,
         counters,
         ..
     } = server;
-    let threads = threads.into_setups(main, async_pool);
+    let threads = threads.into_setups(main, loop_limits);
     let (txs, threads): (Vec<_>, Vec<_>) = threads
         .into_iter()
         .map(|setup| {
@@ -184,6 +185,15 @@ async fn fanout_worker_loop<D: TransportDriver>(
         thread,
     )
     .map_err(ServeError::LaneHost)?;
+    let event_loop = match LoopDriver::start(&tpc_thread) {
+        Ok(event_loop) => event_loop,
+        Err(failed) => {
+            if let Some(host) = lane_host {
+                host.shutdown().await;
+            }
+            return Err(failed);
+        }
+    };
     let tracker = LocalTasks::new();
     let ws = upgrade_target(&tpc_thread, &conn_stop, &tracker);
     let mut accepting = true;
@@ -218,6 +228,7 @@ async fn fanout_worker_loop<D: TransportDriver>(
     ThreadDrain {
         connections: tracker,
         lane_host,
+        event_loop,
     }
     .finish(&deadline, &tpc_thread.site.counters.run)
     .await;

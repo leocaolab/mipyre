@@ -15,7 +15,6 @@ use mipyre_http::plan::route::{WsPlace, WsRoute};
 
 use super::config::{FlagError, ServerKind, ServerRecipe};
 use super::settings::{FlagUse, ServerFlagValues};
-use mipyre_runtime::RouteKinds;
 use mipyre_server::AcceptMode;
 use mipyre_subinterp::gc::GcMode;
 
@@ -268,16 +267,6 @@ impl std::fmt::Display for Topology {
 /// The fewest sub-interpreters the pool defaults to: `def` and `async def` handlers each need one
 /// of their own, and a one-CPU host must still start an app that has both.
 const POOL_DEFAULT_MIN: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
-
-/// Counts the async-engine workers for a TPC server's `async def` routes: one
-/// per TPC thread, or half as many (at least one) when `def` routes share the cores.
-pub(crate) fn tpc_async_workers(threads: NonZeroUsize, kinds: RouteKinds) -> NonZeroUsize {
-    if kinds.has_sync() {
-        NonZeroUsize::new(threads.get() / 2).unwrap_or(NonZeroUsize::MIN)
-    } else {
-        threads
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -614,15 +603,6 @@ mod tests {
             }
         }
         assert_eq!(unused_names(&layout(POOL), &given), ["tpc_accept"]);
-    }
-
-    #[test]
-    fn tpc_async_pool_shares_the_cores_with_sync_routes() {
-        assert_eq!(tpc_async_workers(n(8), RouteKinds::Async), n(8));
-        assert_eq!(tpc_async_workers(n(8), RouteKinds::Both), n(4));
-        assert_eq!(tpc_async_workers(n(3), RouteKinds::Both), n(1));
-        assert_eq!(tpc_async_workers(n(1), RouteKinds::Both), n(1));
-        assert_eq!(tpc_async_workers(n(1), RouteKinds::Async), n(1));
     }
 
     #[test]

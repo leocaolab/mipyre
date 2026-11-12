@@ -30,12 +30,25 @@ pub struct ServerRequestId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientRequestId(HeaderValue);
 
+const fn id_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/' | b'+' | b'=' | b';' | b'@' | b'~')
+}
+
+/// Tells for each byte whether `id_byte` allows it. Checking an id is then one load per byte, not
+/// a chain of comparisons whose cost depends on the optimizer merging the letter and digit
+/// ranges, which LLVM 23 does not.
+static ID_BYTES: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut b = 0;
+    while b < table.len() {
+        table[b] = id_byte(b as u8);
+        b += 1;
+    }
+    table
+};
+
 fn usable(bytes: &[u8]) -> bool {
-    (1..=MAX_CLIENT_ID_LEN).contains(&bytes.len())
-        && bytes.iter().all(|&b| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'-' | b'_' | b'.' | b':' | b'/' | b'+' | b'=' | b';' | b'@' | b'~')
-        })
+    (1..=MAX_CLIENT_ID_LEN).contains(&bytes.len()) && bytes.iter().all(|&b| ID_BYTES[usize::from(b)])
 }
 
 impl ClientRequestId {
@@ -115,5 +128,42 @@ impl fmt::Display for RequestId {
             RequestId::Server(_) => self.with_text(|text| f.write_str(text)),
             RequestId::Client(id) => id.fmt(f),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usable_by_comparisons(bytes: &[u8]) -> bool {
+        (1..=MAX_CLIENT_ID_LEN).contains(&bytes.len())
+            && bytes.iter().all(|&b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(b, b'-' | b'_' | b'.' | b':' | b'/' | b'+' | b'=' | b';' | b'@' | b'~')
+            })
+    }
+
+    #[test]
+    fn every_byte_is_usable_exactly_when_the_comparisons_allow_it() {
+        for b in u8::MIN..=u8::MAX {
+            assert_eq!(usable(&[b]), usable_by_comparisons(&[b]), "byte {b:#04x}");
+            let last = [[b'a'; MAX_CLIENT_ID_LEN - 1].as_slice(), &[b]].concat();
+            assert_eq!(
+                usable(&last),
+                usable_by_comparisons(&last),
+                "byte {b:#04x} last of {MAX_CLIENT_ID_LEN}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_id_is_one_to_max_bytes_long() {
+        for len in [0, 1, MAX_CLIENT_ID_LEN, MAX_CLIENT_ID_LEN + 1] {
+            let id = vec![b'a'; len];
+            assert_eq!(usable(&id), usable_by_comparisons(&id), "length {len}");
+        }
+        assert!(!usable(b""));
+        assert!(usable(&[b'a'; MAX_CLIENT_ID_LEN]));
+        assert!(!usable(&[b'a'; MAX_CLIENT_ID_LEN + 1]));
     }
 }

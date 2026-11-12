@@ -3,14 +3,18 @@
 //!
 //! A connection never leaves its thread (`LocalSet::spawn_local`), so its future needs no `Send`
 //! and there is no work stealing. When a route runs on a sub-interpreter each thread owns one
-//! worker and runs `def` handlers inline, while `async def` handlers go to the async worker pool;
-//! main-interpreter handlers go to the main interpreter's threads.
+//! worker and runs `def` handlers inline, and `async def` handlers as Tasks on that worker's event
+//! loop; main-interpreter handlers go to the main interpreter's threads.
 
+mod admission;
 mod conn;
+mod deadline;
 mod error;
 #[cfg(target_os = "macos")]
 mod fanout;
 mod inline;
+mod loop_driver;
+mod on_loop;
 mod startup;
 mod threads;
 
@@ -25,15 +29,17 @@ use mipyre_transport::driver::TransportDriver;
 use crate::site::Site;
 use crate::ServerCounters;
 use crate::ServerRunStop;
-use mipyre_runtime::{InterpreterPool, MainThreads, WorkerIndex, WorkerLife, WorkerRecipe};
+use mipyre_runtime::{MainThreads, WorkerIndex, WorkerLife, WorkerRecipe};
 
+pub use self::admission::LoopLimits;
 #[cfg(feature = "bench")]
 pub use self::conn::drive_conn;
 pub use self::conn::TpcThread;
-pub(crate) use self::conn::{ThreadWorker, WorkerLease};
+pub(crate) use self::conn::{LoopWorker, ThreadWorker, WorkerLease};
 pub use self::error::ServeError;
 #[cfg(feature = "bench")]
 pub use self::inline::tpc_accept_loop_inline;
+pub(crate) use self::on_loop::run_on_loop;
 pub use self::startup::{log_startup, report_pinning, thread_cpus, tpc_banner};
 #[cfg(feature = "bench")]
 pub use self::threads::serve_on_workers;
@@ -100,8 +106,9 @@ pub struct TpcServer {
     pub threads: TpcThreads,
     /// Every thread hands its main-interpreter routes to it; it is `None` when the table has none.
     pub main: Option<Arc<MainThreads>>,
-    /// Every thread hands its `async def` routes to it; it is `None` when the table has none.
-    pub async_pool: Option<Arc<InterpreterPool>>,
+    /// Every thread runs its `async def` routes on its own event loop, holding this many at once;
+    /// it is `None` when the table has none.
+    pub loop_limits: Option<LoopLimits>,
     pub gc: GcPolicy,
     /// The CPUs are in thread order; threads past its end run unpinned.
     pub cpus: Vec<CoreId>,
@@ -129,17 +136,13 @@ impl TpcThreads {
         }
     }
 
-    fn into_setups(
-        self,
-        main: Option<Arc<MainThreads>>,
-        async_pool: Option<Arc<InterpreterPool>>,
-    ) -> Vec<TpcThreadSetup> {
+    fn into_setups(self, main: Option<Arc<MainThreads>>, loop_limits: Option<LoopLimits>) -> Vec<TpcThreadSetup> {
         let setup = |i: usize, site: Arc<Site>, plan: Option<WorkerPlan>| TpcThreadSetup {
             index: WorkerIndex::new(i),
             site,
             plan,
             main: main.clone(),
-            async_pool: async_pool.clone(),
+            loop_limits,
         };
         match self {
             TpcThreads::WithWorkers { threads, recipe } => threads
@@ -168,7 +171,7 @@ struct TpcThreadSetup {
     site: Arc<Site>,
     plan: Option<WorkerPlan>,
     main: Option<Arc<MainThreads>>,
-    async_pool: Option<Arc<InterpreterPool>>,
+    loop_limits: Option<LoopLimits>,
 }
 
 /// The fanout acceptor takes a handle on `retired` before the thread starts, to skip the thread

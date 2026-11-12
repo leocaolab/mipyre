@@ -14,6 +14,7 @@ use mipyre_tpc::{
 };
 
 use super::conn::{ThreadWorker, TpcThread};
+use super::loop_driver::{DriverStop, LoopDriver};
 use super::startup::{report_affinity, with_cores};
 use super::{ServeError, TpcServer, TpcThreadSetup};
 use crate::ServerCounters;
@@ -28,27 +29,34 @@ pub(super) type TpcThreadStop = ThreadStop<ServerStop>;
 pub(super) type ServeThread = ThreadHandle<(), ServeError>;
 
 /// A TPC thread whose accept loop has ended: it takes no more connections, and holds the ones still
-/// open and the process lanes it hosts until they finish.
+/// open, its event loop and the process lanes it hosts until they finish.
 pub(super) struct ThreadDrain {
     pub(super) connections: LocalTasks,
     pub(super) lane_host: Option<Rc<LaneHost>>,
+    pub(super) event_loop: Option<LoopDriver>,
 }
 
 impl ThreadDrain {
     /// Lets the connections finish until the run's stop `deadline` less the teardown margin, then
-    /// shuts the lane host down; the connections still open are closed, counted and logged.
+    /// shuts the lane host down; the connections still open are closed, counted and logged. The
+    /// event loop turns meanwhile, so the connections' `async def` requests can finish; once the
+    /// connections are gone, or a margin before that time, it cancels its Tasks still live, runs
+    /// its finalizers and closes.
     pub(super) async fn finish(self, deadline: &ShutdownDeadline, counters: &ServerCounters) {
-        drain_connections(self.connections, deadline, counters).await;
+        let drain = drain_timeout(deadline, Instant::now());
+        let stop = DriverStop::draining(tokio::time::Instant::now(), drain);
+        if let Some(driver) = &self.event_loop {
+            driver.stop(stop);
+        }
+        drain_within(self.connections, drain, counters).await;
+        if let Some(driver) = self.event_loop {
+            driver.stop(stop.cancelled_by(tokio::time::Instant::now()));
+            driver.finish().await;
+        }
         if let Some(host) = self.lane_host {
             host.shutdown().await;
         }
     }
-}
-
-/// Lets a stopped accept loop's connections finish until the run's stop `deadline` less the
-/// teardown margin; the ones still open then are closed, counted and logged.
-async fn drain_connections(tracker: LocalTasks, deadline: &ShutdownDeadline, counters: &ServerCounters) {
-    drain_within(tracker, drain_timeout(deadline, Instant::now()), counters).await;
 }
 
 /// Lets `tracker`'s connections finish for at most `timeout`; the ones still open then are
@@ -248,12 +256,12 @@ where
     let TpcServer {
         threads,
         main,
-        async_pool,
+        loop_limits,
         cpus,
         counters,
         ..
     } = server;
-    let threads = threads.into_setups(main, async_pool);
+    let threads = threads.into_setups(main, loop_limits);
     // Both are sized by `Topology::accept_loops`; a zip would drop the extra ones unserved.
     assert_eq!(payloads.len(), threads.len(), "one payload per TPC thread");
     let threads = threads.into_iter().zip(payloads).collect();
@@ -348,12 +356,12 @@ where
         site,
         plan,
         main,
-        async_pool,
+        loop_limits,
     } = setup;
     let started = start_here(start_handle, index, || match plan {
         Some(plan) => {
             let created = SubInterpreterWorker::<SyncRunner>::create(index, &plan.recipe.spec())?;
-            Ok(Some(ThreadWorker::new(created, plan.life, plan.retired)))
+            Ok(Some(ThreadWorker::new(created, plan.life, plan.retired, loop_limits)))
         }
         None => Ok(None),
     });
@@ -365,7 +373,6 @@ where
         worker,
         site,
         main,
-        async_pool,
     });
     let counters = Arc::clone(&tpc_thread.site.counters.run);
     let served = serve_on_this_thread(slot.core(), &counters, stop, deadline, || {
@@ -696,7 +703,7 @@ mod stop_tests {
             let tracker = LocalTasks::new();
             tracker.spawn_local(std::future::pending::<()>());
             tracker.spawn_local(std::future::pending::<()>());
-            drain_connections(tracker, &deadline(), &run).await;
+            drain_within(tracker, drain_timeout(&deadline(), Instant::now()), &run).await;
         });
         let timed_out = run.read();
         assert_eq!((timed_out.drain_timeouts, timed_out.drain_closed_connections), (1, 2));
@@ -705,7 +712,7 @@ mod stop_tests {
             let tracker = LocalTasks::new();
             tracker.spawn_local(async {});
             tracker.spawn_local(async {});
-            drain_connections(tracker, &deadline(), &run).await;
+            drain_within(tracker, drain_timeout(&deadline(), Instant::now()), &run).await;
         });
         let clean = run.read();
         assert_eq!((clean.drain_timeouts, clean.drain_closed_connections), (0, 0));

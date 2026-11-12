@@ -21,6 +21,7 @@ use mipyre_util::throttle::LogThrottle;
 use super::job_queue::JobSendError;
 use super::main_threads::MainReplySender;
 use super::pool::{PoolJob, PoolReplySender, ReplySender};
+use super::worker::request_loop::LoopReplySender;
 use crate::exchange::error::{refuse, HandlerError, UnansweredError};
 use crate::exchange::request::Request;
 use crate::sync::Doorbell;
@@ -41,14 +42,18 @@ pub(crate) struct EngineJob {
 /// Where an async engine's answer to one request goes, which decides what the answer may be: only main can answer
 /// with a `Stream`.
 pub(crate) enum EngineReply {
-    Pool(PoolReplySender),
+    /// It is a sub-interpreter worker's answer: a response, never a stream.
+    Worker(PoolReplySender),
+    /// It is a worker's answer to a request it ran on its loop.
+    Loop(LoopReplySender),
     Main(MainReplySender),
 }
 
 impl EngineReply {
     fn is_closed(&self) -> bool {
         match self {
-            EngineReply::Pool(reply) => reply.is_closed(),
+            EngineReply::Worker(reply) => reply.is_closed(),
+            EngineReply::Loop(reply) => reply.is_closed(),
             EngineReply::Main(reply) => reply.is_closed(),
         }
     }
@@ -56,7 +61,8 @@ impl EngineReply {
     /// Answers the request `label` names with `error`, logged.
     pub(crate) fn fail(self, label: &RequestLabel, error: HandlerError) {
         match self {
-            EngineReply::Pool(reply) => send_answer(reply, label, Err(error)),
+            EngineReply::Worker(reply) => send_answer(reply, label, Err(error)),
+            EngineReply::Loop(reply) => send_answer(reply, label, Err(error)),
             EngineReply::Main(reply) => send_answer(reply, label, Err(error)),
         }
     }

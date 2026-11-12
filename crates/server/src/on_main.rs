@@ -23,7 +23,7 @@ use mipyre_runtime::exchange::{refuse, UnansweredError};
 use mipyre_runtime::{InterpreterPool, MainThreads};
 
 use super::pipeline::{collect_body, fail, finish, AcceptEncoding, HandlerRequest, Requester, ResponseSource};
-use super::request::{Backends, WorkerBackend};
+use super::request::{Backends, LoopBackend, WorkerBackend};
 use super::respond::http_response;
 
 /// Holds what one IO thread of the multi-thread server hands its requests, so a request takes one
@@ -38,6 +38,7 @@ pub struct MultiThreadServer {
 
 impl Backends for MultiThreadServer {
     type Inline = Infallible;
+    type OnLoop<'a> = Infallible;
 
     #[inline]
     fn site(&self) -> &Site {
@@ -50,12 +51,16 @@ impl Backends for MultiThreadServer {
     }
 
     #[inline]
-    fn async_pool(&self) -> Option<&InterpreterPool> {
-        self.pool.as_deref()
+    fn async_worker(&self) -> Option<LoopBackend<'_, Infallible>> {
+        self.pool.as_deref().map(LoopBackend::Pool)
     }
 
     async fn run_inline(worker: &Infallible, _: &Site, _: HandlerRequest, _: RouteId) -> Response<ResponseBody> {
         match *worker {}
+    }
+
+    async fn run_on_loop(on: Infallible, _: &Site, _: HandlerRequest, _: RouteId) -> Response<ResponseBody> {
+        match on {}
     }
 
     fn call_unary_inline(

@@ -1,9 +1,9 @@
 //! Handles requests on a TPC thread.
 //!
 //! A `def` worker route runs inline on the TPC thread, in its own sub-interpreter, with no
-//! cross-thread wake; an `async def` route goes to the async worker pool, and a `runtime="main"`
-//! route or the fallback to the main interpreter's threads (an `async def` one to main's async
-//! engine).
+//! cross-thread wake; an `async def` route runs as a Task on that worker's event loop, on the same
+//! thread; a `runtime="main"` route or the fallback goes to the main interpreter's threads (an
+//! `async def` one to main's async engine).
 //!
 //! The inline path allocates nothing of its own per request: the handler's `Request` takes the
 //! method, URI, headers and body bytes hyper already holds, and the log line keeps only a copy of
@@ -16,7 +16,7 @@ use hyper::Response;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::site::Site;
-use crate::tpc::{ThreadWorker, TpcThread, WorkerLease};
+use crate::tpc::{run_on_loop, LoopWorker, ThreadWorker, TpcThread, WorkerLease};
 use mipyre_core::InlineTimer;
 use mipyre_http::io::body::ResponseBody;
 use mipyre_http::io::request_head::{RequestHead, RequestLabel};
@@ -25,14 +25,15 @@ use mipyre_http::plan::route::RouteId;
 use mipyre_runtime::exchange;
 use mipyre_runtime::exchange::RequestBody;
 use mipyre_runtime::exchange::{refuse, HandlerError, UnansweredError};
-use mipyre_runtime::{InterpreterPool, MainThreads};
+use mipyre_runtime::MainThreads;
 
 use super::pipeline::{collect_body, fail, finish, AcceptEncoding, HandlerRequest, Requester, ResponseSource};
-use super::request::{Backends, WorkerBackend};
+use super::request::{Backends, LoopBackend, WorkerBackend};
 use super::respond::http_response;
 
 impl Backends for TpcThread {
     type Inline = ThreadWorker;
+    type OnLoop<'a> = LoopWorker<'a>;
 
     #[inline]
     fn site(&self) -> &Site {
@@ -44,11 +45,11 @@ impl Backends for TpcThread {
         self.worker.as_ref().map(WorkerBackend::Inline)
     }
 
-    /// Returns the pool an `async def` route runs on, off this thread, so the handler's awaits
-    /// overlap other requests and its budget is enforced on time.
+    /// Returns the event loop an `async def` route runs on, on this thread, so the handler's
+    /// awaits overlap other requests.
     #[inline]
-    fn async_pool(&self) -> Option<&InterpreterPool> {
-        self.async_pool.as_deref()
+    fn async_worker(&self) -> Option<LoopBackend<'_, LoopWorker<'_>>> {
+        self.on_loop().map(LoopBackend::OnLoop)
     }
 
     #[inline]
@@ -59,6 +60,16 @@ impl Backends for TpcThread {
         route: RouteId,
     ) -> impl Future<Output = Response<ResponseBody>> + 'a {
         run_inline(site, worker, prepared, route)
+    }
+
+    #[inline]
+    fn run_on_loop<'a>(
+        on: LoopWorker<'a>,
+        site: &'a Site,
+        prepared: HandlerRequest,
+        route: RouteId,
+    ) -> impl Future<Output = Response<ResponseBody>> + 'a {
+        run_on_loop(site, on, prepared, route)
     }
 
     #[inline]

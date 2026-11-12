@@ -160,7 +160,7 @@ impl WorkerStartError {
     /// Converts this error into the exception main raises: an import failure stays an
     /// `ImportError` (or `ModuleNotFoundError`) and anything else is a `RuntimeError`, with the
     /// worker's traceback as its `__cause__` ([`WorkerException`]).
-    pub(crate) fn into_pyerr(self, py: Python<'_>) -> PyErr {
+    pub fn into_pyerr(self, py: Python<'_>) -> PyErr {
         let text = self.to_string();
         let Some(raised) = self.raised() else {
             return PyRuntimeError::new_err(text);
