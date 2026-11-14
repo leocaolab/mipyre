@@ -21,6 +21,7 @@ use super::config::{
     code_value, given_line, read_flag, settled_line, take, CodeValue, DeploymentSources, DeploymentValue, FlagError,
     FlagSource, FlagValue, ServerFlagsError,
 };
+use super::topology::ThreadCount;
 use mipyre_server::AcceptMode;
 
 /// Prefixes of `MIPYRE_` variables that are not ours to read: the test and benchmark tools' own.
@@ -212,6 +213,9 @@ pub(crate) enum FlagShape {
     Count,
     /// A whole number, 1 or more.
     Positive,
+    /// A whole number, 1 or more, or `physical` / `logical` for one thread per physical core or
+    /// per logical CPU.
+    Threads,
     /// A time, 0 or more.
     Duration {
         unit: TimeUnit,
@@ -247,6 +251,7 @@ impl FlagShape {
             FlagShape::Bool => "bool",
             FlagShape::Count => "count",
             FlagShape::Positive => "positive",
+            FlagShape::Threads => "threads",
             FlagShape::Duration { .. } => "duration",
             FlagShape::PositiveDuration { .. } => "positive_duration",
             FlagShape::Port => "port",
@@ -266,6 +271,11 @@ impl FlagShape {
             FlagShape::Bool => "expected 1/true/yes/on or 0/false/no/off".into(),
             FlagShape::Count => "expected a whole number (0 or more)".into(),
             FlagShape::Positive => "expected a positive whole number".into(),
+            FlagShape::Threads => format!(
+                "expected a positive whole number, {:?} or {:?}",
+                ThreadCount::PHYSICAL,
+                ThreadCount::LOGICAL
+            ),
             FlagShape::Duration { unit } => format!("expected a number of {} (0 or more)", unit.words()),
             FlagShape::PositiveDuration {
                 unit: TimeUnit::Seconds,
@@ -482,6 +492,28 @@ impl FlagType for Vec<String> {
 
     fn written(&self) -> String {
         self.join(",")
+    }
+}
+
+impl FlagType for ThreadCount {
+    fn fits(shape: FlagShape) -> bool {
+        shape == FlagShape::Threads
+    }
+
+    fn read(raw: &str, _shape: FlagShape) -> Option<Self> {
+        match raw {
+            ThreadCount::PHYSICAL => Some(ThreadCount::PerPhysicalCore),
+            ThreadCount::LOGICAL => Some(ThreadCount::PerLogicalCpu),
+            count => count.parse().ok().map(ThreadCount::Fixed),
+        }
+    }
+
+    fn written(&self) -> String {
+        match self {
+            ThreadCount::Fixed(n) => n.to_string(),
+            ThreadCount::PerPhysicalCore => ThreadCount::PHYSICAL.to_string(),
+            ThreadCount::PerLogicalCpu => ThreadCount::LOGICAL.to_string(),
+        }
     }
 }
 
@@ -720,12 +752,12 @@ macro_rules! flags {
 
 flags! {
     server {
-    threads: NonZeroUsize = {
+    threads: ThreadCount = {
         name: "threads", file: PyprojectKey::Top("threads"),
         code: [server_flags("threads")],
-        shape: FlagShape::Positive,
+        shape: FlagShape::Threads,
         used: Always,
-        default: "one per physical core (thread-per-core); with tpc off, one per logical CPU",
+        default: "physical (thread-per-core); with tpc off, logical",
         doc: "the server's threads: thread-per-core threads, or with tpc off the I/O threads",
     },
     subinterpreters: NonZeroUsize = {
@@ -1042,6 +1074,17 @@ mod tests {
         round_trip::<AcceptMode>();
         round_trip::<StartStrategy>();
         round_trip::<FailurePolicy>();
+    }
+
+    #[test]
+    fn threads_reads_a_count_or_a_cpu_kind_and_writes_it_back() {
+        for raw in ["3", "physical", "logical"] {
+            let count = ThreadCount::read(raw, FlagShape::Threads);
+            assert_eq!(count.map(|c| c.written()).as_deref(), Some(raw));
+        }
+        for refused in ["0", "-1", "all", "Logical", ""] {
+            assert_eq!(ThreadCount::read(refused, FlagShape::Threads), None, "{refused:?}");
+        }
     }
 
     #[cfg(not(target_os = "macos"))]

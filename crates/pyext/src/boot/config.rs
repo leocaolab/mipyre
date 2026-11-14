@@ -21,6 +21,7 @@ use super::settings::{
     cli_option, env_variable, CodeCall, CodeKey, Deployment, EntryPoint, Flag, FlagType, PyprojectKey,
     ServerFlagValues, ServerFlags, FLAGS, RESERVED_PREFIXES,
 };
+use super::topology::ThreadCount;
 
 /// Counts the requests a worker serves between `gc.collect()`s in count mode; on the baseline
 /// test 5000 gave p99 = 2.0 ms, 100_000 gave about 300 µs, and never collecting gave 240 µs.
@@ -43,7 +44,7 @@ const MAIN_QUEUE_PER_THREAD: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 pub(crate) struct ServerSizes {
     /// Sizes the server's threads: the TPC threads, or the Tokio IO threads of the
     /// multi-thread (`tpc` off) server.
-    pub(crate) threads: Option<FlagValue<NonZeroUsize>>,
+    pub(crate) threads: Option<FlagValue<ThreadCount>>,
     /// Sizes the multi-thread server's sub-interpreter pool; a TPC server has one
     /// sub-interpreter per thread.
     pub(crate) subinterpreters: Option<FlagValue<NonZeroUsize>>,
@@ -1305,8 +1306,11 @@ pub(super) mod tests {
             let r = crate::boot::ServerRecipe::of(Deployment::default().over(&code(&[("threads", "2")]))).unwrap();
             let threads = r.sizes.threads.unwrap();
             assert_eq!(
-                (threads.value().get(), threads.source().to_string()),
-                (2, "ServerFlags(threads=)".to_string())
+                (*threads.value(), threads.source().to_string()),
+                (
+                    ThreadCount::Fixed(NonZeroUsize::new(2).unwrap()),
+                    "ServerFlags(threads=)".to_string()
+                )
             );
         }
 
@@ -1365,7 +1369,7 @@ pub(super) mod tests {
                 code.give(CodeCall::ServerFlags, "threads", "0")
                     .unwrap_err()
                     .to_string(),
-                "ServerFlags(threads=): \"0\" is invalid: expected a positive whole number"
+                "ServerFlags(threads=): \"0\" is invalid: expected a positive whole number, \"physical\" or \"logical\""
             );
         }
     }
@@ -1413,7 +1417,7 @@ pub(super) mod tests {
             )
             .unwrap();
             let threads = d.threads.unwrap();
-            assert_eq!(threads.value, NonZeroUsize::new(8).unwrap());
+            assert_eq!(threads.value, ThreadCount::Fixed(NonZeroUsize::new(8).unwrap()));
             assert_eq!(threads.from.to_string(), "mipyre run --threads");
             let port = d.port.unwrap();
             assert_eq!(

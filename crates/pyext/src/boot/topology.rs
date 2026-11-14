@@ -83,6 +83,28 @@ pub(crate) fn check_websockets(topology: Topology, routes: &[WsRoute]) -> Result
     }
 }
 
+/// Says how many threads a server starts: a fixed number, or one per physical core or per
+/// logical CPU of the CPUs it may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThreadCount {
+    Fixed(NonZeroUsize),
+    PerPhysicalCore,
+    PerLogicalCpu,
+}
+
+impl ThreadCount {
+    pub(crate) const PHYSICAL: &'static str = "physical";
+    pub(crate) const LOGICAL: &'static str = "logical";
+
+    fn of(self, cpus: Cpus) -> NonZeroUsize {
+        match self {
+            ThreadCount::Fixed(n) => n,
+            ThreadCount::PerPhysicalCore => cpus.physical(),
+            ThreadCount::PerLogicalCpu => cpus.logical(),
+        }
+    }
+}
+
 /// Says how one server serves; it is resolved once in `run()` and every serving decision reads
 /// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,10 +142,18 @@ impl Topology {
     pub(crate) fn resolve(mode: InterpreterMode, recipe: &ServerRecipe, cpus: Cpus) -> Result<Self, UnsupportedGcMode> {
         let sizing = &recipe.sizes;
         let topology = if let ServerKind::Tpc(accept) = recipe.server {
-            let threads = sizing.threads.as_ref().map_or(cpus.physical(), |g| *g.value());
+            let threads = sizing
+                .threads
+                .as_ref()
+                .map_or(ThreadCount::PerPhysicalCore, |g| *g.value())
+                .of(cpus);
             Topology::Tpc { threads, accept }
         } else {
-            let io_threads = sizing.threads.as_ref().map_or(cpus.logical(), |g| *g.value());
+            let io_threads = sizing
+                .threads
+                .as_ref()
+                .map_or(ThreadCount::PerLogicalCpu, |g| *g.value())
+                .of(cpus);
             let accept_loops = io_threads.min(cpus.logical());
             match mode {
                 InterpreterMode::Gil => Topology::MultiThreadGil {
@@ -349,6 +379,15 @@ mod tests {
             }
         );
         assert_eq!(t.accept_loops(), n(3));
+    }
+
+    #[test]
+    fn tpc_threads_can_be_one_per_logical_cpu_or_per_physical_core() {
+        let threads = |given| match resolve(InterpreterMode::Subinterp, &[], &[("threads", given)]).unwrap() {
+            Topology::Tpc { threads, .. } => threads.get(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!((threads("logical"), threads("physical")), (16, 8));
     }
 
     /// A layout of `topology` with none of the route facts, taking TCP connections.

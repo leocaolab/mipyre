@@ -2,6 +2,12 @@
 
 All notable changes to mipyre are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/): within 1.x, the public API does not break.
 
+## [4.2.0] — unreleased
+
+### Added
+
+- `threads` (`ServerFlags(threads=)`, `MIPYRE_THREADS`, `--threads`, `[tool.mipyre] threads`) takes `physical` or `logical` as well as a number: one thread per physical core, or one per logical CPU, SMT siblings included, of the CPUs the process may use. The defaults do not change: `physical` on the thread-per-core server, `logical` with `MIPYRE_TPC=0`. With `logical`, the thread-per-core server pins a thread to every core before it pins one to an SMT sibling.
+
 ## [4.1.0] — 2026-11-12
 
 On the thread-per-core server, `async def` handlers run on each thread's own event loop, beside its `def` handlers, and the separate pool of async workers is gone.

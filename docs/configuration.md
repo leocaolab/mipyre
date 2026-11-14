@@ -29,7 +29,7 @@ From `app.run()` or a test, the same reasons are one `mipyre.engine.ConfigError`
 |---|---|---|---|---|
 | address | `ServerFlags(host=)` | `MIPYRE_HOST` | `--host` | `127.0.0.1` |
 | port | `ServerFlags(port=)` | `MIPYRE_PORT` | `--port` | `8000` |
-| server threads: thread-per-core threads (one sub-interpreter each), or with `MIPYRE_TPC=0` the I/O threads and accept loops | `ServerFlags(threads=)` | `MIPYRE_THREADS` | `--threads` | thread-per-core: physical cores (performance cores on Apple silicon); `MIPYRE_TPC=0`: logical CPUs |
+| server threads: thread-per-core threads (one sub-interpreter each), or with `MIPYRE_TPC=0` the I/O threads and accept loops | `ServerFlags(threads=)` | `MIPYRE_THREADS` | `--threads` | a number, `physical` or `logical`. Default: thread-per-core `physical`, one per physical core (performance cores on Apple silicon); `MIPYRE_TPC=0` `logical`, one per logical CPU (SMT siblings included) |
 | the sub-interpreter pool's size (`MIPYRE_TPC=0` only; thread-per-core runs one per thread) | `ServerFlags(subinterpreters=)` | `MIPYRE_SUBINTERPRETERS` | `--subinterpreters` | logical CPUs |
 | server model | | `MIPYRE_TPC` | `--tpc` | `1`: thread-per-core. `0` (or `false`, `no`, `off`): multi-thread server, I/O threads in front of a pool of sub-interpreters |
 | TLS certificate chain and key (PEM) | `ServerFlags(tls_cert=, tls_key=)` | `MIPYRE_TLS_CERT`, `MIPYRE_TLS_KEY` | `--tls-cert`, `--tls-key` | unset: plain HTTP. Set both or neither |
@@ -331,7 +331,7 @@ Each server setting, by its three names. A `[tool.mipyre]` key is written in `py
 
 | Setting | `mipyre run` / `mipyre dev` | Environment | `pyproject.toml` | Default | What it is |
 |---|---|---|---|---|---|
-| `threads` | `--threads` | `MIPYRE_THREADS` | `[tool.mipyre] threads` | one per physical core (thread-per-core); with tpc off, one per logical CPU | the server's threads: thread-per-core threads, or with tpc off the I/O threads |
+| `threads` | `--threads` | `MIPYRE_THREADS` | `[tool.mipyre] threads` | physical (thread-per-core); with tpc off, logical | the server's threads: thread-per-core threads, or with tpc off the I/O threads |
 | `subinterpreters` | `--subinterpreters` | `MIPYRE_SUBINTERPRETERS` | `[tool.mipyre] subinterpreters` | one per logical CPU, at least 2 | the sub-interpreter pool's size, with tpc off; thread-per-core runs one per thread |
 | `tpc` | `--tpc` | `MIPYRE_TPC` | `[tool.mipyre] tpc` | on | thread-per-core; off runs the multi-thread server |
 | `tpc_accept` | `--tpc-accept` | `MIPYRE_TPC_ACCEPT` | `[tool.mipyre] tpc_accept` | listener | how thread-per-core threads take connections on macOS: an accept loop each on one shared socket, or one fanout acceptor |
